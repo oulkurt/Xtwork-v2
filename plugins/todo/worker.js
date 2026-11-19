@@ -20,6 +20,12 @@ function byteLength(value) {
   }, 0);
 }
 
+function validateId(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input) || typeof input.id !== "string" || !input.id) {
+    throw new Error("id is required.");
+  }
+}
+
 function validate(input, creating = false) {
   if (!input || typeof input !== "object" || Array.isArray(input))
     throw new Error("Expected an object.");
@@ -124,19 +130,65 @@ function select(items, input = {}) {
 }
 const actions = {
   create,
+  update: async (input) => {
+    validateId(input);
+    const current = await xtwork.storage.get(key(input.id));
+    if (!current) throw new Error("Todo not found.");
+    const changes = { ...input };
+    delete changes.id;
+    const next = {
+      ...current,
+      ...Object.fromEntries(fields.map((name) => [name, changes[name] ?? current[name]])),
+    };
+    if (!next.due && (changes.time === undefined || changes.time === "")) next.time = "";
+    validate(next);
+    next.title = next.title.trim();
+    next.group = next.group.trim();
+    const now = new Date().toISOString();
+    const item = {
+      ...next,
+      updatedAt: now,
+    };
+    await xtwork.storage.set(key(item.id), item);
+    return item;
+  },
+  complete: async (input) => {
+    validateId(input);
+    const current = await xtwork.storage.get(key(input.id));
+    if (!current) throw new Error("Todo not found.");
+    const done = input.done === undefined ? true : input.done;
+    if (typeof done !== "boolean") throw new Error("done must be a boolean.");
+    const now = new Date().toISOString();
+    const item = {
+      ...current,
+      done,
+      doneAt: done ? now : "",
+      updatedAt: now,
+    };
+    await xtwork.storage.set(key(item.id), item);
+    return item;
+  },
+  delete: async (input) => {
+    validateId(input);
+    const current = await xtwork.storage.get(key(input.id));
+    if (!current) throw new Error("Todo not found.");
+    await xtwork.storage.delete(key(input.id));
+    return { id: input.id, deleted: true };
+  },
   list: async (input) => {
-    const { limit = 50, offset = 0 } = input;
+    const { limit = 50, offset = 0, fullNotes = false } = input;
     if (!Number.isInteger(limit) || limit < 1 || limit > 200)
       throw new Error("limit must be an integer from 1 to 200.");
     if (!Number.isInteger(offset) || offset < 0 || offset > 1000)
       throw new Error("offset must be an integer from 0 to 1000.");
+    if (typeof fullNotes !== "boolean") throw new Error("fullNotes must be a boolean.");
     const items = select(await all(), input);
     const result = [];
     let size = 0;
     for (const item of items.slice(offset, offset + limit)) {
       const chars = Array.from(item.notes);
       const compact =
-        chars.length > 200
+        !fullNotes && chars.length > 200
           ? {
               ...item,
               notes: chars.slice(0, 200).join(""),
@@ -155,6 +207,6 @@ const actions = {
 export const tools = actions;
 
 export function onView(method, input) {
-  if (method !== "create" && method !== "list") throw new Error("Unknown todo action.");
+  if (!(method in actions)) throw new Error("Unknown todo action.");
   return actions[method](input);
 }

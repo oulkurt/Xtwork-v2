@@ -21,11 +21,17 @@ export function TodoPanel() {
       if (!frame || event.source !== frame || event.origin !== "null" ||
           request?.channel !== channel || !Number.isSafeInteger(request.id)) return;
 
+      const method = request.method;
+      const creating = method === "create";
+      const listing = method === "list";
+      const mutating = creating || method === "update" || method === "complete" || method === "delete";
+      if (!creating && !listing && !mutating) return;
       const title = typeof request.title === "string" ? request.title.trim() : "";
-      const creating = request.method === "create";
-      if (creating ? title.length < 1 || title.length > 200 : request.method !== "list") return;
+      if (creating && (title.length < 1 || title.length > 200)) return;
+      const id = typeof request.todoId === "string" ? request.todoId : "";
+      if (!creating && !listing && !id) return;
       const offset = request.offset ?? 0;
-      if (!creating && (!Number.isInteger(offset) || offset < 0 || offset > 1000)) return;
+      if (listing && (!Number.isInteger(offset) || offset < 0 || offset > 1000)) return;
       const target = frame;
 
       function reply(result: { value?: unknown; error?: string }) {
@@ -38,11 +44,40 @@ export function TodoPanel() {
         const token = await readDesktopPrimaryBearerToken();
         if (!token) throw new Error("请先连接本机服务");
         const headers = new Headers({ Authorization: `Bearer ${token}` });
-        if (creating) headers.set("Content-Type", "application/json");
-        const url = creating ? "/api/xtwork/todo" : `/api/xtwork/todo?offset=${offset}`;
+        if (mutating) headers.set("Content-Type", "application/json");
+        const url = listing
+          ? `/api/xtwork/todo?filter=${encodeURIComponent(typeof request.filter === "string" ? request.filter : "all")}&offset=${offset}&fullNotes=${request.fullNotes === true ? "true" : "false"}`
+          : "/api/xtwork/todo";
+        const body = creating
+          ? {
+              title,
+              ...(typeof request.notes === "string" ? { notes: request.notes } : {}),
+              ...(typeof request.group === "string" ? { group: request.group } : {}),
+              ...(typeof request.due === "string" ? { due: request.due } : {}),
+              ...(typeof request.time === "string" ? { time: request.time } : {}),
+              ...(typeof request.priority === "string" ? { priority: request.priority } : {}),
+            }
+          : method === "update"
+            ? {
+                id,
+                ...(typeof request.title === "string" ? { title: request.title } : {}),
+                ...(typeof request.notes === "string" ? { notes: request.notes } : {}),
+                ...(typeof request.group === "string" ? { group: request.group } : {}),
+                ...(typeof request.due === "string" ? { due: request.due } : {}),
+                ...(typeof request.time === "string" ? { time: request.time } : {}),
+                ...(typeof request.priority === "string" ? { priority: request.priority } : {}),
+              }
+            : method === "complete"
+              ? { action: "complete", id, ...(typeof request.done === "boolean" ? { done: request.done } : {}) }
+              : { id };
         const response = await fetch(url, {
           headers,
-          ...(creating ? { method: "POST", body: JSON.stringify({ title }) } : {}),
+          ...(mutating
+            ? {
+                method: creating ? "POST" : method === "delete" ? "DELETE" : "PATCH",
+                body: JSON.stringify(body),
+              }
+            : {}),
         });
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || "待办服务暂不可用");
@@ -77,7 +112,7 @@ export function TodoPanel() {
           <iframe
             ref={iframe}
             title="待办事项"
-            sandbox="allow-scripts"
+            sandbox="allow-scripts allow-forms"
             srcDoc={todoView}
             className="min-h-0 w-full flex-1 border-0"
             onLoad={() => iframe.current?.contentWindow?.postMessage({

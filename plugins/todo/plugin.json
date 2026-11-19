@@ -91,9 +91,63 @@
               "maximum": 200,
               "default": 50,
               "description": "Maximum items to return; default 50."
+            },
+            "fullNotes": {
+              "type": "boolean",
+              "default": false,
+              "description": "Return full note text instead of compact previews."
             }
           },
           "additionalProperties": false
+        },
+        "confirm": false
+      },
+      {
+        "name": "update",
+        "title": "修改待办",
+        "description": "Update an existing todo. Only supplied fields are changed.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "notes": { "type": "string", "maxLength": 2000 },
+            "group": { "type": "string", "maxLength": 40 },
+            "due": { "type": "string", "description": "User local timezone date YYYY-MM-DD, or empty to clear." },
+            "time": { "type": "string", "description": "User local timezone time HH:MM; requires due, or empty to clear." },
+            "priority": { "type": "string", "enum": ["none", "low", "medium", "high"] }
+          },
+          "additionalProperties": false,
+          "required": ["id"]
+        },
+        "confirm": false
+      },
+      {
+        "name": "complete",
+        "title": "完成待办",
+        "description": "Mark a todo as completed or reopen it.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "done": { "type": "boolean", "default": true }
+          },
+          "additionalProperties": false,
+          "required": ["id"]
+        },
+        "confirm": false
+      },
+      {
+        "name": "delete",
+        "title": "删除待办",
+        "description": "Delete an existing todo.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "string", "minLength": 1, "maxLength": 200 }
+          },
+          "additionalProperties": false,
+          "required": ["id"]
         },
         "confirm": false
       }

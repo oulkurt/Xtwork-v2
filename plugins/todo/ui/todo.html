@@ -4,35 +4,130 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <style>
-  :root { color-scheme: light dark; font: 14px system-ui, sans-serif; color: CanvasText; }
-  body { margin: 0; padding: 0 24px 24px; }
-  form { display: flex; gap: 8px; }
-  input, button { box-sizing: border-box; padding: 8px 10px; font: inherit; border: 1px solid color-mix(in srgb, CanvasText 22%, transparent); border-radius: 6px; }
-  input { flex: 1; min-width: 0; background: transparent; color: inherit; }
-  button { cursor: pointer; color: ButtonText; background: ButtonFace; }
-  button:disabled { opacity: .6; cursor: progress; }
-  p { margin: 16px 0 8px; color: color-mix(in srgb, CanvasText 70%, transparent); }
-  ul { list-style: none; margin: 12px 0 0; padding: 0; }
-  li { padding: 11px 0; border-bottom: 1px solid color-mix(in srgb, CanvasText 15%, transparent); overflow-wrap: anywhere; }
-  small { margin-inline-start: 8px; color: color-mix(in srgb, CanvasText 60%, transparent); }
+  :root {
+    color-scheme: light dark;
+    font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: CanvasText;
+    --muted: color-mix(in srgb, CanvasText 62%, transparent);
+    --faint: color-mix(in srgb, CanvasText 12%, transparent);
+    --line: color-mix(in srgb, CanvasText 16%, transparent);
+    --accent: #6d58d9;
+    --accent-contrast: #fff;
+    --danger: #c43c4b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px 22px 28px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+  h1 { font-size: 22px; letter-spacing: -0.02em; margin: 0; }
+  #count { color: var(--muted); font-size: 12px; }
+  #create-form { display: flex; gap: 8px; }
+  #create-form > button { flex: 0 0 auto; }
+  input, textarea, select, button { box-sizing: border-box; font: inherit; border-radius: 8px; }
+  input, textarea, select { min-width: 0; width: 100%; color: inherit; background: color-mix(in srgb, Canvas 90%, CanvasText 10%); border: 1px solid var(--line); padding: 9px 11px; }
+  input:focus, textarea:focus, select:focus, button:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 2px; }
+  textarea { min-height: 72px; resize: vertical; }
+  button { border: 1px solid var(--line); padding: 8px 11px; cursor: pointer; color: inherit; background: transparent; }
+  button:hover { background: var(--faint); }
+  button:disabled { cursor: progress; opacity: .58; }
+  .primary { border-color: var(--accent); color: var(--accent-contrast); background: var(--accent); }
+  .primary:hover { background: color-mix(in srgb, var(--accent) 86%, CanvasText); }
+  .filters { display: flex; gap: 4px; overflow-x: auto; padding: 18px 0 10px; scrollbar-width: none; }
+  .filters::-webkit-scrollbar { display: none; }
+  .filters button { white-space: nowrap; border-color: transparent; color: var(--muted); padding: 6px 9px; }
+  .filters button[aria-pressed="true"] { color: CanvasText; background: var(--faint); border-color: var(--line); }
+  #status { min-height: 22px; margin: 8px 0 4px; color: var(--muted); }
+  #status.error { color: var(--danger); }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: start; padding: 13px 0; border-top: 1px solid var(--line); }
+  li:first-child { border-top: 0; }
+  .check { width: 26px; height: 26px; padding: 0; border-radius: 50%; margin-top: 1px; }
+  .check.done { color: var(--accent-contrast); border-color: var(--accent); background: var(--accent); }
+  .check.done::after { content: ""; display: inline-block; width: 8px; height: 4px; border-left: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: translateY(-1px) rotate(-45deg); }
+  .content { min-width: 0; }
+  .title { font-weight: 600; overflow-wrap: anywhere; }
+  .done .title { color: var(--muted); text-decoration: line-through; }
+  .meta { display: flex; flex-wrap: wrap; gap: 5px 8px; margin-top: 4px; color: var(--muted); font-size: 12px; }
+  .meta span { overflow-wrap: anywhere; }
+  .notes { margin: 6px 0 0; color: var(--muted); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .actions { display: flex; gap: 3px; }
+  .actions button { border-color: transparent; color: var(--muted); padding: 5px 6px; }
+  .actions .delete:hover { color: var(--danger); }
+  #more { display: block; width: 100%; margin-top: 10px; }
+  #more[hidden] { display: none; }
+  #empty { padding: 34px 8px; text-align: center; color: var(--muted); }
+  #editor { margin: 4px 0 16px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--faint); }
+  #editor h2 { margin: 0 0 12px; font-size: 14px; }
+  .field { display: grid; gap: 5px; margin-top: 10px; }
+  .field:first-of-type { margin-top: 0; }
+  label { color: var(--muted); font-size: 12px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .editor-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  @media (max-width: 420px) {
+    body { padding-inline: 14px; }
+    .actions button { font-size: 12px; }
+  }
 </style>
-<form>
-  <input name="title" aria-label="待办内容" required maxlength="200" placeholder="新增待办">
-  <button type="submit">添加</button>
-</form>
-<p role="status">正在读取待办…</p>
-<ul aria-label="未完成"></ul>
-<button type="button" id="more" hidden>加载更多</button>
+<body>
+  <header>
+    <h1>待办</h1>
+    <span id="count" aria-live="polite"></span>
+  </header>
+
+  <form id="create-form">
+    <input id="new-title" name="title" aria-label="待办内容" required maxlength="200" placeholder="接下来要做什么？">
+    <button class="primary" type="submit">添加</button>
+  </form>
+
+  <nav class="filters" aria-label="待办筛选">
+    <button type="button" data-filter="all" aria-pressed="true">未完成</button>
+    <button type="button" data-filter="today" aria-pressed="false">今天</button>
+    <button type="button" data-filter="week" aria-pressed="false">本周</button>
+    <button type="button" data-filter="overdue" aria-pressed="false">逾期</button>
+    <button type="button" data-filter="done" aria-pressed="false">已完成</button>
+  </nav>
+
+  <section id="editor" hidden aria-labelledby="editor-title">
+    <h2 id="editor-title">编辑待办</h2>
+    <form id="edit-form">
+      <div class="field"><label for="edit-title">标题</label><input id="edit-title" name="title" required maxlength="200"></div>
+      <div class="row">
+        <div class="field"><label for="edit-due">截止日期</label><input id="edit-due" name="due" type="date"></div>
+        <div class="field"><label for="edit-time">时间</label><input id="edit-time" name="time" type="time"></div>
+      </div>
+      <div class="field"><label for="edit-priority">优先级</label><select id="edit-priority" name="priority"><option value="none">无</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></div>
+      <div class="field"><label for="edit-notes">备注</label><textarea id="edit-notes" name="notes" maxlength="2000" placeholder="补充说明（可选）"></textarea></div>
+      <div class="editor-actions"><button id="cancel-edit" type="button">取消</button><button class="primary" type="submit">保存</button></div>
+    </form>
+  </section>
+
+  <p id="status" role="status">正在读取待办…</p>
+  <ul id="items" aria-label="待办列表"></ul>
+  <p id="empty" hidden></p>
+  <button type="button" id="more" hidden>加载更多</button>
+
 <script>
   const channel = "xtwork:todo";
-  const form = document.querySelector("form");
-  const field = form.elements.namedItem("title");
-  const submit = form.querySelector("button");
-  const status = document.querySelector("p");
-  const items = document.querySelector("ul");
+  const form = document.querySelector("#create-form");
+  const field = document.querySelector("#new-title");
+  const status = document.querySelector("#status");
+  const count = document.querySelector("#count");
+  const items = document.querySelector("#items");
+  const empty = document.querySelector("#empty");
   const more = document.querySelector("#more");
+  const editor = document.querySelector("#editor");
+  const editForm = document.querySelector("#edit-form");
+  const editTitle = document.querySelector("#edit-title");
+  const editDue = document.querySelector("#edit-due");
+  const editTime = document.querySelector("#edit-time");
+  const editPriority = document.querySelector("#edit-priority");
+  const editNotes = document.querySelector("#edit-notes");
   let nextOffset = null;
   let nextId = 0;
+  let activeFilter = "all";
+  let editingId = null;
+  let deleteId = null;
+  let busy = false;
+  let loadedItems = [];
   const pending = new Map();
 
   function call(method, params) {
@@ -43,66 +138,128 @@
     });
   }
 
+  function setStatus(message, error = false) {
+    status.textContent = message;
+    status.classList.toggle("error", error);
+  }
+
   async function perform(action) {
-    if (submit.disabled) return;
-    submit.disabled = more.disabled = true;
-    try {
-      await action();
-    } catch (error) {
-      status.textContent = error.message;
-    } finally {
-      submit.disabled = more.disabled = false;
+    if (busy) return;
+    busy = true;
+    document.querySelectorAll("button, input, textarea, select").forEach((element) => { element.disabled = true; });
+    try { await action(); }
+    catch (error) { setStatus(error instanceof Error ? error.message : "操作失败", true); }
+    finally {
+      busy = false;
+      document.querySelectorAll("button, input, textarea, select").forEach((element) => { element.disabled = false; });
     }
   }
 
-  async function load(offset = 0) {
-    const result = await call("list", { offset });
-    const rows = result.items.map((item) => {
+  function formatDue(item) {
+    if (!item.due) return "";
+    return [item.due, item.time].filter(Boolean).join(" ");
+  }
+
+  function render() {
+    items.replaceChildren(...loadedItems.map((item) => {
       const row = document.createElement("li");
-      row.textContent = item.title;
-      if (item.due) {
-        const due = document.createElement("small");
-        due.textContent = [item.due, item.time].filter(Boolean).join(" ");
-        row.append(due);
+      if (item.done) row.classList.add("done");
+      const check = document.createElement("button");
+      check.className = `check${item.done ? " done" : ""}`;
+      check.type = "button";
+      check.setAttribute("aria-label", item.done ? "重新打开" : "标记完成");
+      check.addEventListener("click", () => perform(async () => { await call("complete", { todoId: item.id, done: !item.done }); await load(); }));
+      const content = document.createElement("div");
+      content.className = "content";
+      const title = document.createElement("div");
+      title.className = "title";
+      title.textContent = item.title;
+      content.append(title);
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      const due = formatDue(item);
+      if (due) { const value = document.createElement("span"); value.textContent = due; meta.append(value); }
+      if (item.group) { const value = document.createElement("span"); value.textContent = item.group; meta.append(value); }
+      if (item.priority && item.priority !== "none") { const value = document.createElement("span"); value.textContent = `优先级：${item.priority}`; meta.append(value); }
+      if (meta.childElementCount) content.append(meta);
+      if (item.notes) { const notes = document.createElement("p"); notes.className = "notes"; notes.textContent = item.notes; content.append(notes); }
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      const edit = document.createElement("button"); edit.type = "button"; edit.textContent = "编辑"; edit.addEventListener("click", () => openEditor(item)); actions.append(edit);
+      if (deleteId === item.id) {
+        const confirmDelete = document.createElement("button");
+        confirmDelete.type = "button";
+        confirmDelete.className = "delete";
+        confirmDelete.textContent = "确认删除";
+        confirmDelete.addEventListener("click", () => perform(async () => { await call("delete", { todoId: item.id }); await load(); }));
+        const cancelDelete = document.createElement("button");
+        cancelDelete.type = "button";
+        cancelDelete.textContent = "取消";
+        cancelDelete.addEventListener("click", () => { deleteId = null; render(); });
+        actions.append(confirmDelete, cancelDelete);
+      } else {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "delete";
+        remove.textContent = "删除";
+        remove.addEventListener("click", () => { deleteId = item.id; render(); });
+        actions.append(remove);
       }
+      row.append(check, content, actions);
       return row;
-    });
-    if (offset === 0) items.replaceChildren(...rows);
-    else items.append(...rows);
+    }));
+    count.textContent = loadedItems.length ? `${loadedItems.length}${nextOffset === null ? "" : "+"} 项` : "";
+    empty.hidden = loadedItems.length !== 0;
+    if (!loadedItems.length) empty.textContent = activeFilter === "done" ? "还没有已完成的待办" : "这里还没有待办";
+    setStatus(loadedItems.length ? (activeFilter === "done" ? "已完成" : "未完成") : "");
+  }
+
+  async function load(offset = 0) {
+    if (offset === 0) deleteId = null;
+    const result = await call("list", { filter: activeFilter, offset, fullNotes: true });
+    loadedItems = offset === 0 ? result.items : loadedItems.concat(result.items);
     nextOffset = result.nextOffset;
     more.hidden = nextOffset === null;
-    status.textContent = items.childElementCount ? "未完成" : "暂无待办";
+    render();
   }
+
+  function openEditor(item) {
+    editingId = item.id;
+    editTitle.value = item.title;
+    editDue.value = item.due || "";
+    editTime.value = item.time || "";
+    editPriority.value = item.priority || "none";
+    editNotes.value = item.notes || "";
+    editor.hidden = false;
+    editTitle.focus();
+    editor.scrollIntoView({ block: "nearest" });
+  }
+
+  function closeEditor() { editingId = null; editor.hidden = true; editForm.reset(); }
 
   window.addEventListener("message", (event) => {
     const payload = event.data;
     if (event.source !== parent || payload?.channel !== channel) return;
-    if (payload.theme === "dark" || payload.theme === "light") {
-      document.documentElement.style.colorScheme = payload.theme;
-      void perform(load);
-      return;
-    }
+    if (payload.theme === "dark" || payload.theme === "light") { document.documentElement.style.colorScheme = payload.theme; return; }
     const request = pending.get(payload.id);
     if (!request) return;
     pending.delete(payload.id);
-    if (payload.error) request.reject(new Error(payload.error));
-    else request.resolve(payload.value);
+    if (payload.error) request.reject(new Error(payload.error)); else request.resolve(payload.value);
   });
 
-  more.addEventListener("click", () => {
-    if (nextOffset !== null) void perform(() => load(nextOffset));
-  });
+  document.querySelectorAll("[data-filter]").forEach((button) => button.addEventListener("click", () => {
+    if (activeFilter === button.dataset.filter) return;
+    activeFilter = button.dataset.filter;
+    document.querySelectorAll("[data-filter]").forEach((item) => item.setAttribute("aria-pressed", String(item === button)));
+    closeEditor();
+    void perform(() => load());
+  }));
 
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const title = field.value.trim();
-    if (!title || submit.disabled) return;
-    await perform(async () => {
-      await call("create", { title });
-      form.reset();
-      await load();
-    });
-    field.focus();
-  });
+  more.addEventListener("click", () => { if (nextOffset !== null) void perform(() => load(nextOffset)); });
+  document.querySelector("#cancel-edit").addEventListener("click", closeEditor);
+  form.addEventListener("submit", (event) => { event.preventDefault(); const title = field.value.trim(); if (title) void perform(async () => { await call("create", { title }); form.reset(); activeFilter = "all"; document.querySelectorAll("[data-filter]").forEach((item) => item.setAttribute("aria-pressed", String(item.dataset.filter === "all"))); await load(); field.focus(); }); });
+  editForm.addEventListener("submit", (event) => { event.preventDefault(); if (!editingId) return; void perform(async () => { await call("update", { todoId: editingId, title: editTitle.value.trim(), due: editDue.value, time: editTime.value, priority: editPriority.value, notes: editNotes.value }); closeEditor(); await load(); }); });
+  void perform(() => load());
 </script>
+</body>
 </html>
