@@ -1,4 +1,4 @@
-# xtwork_v2 规划
+# 小瞳 Work v2
 
 小瞳 Work 的下一版。用户打开桌面应用就能开始处理任务。聊天里提到明确的行动或安排，就能记入待办或日程。需要参考资料时，可以把 Obsidian 笔记带进对话。远程连接也走同一套任务和权限系统，四个平台的首发范围分别评估。
 
@@ -10,7 +10,21 @@
 - 用 moejs 做插件。待办、日程和 Obsidian 进入首发验收。飞书、企业微信、微信、钉钉是远程连接的候选，具体功能仍待讨论。
 - v2 独立搭建。历史 `xtwork_mygo` 只提供可选参考，旧外壳、本地补丁和数据迁移都不构成开工依赖。
 
-当前交付是规划与可交互线框。桌面壳、运行时和插件的联调由 M0 起逐项验收。
+## 运行桌面预览
+
+在 macOS 13.5 或更新版本的 Apple Silicon Mac 上安装 Node `26.13.1`、pnpm 和 Go `1.27.3` 或以上版本，再运行：
+
+```sh
+node scripts/build-server.mjs
+node scripts/build-desktop.mjs --skip-dmg
+open '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'
+```
+
+预览经本机 Magpie 连接模型。需要切到 DeepSeek 测试时，给桌面进程传入 `XTWORK_MODEL_UPSTREAM_MODEL=auto/deepseek-v4.1-flash`。构建、模型参数和 R2 更新见 [桌面开发说明](doc/desktop-foundation.md)。
+
+## 数据与隐私
+
+应用关闭使用量遥测和远程诊断导出。待办和对话记录保存在本机。发送消息后，助手会把处理请求所需的对话和工具结果交给已配置的模型服务。更新检查访问小瞳的 R2 发布源。
 
 ## 预览交互
 

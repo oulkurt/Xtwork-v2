@@ -1,0 +1,168 @@
+--- a/apps/server/src/serverSettings.ts
++++ b/apps/server/src/serverSettings.ts
+@@ -43,6 +43,7 @@
+ import * as Scope from "effect/Scope";
+ import * as Stream from "effect/Stream";
+ import * as SqlClient from "effect/sql/SqlClient";
++import * as HostProcess from "@t3tools/shared/HostProcess";
+ import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
+ import { resolveSymlinkTarget } from "@t3tools/shared/symlink";
+ import * as ServerConfig from "./config.ts";
+@@ -56,6 +57,7 @@
+ } from "@t3tools/shared/serverSettings";
+ import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
+ import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
++import { startDimRuntime, XTWORK_DIM_INSTANCE_ID } from "./xtwork/gateway.ts";
+ import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
+ import {
+   readSecretFieldValues,
+@@ -260,6 +262,9 @@
+
+     /** The administrator's policy as clients see it; absent when unmanaged. */
+     readonly managedPolicy?: ManagedPolicySummary | undefined;
++
++    /** Local gateway credentials are given only to the bundled provider at launch. */
++    readonly xtworkDimEnvironment?: ProviderInstanceConfig["environment"];
+
+     readonly getSettings: Effect.Effect<ServerSettings, ServerSettingsError>;
+
+@@ -668,8 +673,31 @@
+   };
+ }
+
++class BundledDimError extends Schema.TaggedError<
++  BundledDimError,
++  { readonly brand: unique symbol }
++>()("BundledDimError", { message: Schema.String, cause: Schema.Defect() }) {}
++
+ const make = Effect.gen(function* () {
+-  const { settingsPath } = yield* ServerConfig.ServerConfig;
++  const { baseDir, settingsPath } = yield* ServerConfig.ServerConfig;
++  const environment = yield* HostProcess.Environment;
++  const binaryPath = environment.XTWORK_DIM_BINARY;
++  const dimRuntime = binaryPath
++    ? yield* Effect.acquireRelease(
++        Effect.tryPromise({
++          try: () => startDimRuntime(binaryPath, baseDir, environment),
++          catch: (cause) =>
++            new BundledDimError({ message: "Could not start the bundled Dim model gateway.", cause }),
++        }).pipe(Effect.orDie),
++        (runtime) =>
++          Effect.tryPromise({
++            try: () => runtime.close(),
++            catch: (cause) =>
++              new BundledDimError({ message: "Could not stop the bundled Dim daemon.", cause }),
++          }).pipe(Effect.ignore({ log: true })),
++      )
++    : undefined;
++  const dimInstanceId = ProviderInstanceId.make(XTWORK_DIM_INSTANCE_ID);
+   const fs = yield* FileSystem.FileSystem;
+   const pathService = yield* Path.Path;
+   const secretStore = yield* ServerSecretStore.ServerSecretStore;
+@@ -789,8 +817,9 @@
+     let legacyProviders: Readonly<Record<string, unknown>> | undefined;
+     let legacySourceControl: Parameters<typeof migrateLegacySourceControlSettings>[1] = {};
+     let parseFailure = Option.none<unknown>();
+-
+-    if (yield* readConfigExists) {
++    const hasSettings = yield* readConfigExists;
++
++    if (hasSettings) {
+       const raw = yield* readRawConfig;
+       const parsed = decodeSettingsFileJsonExit(raw);
+       const decoded = Exit.isFailure(parsed)
+@@ -823,6 +852,27 @@
+       } else {
+         settings = decoded.value;
+       }
++    }
++    const configuredDim = settings.providerInstances[dimInstanceId];
++    const seedDim = !hasSettings && dimRuntime !== undefined;
++    if (dimRuntime !== undefined && (seedDim || configuredDim?.driver === ACP_REGISTRY_DRIVER)) {
++      settings = {
++        ...settings,
++        // Dim receives the standard alias from model.json and advertises ACP's default model.
++        defaultModelSelection: seedDim
++          ? (settings.defaultModelSelection ?? { instanceId: dimInstanceId, model: "default" })
++          : settings.defaultModelSelection,
++        providerInstances: {
++          ...settings.providerInstances,
++          [dimInstanceId]: {
++            displayName: "内置助手",
++            enabled: true,
++            ...configuredDim,
++            driver: ACP_REGISTRY_DRIVER,
++            config: dimRuntime.config,
++          },
++        },
++      };
+     }
+     // Settings saved by a server that kept the mode in `compactIdleThreads` move
+     // it to `idleCompaction`, so that switch goes to clients as a boolean. The
+@@ -919,6 +969,7 @@
+       ? yield* moveInlineSettingsSecrets(sourceControlMigration.settings)
+       : folded;
+     if (
++      seedDim ||
+       migrated !== loaded ||
+       (settingsFileTrusted && legacyProviders !== undefined) ||
+       hasLegacySourceControl
+@@ -1374,6 +1425,7 @@
+     managedPolicy,
+     start,
+     ready: Deferred.await(startedDeferred),
++    xtworkDimEnvironment: dimRuntime?.environment,
+     getSettings: getMaterializedSettings,
+     updateSettings: (patch) =>
+       updateAndPersistSettings(patch, (current) =>
+--- a/apps/server/src/provider/ProviderInstanceRegistryHydration.ts
++++ b/apps/server/src/provider/ProviderInstanceRegistryHydration.ts
+@@ -32,6 +32,7 @@
+ import type * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
+ import * as ServerConfig from "../config.ts";
+ import type * as PortScanner from "../preview/PortScanner.ts";
++import { XTWORK_DIM_INSTANCE_ID } from "../xtwork/gateway.ts";
+
+ type ProviderInstanceRegistryHydrationEnv =
+   | Exclude<
+@@ -54,8 +55,20 @@
+
+ export const deriveProviderInstanceConfigMap = (
+   settings: ServerSettings,
++  dimEnvironment?: ProviderInstanceConfig["environment"],
+ ): ProviderInstanceConfigMap => {
+   const merged: Record<string, ProviderInstanceConfig> = { ...settings.providerInstances };
++  const dim = merged[XTWORK_DIM_INSTANCE_ID];
++  if (dim?.driver === "acpRegistry" && dimEnvironment !== undefined) {
++    const configuredNames = new Set(dimEnvironment.map(({ name }) => name));
++    merged[XTWORK_DIM_INSTANCE_ID] = {
++      ...dim,
++      environment: [
++        ...(dim.environment ?? []).filter(({ name }) => !configuredNames.has(name)),
++        ...dimEnvironment,
++      ],
++    };
++  }
+
+   for (const driver of BUILT_IN_DRIVERS) {
+     if (driver.metadata.hasDefaultInstance === false) continue;
+@@ -148,7 +161,9 @@
+           serverSettings.getSettings.pipe(
+             Effect.flatMap((current) =>
+               Effect.gen(function* () {
+-                yield* mutator.reconcile(deriveProviderInstanceConfigMap(current));
++                yield* mutator.reconcile(
++                  deriveProviderInstanceConfigMap(current, serverSettings.xtworkDimEnvironment),
++                );
+                 // Reconcile leaves instances parked on an unreadable secret alone,
+                 // and a corrected secret provider is what can make them readable.
+                 const next = vaultConfigs(current);
+@@ -187,7 +202,7 @@
+     const initialConfigMap =
+       initialSettings === undefined
+         ? ({} as ProviderInstanceConfigMap)
+-        : deriveProviderInstanceConfigMap(initialSettings);
++        : deriveProviderInstanceConfigMap(initialSettings, serverSettings.xtworkDimEnvironment);
+
+     // Drivers launch from the host environment, minus launch overrides a policy ignores.
+     const hostEnvironment = ManagedProviders.providerHostEnvironment(

@@ -1,0 +1,28 @@
+diff --git a/apps/server/src/mcp/McpHttpServer.ts b/apps/server/src/mcp/McpHttpServer.ts
+--- a/apps/server/src/mcp/McpHttpServer.ts
++++ b/apps/server/src/mcp/McpHttpServer.ts
+@@ -93,6 +93,8 @@
+ import { HtmlPreviewTool, HtmlPreviewToolkit, HtmlRenderToolkit } from "./toolkits/html/tools.ts";
+ import { MCP_HTTP_PATH } from "../httpCors.ts";
+ import { requestUrl } from "../requestUrl.ts";
++import * as XtworkPluginMcp from "./XtworkPluginMcp.ts";
++import { isPluginToolName } from "./XtworkPluginHost.ts";
+
+ const mcpResourceMetadataUrl = (request: HttpServerRequest.HttpServerRequest) =>
+   requestUrl(request).pipe(
+@@ -1390,6 +1392,7 @@
+   layerDeviceToolkit,
+   layerHtmlToolkit,
+   layerMessageToolkit,
++  XtworkPluginMcp.layer,
+ );
+
+ const layerToolExposure = Layer.effect(
+@@ -1417,6 +1420,7 @@
+       if (method !== "tools/list") return true;
+       const scope = yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext);
+       const providerSessionId = Option.getOrUndefined(scope)?.thread?.providerSessionId;
++      if (isPluginToolName(target)) return providerSessionId !== undefined;
+       if (headers[MCP_TOOL_EXPOSURE_HEADER] !== "deferred" || providerSessionId === undefined) {
+         return target !== McpToolExposure.TOOL_SEARCH;
+       }

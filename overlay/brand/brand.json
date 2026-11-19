@@ -1,0 +1,12 @@
+{
+  "name": "小瞳 Work",
+  "displayName": "小瞳 Work v2",
+  "stageLabel": "Alpha",
+  "version": "0.1.0-alpha.1",
+  "identifier": "cn.skykale.xtwork.v2",
+  "slug": "xtwork-v2",
+  "scheme": "xtwork-v2",
+  "repository": "oulkurt/Xtwork-v2",
+  "supportUrl": "https://github.com/oulkurt/Xtwork-v2/issues",
+  "updateUrl": "https://xiaotongwork.skykale.cn/xtwork-v2/updates"
+}
