@@ -1,0 +1,18 @@
+ts	phase	decision	why	evidence	result
+2026-11-19T07:17:40Z	调查	核对 main、桌面预览分支和构建缓存的边界	预览实现和上游缓存需要各自按提交取证	f652f9c; 488b882; upstream.lock@488b882; 3ce2145	main 是规划；PR #1 当时开放；没有将缓存当作 v2 源码
+2026-11-19T07:17:40Z	调查	追踪产品取舍、旧版关系和上游升级节奏	README 的已确认方向需要与专题文档和历史相互印证	README.md; docs/12-从xtwork迁移.md; docs/02-上游与改造层.md; docs/11-风险与待定.md	旧实现、旧草案和当前决策分别可追溯
+2026-11-19T07:17:40Z	调查	读取依赖、数据库迁移、插件契约和预览验收	需要确定数据的实际写入者和各接口的边界	3ce2145:apps/server/src/persistence/; 488b882:plugin-host/; 488b882:doc/desktop-foundation.md	核对源码；验收来自 PR 记录，本次未重跑
+2026-11-19T07:17:40Z	调查	核对 GitHub PR、Issue 及可用资料来源	批准依据需要能追到决策记录	https://github.com/oulkurt/Xtwork-v2/pull/1; f652f9c	PR 有历史验收说明；没有关联 Issue 或正式 GitHub review；其余团队系统未接入
+2026-11-19T07:17:40Z	设计	使用一个入口索引和独立 ADR	保留原规划的细节，同时让状态、依据和后继关系有固定入口	DECISIONS.md; docs/decisions/README.md	方案比在多篇规划里重复维护状态更容易追踪
+2026-11-19T07:17:40Z	设计	将审批状态与证据强度分开	源码能证实预览行为，正式取舍需要明确记录	DECISIONS.md; docs/decisions/007-plugin-contract.md; docs/decisions/008-model-gateway.md	预览实现可为 Confirmed；两个产品设计保留 Proposed
+2026-11-19T07:21:07Z	整理	建立六条已确认方向和两条待定契约记录	范围优先采用已明确的产品取舍和有实际验证路径的接口	DECISIONS.md; docs/decisions/	保留 Q 编号并登记历史候选
+2026-11-19T07:21:07Z	整理	修复上游文档两个仅在分支上存在的链接	main 没有锁文件和桌面运行文档，固定链接可以用于两条分支	docs/02-上游与改造层.md	链接固定到 488b882，保留已定同步策略
+2026-11-19T07:27:23Z	复核	用 Git 对象替换误抄的桌面预览提交并加强链接扫描	初版扫描只识别满 40 位的 SHA，遗漏了无效的固定链接	git rev-parse 488b882; gh api repos/oulkurt/Xtwork-v2/git/commits/488b882a6e6d24b379384b33eb6cec667574c2f5	再次扫描 235 处本地链接、50 处固定 Git 引用，均通过
+2026-11-19T07:27:23Z	复核	核对 ADR 结构、状态与原 Q 编号	防止把预览行为当作批准记录，避免遗漏已有问题	DECISIONS.md; docs/decisions/; docs/11-风险与待定.md	8 份 ADR，6 Accepted、2 Proposed；11 个原待定 Q，新增 3 个 P
+2026-11-19T07:27:23Z	复核	对照工作区历史与提交范围	确保已有 AGENTS 和用户同步策略无覆盖，业务实现无改动	git diff --check; git status --short; AGENTS.md §10.4	Markdown 校验通过；现有 AGENTS 和 docs/11 原样保留；运行验收引用历史记录
+2026-11-19T07:29:26Z	复核	按工作区最新 AGENTS.md 的冲突处理章节更新 ADR 指南	调查期间工作区中的 AGENTS 已变更为简版，原第 10 节引用失效	AGENTS.md:48; docs/decisions/README.md:3	更新引用，未编辑 AGENTS.md
+2026-11-19T07:52:28Z	复核	更正历史记录中对 docs/11 的描述并补充审批来源	Q-11 的文档更新是本次调查的既有工作区变化，不能写成原样保留；上游同步讨论包含用户明确指示	docs/11-风险与待定.md:31; t3-thread://v2/1a5417d8-ad4a-4937-a679-e9a08eb9fbca/7686181e-5c5e-488b-8440-4d5583408106; docs/decisions/005-clean-v2-start.md; docs/decisions/006-upstream-update-policy.md	Accepted provenance qualified; Q-11 source recorded; prior row remains history
+2026-11-19T07:53:38Z	复核	将历史 PR 验收与源码事实分开，并记录遥测实现差异	此次没有重跑桌面链路；预览脚本通过 overlay 替换分析层而非只读环境变量	DECISIONS.md:30-37; docs/02-上游与改造层.md:82; 488b882:scripts/prepare.mjs:109-121	历史验收改为明确标注；P-02 保留为待统一的技术契约
+2026-11-19T07:58:26Z	复核	将新增待决策 ID 改为 PD-01 至 PD-03	docs/02 的 P-01 至 P-11 已是上游补丁编号，不能复用 P 前缀表示项目待决策	DECISIONS.md:56-58; docs/02-上游与改造层.md:81-91; docs/decisions/004-general-task-experience.md; docs/decisions/007-plugin-contract.md; docs/decisions/008-model-gateway.md	决策 ID 与补丁 ID 不再冲突
+2026-11-19T07:59:10Z	复核	澄清先前审计行中的 P-02 含义	先前行记录的是 docs/02 的遥测补丁 P-02；本索引的正式模型网关待决策已改为 PD-02	audit row 15; docs/02-上游与改造层.md:82; DECISIONS.md:57	历史行保留；当前 ID 命名无歧义
+2026-11-19T08:04:33Z	复核	记录并行任务在调查期间推进仓库基线	调查开始时 main 为 f652f9c；工作区随后切到 feat/kero-theme，HEAD 为 6b0e780，包含 488b882 的相同桌面实现	git show -s 6b0e780; git diff 488b882 6b0e780; git status --short --branch	文档继续保留旧基线和固定提交证据，并明确当前工作区分支
