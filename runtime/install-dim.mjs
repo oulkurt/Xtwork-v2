@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { access, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, cp, mkdir, mkdtemp, readFile, rename, rm } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
 const destinationArg = process.argv[2];
@@ -14,16 +13,29 @@ const asset = lock.assets[platform];
 if (!asset) throw new Error(`No pinned Dim release for ${platform}`);
 
 const executable = process.platform === "win32" ? "dimcode.exe" : "dimcode";
-const download = await mkdtemp(join(tmpdir(), "xtwork-dim-"));
+const cache = resolve(import.meta.dirname, "../.build/downloads");
+const archivePath = join(cache, basename(new URL(asset.url).pathname));
+await mkdir(cache, { recursive: true });
+const download = await mkdtemp(join(cache, "dim-"));
+
+async function matchesLock(path) {
+  try {
+    const bytes = await readFile(path);
+    return createHash("sha256").update(bytes).digest("hex") === asset.sha256;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 try {
-  const archiveName = basename(new URL(asset.url).pathname);
-  const archivePath = join(download, archiveName);
-  const response = await fetch(asset.url);
-  if (!response.ok) throw new Error(`Dim ${lock.tag} download returned HTTP ${response.status}`);
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  const sha256 = createHash("sha256").update(bytes).digest("hex");
-  if (sha256 !== asset.sha256) throw new Error(`Dim ${lock.tag} failed SHA-256 verification`);
-  await writeFile(archivePath, bytes);
+  if (!await matchesLock(archivePath)) {
+    const temporary = join(download, "archive");
+    execFileSync("curl", ["--fail", "--silent", "--show-error", "--location", "--retry", "2",
+      "--connect-timeout", "15", "--max-time", "90", "--output", temporary, asset.url], { stdio: "inherit" });
+    if (!await matchesLock(temporary)) throw new Error(`Dim ${lock.tag} failed SHA-256 verification`);
+    await rename(temporary, archivePath);
+  }
 
   execFileSync("tar", ["-xf", archivePath, "-C", download], { stdio: "inherit" });
   const releaseDir = join(download, `dimcode-${platform}`);
