@@ -1,0 +1,1044 @@
+diff --git a/apps/web/index.html b/apps/web/index.html
+index 051e3090..8e1cbb7e 100644
+--- a/apps/web/index.html
++++ b/apps/web/index.html
+@@ -6,14 +6,14 @@
+       name="viewport"
+       content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+     />
+-    <meta name="theme-color" content="#000000" />
++    <meta name="theme-color" content="#141416" />
+     <link rel="icon" href="/favicon.ico" sizes="48x48" />
+     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+     <link rel="manifest" href="/manifest.webmanifest" />
+     <script>
+       (() => {
+-        const LIGHT_BACKGROUND = "#ffffff";
+-        const DARK_BACKGROUND = "#000000";
++        const LIGHT_BACKGROUND = "#f6f6f7";
++        const DARK_BACKGROUND = "#141416";
+         const CUSTOM_THEMES_STORAGE_KEY = "t3code:themes:v1";
+         const ENVIRONMENT_THEMES_STORAGE_KEY = "t3code:environment-themes:v1";
+         const THEME_FOLLOW_SYSTEM_STORAGE_KEY = "t3code:theme-follow-system";
+@@ -21,108 +21,91 @@
+         const THEME_HALVES_STORAGE_KEY = "t3code:theme-halves:v1";
+         const SPLASH_COLORS = {
+           light: {
+-            background: "#ffffff",
+-            foreground: "#262626",
+-            accent: "#4f46e5",
++            background: "#f6f6f7",
++            foreground: "#1d1d1f",
++            accent: "#3b6cf6",
+           },
+           dark: {
+-            background: "#000000",
+-            foreground: "#f5f5f5",
+-            accent: "#818cf8",
++            background: "#141416",
++            foreground: "#ececf0",
++            accent: "#6b93ff",
+           },
+         };
+-        // These are the runtime defaults used to complete a custom palette
+-        // when a stored theme omits a role. Keep them separate from the
+-        // unselected splash so a partial custom theme does not flash generic
+-        // app colors before React mounts.
+-        const DEFAULT_THEME_PALETTES = {
+-          light: {
+-            background: "oklch(0.982446 0.010114 325.653)",
+-            foreground: "oklch(0.325698 0.116116 325.037)",
+-            accent: "oklch(0.591646 0.217985 0.584)",
+-            chrome: "oklch(0.982446 0.010114 325.653)",
+-          },
+-          dark: {
+-            background: "oklch(0.22813 0.020366 307.469)",
+-            foreground: "oklch(0.980735 0.004092 301.426)",
+-            accent: "oklch(0.460685 0.185347 4.099)",
+-            chrome: "oklch(0.22813 0.020366 307.469)",
+-          },
+-        };
+-        // Keep this small boot-time copy in sync with the built-in palettes so
+-        // the selected theme is visible before the app has mounted.
++        // Keep this boot-time copy in sync with the built-in palettes.
+         const BUILT_IN_THEME_PALETTES = {
+           "t3-chat": {
+             light: {
+-              background: "oklch(0.982446 0.010114 325.653)",
+-              foreground: "oklch(0.325698 0.116116 325.037)",
+-              accent: "oklch(0.591646 0.217985 0.584)",
+-              chrome: "oklch(0.982446 0.010114 325.653)",
++              background: "oklch(0.921005 0.028004 311.307)",
++              foreground: "oklch(0.231576 0.003805 286.099)",
++              accent: "oklch(0.5335 0.156873 344.507)",
++              chrome: "oklch(0.921005 0.028004 311.307)",
+             },
+             dark: {
+-              background: "oklch(0.22813 0.020366 307.469)",
+-              foreground: "oklch(0.980735 0.004092 301.426)",
+-              accent: "oklch(0.460685 0.185347 4.099)",
+-              chrome: "oklch(0.22813 0.020366 307.469)",
++              background: "oklch(0.205885 0.042164 341.081)",
++              foreground: "oklch(0.944229 0.005342 286.297)",
++              accent: "oklch(0.710064 0.143146 346.178)",
++              chrome: "oklch(0.205885 0.042164 341.081)",
+             },
+           },
+           grove: {
+             light: {
+-              background: "oklch(0.972369 0.005497 157.15)",
+-              foreground: "oklch(0.222003 0.03479 328.979)",
+-              accent: "oklch(0.523295 0.112292 158.089)",
+-              chrome: "oklch(0.972369 0.005497 157.15)",
++              background: "oklch(0.937604 0.017484 153.557)",
++              foreground: "oklch(0.231576 0.003805 286.099)",
++              accent: "oklch(0.52911 0.104642 154.932)",
++              chrome: "oklch(0.937604 0.017484 153.557)",
+             },
+             dark: {
+-              background: "oklch(0.260865 0.02152 162.75)",
+-              foreground: "oklch(0.990339 0.008411 325.64)",
+-              accent: "oklch(0.796228 0.133058 157.319)",
+-              chrome: "oklch(0.260865 0.02152 162.75)",
++              background: "oklch(0.204501 0.039648 149.945)",
++              foreground: "oklch(0.944229 0.005342 286.297)",
++              accent: "oklch(0.755561 0.133962 152.787)",
++              chrome: "oklch(0.204501 0.039648 149.945)",
+             },
+           },
+           ocean: {
+             light: {
+-              background: "oklch(0.974199 0.002856 241.597)",
+-              foreground: "oklch(0.222003 0.03479 328.979)",
+-              accent: "oklch(0.536684 0.120219 247.01)",
+-              chrome: "oklch(0.974199 0.002856 241.597)",
++              background: "oklch(0.92932 0.017874 214.381)",
++              foreground: "oklch(0.231576 0.003805 286.099)",
++              accent: "oklch(0.541842 0.082664 210.409)",
++              chrome: "oklch(0.92932 0.017874 214.381)",
+             },
+             dark: {
+-              background: "oklch(0.242641 0.024125 250.573)",
+-              foreground: "oklch(0.990339 0.008411 325.64)",
+-              accent: "oklch(0.758933 0.105833 241.548)",
+-              chrome: "oklch(0.242641 0.024125 250.573)",
++              background: "oklch(0.204879 0.036643 217.234)",
++              foreground: "oklch(0.944229 0.005342 286.297)",
++              accent: "oklch(0.770199 0.102547 205.701)",
++              chrome: "oklch(0.204879 0.036643 217.234)",
+             },
+           },
+           ember: {
+             light: {
+-              background: "oklch(0.976527 0.002685 60.725)",
+-              foreground: "oklch(0.222003 0.03479 328.979)",
+-              accent: "oklch(0.552831 0.129438 44.656)",
+-              chrome: "oklch(0.976527 0.002685 60.725)",
++              background: "oklch(0.922911 0.026593 50.852)",
++              foreground: "oklch(0.231576 0.003805 286.099)",
++              accent: "oklch(0.577477 0.131987 49.184)",
++              chrome: "oklch(0.922911 0.026593 50.852)",
+             },
+             dark: {
+-              background: "oklch(0.245899 0.019144 42.044)",
+-              foreground: "oklch(0.990339 0.008411 325.64)",
+-              accent: "oklch(0.762174 0.124117 52.082)",
+-              chrome: "oklch(0.245899 0.019144 42.044)",
++              background: "oklch(0.21526 0.044444 44.812)",
++              foreground: "oklch(0.944229 0.005342 286.297)",
++              accent: "oklch(0.775777 0.116624 54.008)",
++              chrome: "oklch(0.21526 0.044444 44.812)",
+             },
+           },
+           iris: {
+             light: {
+-              background: "oklch(0.976531 0.003855 303.226)",
+-              foreground: "oklch(0.222003 0.03479 328.979)",
+-              accent: "oklch(0.525348 0.15373 294.176)",
+-              chrome: "oklch(0.976531 0.003855 303.226)",
++              background: "oklch(0.905776 0.033736 302.725)",
++              foreground: "oklch(0.231576 0.003805 286.099)",
++              accent: "oklch(0.511628 0.146491 309.025)",
++              chrome: "oklch(0.905776 0.033736 302.725)",
+             },
+             dark: {
+-              background: "oklch(0.225975 0.031062 293.741)",
+-              foreground: "oklch(0.990339 0.008411 325.64)",
+-              accent: "oklch(0.671712 0.169136 293.929)",
+-              chrome: "oklch(0.225975 0.031062 293.741)",
++              background: "oklch(0.201285 0.059812 295.394)",
++              foreground: "oklch(0.944229 0.005342 286.297)",
++              accent: "oklch(0.7258 0.138253 310.876)",
++              chrome: "oklch(0.201285 0.059812 295.394)",
+             },
+           },
+         };
++        // A partial custom palette uses the same fallback as the theme runtime.
++        const DEFAULT_THEME_PALETTES = BUILT_IN_THEME_PALETTES["t3-chat"];
+         const BUILT_IN_THEME_MODES = Object.fromEntries(
+           Object.entries(BUILT_IN_THEME_PALETTES).map(([id, palettes]) => [
+             id,
+@@ -402,15 +385,15 @@
+       }
+
+       body {
+-        background: #ffffff;
+-        color: #262626;
++        background: #f6f6f7;
++        color: #1d1d1f;
+         font-family:
+           -apple-system, BlinkMacSystemFont, "Inter Variable", "Segoe UI", system-ui, sans-serif;
+       }
+
+       html.dark body {
+-        background: #000000;
+-        color: #f5f5f5;
++        background: #141416;
++        color: #ececf0;
+       }
+
+       #boot-shell {
+@@ -453,8 +436,8 @@
+       }
+
+       #boot-error {
+-        --boot-error-fg: #262626;
+-        --boot-error-bg: #ffffff;
++        --boot-error-fg: #1d1d1f;
++        --boot-error-bg: #f6f6f7;
+         --boot-error-line: color-mix(in srgb, currentColor 12%, transparent);
+         display: flex;
+         flex-direction: column;
+@@ -467,8 +450,8 @@
+       }
+
+       html.dark #boot-error {
+-        --boot-error-fg: #f5f5f5;
+-        --boot-error-bg: #000000;
++        --boot-error-fg: #ececf0;
++        --boot-error-bg: #141416;
+       }
+
+       html[data-theme-selected="true"] #boot-error {
+diff --git a/apps/web/src/components/CommandPaletteThemeItems.tsx b/apps/web/src/components/CommandPaletteThemeItems.tsx
+index 4fde126c..cc172d64 100644
+--- a/apps/web/src/components/CommandPaletteThemeItems.tsx
++++ b/apps/web/src/components/CommandPaletteThemeItems.tsx
+@@ -1,4 +1,3 @@
+-import { BUILT_IN_THEMES } from "@t3tools/shared/themePalettes";
+ import { msg, T, useGT, useMessages } from "gt-react";
+ import { MonitorIcon, MoonIcon, PaletteIcon, SunIcon } from "lucide-react";
+
+@@ -6,7 +5,7 @@ import { m } from "../i18n/messages";
+ import { useCustomThemes } from "../hooks/useCustomThemes";
+ import { useEnvironmentThemeDefinitions } from "../hooks/useEnvironmentTheme";
+ import { useTheme } from "../hooks/useTheme";
+-import { getThemeDefinition } from "../themePalette";
++import { BUILT_IN_THEMES, getThemeDefinition } from "../themePalette";
+ import {
+   ADDON_ICON_CLASS,
+   ITEM_ICON_CLASS,
+diff --git a/apps/web/src/components/settings/ThemePreviewCircles.tsx b/apps/web/src/components/settings/ThemePreviewCircles.tsx
+index 8f23f5be..fe40785c 100644
+--- a/apps/web/src/components/settings/ThemePreviewCircles.tsx
++++ b/apps/web/src/components/settings/ThemePreviewCircles.tsx
+@@ -1,13 +1,12 @@
+ import { useGT } from "gt-react";
+ import { MoonIcon, SunIcon } from "lucide-react";
+ import type { CSSProperties } from "react";
+-import {
+-  STANDARD_THEME_PREVIEW_COLORS as SHARED_STANDARD_THEME_PREVIEW_COLORS,
+-  THEME_PREVIEW_RENDER_SPECS,
+-} from "@t3tools/shared/themePreview";
++import { THEME_PREVIEW_RENDER_SPECS } from "@t3tools/shared/themePreview";
++import { PAPER_THEME_LABEL } from "../../appearancePalettes";
+ import { cn } from "../../lib/utils";
+ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+ import {
++  getStandardThemeColors,
+   getThemeColorsForMode,
+   getThemeModes,
+   type ThemeAppearance,
+@@ -36,33 +35,13 @@ export type ThemeCardDefinition = {
+ export type ThemeMode = ThemeAppearance | "system";
+ export type ThemeCardPreviewColors = ThemeCardPreview["colors"];
+
+-const STANDARD_THEME_PREVIEW_COLORS: Record<
+-  ThemeAppearance,
+-  Readonly<Record<ThemePreviewRole, string>>
+-> = {
+-  light: {
+-    sidebar: "#fafafa",
+-    surface: "#ffffff",
+-    accentSurface: "#f4f4f5",
+-    messageSurface: "#e4e4e7",
+-    ...SHARED_STANDARD_THEME_PREVIEW_COLORS.light,
+-  },
+-  dark: {
+-    sidebar: "#0f0f10",
+-    surface: "#121212",
+-    accentSurface: "#27272a",
+-    messageSurface: "#27272a",
+-    ...SHARED_STANDARD_THEME_PREVIEW_COLORS.dark,
+-  },
+-};
+-
+ export const STANDARD_THEME_CARDS: ReadonlyArray<ThemeCardDefinition> = [
+   {
+     id: "default",
+-    label: "T3 Code",
++    label: PAPER_THEME_LABEL,
+     previews: (["light", "dark"] as const).map((mode) => ({
+       mode,
+-      colors: STANDARD_THEME_PREVIEW_COLORS[mode],
++      colors: getStandardThemeColors(mode),
+     })),
+   },
+ ];
+diff --git a/apps/web/src/index.css b/apps/web/src/index.css
+index 05541d39..dcd07a9e 100644
+--- a/apps/web/src/index.css
++++ b/apps/web/src/index.css
+@@ -751,135 +751,134 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
+     display: none;
+   }
+
+-  /* Each maintainer palette gives the same line art its own material: rose
+-     vellum, forest drafting paper, marine cyanotype, copper, and violet ink.
++  /* Each built-in palette tints the existing sidebar artwork.
+      These colors stay deliberately deep at the top edge so the white stage
+      wordmark and controls retain contrast in both appearance modes. */
+   html[data-theme-id="t3-chat"] {
+-    --stage-art-top: oklch(0.760675 0.141361 348.019);
+-    --stage-art-mid: oklch(0.588093 0.188832 353.138);
+-    --stage-art-bottom: oklch(0.383959 0.135096 348.656);
+-    --stage-art-highlight: oklch(0.949689 0.034241 339.171);
+-    --stage-art-secondary: oklch(0.763402 0.163836 352.525);
+-    --stage-art-tertiary: oklch(0.70819 0.180285 311.949);
+-    --stage-art-line: oklch(0.952158 0.034194 336.179);
++    --stage-art-top: #b04c8d;
++    --stage-art-mid: #8e326e;
++    --stage-art-bottom: #5b1e43;
++    --stage-art-highlight: #f6efcf;
++    --stage-art-secondary: #d38ab7;
++    --stage-art-tertiary: #c8a9df;
++    --stage-art-line: #f7eee4;
+
+     @variant dark {
+-      --stage-art-top: oklch(0.540689 0.143665 347.587);
+-      --stage-art-mid: oklch(0.396586 0.126592 347.6);
+-      --stage-art-bottom: oklch(0.249959 0.079694 340.523);
+-      --stage-art-highlight: oklch(0.921297 0.051708 343.229);
+-      --stage-art-secondary: oklch(0.667398 0.165674 352.549);
+-      --stage-art-tertiary: oklch(0.609315 0.163722 306.315);
+-      --stage-art-line: oklch(0.945349 0.036045 341.433);
++      --stage-art-top: #8e3a6e;
++      --stage-art-mid: #64274e;
++      --stage-art-bottom: #3a182b;
++      --stage-art-highlight: #f3e7f1;
++      --stage-art-secondary: #b85d92;
++      --stage-art-tertiary: #9a6bb2;
++      --stage-art-line: #f3e7f1;
+     }
+   }
+
+   html[data-theme-id="grove"] {
+-    --stage-art-top: oklch(0.751465 0.112731 157.313);
+-    --stage-art-mid: oklch(0.567105 0.11099 158.859);
+-    --stage-art-bottom: oklch(0.367918 0.067635 160.558);
+-    --stage-art-highlight: oklch(0.976387 0.034353 161.456);
+-    --stage-art-secondary: oklch(0.80968 0.117071 158.817);
+-    --stage-art-tertiary: oklch(0.784102 0.108047 88.516);
+-    --stage-art-line: oklch(0.981098 0.027812 158.718);
+-    --stage-night-top: oklch(0.45805 0.079616 160.092);
+-    --stage-night-mid: oklch(0.368483 0.065631 162.719);
+-    --stage-night-bottom: oklch(0.264797 0.044397 168.088);
+-    --stage-night-highlight: oklch(0.912563 0.055173 158.974);
+-    --stage-night-secondary: oklch(0.665652 0.109731 156.599);
+-    --stage-night-tertiary: oklch(0.698651 0.103024 89.828);
+-    --stage-night-line: oklch(0.945336 0.041923 157.222);
++    --stage-art-top: #2f7d50;
++    --stage-art-mid: #22643f;
++    --stage-art-bottom: #123e28;
++    --stage-art-highlight: #f5f0d6;
++    --stage-art-secondary: #7eb68e;
++    --stage-art-tertiary: #b4b873;
++    --stage-art-line: #f3f2e2;
++    --stage-night-top: #2a7048;
++    --stage-night-mid: #1c5234;
++    --stage-night-bottom: #0e301f;
++    --stage-night-highlight: #f3f2e2;
++    --stage-night-secondary: #639b76;
++    --stage-night-tertiary: #9ca260;
++    --stage-night-line: #f3f2e2;
+
+     @variant dark {
+-      --stage-art-top: oklch(0.58719 0.09869 157.426);
+-      --stage-art-mid: oklch(0.454979 0.079031 159.756);
+-      --stage-art-bottom: oklch(0.297856 0.050355 161.167);
+-      --stage-art-highlight: oklch(0.952407 0.053872 158.44);
+-      --stage-art-secondary: oklch(0.732591 0.120606 155.853);
+-      --stage-art-tertiary: oklch(0.716282 0.116547 80.563);
+-      --stage-art-line: oklch(0.961577 0.035285 157.03);
+-      --stage-night-top: oklch(0.398632 0.065534 158.601);
+-      --stage-night-mid: oklch(0.290561 0.049694 160.456);
+-      --stage-night-bottom: oklch(0.210147 0.03173 169.818);
+-      --stage-night-highlight: oklch(0.866303 0.057526 156.796);
+-      --stage-night-secondary: oklch(0.586553 0.093722 157.365);
+-      --stage-night-tertiary: oklch(0.6364 0.101769 82.985);
+-      --stage-night-line: oklch(0.913292 0.035718 156.976);
++      --stage-art-top: #067132;
++      --stage-art-mid: #0a4f25;
++      --stage-art-bottom: #092b17;
++      --stage-art-highlight: #ebf2e7;
++      --stage-art-secondary: #4d9e65;
++      --stage-art-tertiary: #879a48;
++      --stage-art-line: #ebf2e7;
++      --stage-night-top: #075d2b;
++      --stage-night-mid: #083d20;
++      --stage-night-bottom: #062411;
++      --stage-night-highlight: #e2eee5;
++      --stage-night-secondary: #3d8054;
++      --stage-night-tertiary: #70823d;
++      --stage-night-line: #e2eee5;
+     }
+   }
+
+   html[data-theme-id="ocean"] {
+-    --stage-art-top: oklch(0.792993 0.088072 220.421);
+-    --stage-art-mid: oklch(0.590296 0.116841 243.184);
+-    --stage-art-bottom: oklch(0.409123 0.093718 247.98);
+-    --stage-art-highlight: oklch(0.971217 0.023008 213.615);
+-    --stage-art-secondary: oklch(0.788391 0.090856 215.684);
+-    --stage-art-tertiary: oklch(0.76441 0.099607 187.893);
+-    --stage-art-line: oklch(0.976025 0.019647 212.543);
++    --stage-art-top: #247c8a;
++    --stage-art-mid: #1d6470;
++    --stage-art-bottom: #0f4048;
++    --stage-art-highlight: #f2f2e8;
++    --stage-art-secondary: #75b9c3;
++    --stage-art-tertiary: #80c9c4;
++    --stage-art-line: #ecf3f0;
+
+     @variant dark {
+-      --stage-art-top: oklch(0.59663 0.089167 233.427);
+-      --stage-art-mid: oklch(0.461094 0.084904 243.478);
+-      --stage-art-bottom: oklch(0.294818 0.05947 250.526);
+-      --stage-art-highlight: oklch(0.952907 0.032224 221.27);
+-      --stage-art-secondary: oklch(0.732079 0.09296 224.414);
+-      --stage-art-tertiary: oklch(0.720885 0.095495 190.903);
+-      --stage-art-line: oklch(0.961039 0.027355 219.756);
++      --stage-art-top: #007080;
++      --stage-art-mid: #00505b;
++      --stage-art-bottom: #00353a;
++      --stage-art-highlight: #e3eff1;
++      --stage-art-secondary: #2b9eac;
++      --stage-art-tertiary: #4ba98d;
++      --stage-art-line: #e3eff1;
+     }
+   }
+
+   html[data-theme-id="ember"] {
+-    --stage-art-top: oklch(0.782439 0.118806 52.569);
+-    --stage-art-mid: oklch(0.62863 0.15922 39.401);
+-    --stage-art-bottom: oklch(0.404251 0.117664 30.424);
+-    --stage-art-highlight: oklch(0.962469 0.02774 70.95);
+-    --stage-art-secondary: oklch(0.815735 0.11904 53.659);
+-    --stage-art-tertiary: oklch(0.69361 0.159346 24.787);
+-    --stage-art-line: oklch(0.970313 0.02052 67.583);
+-    --stage-night-top: oklch(0.470236 0.102322 39.355);
+-    --stage-night-mid: oklch(0.345367 0.080697 33.217);
+-    --stage-night-bottom: oklch(0.227386 0.056077 27.437);
+-    --stage-night-highlight: oklch(0.903891 0.059281 56.181);
+-    --stage-night-secondary: oklch(0.641705 0.126508 44.376);
+-    --stage-night-tertiary: oklch(0.538694 0.129931 25.865);
+-    --stage-night-line: oklch(0.926348 0.046029 58.73);
++    --stage-art-top: #b65e27;
++    --stage-art-mid: #944618;
++    --stage-art-bottom: #59240e;
++    --stage-art-highlight: #f6f0da;
++    --stage-art-secondary: #dd9f79;
++    --stage-art-tertiary: #d87a53;
++    --stage-art-line: #f8eedf;
++    --stage-night-top: #a65220;
++    --stage-night-mid: #7e3813;
++    --stage-night-bottom: #4b1f0b;
++    --stage-night-highlight: #f8eedf;
++    --stage-night-secondary: #c5815e;
++    --stage-night-tertiary: #c36744;
++    --stage-night-line: #f8eedf;
+
+     @variant dark {
+-      --stage-art-top: oklch(0.597533 0.120694 43.455);
+-      --stage-art-mid: oklch(0.437763 0.101287 34.86);
+-      --stage-art-bottom: oklch(0.264269 0.055858 26.548);
+-      --stage-art-highlight: oklch(0.929214 0.042638 55.801);
+-      --stage-art-secondary: oklch(0.705592 0.137369 43.176);
+-      --stage-art-tertiary: oklch(0.629583 0.158322 24.088);
+-      --stage-art-line: oklch(0.945058 0.033906 58.824);
+-      --stage-night-top: oklch(0.392352 0.081287 36.444);
+-      --stage-night-mid: oklch(0.271305 0.056352 31.135);
+-      --stage-night-bottom: oklch(0.182126 0.028154 27.774);
+-      --stage-night-highlight: oklch(0.851007 0.061294 53.805);
+-      --stage-night-secondary: oklch(0.560789 0.10645 42.953);
+-      --stage-night-tertiary: oklch(0.476228 0.106656 24.165);
+-      --stage-night-line: oklch(0.884931 0.046607 56.556);
++      --stage-art-top: #973e16;
++      --stage-art-mid: #642a0e;
++      --stage-art-bottom: #3e1907;
++      --stage-art-highlight: #f8e7dc;
++      --stage-art-secondary: #c76a32;
++      --stage-art-tertiary: #cc8050;
++      --stage-art-line: #f8e7dc;
++      --stage-night-top: #7c3412;
++      --stage-night-mid: #52230d;
++      --stage-night-bottom: #311405;
++      --stage-night-highlight: #f5e1d6;
++      --stage-night-secondary: #a9582b;
++      --stage-night-tertiary: #ac6b43;
++      --stage-night-line: #f5e1d6;
+     }
+   }
+
+   html[data-theme-id="iris"] {
+-    --stage-art-top: oklch(0.738305 0.113454 298.926);
+-    --stage-art-mid: oklch(0.551826 0.159189 294.531);
+-    --stage-art-bottom: oklch(0.37147 0.133317 289.999);
+-    --stage-art-highlight: oklch(0.949472 0.029204 303.081);
+-    --stage-art-secondary: oklch(0.745085 0.125892 298.647);
+-    --stage-art-tertiary: oklch(0.73066 0.167815 340.964);
+-    --stage-art-line: oklch(0.960278 0.024064 306.969);
++    --stage-art-top: #7f4aa5;
++    --stage-art-mid: #66317f;
++    --stage-art-bottom: #3d1d56;
++    --stage-art-highlight: #f7e6cf;
++    --stage-art-secondary: #b27dcc;
++    --stage-art-tertiary: #d39ab7;
++    --stage-art-line: #f6e3dc;
+
+     @variant dark {
+-      --stage-art-top: oklch(0.57297 0.145973 295.185);
+-      --stage-art-mid: oklch(0.419499 0.13752 292.131);
+-      --stage-art-bottom: oklch(0.274235 0.095798 286.608);
+-      --stage-art-highlight: oklch(0.916698 0.047206 300.224);
+-      --stage-art-secondary: oklch(0.670994 0.13095 296.689);
+-      --stage-art-tertiary: oklch(0.679357 0.165376 340.439);
+-      --stage-art-line: oklch(0.940582 0.032921 299.076);
++      --stage-art-top: #7d418a;
++      --stage-art-mid: #542c62;
++      --stage-art-bottom: #331838;
++      --stage-art-highlight: #efdeee;
++      --stage-art-secondary: #a665b5;
++      --stage-art-tertiary: #c27eaa;
++      --stage-art-line: #efdeee;
+     }
+   }
+
+@@ -1111,170 +1110,115 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
+   animation-duration: 0s !important;
+ }
+
++/* Keep the first paint of the default theme aligned with appearancePalettes.ts. */
+ :root {
+   color-scheme: light;
+   --radius: 0.5rem;
+-  --background: var(--color-zinc-25);
++  --background: #f6f6f7;
+   --app-chrome-background: var(--background);
+   --toolbar-background: var(--app-chrome-background);
+   --toolbar-foreground: var(--foreground);
+   --toolbar-border: var(--border);
+-  --toolbar-control: var(--popover);
++  --toolbar-control: var(--surface-raised);
+   --toolbar-control-foreground: var(--foreground);
+-  --toolbar-control-hover: var(--accent);
+-  --surface-raised: color-mix(in srgb, var(--card) 20%, transparent);
+-  --foreground: var(--color-zinc-900);
+-  --card: var(--color-white);
+-  --card-foreground: var(--color-zinc-900);
+-  --popover: var(--color-white);
+-  --popover-foreground: var(--color-zinc-900);
+-  --primary: oklch(0.488 0.217 264);
+-  --primary-foreground: var(--color-white);
+-  --secondary: var(--color-zinc-50);
+-  --secondary-foreground: var(--color-zinc-800);
+-  --muted: var(--color-zinc-50);
+-  --muted-foreground: var(--color-zinc-500);
++  --toolbar-control-hover: #edf0fc;
++  --surface-raised: #fcfcfc;
++  --foreground: #1d1d1f;
++  --card: #fcfcfc;
++  --card-foreground: var(--foreground);
++  --popover: #fcfcfc;
++  --popover-foreground: var(--foreground);
++  --primary: #3b6cf6;
++  --primary-foreground: #ffffff;
++  --secondary: #f3f3f3;
++  --secondary-foreground: var(--foreground);
++  --muted: #f6f6f6;
++  --muted-foreground: #69696b;
+   --placeholder: var(--muted-foreground);
+-  --secondary-label: var(--muted-foreground);
+-  --icon-muted: var(--muted-foreground);
+-  /* One step past the accent, so a user turn stands off the near-white canvas. */
+-  --message-surface: color-mix(in srgb, var(--color-zinc-200) 55%, var(--color-zinc-100));
++  --secondary-label: #69696b;
++  --icon-muted: var(--secondary-label);
++  --message-surface: #e5ebfb;
+   --message-foreground: var(--foreground);
+   --message-action: var(--primary);
+   --message-action-foreground: var(--primary-foreground);
+-  --message-action-hover: color-mix(in srgb, var(--primary) 90%, var(--background));
+-  --accent: var(--color-zinc-100);
+-  --accent-foreground: var(--color-zinc-900);
+-  --error: var(--color-red-500);
+-  --error-foreground: var(--color-red-700);
++  --message-action-hover: #345fd8;
++  --accent: #e5ebfb;
++  --accent-foreground: var(--foreground);
++  --error: #d93a35;
+   --tool-error-icon: var(--error);
+-  --error-surface: color-mix(in srgb, var(--error) 8%, transparent);
++  --error-foreground: #8f241f;
++  --error-surface: #f3e3e4;
+   --destructive: var(--error);
+-  --border: var(--color-zinc-200);
+-  --input: var(--color-zinc-300);
+-  --ring: var(--primary);
+   --destructive-foreground: var(--error-foreground);
++  --border: #d8d8d9;
++  --input: #c6c6c7;
++  --ring: var(--primary);
+   --info: var(--color-blue-500);
+   --info-foreground: var(--color-blue-700);
+-  /* Messages from a guest link, and the sidebar Request status. */
+   --guest: var(--color-fuchsia-500);
+   --guest-foreground: var(--color-fuchsia-600);
+   --guest-surface: color-mix(in srgb, var(--guest) 14%, var(--message-surface));
+   --success: var(--color-emerald-500);
+   --success-foreground: var(--color-emerald-700);
+-  --warning: var(--color-amber-500);
+-  --warning-foreground: var(--color-amber-700);
+-  --warning-surface: color-mix(in srgb, var(--warning) 8%, transparent);
++  --warning: #c27b0f;
++  --warning-foreground: #714500;
++  --warning-surface: #f1eae0;
+   --update: var(--primary);
+-  --update-foreground: var(--primary);
+-  /* Keep every sidebar primitive on the same light surface hierarchy, including
+-     portaled mobile sheets and settings navigation outside the app sidebar. */
+-  --sidebar: var(--color-zinc-50);
++  --update-foreground: #345bc7;
++  --sidebar: #f7f7f8;
+   --sidebar-foreground: var(--foreground);
+-  --sidebar-muted-foreground: var(--muted-foreground);
+-  --sidebar-control-surface: var(--color-zinc-100);
+-  --sidebar-row-hover: var(--color-zinc-25);
+-  --sidebar-row-active: var(--color-white);
+-  --sidebar-row-selected: var(--color-white);
++  --sidebar-muted-foreground: #69696b;
++  --sidebar-control-surface: #e6e6e7;
++  --sidebar-row-hover: #eceff8;
++  --sidebar-row-active: #e4e9f8;
++  --sidebar-row-selected: #e8ecf8;
+   --sidebar-border: var(--border);
+   --sidebar-stage-fade: var(--sidebar);
+-  --code-background: color-mix(in srgb, var(--card) 90%, var(--background));
++  --code-background: #fbfbfb;
+   --code-foreground: var(--foreground);
+   --terminal-background: var(--background);
+   --terminal-foreground: var(--foreground);
+-  --terminal-cursor: rgb(38 56 78);
+-  --terminal-selection-background: rgb(37 63 99 / 20%);
++  --terminal-cursor: var(--primary);
++  --terminal-selection-background: #cdd8f7;
+
+   @variant dark {
+     color-scheme: dark;
+-    /* The canvas is true black, matching the sidebar. Raised surfaces keep the tone they had
+-       over neutral-950, so cards, popovers, and the composer still lift. Borders and hover
+-       states provide separation without milky gray fills. */
+-    --background: #000;
+-    --surface-raised: color-mix(in srgb, var(--color-neutral-950) 97%, var(--color-white));
+-    --foreground: var(--color-neutral-100);
+-    --card: color-mix(in srgb, var(--color-neutral-950) 97%, var(--color-white));
+-    --card-foreground: var(--color-neutral-100);
+-    --popover: color-mix(in srgb, var(--color-neutral-950) 97%, var(--color-white));
+-    --popover-foreground: var(--color-neutral-100);
+-    --primary: oklch(0.571 0.21 264);
+-    --secondary: --alpha(var(--color-white) / 3%);
+-    --secondary-foreground: var(--color-neutral-100);
+-    --muted: --alpha(var(--color-white) / 3%);
+-    --muted-foreground: var(--color-neutral-400);
+-    --accent: --alpha(var(--color-white) / 4%);
+-    --accent-foreground: var(--color-neutral-100);
+-    /* A user turn sits above the composer tone, level with the selected sidebar row. */
+-    --message-surface: color-mix(in srgb, var(--color-neutral-950) 92%, var(--color-white));
+-    --error: color-mix(in srgb, var(--color-red-500) 90%, var(--color-white));
+-    --error-foreground: var(--color-red-400);
+-    --tool-error-icon: #fca5a5;
+-    --error-surface: color-mix(in srgb, var(--error) 16%, transparent);
+-    --border: --alpha(var(--color-white) / 8%);
+-    --input: --alpha(var(--color-white) / 11%);
++    --background: #141416;
++    --toolbar-control-hover: #3e4352;
++    --surface-raised: #38383a;
++    --foreground: #ececf0;
++    --card: #272729;
++    --popover: #48484a;
++    --primary: #6b93ff;
++    --primary-foreground: #141416;
++    --secondary: #373739;
++    --muted: #313133;
++    --muted-foreground: #b5b5ba;
++    --secondary-label: #848487;
++    --message-surface: #32384b;
++    --message-action-hover: #80a2ff;
++    --accent: #363f58;
++    --error: #ff6961;
++    --tool-error-icon: var(--error-foreground);
++    --error-foreground: #ffb8b0;
++    --error-surface: #482727;
++    --border: #444446;
++    --input: #59595c;
+     --info-foreground: var(--color-blue-400);
+     --guest-foreground: var(--color-fuchsia-300);
+     --success-foreground: var(--color-emerald-400);
+-    --warning-foreground: var(--color-amber-400);
+-    --warning-surface: color-mix(in srgb, var(--warning) 16%, transparent);
+-    --update-foreground: var(--color-blue-400);
+-    --sidebar: var(--card);
+-    --sidebar-control-surface: var(--muted);
+-    --sidebar-row-hover: var(--accent);
+-    --sidebar-row-active: var(--accent);
+-    --sidebar-row-selected: var(--muted);
+-    --sidebar-stage-fade: var(--card);
+-    --terminal-cursor: rgb(180 203 255);
+-    --terminal-selection-background: rgb(180 203 255 / 25%);
+-  }
+-}
+-
+-/* Keep both sidebar implementations (default and legacy) on the same quiet
+-   zinc hierarchy: zinc-50 navigation, zinc-25 hover, and white selected/raised
+-   surfaces. */
+-[data-app-sidebar] {
+-  --background: var(--color-zinc-25);
+-  --foreground: var(--color-zinc-900);
+-  --card: var(--color-white);
+-  --card-foreground: var(--color-zinc-900);
+-  --accent: var(--color-zinc-100);
+-  --accent-foreground: var(--color-zinc-900);
+-  --muted: var(--color-zinc-50);
+-  --muted-foreground: var(--color-zinc-500);
+-  --border: var(--color-zinc-200);
+-  --input: var(--color-zinc-300);
+-  --sidebar: var(--color-zinc-50);
+-  --sidebar-foreground: var(--color-zinc-900);
+-  --sidebar-muted-foreground: var(--color-zinc-500);
+-  --sidebar-control-surface: var(--color-zinc-100);
+-  --sidebar-row-hover: var(--color-zinc-25);
+-  --sidebar-row-active: var(--color-white);
+-  --sidebar-row-selected: var(--color-white);
+-  --sidebar-border: var(--color-zinc-200);
+-  --sidebar-stage-fade: var(--sidebar);
+-
+-  @variant dark {
+-    --background: #000;
+-    --foreground: #f1f3f7;
+-    --card: #000;
+-    --card-foreground: var(--foreground);
+-    --accent: #191a1d;
+-    --accent-foreground: #f7f9ff;
+-    --muted: #0a0a0a;
+-    --muted-foreground: #a3a3a3;
+-    --border: rgb(255 255 255 / 8%);
+-    --input: rgb(255 255 255 / 18%);
+-    --sidebar: var(--card);
+-    --sidebar-foreground: var(--foreground);
+-    --sidebar-muted-foreground: var(--muted-foreground);
+-    --sidebar-control-surface: var(--muted);
+-    --sidebar-row-hover: color-mix(in srgb, var(--contrast-foreground) 8%, transparent);
+-    --sidebar-row-active: color-mix(in srgb, var(--contrast-foreground) 11%, transparent);
+-    --sidebar-row-selected: color-mix(in srgb, var(--contrast-foreground) 7%, transparent);
+-    --sidebar-border: var(--border);
+-    --sidebar-stage-fade: var(--card);
+-    /* Row metadata sits a step below read titles (75% white). */
+-    --secondary-label: #8f8f8f;
++    --warning: #f0b94e;
++    --warning-foreground: #ffdf8f;
++    --warning-surface: #443822;
++    --update-foreground: #87a7fc;
++    --sidebar: #121214;
++    --sidebar-muted-foreground: #848487;
++    --sidebar-control-surface: #28282a;
++    --sidebar-row-hover: #1d2130;
++    --sidebar-row-active: #22293e;
++    --sidebar-row-selected: #1e2435;
++    --code-background: #1e1e20;
++    --terminal-selection-background: #303d61;
+   }
+ }
+
+@@ -1539,9 +1483,7 @@ html[data-theme-id] :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblo
+   color: color-mix(in srgb, var(--code-foreground) 72%, transparent);
+ }
+
+-/* T3 Chat renders inline code and compact chat artifacts with its translucent
+-   secondary surface flattened over the light chat canvas. The raw muted and
+-   secondary tokens are substantially darker than those visible pixels. */
++/* Use the same surface for inline code and compact chat artifacts in the petal palette. */
+ html[data-theme-id="t3-chat"] {
+   @variant light {
+     & .chat-markdown :not(pre) > code,
+@@ -1589,8 +1531,7 @@ html[data-theme-id] [data-app-sidebar] {
+   }
+ }
+
+-/* T3 Chat's panel divider is deliberately pink, and its resize affordance
+-   keeps that color while hovered. Do not neutralize this branded edge. */
++/* Keep the petal palette's tinted divider on hover. */
+ html[data-theme-id="t3-chat"] [data-app-sidebar] {
+   @variant dark {
+     border-color: var(--contrast-sidebar-border);
+diff --git a/apps/web/src/themeBoot.test.ts b/apps/web/src/themeBoot.test.ts
+index 891096cb..c3318603 100644
+--- a/apps/web/src/themeBoot.test.ts
++++ b/apps/web/src/themeBoot.test.ts
+@@ -5,6 +5,7 @@ import {
+   CUSTOM_THEMES_STORAGE_KEY,
+   ENVIRONMENT_THEMES_STORAGE_KEY,
+   getDefaultThemeColors,
++  getStandardThemeColors,
+   getThemeColorsForMode,
+   invalidateCustomThemes,
+   isKnownThemePreference,
+@@ -148,6 +149,19 @@ const CHARCOAL_DARK_ONLY = {
+ };
+
+ describe("index.html boot script", () => {
++  it.each(["light", "dark"] as const)("paints the default splash in %s mode", (mode) => {
++    const boot = runBootScript({
++      storage: { [THEME_STORAGE_KEY]: mode },
++      prefersDark: mode === "light",
++    });
++    const colors = getStandardThemeColors(mode);
++    expect(toCanonicalThemeColor(boot.backgroundColor)).toBe(colors.chrome);
++    expect(boot.metaContent).toBe(boot.backgroundColor);
++    expect(toCanonicalThemeColor(boot.bootVariables["--boot-background"])).toBe(colors.canvas);
++    expect(toCanonicalThemeColor(boot.bootVariables["--boot-foreground"])).toBe(colors.text);
++    expect(toCanonicalThemeColor(boot.bootVariables["--boot-accent"])).toBe(colors.accent);
++  });
++
+   const parityCases: ReadonlyArray<{
+     name: string;
+     storage: Record<string, string>;
+diff --git a/apps/web/src/themePalette.browser.test.ts b/apps/web/src/themePalette.browser.test.ts
+index 4204b069..545325a2 100644
+--- a/apps/web/src/themePalette.browser.test.ts
++++ b/apps/web/src/themePalette.browser.test.ts
+@@ -22,7 +22,7 @@ function paintedChannels(variable: string, canvas: readonly number[] = [0, 0, 0]
+ }
+
+ describe("standard painted theme colors", () => {
+-  it("match the chip surfaces index.css paints", () => {
++  it("match the surfaces and controls index.css paints", () => {
+     const root = document.documentElement;
+     try {
+       for (const appearance of ["light", "dark"] as const) {
+@@ -32,6 +32,10 @@ describe("standard painted theme colors", () => {
+         for (const [variable, role] of [
+           ["--background", "canvas"],
+           ["--card", "surface"],
++          ["--toolbar-control-hover", "toolbarControlHover"],
++          ["--sidebar", "sidebar"],
++          ["--sidebar-row-selected", "sidebarRowSelected"],
++          ["--primary", "messageAction"],
+           ["--surface-raised", "surfaceRaised"],
+           ["--message-surface", "messageSurface"],
+         ] as const) {
+diff --git a/apps/web/src/themePalette.test.ts b/apps/web/src/themePalette.test.ts
+index dd33895b..972ed875 100644
+--- a/apps/web/src/themePalette.test.ts
++++ b/apps/web/src/themePalette.test.ts
+@@ -1,12 +1,12 @@
+ import { describe, expect, it, vi } from "vite-plus/test";
+ import { converter } from "culori/fn";
+-import { BUILT_IN_THEMES } from "@t3tools/shared/themePalettes";
+
+ import { CONTEXT_CHIP_ACCENTS, contextChipColorVariable } from "./lib/contextChipAccents";
+ import { appAtomRegistry } from "./rpc/atomRegistry";
+
+ import {
+   applyThemePalette,
++  BUILT_IN_THEMES,
+   canonicalThemePreference,
+   contextChipVariables,
+   getThemeDefinition,
+@@ -65,6 +65,20 @@ function contrastRatio(first: string, second: string): number {
+   return (lighter + 0.05) / (darker + 0.05);
+ }
+
++describe("Xtwork appearance palettes", () => {
++  it("uses Paper by default and displays the product theme names", () => {
++    expect(asHex(getStandardThemeColors("light").canvas)).toBe("#f6f6f7");
++    expect(asHex(getStandardThemeColors("dark").canvas)).toBe("#141416");
++    expect(BUILT_IN_THEMES.map((theme) => theme.label)).toEqual([
++      "花瓣",
++      "草甸",
++      "潮汐",
++      "暖杏",
++      "暮色",
++    ]);
++  });
++});
++
+ describe("theme files", () => {
+   it("gives non-Latin theme names distinct stable ids", () => {
+     const file = {
+@@ -654,10 +668,6 @@ describe("context chip colors", () => {
+   });
+
+   it("reads at 5:1 on the standard surfaces as index.css paints them", () => {
+-    const painted = {
+-      light: ["#fcfcfc", "#ffffff", "#ebebed"],
+-      dark: ["#000000", "#0a0a0a", "#111111", "#141414", "#1e1e1e"],
+-    } as const;
+     const properties = new Map<string, string>();
+     vi.stubGlobal("window", { localStorage: { getItem: () => null } });
+     vi.stubGlobal("document", {
+@@ -673,12 +683,14 @@ describe("context chip colors", () => {
+     try {
+       for (const appearance of ["light", "dark"] as const) {
+         applyThemePalette("system", appearance);
++        const { canvas, surface, surfaceRaised, messageSurface } =
++          getStandardThemeColors(appearance);
+         for (const kind of Object.keys(CONTEXT_CHIP_ACCENTS) as Array<
+           keyof typeof CONTEXT_CHIP_ACCENTS
+         >) {
+-          for (const surface of painted[appearance]) {
++          for (const background of [canvas, surface, surfaceRaised, messageSurface]) {
+             expect(
+-              contrastRatio(properties.get(contextChipColorVariable(kind))!, surface),
++              contrastRatio(properties.get(contextChipColorVariable(kind))!, background),
+             ).toBeGreaterThanOrEqual(5);
+           }
+         }
+diff --git a/apps/web/src/themePalette.ts b/apps/web/src/themePalette.ts
+index d04e7e16..89a55439 100644
+--- a/apps/web/src/themePalette.ts
++++ b/apps/web/src/themePalette.ts
+@@ -8,14 +8,6 @@ import { msg } from "gt-react";
+ import "culori/css";
+ import { converter, parse } from "culori/fn";
+ import {
+-  BUILT_IN_THEMES,
+-  EMBER_THEME,
+-  GROVE_THEME,
+-  IRIS_THEME,
+-  OCEAN_THEME,
+-  T3_CHAT_THEME,
+-  T3_CODE_LIGHT_THEME_COLORS,
+-  T3_CODE_DARK_THEME_COLORS,
+   RESERVED_THEME_IDS,
+   THEME_COLOR_ROLES,
+   type ThemeAppearance,
+@@ -31,12 +23,13 @@ import {
+ } from "./lib/contextChipAccents";
+
+ import { m } from "./i18n/messages";
++import { PAPER_THEME_COLORS, BUILT_IN_PALETTES } from "./appearancePalettes";
+ import { appAtomRegistry, subscribeAtomChanges } from "./rpc/atomRegistry";
+ import { applyThemeBackground } from "./themeBackground";
+ import { applyThemeCss } from "./themeCss";
+ import { themeServerEnvironmentThemesAtom } from "./state/server";
+
+-export { EMBER_THEME, GROVE_THEME, IRIS_THEME, OCEAN_THEME, T3_CHAT_THEME, THEME_COLOR_ROLES };
++export { THEME_COLOR_ROLES };
+ export type { ThemeAppearance, ThemeColorRole, ThemeColors, ThemeDefinition, ThemeVariants };
+
+ const T3_CHAT_THEME_ID = "t3-chat" as const;
+@@ -434,24 +427,13 @@ function legacyThemeMode(theme: ThemePreference): ThemeAppearance | null {
+
+ export function getStandardThemeColors(appearance: ThemeAppearance): ThemeColors {
+   if (appearance === "dark") {
+-    return (standardDarkThemeColors ??= decodeThemeColors({
+-      ...T3_CODE_DARK_THEME_COLORS,
+-      canvas: "#000000",
+-    }));
++    return (standardDarkThemeColors ??= decodeThemeColors(PAPER_THEME_COLORS.dark));
+   }
+-  return (standardLightThemeColors ??= decodeThemeColors(T3_CODE_LIGHT_THEME_COLORS));
++  return (standardLightThemeColors ??= decodeThemeColors(PAPER_THEME_COLORS.light));
+ }
+
+-// index.css paints the light bubble a step darker than the shared palette mobile uses.
+-const STANDARD_WEB_PAINTED_COLORS: Record<ThemeAppearance, Partial<ThemeColors>> = {
+-  light: { messageSurface: "#ebebed" },
+-  dark: { canvas: "#000000", messageSurface: "#1e1e1e" },
+-};
+-
+ /** The standard theme as index.css paints it, for solves that measure the page. */
+-export function getStandardPaintedThemeColors(appearance: ThemeAppearance): ThemeColors {
+-  return { ...getStandardThemeColors(appearance), ...STANDARD_WEB_PAINTED_COLORS[appearance] };
+-}
++export const getStandardPaintedThemeColors = getStandardThemeColors;
+
+ type ThemeRgbColor = {
+   r: number;
+@@ -1226,12 +1208,24 @@ export function updateThemeColorFamily(
+   }
+ }
+
+-const BUILT_IN_THEME_DEFINITIONS: ReadonlyArray<ThemeDefinition> = BUILT_IN_THEMES;
++export const T3_CHAT_THEME = canonicalizeThemeDefinition(BUILT_IN_PALETTES.petal);
++export const GROVE_THEME = canonicalizeThemeDefinition(BUILT_IN_PALETTES.meadow);
++export const OCEAN_THEME = canonicalizeThemeDefinition(BUILT_IN_PALETTES.tide);
++export const EMBER_THEME = canonicalizeThemeDefinition(BUILT_IN_PALETTES.apricot);
++export const IRIS_THEME = canonicalizeThemeDefinition(BUILT_IN_PALETTES.dusk);
++
++export const BUILT_IN_THEMES: ReadonlyArray<ThemeDefinition> = [
++  T3_CHAT_THEME,
++  GROVE_THEME,
++  OCEAN_THEME,
++  EMBER_THEME,
++  IRIS_THEME,
++];
+
+ export function getThemeDefinition(theme: ThemePreference): ThemeDefinition | null {
+   const themeId = themeIdFromPreference(theme);
+   return (
+-    BUILT_IN_THEME_DEFINITIONS.find((definition) => definition.id === themeId) ??
++    BUILT_IN_THEMES.find((definition) => definition.id === themeId) ??
+     getCustomThemes().find((definition) => definition.id === themeId) ??
+     getEnvironmentThemes().find((definition) => definition.id === themeId) ??
+     null
+@@ -1240,10 +1234,7 @@ export function getThemeDefinition(theme: ThemePreference): ThemeDefinition | nu
+
+ export function themeAllowsSidebarArtwork(theme: ThemePreference): boolean {
+   const themeId = themeIdFromPreference(theme);
+-  return (
+-    BUILT_IN_THEME_DEFINITIONS.find((definition) => definition.id === themeId)?.sidebarArtwork ===
+-    true
+-  );
++  return BUILT_IN_THEMES.find((definition) => definition.id === themeId)?.sidebarArtwork === true;
+ }
+
+ /** Every selection path must check single-appearance themes to keep mix and appearance tiles in sync. */
+@@ -1375,7 +1366,7 @@ export function installCustomTheme(theme: ThemeDefinition): ThemeDefinition {
+   }
+   const library = getWritableCustomThemeLibrary();
+   if (
+-    BUILT_IN_THEME_DEFINITIONS.some((existing) => existing.id === theme.id) ||
++    BUILT_IN_THEMES.some((existing) => existing.id === theme.id) ||
+     library.storedThemes.some((storedTheme) => storedThemeHasId(storedTheme, theme.id))
+   ) {
+     throw new Error(
+@@ -1444,7 +1435,7 @@ export function replaceCustomThemeCollection(
+       m(msg("Your installed themes changed while this package was downloading. Try again.")),
+     );
+   }
+-  const occupiedIds = new Set(BUILT_IN_THEME_DEFINITIONS.map((theme) => theme.id));
++  const occupiedIds = new Set(BUILT_IN_THEMES.map((theme) => theme.id));
+   for (const storedTheme of library.storedThemes) {
+     if (
+       !storedThemeHasCollectionId(storedTheme, collectionId) &&
