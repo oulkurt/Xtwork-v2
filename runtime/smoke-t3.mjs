@@ -134,7 +134,9 @@ try {
   assert.equal(thread.providerInstanceId, "xtworkDim");
   const storagePath = join(env.XTWORK_PLUGIN_DATA_DIR, "todo", "storage.json");
   const records = JSON.parse(await readFile(storagePath, "utf8"));
-  assert.equal(Object.values(records).filter((item) => item.title === todoTitle).length, 1);
+  const todos = Object.values(records).filter((item) => item.title === todoTitle);
+  assert.equal(todos.length, 1);
+  assert.match(todos[0].id, /^req-[a-f0-9]{64}$/, "The Dim MCP request did not get a retry key");
   await stop();
   stop = undefined;
 
@@ -147,7 +149,7 @@ try {
   stop = undefined;
   succeeded = true;
   console.log(
-    "Default Dim created a todo through T3 MCP, read it after restart, and shut down cleanly.",
+    "Default Dim created a retry-safe todo through T3 MCP, read it after restart, and shut down cleanly.",
   );
 } finally {
   if (stop) await stop().catch(() => {});

@@ -60,12 +60,19 @@ async function all() {
 }
 async function create(input, context) {
   validate(input, true);
+  let id;
+  if (context?.operationKey) {
+    id = `req-${context.operationKey}`;
+    const previous = await xtwork.storage.get(key(id));
+    if (previous) return previous;
+  }
   if ((await xtwork.storage.list("item:")).length >= 1000)
     throw new Error("The 1000 item limit has been reached.");
-  let id;
-  do {
-    id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
-  } while (await xtwork.storage.get(key(id)));
+  if (!id) {
+    do {
+      id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+    } while (await xtwork.storage.get(key(id)));
+  }
   const now = new Date().toISOString();
   const item = {
     id,
