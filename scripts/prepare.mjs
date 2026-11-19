@@ -107,10 +107,11 @@ overlayFile(welcomePath, [
 ]);
 
 overlayFile("apps/server/src/telemetry/AnalyticsService.ts", [
+  ['import * as Exit from "effect/Exit";', 'import * as Exit from "effect/Exit";\nimport { constant } from "effect/Function";'],
   [
     "export const layer = Layer.effect(AnalyticsService, make);",
     "export const layer = Layer.succeed(AnalyticsService, AnalyticsService.of({\n" +
-      "  record: () => Effect.void,\n  flush: Effect.void,\n  recordOwners: () => Effect.void,\n}));",
+      "  record: constant(Effect.void),\n  flush: Effect.void,\n  recordOwners: constant(Effect.void),\n}));",
   ],
 ]);
 overlayFile("apps/server/src/cli/config.ts", [
@@ -132,6 +133,7 @@ if (!desktopTrack || !trackState || !trackEnvironments) throw new Error(`Desktop
 overlayFile(settingsPath, [
   [desktopTrack, "{selectedHostedAppChannel"],
   [trackState, "  const selectedHostedAppChannel = hasDesktopBridge ? null : HOSTED_APP_CHANNEL;\n\n"],
+  ['...(appOffTrack ? {} : { "up-to-date": gt("Up to Date") }),', '"up-to-date": gt("Up to Date"),'],
   [trackEnvironments, "\n"],
   ['  const [switchChannel, setSwitchChannel] = useState<DesktopUpdateChannel | null>(null);\n', ""],
   ['  const selectedUpdateChannel = updateState?.channel ?? "latest";\n', ""],

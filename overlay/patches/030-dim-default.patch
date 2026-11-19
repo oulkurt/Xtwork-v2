@@ -1,14 +1,6 @@
 --- a/apps/server/src/serverSettings.ts
 +++ b/apps/server/src/serverSettings.ts
-@@ -25,6 +25,7 @@
- import * as Cache from "effect/Cache";
- import * as Cause from "effect/Cause";
- import * as Context from "effect/Context";
-+import * as Data from "effect/Data";
- import * as Deferred from "effect/Deferred";
- import * as Duration from "effect/Duration";
- import * as Equal from "effect/Equal";
-@@ -43,6 +44,7 @@
+@@ -43,6 +43,7 @@
  import * as Scope from "effect/Scope";
  import * as Stream from "effect/Stream";
  import * as SqlClient from "effect/sql/SqlClient";
@@ -16,7 +8,7 @@
  import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
  import { resolveSymlinkTarget } from "@t3tools/shared/symlink";
  import * as ServerConfig from "./config.ts";
-@@ -56,6 +58,7 @@
+@@ -56,6 +57,7 @@
  } from "@t3tools/shared/serverSettings";
  import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
  import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
@@ -24,7 +16,7 @@
  import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
  import {
    readSecretFieldValues,
-@@ -260,6 +263,9 @@
+@@ -260,6 +262,9 @@
 
      /** The administrator's policy as clients see it; absent when unmanaged. */
      readonly managedPolicy?: ManagedPolicySummary | undefined;
@@ -34,14 +26,14 @@
 
      readonly getSettings: Effect.Effect<ServerSettings, ServerSettingsError>;
 
-@@ -668,8 +674,31 @@
+@@ -668,8 +673,31 @@
    };
  }
 
-+class BundledDimError extends Data.TaggedError("BundledDimError")<{
-+  readonly message: string;
-+  readonly cause: unknown;
-+}> {}
++class BundledDimError extends Schema.TaggedError<
++  BundledDimError,
++  { readonly brand: unique symbol }
++>()("BundledDimError", { message: Schema.String, cause: Schema.Defect() }) {}
 +
  const make = Effect.gen(function* () {
 -  const { settingsPath } = yield* ServerConfig.ServerConfig;
@@ -67,7 +59,7 @@
    const fs = yield* FileSystem.FileSystem;
    const pathService = yield* Path.Path;
    const secretStore = yield* ServerSecretStore.ServerSecretStore;
-@@ -789,8 +818,9 @@
+@@ -789,8 +817,9 @@
      let legacyProviders: Readonly<Record<string, unknown>> | undefined;
      let legacySourceControl: Parameters<typeof migrateLegacySourceControlSettings>[1] = {};
      let parseFailure = Option.none<unknown>();
@@ -79,7 +71,7 @@
        const raw = yield* readRawConfig;
        const parsed = decodeSettingsFileJsonExit(raw);
        const decoded = Exit.isFailure(parsed)
-@@ -823,6 +853,27 @@
+@@ -823,6 +852,27 @@
        } else {
          settings = decoded.value;
        }
@@ -107,7 +99,7 @@
      }
      // Settings saved by a server that kept the mode in `compactIdleThreads` move
      // it to `idleCompaction`, so that switch goes to clients as a boolean. The
-@@ -919,6 +970,7 @@
+@@ -919,6 +969,7 @@
        ? yield* moveInlineSettingsSecrets(sourceControlMigration.settings)
        : folded;
      if (
@@ -115,7 +107,7 @@
        migrated !== loaded ||
        (settingsFileTrusted && legacyProviders !== undefined) ||
        hasLegacySourceControl
-@@ -1374,6 +1426,7 @@
+@@ -1374,6 +1425,7 @@
      managedPolicy,
      start,
      ready: Deferred.await(startedDeferred),

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -75,13 +76,18 @@ type contextMenuItem struct {
 	Children        []contextMenuItem `json:"children"`
 }
 
-func (d *Desktop) ShowContextMenu(items []contextMenuItem, point *mygo.Point) *string {
+type contextMenuPoint struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+
+func (d *Desktop) ShowContextMenu(items []contextMenuItem, point *contextMenuPoint) *string {
 	var selected *string
 	menu := mygo.NewMenu(nativeMenuItems(items, func(id string) { selected = &id }))
 	if point == nil {
 		menu.Popup(d.window)
 	} else {
-		menu.PopupAt(d.window, point.X, point.Y)
+		menu.PopupAt(d.window, int(math.Round(point.X)), int(math.Round(point.Y)))
 	}
 	return selected
 }

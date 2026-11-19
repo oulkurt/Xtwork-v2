@@ -118,13 +118,15 @@ function select(items, input = {}) {
 const actions = {
   create,
   list: async (input) => {
-    const limit = input.limit === undefined ? 50 : input.limit;
+    const { limit = 50, offset = 0 } = input;
     if (!Number.isInteger(limit) || limit < 1 || limit > 200)
       throw new Error("limit must be an integer from 1 to 200.");
+    if (!Number.isInteger(offset) || offset < 0 || offset > 1000)
+      throw new Error("offset must be an integer from 0 to 1000.");
     const items = select(await all(), input);
     const result = [];
     let size = 0;
-    for (const item of items.slice(0, limit)) {
+    for (const item of items.slice(offset, offset + limit)) {
       const chars = Array.from(item.notes);
       const compact =
         chars.length > 200
@@ -139,7 +141,8 @@ const actions = {
       size += bytes;
       result.push(compact);
     }
-    return { total: items.length, items: result };
+    const next = offset + result.length;
+    return { total: items.length, items: result, nextOffset: next < items.length ? next : null };
   },
 };
 export const tools = actions;

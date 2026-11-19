@@ -77,13 +77,17 @@ const serveTodo = Effect.fn("XtworkPlugins.serveTodo")(function* (
   if (Option.isNone(url)) return errorResponse("Invalid request URL.", 400);
   const filter = url.value.searchParams.get("filter") ?? "all";
   if (!creating && !filters.includes(filter)) return errorResponse("Invalid todo filter.", 400);
+  const offset = Number(url.value.searchParams.get("offset") ?? 0);
+  if (!creating && (!Number.isInteger(offset) || offset < 0 || offset > 1000)) {
+    return errorResponse("Invalid todo offset.", 400);
+  }
   const input = creating
     ? yield* request.json.pipe(
         Effect.provideService(HttpServerRequest.MaxBodySize, ByteSize.kibibytes(16)),
         Effect.flatMap(decodeJson),
         Effect.option,
       )
-    : Option.some({ filter });
+    : Option.some({ filter, offset });
   if (Option.isNone(input)) return errorResponse("Expected a JSON todo.", 400);
   const name = creating ? "todo__create" : "todo__list";
   return yield* Effect.tryPromise({

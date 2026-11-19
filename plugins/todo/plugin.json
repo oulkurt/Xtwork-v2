@@ -79,6 +79,12 @@
               "type": "string",
               "maxLength": 40
             },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000,
+              "description": "Start at this index. Use nextOffset from the previous page."
+            },
             "limit": {
               "type": "integer",
               "minimum": 1,

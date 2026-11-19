@@ -23,11 +23,14 @@ export function TodoPanel() {
 
       const title = typeof request.title === "string" ? request.title.trim() : "";
       const creating = request.method === "create";
-      if (request.method !== "list" && (!creating || title.length < 1 || title.length > 200)) return;
+      if (creating ? title.length < 1 || title.length > 200 : request.method !== "list") return;
+      const offset = request.offset ?? 0;
+      if (!creating && (!Number.isInteger(offset) || offset < 0 || offset > 1000)) return;
+      const target = frame;
 
       function reply(result: { value?: unknown; error?: string }) {
-        if (active && frame === iframe.current?.contentWindow) {
-          frame.postMessage({ channel, id: request.id, ...result }, "*");
+        if (active && target === iframe.current?.contentWindow) {
+          target.postMessage({ channel, id: request.id, ...result }, "*");
         }
       }
 
@@ -36,7 +39,8 @@ export function TodoPanel() {
         if (!token) throw new Error("请先连接本机服务");
         const headers = new Headers({ Authorization: `Bearer ${token}` });
         if (creating) headers.set("Content-Type", "application/json");
-        const response = await fetch("/api/xtwork/todo", {
+        const url = creating ? "/api/xtwork/todo" : `/api/xtwork/todo?offset=${offset}`;
+        const response = await fetch(url, {
           headers,
           ...(creating ? { method: "POST", body: JSON.stringify({ title }) } : {}),
         });
