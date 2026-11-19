@@ -138,4 +138,10 @@
     [class~="[-webkit-app-region:no-drag]"] { --app-region: no-drag; }
   `);
   document.adoptedStyleSheets = [...document.adoptedStyleSheets, titlebar];
+
+  call("GetWindowCornerRadius").then((radius) => {
+    if (radius > 0) {
+      titlebar.insertRule(`:root { --xtwork-window-radius: ${radius}px; }`);
+    }
+  }).catch(() => {});
 }

@@ -1,8 +1,8 @@
 diff --git a/apps/web/index.html b/apps/web/index.html
-index 051e3090..8e1cbb7e 100644
+index 051e3090..cd740974 100644
 --- a/apps/web/index.html
 +++ b/apps/web/index.html
-@@ -6,14 +6,14 @@
+@@ -6,123 +6,23 @@
        name="viewport"
        content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
      />
@@ -20,26 +20,20 @@ index 051e3090..8e1cbb7e 100644
          const CUSTOM_THEMES_STORAGE_KEY = "t3code:themes:v1";
          const ENVIRONMENT_THEMES_STORAGE_KEY = "t3code:environment-themes:v1";
          const THEME_FOLLOW_SYSTEM_STORAGE_KEY = "t3code:theme-follow-system";
-@@ -21,108 +21,91 @@
+         const THEME_APPEARANCE_MODE_STORAGE_KEY = "t3code:theme-appearance-mode";
          const THEME_HALVES_STORAGE_KEY = "t3code:theme-halves:v1";
-         const SPLASH_COLORS = {
-           light: {
+-        const SPLASH_COLORS = {
+-          light: {
 -            background: "#ffffff",
 -            foreground: "#262626",
 -            accent: "#4f46e5",
-+            background: "#f6f6f7",
-+            foreground: "#1d1d1f",
-+            accent: "#3b6cf6",
-           },
-           dark: {
+-          },
+-          dark: {
 -            background: "#000000",
 -            foreground: "#f5f5f5",
 -            accent: "#818cf8",
-+            background: "#141416",
-+            foreground: "#ececf0",
-+            accent: "#6b93ff",
-           },
-         };
+-          },
+-        };
 -        // These are the runtime defaults used to complete a custom palette
 -        // when a stored theme omits a role. Keep them separate from the
 -        // unselected splash so a partial custom theme does not flash generic
@@ -60,132 +54,116 @@ index 051e3090..8e1cbb7e 100644
 -        };
 -        // Keep this small boot-time copy in sync with the built-in palettes so
 -        // the selected theme is visible before the app has mounted.
-+        // Keep this boot-time copy in sync with the built-in palettes.
-         const BUILT_IN_THEME_PALETTES = {
-           "t3-chat": {
-             light: {
+-        const BUILT_IN_THEME_PALETTES = {
+-          "t3-chat": {
+-            light: {
 -              background: "oklch(0.982446 0.010114 325.653)",
 -              foreground: "oklch(0.325698 0.116116 325.037)",
 -              accent: "oklch(0.591646 0.217985 0.584)",
 -              chrome: "oklch(0.982446 0.010114 325.653)",
-+              background: "oklch(0.921005 0.028004 311.307)",
-+              foreground: "oklch(0.231576 0.003805 286.099)",
-+              accent: "oklch(0.5335 0.156873 344.507)",
-+              chrome: "oklch(0.921005 0.028004 311.307)",
-             },
-             dark: {
+-            },
+-            dark: {
 -              background: "oklch(0.22813 0.020366 307.469)",
 -              foreground: "oklch(0.980735 0.004092 301.426)",
 -              accent: "oklch(0.460685 0.185347 4.099)",
 -              chrome: "oklch(0.22813 0.020366 307.469)",
-+              background: "oklch(0.205885 0.042164 341.081)",
-+              foreground: "oklch(0.944229 0.005342 286.297)",
-+              accent: "oklch(0.710064 0.143146 346.178)",
-+              chrome: "oklch(0.205885 0.042164 341.081)",
-             },
-           },
-           grove: {
-             light: {
+-            },
+-          },
+-          grove: {
+-            light: {
 -              background: "oklch(0.972369 0.005497 157.15)",
 -              foreground: "oklch(0.222003 0.03479 328.979)",
 -              accent: "oklch(0.523295 0.112292 158.089)",
 -              chrome: "oklch(0.972369 0.005497 157.15)",
-+              background: "oklch(0.937604 0.017484 153.557)",
-+              foreground: "oklch(0.231576 0.003805 286.099)",
-+              accent: "oklch(0.52911 0.104642 154.932)",
-+              chrome: "oklch(0.937604 0.017484 153.557)",
-             },
-             dark: {
+-            },
+-            dark: {
 -              background: "oklch(0.260865 0.02152 162.75)",
 -              foreground: "oklch(0.990339 0.008411 325.64)",
 -              accent: "oklch(0.796228 0.133058 157.319)",
 -              chrome: "oklch(0.260865 0.02152 162.75)",
-+              background: "oklch(0.204501 0.039648 149.945)",
-+              foreground: "oklch(0.944229 0.005342 286.297)",
-+              accent: "oklch(0.755561 0.133962 152.787)",
-+              chrome: "oklch(0.204501 0.039648 149.945)",
-             },
-           },
-           ocean: {
-             light: {
+-            },
+-          },
+-          ocean: {
+-            light: {
 -              background: "oklch(0.974199 0.002856 241.597)",
 -              foreground: "oklch(0.222003 0.03479 328.979)",
 -              accent: "oklch(0.536684 0.120219 247.01)",
 -              chrome: "oklch(0.974199 0.002856 241.597)",
-+              background: "oklch(0.92932 0.017874 214.381)",
-+              foreground: "oklch(0.231576 0.003805 286.099)",
-+              accent: "oklch(0.541842 0.082664 210.409)",
-+              chrome: "oklch(0.92932 0.017874 214.381)",
-             },
-             dark: {
+-            },
+-            dark: {
 -              background: "oklch(0.242641 0.024125 250.573)",
 -              foreground: "oklch(0.990339 0.008411 325.64)",
 -              accent: "oklch(0.758933 0.105833 241.548)",
 -              chrome: "oklch(0.242641 0.024125 250.573)",
-+              background: "oklch(0.204879 0.036643 217.234)",
-+              foreground: "oklch(0.944229 0.005342 286.297)",
-+              accent: "oklch(0.770199 0.102547 205.701)",
-+              chrome: "oklch(0.204879 0.036643 217.234)",
-             },
-           },
-           ember: {
-             light: {
+-            },
+-          },
+-          ember: {
+-            light: {
 -              background: "oklch(0.976527 0.002685 60.725)",
 -              foreground: "oklch(0.222003 0.03479 328.979)",
 -              accent: "oklch(0.552831 0.129438 44.656)",
 -              chrome: "oklch(0.976527 0.002685 60.725)",
-+              background: "oklch(0.922911 0.026593 50.852)",
-+              foreground: "oklch(0.231576 0.003805 286.099)",
-+              accent: "oklch(0.577477 0.131987 49.184)",
-+              chrome: "oklch(0.922911 0.026593 50.852)",
-             },
-             dark: {
+-            },
+-            dark: {
 -              background: "oklch(0.245899 0.019144 42.044)",
 -              foreground: "oklch(0.990339 0.008411 325.64)",
 -              accent: "oklch(0.762174 0.124117 52.082)",
 -              chrome: "oklch(0.245899 0.019144 42.044)",
-+              background: "oklch(0.21526 0.044444 44.812)",
-+              foreground: "oklch(0.944229 0.005342 286.297)",
-+              accent: "oklch(0.775777 0.116624 54.008)",
-+              chrome: "oklch(0.21526 0.044444 44.812)",
-             },
-           },
-           iris: {
-             light: {
+-            },
+-          },
+-          iris: {
+-            light: {
 -              background: "oklch(0.976531 0.003855 303.226)",
 -              foreground: "oklch(0.222003 0.03479 328.979)",
 -              accent: "oklch(0.525348 0.15373 294.176)",
 -              chrome: "oklch(0.976531 0.003855 303.226)",
-+              background: "oklch(0.905776 0.033736 302.725)",
-+              foreground: "oklch(0.231576 0.003805 286.099)",
-+              accent: "oklch(0.511628 0.146491 309.025)",
-+              chrome: "oklch(0.905776 0.033736 302.725)",
-             },
-             dark: {
+-            },
+-            dark: {
 -              background: "oklch(0.225975 0.031062 293.741)",
 -              foreground: "oklch(0.990339 0.008411 325.64)",
 -              accent: "oklch(0.671712 0.169136 293.929)",
 -              chrome: "oklch(0.225975 0.031062 293.741)",
-+              background: "oklch(0.201285 0.059812 295.394)",
-+              foreground: "oklch(0.944229 0.005342 286.297)",
-+              accent: "oklch(0.7258 0.138253 310.876)",
-+              chrome: "oklch(0.201285 0.059812 295.394)",
-             },
-           },
-         };
+-            },
+-          },
+-        };
++        const SPLASH_COLORS = {"light":{"background":"#f6f6f7","foreground":"#292929","accent":"#466fbd","chrome":"#f6f6f7","wash":"linear-gradient(180deg in oklab, #f6f6f7, #f7f7f8, #f8f8f8)"},"dark":{"background":"#141416","foreground":"#e4e4e4","accent":"#7daafd","chrome":"#141416","wash":"linear-gradient(225deg in oklab, rgb(90 120 200 / 0.10), transparent 50%), linear-gradient(180deg in oklab, #141416, #151517, #161618)"}};
++        const BUILT_IN_THEME_PALETTES = {"t3-chat":{"light":{"background":"#ebe0f3","foreground":"#34232b","accent":"#a84e7c","chrome":"#ebe0f3","wash":"linear-gradient(225deg in oklab, rgb(247 220 241 / 0.75), transparent 50%), linear-gradient(180deg in oklab, #ebe0f3, #f3e7f1, #f7eee4, #f6efcf)"},"dark":{"background":"#240f1d","foreground":"#ede1e6","accent":"#e887b6","chrome":"#240f1d","wash":"linear-gradient(225deg in oklab, rgb(142 58 110 / 0.30), transparent 50%), linear-gradient(180deg in oklab, #240f1d, #26111a, #271610)"}},"grove":{"light":{"background":"#e2eee5","foreground":"#212d1e","accent":"#448335","chrome":"#e2eee5","wash":"linear-gradient(225deg in oklab, rgb(214 240 222 / 0.75), transparent 50%), linear-gradient(180deg in oklab, #e2eee5, #ebf2e7, #f3f2e2, #f5f0d6)"},"dark":{"background":"#081c0d","foreground":"#dfe7de","accent":"#7dbf6e","chrome":"#081c0d","wash":"linear-gradient(225deg in oklab, rgb(6 113 50 / 0.30), transparent 50%), linear-gradient(180deg in oklab, #081c0d, #101d0c, #1b1c0b)"}},"ocean":{"light":{"background":"#dbebef","foreground":"#162d30","accent":"#008492","chrome":"#dbebef","wash":"linear-gradient(225deg in oklab, rgb(194 232 238 / 0.75), transparent 50%), linear-gradient(180deg in oklab, #dbebef, #e3eff1, #ecf3f0, #f2f2e8)"},"dark":{"background":"#001b22","foreground":"#dae8e9","accent":"#00c2d2","chrome":"#001b22","wash":"linear-gradient(225deg in oklab, rgb(0 112 128 / 0.30), transparent 50%), linear-gradient(180deg in oklab, #001b22, #001e1f, #0b1e1b)"}},"ember":{"light":{"background":"#f5e1d6","foreground":"#35251b","accent":"#ac571d","chrome":"#f5e1d6","wash":"linear-gradient(225deg in oklab, rgb(252 212 194 / 0.78), transparent 50%), linear-gradient(180deg in oklab, #f5e1d6, #f8e7dc, #f8eedf, #f6f0da)"},"dark":{"background":"#2a1207","foreground":"#ede2dc","accent":"#ec915c","chrome":"#2a1207","wash":"linear-gradient(225deg in oklab, rgb(151 62 22 / 0.30), transparent 50%), linear-gradient(180deg in oklab, #2a1207, #291507, #25190a)"}},"iris":{"light":{"background":"#e4dbf3","foreground":"#2f2433","accent":"#8e57a5","chrome":"#e4dbf3","wash":"linear-gradient(225deg in oklab, rgb(246 206 222 / 0.80), transparent 50%), linear-gradient(180deg in oklab, #e4dbf3, #efdeee, #f6e3dc, #f7e6cf)"},"dark":{"background":"#190f2e","foreground":"#e8e2ec","accent":"#ca91e3","chrome":"#190f2e","wash":"linear-gradient(225deg in oklab, rgb(125 65 138 / 0.30), transparent 50%), linear-gradient(180deg in oklab, #190f2e, #260f24, #2d140b)"}}};
 +        // A partial custom palette uses the same fallback as the theme runtime.
 +        const DEFAULT_THEME_PALETTES = BUILT_IN_THEME_PALETTES["t3-chat"];
          const BUILT_IN_THEME_MODES = Object.fromEntries(
            Object.entries(BUILT_IN_THEME_PALETTES).map(([id, palettes]) => [
              id,
-@@ -402,15 +385,15 @@
+@@ -343,6 +243,7 @@
+                 accent: isThemeColor(customColors.accent)
+                   ? customColors.accent
+                   : (customDefaults?.accent ?? fallbackSplash.accent),
++                wash: "none",
+               }
+             : null;
+           if (effectiveIsThemed) {
+@@ -371,11 +272,9 @@
+                 ? DARK_BACKGROUND
+                 : LIGHT_BACKGROUND;
+           document.documentElement.style.backgroundColor = chromeColor;
+-          if (hasSelection) {
+-            const splashColors = customSplash ?? builtInSplash ?? fallbackSplash;
+-            for (const [name, value] of Object.entries(splashColors)) {
+-              document.documentElement.style.setProperty(`--boot-${name}`, value);
+-            }
++          const splashColors = customSplash ?? builtInSplash ?? fallbackSplash;
++          for (const [name, value] of Object.entries(splashColors)) {
++            document.documentElement.style.setProperty(`--boot-${name}`, value);
+           }
+           setThemeColor(chromeColor);
+         } catch {
+@@ -402,15 +301,15 @@
        }
 
        body {
 -        background: #ffffff;
 -        color: #262626;
 +        background: #f6f6f7;
-+        color: #1d1d1f;
++        color: #292929;
          font-family:
            -apple-system, BlinkMacSystemFont, "Inter Variable", "Segoe UI", system-ui, sans-serif;
        }
@@ -194,34 +172,51 @@ index 051e3090..8e1cbb7e 100644
 -        background: #000000;
 -        color: #f5f5f5;
 +        background: #141416;
-+        color: #ececf0;
++        color: #e4e4e4;
        }
 
        #boot-shell {
-@@ -453,8 +436,8 @@
+@@ -420,13 +319,9 @@
+         min-height: 100%;
+         align-items: center;
+         justify-content: center;
+-        background: inherit;
+-        color: inherit;
+-      }
+-
+-      html[data-theme-selected="true"] #boot-shell {
+-        background: var(--boot-background);
+-        color: var(--boot-foreground);
++        background-color: var(--boot-background, inherit);
++        background-image: var(--boot-wash, none);
++        color: var(--boot-foreground, inherit);
+       }
+
+       #boot-shell-card {
+@@ -453,8 +348,8 @@
        }
 
        #boot-error {
 -        --boot-error-fg: #262626;
 -        --boot-error-bg: #ffffff;
-+        --boot-error-fg: #1d1d1f;
++        --boot-error-fg: #292929;
 +        --boot-error-bg: #f6f6f7;
          --boot-error-line: color-mix(in srgb, currentColor 12%, transparent);
          display: flex;
          flex-direction: column;
-@@ -467,8 +450,8 @@
+@@ -467,8 +362,8 @@
        }
 
        html.dark #boot-error {
 -        --boot-error-fg: #f5f5f5;
 -        --boot-error-bg: #000000;
-+        --boot-error-fg: #ececf0;
++        --boot-error-fg: #e4e4e4;
 +        --boot-error-bg: #141416;
        }
 
        html[data-theme-selected="true"] #boot-error {
 diff --git a/apps/web/src/components/CommandPaletteThemeItems.tsx b/apps/web/src/components/CommandPaletteThemeItems.tsx
-index 4fde126c..cc172d64 100644
+index 4fde126c..8d507293 100644
 --- a/apps/web/src/components/CommandPaletteThemeItems.tsx
 +++ b/apps/web/src/components/CommandPaletteThemeItems.tsx
 @@ -1,4 +1,3 @@
@@ -238,20 +233,40 @@ index 4fde126c..cc172d64 100644
  import {
    ADDON_ICON_CLASS,
    ITEM_ICON_CLASS,
+@@ -106,7 +105,7 @@ export function useCommandPaletteThemeItems() {
+                     key={preview.mode}
+                     colors={preview.colors}
+                     mode={preview.mode}
+-                    className="size-3 border-0"
++                    className="h-3 w-5 border-0"
+                   />
+                 ))}
+               </span>
+diff --git a/apps/web/src/components/settings/SettingsSidebarNav.tsx b/apps/web/src/components/settings/SettingsSidebarNav.tsx
+index 174a80bf..765bfd71 100644
+--- a/apps/web/src/components/settings/SettingsSidebarNav.tsx
++++ b/apps/web/src/components/settings/SettingsSidebarNav.tsx
+@@ -257,6 +257,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
+   return (
+     <nav
+       {...navArea}
++      data-xtwork-search-open={compactSearchOpen ? "" : undefined}
+       role="navigation"
+       className={cn(
+         "flex w-60 shrink-0 flex-col border-e bg-sidebar text-sidebar-foreground max-md:w-14",
 diff --git a/apps/web/src/components/settings/ThemePreviewCircles.tsx b/apps/web/src/components/settings/ThemePreviewCircles.tsx
-index 8f23f5be..fe40785c 100644
+index 8f23f5be..1eed7c53 100644
 --- a/apps/web/src/components/settings/ThemePreviewCircles.tsx
 +++ b/apps/web/src/components/settings/ThemePreviewCircles.tsx
-@@ -1,13 +1,12 @@
+@@ -1,32 +1,24 @@
  import { useGT } from "gt-react";
  import { MoonIcon, SunIcon } from "lucide-react";
- import type { CSSProperties } from "react";
+-import type { CSSProperties } from "react";
 -import {
 -  STANDARD_THEME_PREVIEW_COLORS as SHARED_STANDARD_THEME_PREVIEW_COLORS,
 -  THEME_PREVIEW_RENDER_SPECS,
 -} from "@t3tools/shared/themePreview";
-+import { THEME_PREVIEW_RENDER_SPECS } from "@t3tools/shared/themePreview";
-+import { PAPER_THEME_LABEL } from "../../appearancePalettes";
++import { getBuiltInThemeWash, PAPER_THEME_LABEL } from "../../appearancePalettes";
  import { cn } from "../../lib/utils";
  import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
  import {
@@ -259,9 +274,36 @@ index 8f23f5be..fe40785c 100644
    getThemeColorsForMode,
    getThemeModes,
    type ThemeAppearance,
-@@ -36,33 +35,13 @@ export type ThemeCardDefinition = {
++  type ThemeColors,
+   type ThemeDefinition,
+ } from "../../themePalette";
+
+-const THEME_PREVIEW_ROLES = [
+-  "sidebar",
+-  "canvas",
+-  "surface",
+-  "accentSurface",
+-  "accent",
+-  "messageSurface",
+-  "messageAction",
+-] as const;
+-type ThemePreviewRole = (typeof THEME_PREVIEW_ROLES)[number];
++export const THEME_SWATCH_CORNERS =
++  "rounded-[var(--xtwork-window-radius,18px)] [corner-shape:squircle]";
++
++export type ThemeCardPreviewColors = Readonly<ThemeColors & { wash: string | undefined }>;
+ type ThemeCardPreview = {
+   mode: ThemeAppearance;
+-  colors: Readonly<Record<ThemePreviewRole, string>>;
++  colors: ThemeCardPreviewColors;
+ };
+ export type ThemeCardDefinition = {
+   id: string;
+@@ -34,35 +26,22 @@ export type ThemeCardDefinition = {
+   previews: ReadonlyArray<ThemeCardPreview>;
+ };
  export type ThemeMode = ThemeAppearance | "system";
- export type ThemeCardPreviewColors = ThemeCardPreview["colors"];
+-export type ThemeCardPreviewColors = ThemeCardPreview["colors"];
 
 -const STANDARD_THEME_PREVIEW_COLORS: Record<
 -  ThemeAppearance,
@@ -282,7 +324,14 @@ index 8f23f5be..fe40785c 100644
 -    ...SHARED_STANDARD_THEME_PREVIEW_COLORS.dark,
 -  },
 -};
--
++function previewColors(
++  id: string,
++  mode: ThemeAppearance,
++  colors: ThemeColors,
++): ThemeCardPreviewColors {
++  return { ...colors, wash: getBuiltInThemeWash(id, mode) };
++}
+
  export const STANDARD_THEME_CARDS: ReadonlyArray<ThemeCardDefinition> = [
    {
      id: "default",
@@ -291,12 +340,295 @@ index 8f23f5be..fe40785c 100644
      previews: (["light", "dark"] as const).map((mode) => ({
        mode,
 -      colors: STANDARD_THEME_PREVIEW_COLORS[mode],
-+      colors: getStandardThemeColors(mode),
++      colors: previewColors("default", mode, getStandardThemeColors(mode)),
      })),
    },
  ];
+@@ -78,47 +57,13 @@ export function getThemeCardDefinition(theme: ThemeDefinition): ThemeCardDefinit
+   return {
+     id: theme.id,
+     label: theme.label,
+-    previews: getThemeModes(theme).map((mode) => {
+-      const colors = getThemeColorsForMode(theme, mode) ?? theme.colors;
+-      return {
+-        mode,
+-        colors: {
+-          sidebar: colors.sidebar,
+-          canvas: colors.canvas,
+-          surface: colors.surface,
+-          accentSurface: colors.accentSurface,
+-          accent: colors.accent,
+-          messageSurface: colors.messageSurface,
+-          messageAction: colors.messageAction,
+-        },
+-      };
+-    }),
+-  };
+-}
+-
+-function getThemePreviewStyle(
+-  colors: ThemeCardPreviewColors,
+-  mode: ThemeAppearance,
+-): CSSProperties {
+-  const spec = THEME_PREVIEW_RENDER_SPECS[mode];
+-  const modeBase = `color-mix(in oklab, ${colors.canvas} ${spec.baseWeight * 100}%, ${spec.baseTarget})`;
+-  const accentPosition = `${spec.accent.center[0] * 100}% ${spec.accent.center[1] * 100}%`;
+-  const actionPosition = `${spec.action.center[0] * 100}% ${spec.action.center[1] * 100}%`;
+-  return {
+-    backgroundColor: modeBase,
+-    backgroundImage: [
+-      `radial-gradient(circle at ${accentPosition} in oklab, ${colors.accent} 0%, color-mix(in oklab, ${colors.accent} ${spec.accent.middleOpacity * 100}%, transparent) ${spec.accent.middleOffset * 100}%, transparent ${spec.accent.endOffset * 100}%)`,
+-      `radial-gradient(circle at ${actionPosition} in oklab, color-mix(in oklab, ${colors.messageAction} ${spec.action.startOpacity * 100}%, transparent) 0%, transparent ${spec.action.endOffset * 100}%)`,
+-    ].join(", "),
++    previews: getThemeModes(theme).map((mode) => ({
++      mode,
++      colors: previewColors(theme.id, mode, getThemeColorsForMode(theme, mode) ?? theme.colors),
++    })),
+   };
+ }
+
+-function themePreviewEdgeShadow(mode: ThemeAppearance): string {
+-  return mode === "dark"
+-    ? "inset 0 0 0 1px rgb(255 255 255 / 0.14), 0 1px 2px rgb(0 0 0 / 0.18)"
+-    : "inset 0 0 0 1px rgb(0 0 0 / 0.10), 0 1px 2px rgb(0 0 0 / 0.08)";
+-}
+-
+ export function ThemePreviewCircle({
+   colors,
+   mode,
+@@ -131,20 +76,50 @@ export function ThemePreviewCircle({
+   return (
+     <span
+       aria-hidden
++      data-theme-swatch={mode}
+       className={cn(
+-        "relative block size-14 shrink-0 overflow-hidden rounded-full border-2 border-background",
++        "relative block h-[60px] w-20 shrink-0 overflow-hidden border",
++        THEME_SWATCH_CORNERS,
+         className,
+       )}
+-      style={{ boxShadow: themePreviewEdgeShadow(mode) }}
++      style={{
++        backgroundColor: colors.canvas,
++        backgroundImage: colors.wash,
++        borderColor: `color-mix(in srgb, ${colors.text} 18%, transparent)`,
++      }}
+     >
+       <span
+-        className="absolute inset-0 rounded-full"
++        className="absolute inset-y-0 left-0 w-[28%] border-r"
+         style={{
+-          ...getThemePreviewStyle(colors, mode),
+-          filter: `blur(${THEME_PREVIEW_RENDER_SPECS[mode].blurAt56Px}px)`,
+-          transform: `scale(${THEME_PREVIEW_RENDER_SPECS[mode].scale})`,
++          backgroundColor: colors.wash ? undefined : colors.sidebar,
++          borderColor: colors.border,
+         }}
+       />
++      <span
++        className="absolute inset-y-[11%] left-[30%] right-[7%] rounded-md"
++        style={{ backgroundColor: colors.surface }}
++      />
++      <span
++        className="absolute left-[8%] top-[35%] h-[8%] w-[15%] rounded-sm"
++        style={{ backgroundColor: colors.accentSurface }}
++      />
++      <span
++        className="absolute left-[37%] top-[28%] h-[5%] w-[31%] rounded-sm"
++        style={{ backgroundColor: colors.text, opacity: 0.65 }}
++      />
++      <span
++        className="absolute left-[37%] top-[42%] h-[5%] w-[38%] rounded-sm"
++        style={{ backgroundColor: colors.textMuted, opacity: 0.54 }}
++      />
++      <span
++        className="absolute bottom-[21%] left-[36%] right-[13%] flex h-[19%] items-center justify-end rounded-md border px-[5%]"
++        style={{ backgroundColor: colors.surface, borderColor: colors.border }}
++      >
++        <span
++          className="aspect-square h-[65%] rounded-sm"
++          style={{ backgroundColor: colors.messageAction }}
++        />
++      </span>
+     </span>
+   );
+ }
+@@ -162,7 +137,7 @@ export function ThemePreviewCircles({
+ }) {
+   const gt = useGT();
+   return (
+-    <div className="flex min-h-16 items-center justify-center gap-2.5 px-3 pt-3">
++    <div className="flex min-h-16 items-center justify-center gap-3 px-3 pt-3">
+       {previews.map((preview) => {
+         const mode = preview.mode;
+         const isPicked = activeModes.includes(mode);
+@@ -178,7 +153,8 @@ export function ThemePreviewCircles({
+                   }
+                   aria-pressed={isPicked}
+                   className={cn(
+-                    "relative flex size-[68px] shrink-0 transform-gpu cursor-pointer items-center justify-center rounded-full p-1.5 outline-none transition-transform hover:scale-105 focus-visible:outline-2 focus-visible:outline-solid focus-visible:-outline-offset-5 focus-visible:outline-foreground/60",
++                    "relative flex h-[60px] w-20 shrink-0 transform-gpu cursor-pointer items-center justify-center outline-none transition-transform hover:scale-105 focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-offset-2 focus-visible:outline-foreground/60",
++                    THEME_SWATCH_CORNERS,
+                     isPicked && "hover:scale-100",
+                   )}
+                   onClick={(event) => {
+@@ -187,17 +163,19 @@ export function ThemePreviewCircles({
+                   }}
+                   type="button"
+                 >
+-                  <ThemePreviewCircle colors={preview.colors} mode={mode} />
++                  <ThemePreviewCircle colors={preview.colors} mode={mode} className="size-full" />
+                   {isPicked ? (
+                     <>
+                       <span
+                         aria-hidden
+-                        className="pointer-events-none absolute inset-0 rounded-full"
+-                        style={{ boxShadow: "inset 0 0 0 2px var(--ring)" }}
++                        className={cn(
++                          "pointer-events-none absolute inset-0 ring-2 ring-inset ring-ring",
++                          THEME_SWATCH_CORNERS,
++                        )}
+                       />
+                       <span
+                         aria-hidden
+-                        className="pointer-events-none absolute bottom-0.5 right-0.5 flex size-5 items-center justify-center rounded-full border border-border/70 bg-background text-foreground shadow-sm"
++                        className="pointer-events-none absolute -bottom-0.5 -right-0.5 flex size-5 items-center justify-center rounded-full border border-border/70 bg-background text-foreground shadow-sm"
+                       >
+                         {mode === "light" ? (
+                           <SunIcon className="size-3" />
+diff --git a/apps/web/src/components/settings/ThemeSettings.tsx b/apps/web/src/components/settings/ThemeSettings.tsx
+index 9e59c2ef..9f73e0d7 100644
+--- a/apps/web/src/components/settings/ThemeSettings.tsx
++++ b/apps/web/src/components/settings/ThemeSettings.tsx
+@@ -45,6 +45,7 @@ import { useSearchableSetting } from "./settingsSearch";
+ import { useThemeEditorStore } from "./themeEditorStore";
+ import {
+   STANDARD_THEME_CARDS,
++  THEME_SWATCH_CORNERS,
+   getThemeCardDefinition,
+   previewColorsOf,
+   ThemePreviewCircles,
+@@ -161,7 +162,7 @@ function ThemeLibraryCard({
+               {variantNavigation ? (
+                 <div
+                   aria-label={gt("Light and dark theme variants")}
+-                  className="relative h-20"
++                  className="relative h-[5.5rem]"
+                   role="group"
+                   onBlurCapture={(event) => {
+                     const nextTarget = event.relatedTarget;
+@@ -210,7 +211,10 @@ function ThemeLibraryCard({
+                                     })
+                             }
+                             aria-pressed={isActive}
+-                            className="absolute left-1/2 top-2 z-20 flex size-14 items-center justify-center rounded-full outline-none focus-visible:outline-2 focus-visible:outline-solid focus-visible:-outline-offset-5 focus-visible:outline-foreground/60"
++                            className={cn(
++                              "absolute left-1/2 top-2 z-20 flex h-[60px] w-20 items-center justify-center outline-none focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-offset-2 focus-visible:outline-foreground/60",
++                              THEME_SWATCH_CORNERS,
++                            )}
+                             style={{
+                               transform: `translateX(calc(-50% + ${rootOffsetX}px))`,
+                             }}
+@@ -225,11 +229,15 @@ function ThemeLibraryCard({
+                             <ThemePreviewCircle
+                               colors={selected.preview.colors}
+                               mode={selected.preview.mode}
++                              className="size-full"
+                             />
+                             {isActive ? (
+                               <span
+                                 aria-hidden
+-                                className="pointer-events-none absolute inset-0 rounded-full ring-2 ring-inset ring-ring"
++                                className={cn(
++                                  "pointer-events-none absolute inset-0 ring-2 ring-inset ring-ring",
++                                  THEME_SWATCH_CORNERS,
++                                )}
+                               />
+                             ) : null}
+                             {isActive ? (
+@@ -286,12 +294,7 @@ function ThemeLibraryCard({
+                                           : gt("Use {label} for dark mode", { label: option.label })
+                                     }
+                                     aria-pressed={optionIsActive}
+-                                    className={cn(
+-                                      "absolute left-1/2 top-1 z-30 flex size-7 items-center justify-center rounded-full bg-background shadow-sm outline-none transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+-                                      optionIsActive
+-                                        ? "ring-2 ring-inset ring-ring"
+-                                        : "ring-1 ring-border/70",
+-                                    )}
++                                    className="absolute left-1/2 top-1 z-30 flex h-6 w-8 items-center justify-center rounded-lg shadow-sm outline-none transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-ring"
+                                     style={{
+                                       opacity: isOpen ? 1 : 0,
+                                       pointerEvents: isOpen ? "auto" : "none",
+@@ -306,12 +309,20 @@ function ThemeLibraryCard({
+                                     onFocus={() => setRadialModeOpen(mode)}
+                                     onMouseEnter={() => setRadialModeOpen(mode)}
+                                   >
+-                                    <span className="pointer-events-none scale-[0.43]">
+-                                      <ThemePreviewCircle
+-                                        colors={preview.colors}
+-                                        mode={preview.mode}
+-                                      />
+-                                    </span>
++                                    <ThemePreviewCircle
++                                      className="pointer-events-none size-full rounded-lg border-0"
++                                      colors={preview.colors}
++                                      mode={preview.mode}
++                                    />
++                                    <span
++                                      aria-hidden
++                                      className={cn(
++                                        "pointer-events-none absolute inset-0 rounded-lg",
++                                        optionIsActive
++                                          ? "ring-2 ring-inset ring-ring"
++                                          : "ring-1 ring-border/70",
++                                      )}
++                                    />
+                                   </button>
+                                 </ThemeVariantTooltip>
+                               );
+@@ -1025,7 +1036,7 @@ export function ThemeLibrary({
+                     <span className="flex min-h-12 items-center justify-center gap-1">
+                       {card.previews.map((preview) => (
+                         <span
+-                          className="flex size-11 shrink-0 items-center justify-center"
++                          className="flex h-[45px] w-[60px] shrink-0 items-center justify-center"
+                           key={preview.mode}
+                         >
+                           <span className="flex scale-75">
+diff --git a/apps/web/src/components/settings/ThemeWireframe.tsx b/apps/web/src/components/settings/ThemeWireframe.tsx
+index d600a7dc..0cd8f4a9 100644
+--- a/apps/web/src/components/settings/ThemeWireframe.tsx
++++ b/apps/web/src/components/settings/ThemeWireframe.tsx
+@@ -23,12 +23,24 @@ function ThemeWireframePane({
+             }
+       }
+     >
+-      <span className="absolute inset-0" style={{ backgroundColor: colors.canvas }} />
++      <span
++        className="absolute inset-0"
++        style={{ backgroundColor: colors.canvas, backgroundImage: colors.wash }}
++      />
+       <span
+         className="absolute inset-y-0 left-0 w-[22%]"
+-        style={{ backgroundColor: colors.sidebar, boxShadow: `inset -1px 0 0 ${line}` }}
++        style={{
++          backgroundColor: colors.wash ? undefined : colors.sidebar,
++          boxShadow: `inset -1px 0 0 ${line}`,
++        }}
+       />
+
++      {colors.wash ? (
++        <span
++          className="absolute inset-y-[4%] left-[23%] right-[2%] rounded-md"
++          style={{ backgroundColor: colors.surface }}
++        />
++      ) : null}
+       <span
+         className="absolute left-[3%] top-[8%] h-[8%] w-[16%] rounded-md"
+         style={{ backgroundColor: colors.surface, boxShadow: `inset 0 0 0 1px ${line}` }}
 diff --git a/apps/web/src/index.css b/apps/web/src/index.css
-index 05541d39..dcd07a9e 100644
+index 05541d39..e8ded381 100644
 --- a/apps/web/src/index.css
 +++ b/apps/web/src/index.css
 @@ -751,135 +751,134 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
@@ -779,7 +1111,73 @@ index 05541d39..dcd07a9e 100644
    }
  }
 
-@@ -1539,9 +1483,7 @@ html[data-theme-id] :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblo
+@@ -1323,7 +1267,7 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
+    independent; error, warning, and update roles are themeable below. */
+ /* The non-empty marker adds enough specificity to outrank the generated root
+    dark variant without reintroducing raw `.dark` selectors. */
+-html[data-theme-id]:not([data-theme-id=""]) {
++html:is([data-xtwork-wash], [data-theme-id]):not([data-theme-id=""]) {
+   --background: var(--app-theme-canvas);
+   --app-chrome-background: var(--app-theme-chrome);
+   --toolbar-background: var(--app-theme-toolbar);
+@@ -1389,6 +1333,56 @@ html[data-theme-id]:not([data-theme-id=""]) {
+   --terminal-selection-background: var(--app-theme-terminal-selection-background);
+ }
+
++/* The window and settings sidebar show the wash beneath opaque work surfaces. */
++html[data-xtwork-wash] body,
++html[data-xtwork-wash] [data-xtwork-settings] {
++  background-image: var(--xtwork-window-wash);
++  background-repeat: no-repeat;
++  background-size: 100% 100%;
++}
++
++html[data-xtwork-wash] [data-workspace-area="settings"] {
++  background: var(--card);
++}
++
++html[data-xtwork-wash] [data-workspace-area="settings"] > header {
++  background: var(--toolbar-background);
++}
++
++html[data-xtwork-wash] [data-workspace-area="settings-nav"]:not([data-xtwork-search-open]),
++html[data-xtwork-wash] [data-app-sidebar] > [data-slot="sidebar-inner"] {
++  background: transparent;
++}
++
++html[data-xtwork-wash] [data-settings-section][aria-current="page"] {
++  background-color: var(--sidebar-row-active);
++}
++
++html[data-xtwork-wash] [data-settings-section][aria-current="page"] > svg {
++  color: var(--ring);
++}
++
++html[data-xtwork-wash] [data-slot="sidebar-inset"] {
++  background: var(--card);
++}
++
++@media (min-width: 48rem) {
++  html[data-xtwork-wash]
++    [data-slot="sidebar-wrapper"][data-sidebar-state="expanded"]:has([data-app-sidebar])
++    > [data-slot="sidebar-inset"] {
++    max-height: calc(100dvh - 16px);
++    margin: 8px 8px 8px 0;
++    overflow: hidden;
++    border: 1px solid var(--contrast-border);
++    border-radius: 14px;
++  }
++
++  html[data-xtwork-wash] [data-app-sidebar][data-slot="sidebar-container"],
++  html[data-xtwork-wash] [data-workspace-area="settings-nav"] {
++    border-color: transparent;
++  }
++}
++
+ /* Theme-token dependency probes are restored synchronously, before paint. Keep
+    transitions from observing the temporary sentinel color in between. */
+ html[data-theme-token-probe],
+@@ -1539,9 +1533,7 @@ html[data-theme-id] :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblo
    color: color-mix(in srgb, var(--code-foreground) 72%, transparent);
  }
 
@@ -790,7 +1188,7 @@ index 05541d39..dcd07a9e 100644
  html[data-theme-id="t3-chat"] {
    @variant light {
      & .chat-markdown :not(pre) > code,
-@@ -1589,8 +1531,7 @@ html[data-theme-id] [data-app-sidebar] {
+@@ -1589,8 +1581,7 @@ html[data-theme-id] [data-app-sidebar] {
    }
  }
 
@@ -800,11 +1198,29 @@ index 05541d39..dcd07a9e 100644
  html[data-theme-id="t3-chat"] [data-app-sidebar] {
    @variant dark {
      border-color: var(--contrast-sidebar-border);
+diff --git a/apps/web/src/routes/_chat.settings.tsx b/apps/web/src/routes/_chat.settings.tsx
+index c9753493..82b31a5e 100644
+--- a/apps/web/src/routes/_chat.settings.tsx
++++ b/apps/web/src/routes/_chat.settings.tsx
+@@ -134,7 +134,7 @@ function SettingsContentLayout() {
+
+   return (
+     <AppRouteModal label={gt("Settings")}>
+-      <div className="relative flex min-h-0 flex-1">
++      <div className="relative flex min-h-0 flex-1" data-xtwork-settings="">
+         <SettingsSidebarNav pathname={location.pathname} />
+         <div {...contentArea} className="flex min-h-0 min-w-0 flex-1 flex-col">
+           <header className="flex h-12 shrink-0 items-center gap-3 border-b ps-5 pe-2">
 diff --git a/apps/web/src/themeBoot.test.ts b/apps/web/src/themeBoot.test.ts
-index 891096cb..c3318603 100644
+index 891096cb..f874e9ca 100644
 --- a/apps/web/src/themeBoot.test.ts
 +++ b/apps/web/src/themeBoot.test.ts
-@@ -5,6 +5,7 @@ import {
+@@ -1,10 +1,12 @@
+ import { describe, expect, it, vi } from "vite-plus/test";
+
+ import indexHtml from "../index.html?raw";
++import { getBuiltInThemeWash } from "./appearancePalettes";
+ import {
    CUSTOM_THEMES_STORAGE_KEY,
    ENVIRONMENT_THEMES_STORAGE_KEY,
    getDefaultThemeColors,
@@ -812,7 +1228,7 @@ index 891096cb..c3318603 100644
    getThemeColorsForMode,
    invalidateCustomThemes,
    isKnownThemePreference,
-@@ -148,6 +149,19 @@ const CHARCOAL_DARK_ONLY = {
+@@ -148,6 +150,20 @@ const CHARCOAL_DARK_ONLY = {
  };
 
  describe("index.html boot script", () => {
@@ -827,25 +1243,107 @@ index 891096cb..c3318603 100644
 +    expect(toCanonicalThemeColor(boot.bootVariables["--boot-background"])).toBe(colors.canvas);
 +    expect(toCanonicalThemeColor(boot.bootVariables["--boot-foreground"])).toBe(colors.text);
 +    expect(toCanonicalThemeColor(boot.bootVariables["--boot-accent"])).toBe(colors.accent);
++    expect(boot.bootVariables["--boot-wash"]).toBe(getBuiltInThemeWash("default", mode));
 +  });
 +
    const parityCases: ReadonlyArray<{
      name: string;
      storage: Record<string, string>;
+@@ -324,11 +340,12 @@ describe("index.html boot script", () => {
+         });
+         expect(boot.themeId).toBe(theme.id);
+         expect(boot.isDark).toBe(mode === "dark");
+-        expect(boot.bootVariables["--boot-background"]).toBe(colors!.canvas);
+-        expect(boot.bootVariables["--boot-foreground"]).toBe(colors!.text);
+-        expect(boot.bootVariables["--boot-accent"]).toBe(colors!.accent);
+-        expect(boot.backgroundColor).toBe(colors!.chrome);
+-        expect(boot.metaContent).toBe(colors!.chrome);
++        expect(toCanonicalThemeColor(boot.bootVariables["--boot-background"])).toBe(colors!.canvas);
++        expect(toCanonicalThemeColor(boot.bootVariables["--boot-foreground"])).toBe(colors!.text);
++        expect(toCanonicalThemeColor(boot.bootVariables["--boot-accent"])).toBe(colors!.accent);
++        expect(toCanonicalThemeColor(boot.backgroundColor)).toBe(colors!.chrome);
++        expect(boot.metaContent).toBe(boot.backgroundColor);
++        expect(boot.bootVariables["--boot-wash"]).toBe(getBuiltInThemeWash(theme.id, mode));
+       }
+     }
+   });
+@@ -343,14 +360,14 @@ describe("index.html boot script", () => {
+     const dark = runBootScript({ storage, prefersDark: true });
+     expect(dark.isDark).toBe(true);
+     expect(dark.themeId).toBe(GROVE_THEME.id);
+-    expect(dark.bootVariables["--boot-background"]).toBe(
++    expect(toCanonicalThemeColor(dark.bootVariables["--boot-background"])).toBe(
+       getThemeColorsForMode(GROVE_THEME, "dark")!.canvas,
+     );
+
+     const light = runBootScript({ storage, prefersDark: false });
+     expect(light.isDark).toBe(false);
+     expect(light.themeId).toBe("t3-chat");
+-    expect(light.bootVariables["--boot-background"]).toBe(
++    expect(toCanonicalThemeColor(light.bootVariables["--boot-background"])).toBe(
+       getThemeColorsForMode(T3_CHAT_THEME, "light")!.canvas,
+     );
+   });
+@@ -367,7 +384,7 @@ describe("index.html boot script", () => {
+     expect(boot.isDark).toBe(true);
+     expect(boot.themeId).toBe(GROVE_THEME.id);
+     expect(boot.themeSelected).toBe("true");
+-    expect(boot.bootVariables["--boot-background"]).toBe(
++    expect(toCanonicalThemeColor(boot.bootVariables["--boot-background"])).toBe(
+       getThemeColorsForMode(GROVE_THEME, "dark")!.canvas,
+     );
+   });
+@@ -390,11 +407,16 @@ describe("index.html boot script", () => {
+     });
+
+     expect(boot.themeId).toBe("partial");
+-    expect(boot.bootVariables["--boot-background"]).toBe(getDefaultThemeColors("dark").canvas);
++    expect(toCanonicalThemeColor(boot.bootVariables["--boot-background"])).toBe(
++      getDefaultThemeColors("dark").canvas,
++    );
+     expect(boot.bootVariables["--boot-foreground"]).toBe("#fffaff");
+-    expect(boot.bootVariables["--boot-accent"]).toBe(getDefaultThemeColors("dark").accent);
+-    expect(boot.backgroundColor).toBe(DEFAULT_DARK_CHROME);
+-    expect(boot.metaContent).toBe(DEFAULT_DARK_CHROME);
++    expect(toCanonicalThemeColor(boot.bootVariables["--boot-accent"])).toBe(
++      getDefaultThemeColors("dark").accent,
++    );
++    expect(boot.bootVariables["--boot-wash"]).toBe("none");
++    expect(toCanonicalThemeColor(boot.backgroundColor)).toBe(DEFAULT_DARK_CHROME);
++    expect(boot.metaContent).toBe(boot.backgroundColor);
+   });
+
+   it("follows the OS appearance when storage is unavailable", () => {
 diff --git a/apps/web/src/themePalette.browser.test.ts b/apps/web/src/themePalette.browser.test.ts
-index 4204b069..545325a2 100644
+index 4204b069..315d920f 100644
 --- a/apps/web/src/themePalette.browser.test.ts
 +++ b/apps/web/src/themePalette.browser.test.ts
-@@ -22,7 +22,7 @@ function paintedChannels(variable: string, canvas: readonly number[] = [0, 0, 0]
+@@ -2,7 +2,11 @@ import { converter } from "culori/fn";
+ import { describe, expect, it } from "vite-plus/test";
+
+ import "~/index.css";
+-import { getStandardPaintedThemeColors } from "./themePalette";
++import {
++  applyThemeColorPreview,
++  applyThemePalette,
++  getStandardPaintedThemeColors,
++} from "./themePalette";
+
+ const toRgb = converter("rgb");
+
+@@ -22,23 +26,30 @@ function paintedChannels(variable: string, canvas: readonly number[] = [0, 0, 0]
  }
 
  describe("standard painted theme colors", () => {
 -  it("match the chip surfaces index.css paints", () => {
-+  it("match the surfaces and controls index.css paints", () => {
++  it("match the surfaces and controls applied to index.css", () => {
      const root = document.documentElement;
      try {
        for (const appearance of ["light", "dark"] as const) {
-@@ -32,6 +32,10 @@ describe("standard painted theme colors", () => {
+         root.classList.toggle("dark", appearance === "dark");
++        applyThemePalette("system", appearance);
+         const colors = getStandardPaintedThemeColors(appearance);
+         const canvas = paintedChannels("--background");
          for (const [variable, role] of [
            ["--background", "canvas"],
            ["--card", "surface"],
@@ -856,6 +1354,39 @@ index 4204b069..545325a2 100644
            ["--surface-raised", "surfaceRaised"],
            ["--message-surface", "messageSurface"],
          ] as const) {
+           const expected = toRgb(colors[role])!;
++          const alpha = expected.alpha ?? 1;
+           const painted = paintedChannels(variable, canvas);
+           [expected.r, expected.g, expected.b].forEach((channel, index) => {
+-            expect(Math.abs(channel * 255 - painted[index]!), `${appearance} ${role}`).toBeLessThan(
++            const composited = channel * 255 * alpha + canvas[index]! * (1 - alpha);
++            expect(Math.abs(composited - painted[index]!), `${appearance} ${role}`).toBeLessThan(
+               1.5,
+             );
+           });
+@@ -48,4 +59,22 @@ describe("standard painted theme colors", () => {
+       root.classList.remove("dark");
+     }
+   });
++
++  it("shows the selected built-in wash and removes it for the theme editor", () => {
++    try {
++      applyThemePalette("ember", "light");
++      expect(getComputedStyle(document.body).backgroundImage).toContain("linear-gradient");
++      expect(getComputedStyle(document.body).backgroundImage).toContain("252, 212, 194");
++
++      applyThemePalette("ember", "dark");
++      expect(getComputedStyle(document.body).backgroundImage).toContain("151, 62, 22");
++
++      applyThemeColorPreview(getStandardPaintedThemeColors("dark"), "dark");
++      expect(document.documentElement.getAttribute("data-xtwork-wash")).toBeNull();
++      expect(getComputedStyle(document.body).backgroundImage).not.toContain("linear-gradient");
++    } finally {
++      document.documentElement.classList.remove("dark");
++      applyThemePalette("system", "light");
++    }
++  });
+ });
 diff --git a/apps/web/src/themePalette.test.ts b/apps/web/src/themePalette.test.ts
 index dd33895b..972ed875 100644
 --- a/apps/web/src/themePalette.test.ts
@@ -924,7 +1455,7 @@ index dd33895b..972ed875 100644
            }
          }
 diff --git a/apps/web/src/themePalette.ts b/apps/web/src/themePalette.ts
-index d04e7e16..89a55439 100644
+index d04e7e16..1d18dff7 100644
 --- a/apps/web/src/themePalette.ts
 +++ b/apps/web/src/themePalette.ts
 @@ -8,14 +8,6 @@ import { msg } from "gt-react";
@@ -946,7 +1477,7 @@ index d04e7e16..89a55439 100644
  } from "./lib/contextChipAccents";
 
  import { m } from "./i18n/messages";
-+import { PAPER_THEME_COLORS, BUILT_IN_PALETTES } from "./appearancePalettes";
++import { BUILT_IN_PALETTES, getBuiltInThemeWash, PAPER_THEME_COLORS } from "./appearancePalettes";
  import { appAtomRegistry, subscribeAtomChanges } from "./rpc/atomRegistry";
  import { applyThemeBackground } from "./themeBackground";
  import { applyThemeCss } from "./themeCss";
@@ -1042,3 +1573,66 @@ index d04e7e16..89a55439 100644
    for (const storedTheme of library.storedThemes) {
      if (
        !storedThemeHasCollectionId(storedTheme, collectionId) &&
+@@ -1720,6 +1711,16 @@ export function getThemeColorVariable(role: ThemeColorRole): string {
+
+ export const THEME_PREVIEW_ID = "__preview";
+
++function applyWindowWash(root: HTMLElement, wash?: string): void {
++  if (wash === undefined) {
++    delete root.dataset.xtworkWash;
++    root.style.removeProperty("--xtwork-window-wash");
++  } else {
++    root.dataset.xtworkWash = "";
++    root.style.setProperty("--xtwork-window-wash", wash);
++  }
++}
++
+ /** Callers must restore the stored theme with refreshTheme when the draft closes. */
+ export function applyThemeColorPreview(
+   colors: ThemeColors,
+@@ -1730,6 +1731,7 @@ export function applyThemeColorPreview(
+   const root = document.documentElement;
+   if (!root?.style) return;
+
++  applyWindowWash(root);
+   root.dataset.themeId = THEME_PREVIEW_ID;
+   root.classList.toggle("dark", appearance === "dark");
+   for (const [role, value] of Object.entries(colors) as Array<[ThemeColorRole, string]>) {
+@@ -1751,22 +1753,25 @@ export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppe
+   applyThemeCss(palette?.css);
+   applyThemeBackground(palette?.id);
+
++  const mode =
++    appearance ??
++    legacyThemeMode(theme) ??
++    palette?.appearance ??
++    (theme === "dark" ? "dark" : "light");
++  const colors = palette
++    ? (getThemeColorsForMode(palette, mode) ?? palette.colors)
++    : getStandardPaintedThemeColors(mode);
++  applyWindowWash(root, getBuiltInThemeWash(palette?.id ?? "default", mode));
++
+   if (palette) {
+     root.dataset.themeId = palette.id;
+-    const mode = appearance ?? legacyThemeMode(theme) ?? palette.appearance;
+-    const colors = getThemeColorsForMode(palette, mode) ?? palette.colors;
+-    for (const [role, value] of Object.entries(colors) as Array<[ThemeColorRole, string]>) {
+-      root.style.setProperty(APP_THEME_VARIABLES[role], value);
+-    }
+-    applyContextChipVariables(root, colors);
+-    return;
++  } else {
++    delete root.dataset.themeId;
+   }
+-
+-  delete root.dataset.themeId;
+-  for (const variable of Object.values(APP_THEME_VARIABLES)) {
+-    root.style.removeProperty(variable);
++  for (const [role, value] of Object.entries(colors) as Array<[ThemeColorRole, string]>) {
++    root.style.setProperty(APP_THEME_VARIABLES[role], value);
+   }
+-  applyContextChipVariables(root, getStandardPaintedThemeColors(appearance ?? "light"));
++  applyContextChipVariables(root, colors);
+ }
+
+ export function resolveThemeAppearance(

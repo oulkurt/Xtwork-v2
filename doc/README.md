@@ -2,20 +2,20 @@
 
 ## 当前进度
 
-**Apple Silicon macOS Alpha 预览（`0.1.0-alpha.1`）。** 截至 2026-11-19，主线 `a20099f` 已合入桌面底座、内置助手、待办创建与查询、工具型插件和六套配色。正式发布仍待验收。 [桌面底座 #1](https://github.com/oulkurt/Xtwork-v2/pull/1) · [插件与去重 #2](https://github.com/oulkurt/Xtwork-v2/pull/2) · [配色 #3](https://github.com/oulkurt/Xtwork-v2/pull/3) · [决策记录 #4](https://github.com/oulkurt/Xtwork-v2/pull/4)
+**Apple Silicon macOS Alpha 预览（`0.1.0-alpha.1`）。** 截至 2026-11-19，已实现桌面底座、内置助手、待办管理、工具型插件和六套渐变配色。正式发布仍待验收。 [桌面底座](https://github.com/oulkurt/Xtwork-v2/pull/1) · [插件与去重](https://github.com/oulkurt/Xtwork-v2/pull/2) · [待办面板](https://github.com/oulkurt/Xtwork-v2/pull/6) · [界面配色](ui-appearance.md)
 
 | 里程碑 | 现状 | 还缺什么 |
 |---|---|---|
 | M0 桌面、T3、Dim | 核心链路已实跑。历史验收记录了 macOS 启动、DeepSeek 流式回复、MCP 待办与退出清理。 [桌面验收](desktop-foundation.md#首轮验收) | 取消生成的端到端验收 |
 | M1 通用任务桌面版 | 部分实现。已有品牌、默认助手和桌面桥接。 | 默认免项目对话、PR／Issues 收进设置、干净机器首启和首发模型授权。 [通用任务规划](plan/08-通用任务化改造.md) |
 | M2 插件通路 | 部分实现。Go 宿主、MCP 工具、待办面板和插件禁用已接通。同一 MCP 会话内重发同一创建请求只写一次。 [工具型插件](plugin-tools.md) | `@` 上下文、交互审批与撤销、公开插件契约冻结 |
-| M3 内置插件 | 部分实现。待办已能创建、查询和重启后读回。 | 待办管理与提醒、日程、Obsidian 引用。 [内置插件规划](plan/06-内置插件-待办日程笔记.md) |
+| M3 内置插件 | 部分实现。待办可创建、查询、编辑、完成、重开和删除，重启后可读回。 | 待办撤销与提醒、日程、Obsidian 引用。 [工具型插件](plugin-tools.md) · [内置插件规划](plan/06-内置插件-待办日程笔记.md) |
 | M4 远程连接 | 只有规划。 | 选定试点平台，验证绑定、收消息与回复。 [远程连接规划](plan/07-远程连接插件.md) |
 | M5 发布候选 | 已有 macOS 打包、签名更新和 R2 上传脚本。本地签名更新有历史验收记录。 | 正式签名公证、发布渠道及干净环境的安装升级验收。Windows 和其他平台按首发范围另行验收。 [发布规划](plan/09-品牌与发布.md) |
 
 **建议下一步**　按原型先补 M1，让用户打开应用就能开始不选项目的对话，并把 PR 和 Issues 收进设置。首发前还要确定模型是产品提供还是用户自带 Key。 [交互原型](../.smyw/20261119-xtwork-v2/preview.html) · [Q-03 模型授权](../DECISIONS.md#pending-decisions)
 
-**本轮核验**　在 macOS arm64 上成功应用上游补丁。`shell` 和 `plugin-host` 均通过 `go vet ./...`，共跑过 6 项 Go 竞态测试。桌面窗口、真实模型和签名更新沿用首轮实跑记录。 [桌面测试](../shell/backend_test.go) · [宿主测试](../plugin-host/host_test.go)
+**验收记录**　桌面底座已验证窗口、真实模型与签名更新。待办面板已在 Chromium 和 WebKit 跑通新增、筛选、编辑、完成、重开和删除。 [桌面验收](desktop-foundation.md#首轮验收) · [待办面板验收](https://github.com/oulkurt/Xtwork-v2/pull/6)
 
 ## 当前运行进程
 
