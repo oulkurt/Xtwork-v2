@@ -34,6 +34,13 @@ func (d *Desktop) RevealWindow() {
 	}
 }
 
+func (d *Desktop) GetWindowCornerRadius() float64 {
+	if d.window == nil {
+		return 0
+	}
+	return d.window.CornerRadius()
+}
+
 func (d *Desktop) SetTheme(theme string) {
 	mygo.Theme.SetSource(mygo.ThemeSource(theme))
 }

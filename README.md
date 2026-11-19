@@ -1,6 +1,6 @@
 # 小瞳 Work v2
 
-小瞳 Work 的下一版，面向日常任务。当前处于 Apple Silicon Mac 的 Alpha 预览，已接通内置助手和待办创建、查询。[查看当前进度](doc/README.md#当前进度)
+小瞳 Work 的下一版，面向日常任务。当前处于 Apple Silicon Mac 的 Alpha 预览，已接通内置助手和待办管理。[查看当前进度](doc/README.md#当前进度)
 
 ## 已确认的方向
 
