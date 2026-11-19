@@ -20,6 +20,8 @@ open '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'
 
 ## 待办插件
 
+工具型插件的当前范围、重试幂等规则和验证命令见 [工具型插件](plugin-tools.md)。
+
 待办的 worker 和加载逻辑来自旧 xtwork 的 moejs 插件运行时。T3 启动独立 Go 宿主，经 JSONL 查询和调用工具。Dim 会话通过 T3 的 MCP 服务发现 `todo__create`、`todo__list`。侧栏的「待办」面板经同一宿主读取和创建待办。面板在不透明源 iframe 中运行，宿主页面转发两种固定消息。
 
 验证时在对话里说「记一条待办：周五前发季度报告」，打开「待办」查看结果，重开应用再检查一次。可通过 `XTWORK_PLUGINS_DISABLED=todo` 验证禁用状态。日程、Obsidian 和其它插件后续按工具、界面的顺序接入。

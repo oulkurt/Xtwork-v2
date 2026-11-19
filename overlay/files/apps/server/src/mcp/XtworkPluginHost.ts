@@ -81,8 +81,13 @@ export class XtworkPluginHost {
     return tools;
   }
 
-  invoke(name: string, input: Schema.Json, threadId: string, signal: AbortSignal) {
-    return this.request("tools.invoke", { name, input, context: { threadId } }, signal);
+  invoke(
+    name: string,
+    input: Schema.Json,
+    context: { readonly threadId: string; readonly operationKey: string | undefined },
+    signal: AbortSignal,
+  ) {
+    return this.request("tools.invoke", { name, input, context }, signal);
   }
 
   callView(name: string, input: Schema.Json, signal: AbortSignal) {

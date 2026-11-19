@@ -120,3 +120,115 @@ func TestTodoViewCanLoadPastFirstPage(t *testing.T) {
 		}
 	}
 }
+
+func TestRepeatedThreadToolInvocationIsIdempotent(t *testing.T) {
+	plugins, err := filepath.Abs("../plugins")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := t.TempDir()
+	h, err := newHost(plugins, data, "", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	create := func(h *host, key string) string {
+		t.Helper()
+		params := fmt.Sprintf(`{"name":"todo__create","input":{"title":"Same title"},"context":{"threadId":"thread-retry","operationKey":%q}}`, key)
+		result := h.dispatch(t.Context(), request{Method: "tools.invoke", Params: json.RawMessage(params)})
+		if result.Error != nil {
+			t.Fatal(result.Error)
+		}
+		return string(result.Result.(json.RawMessage))
+	}
+	first := create(h, "request-one")
+	h.close()
+
+	h, err = newHost(plugins, data, "", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.close()
+	if got := create(h, "request-one"); got != first {
+		t.Fatalf("retry returned a different todo: %s", got)
+	}
+	if got := create(h, "request-two"); got == first {
+		t.Fatal("a new request reused the first todo")
+	}
+	result := h.dispatch(t.Context(), request{
+		Method: "tools.invoke",
+		Params: json.RawMessage(`{"name":"todo__list","input":{"limit":10}}`),
+	})
+	if result.Error != nil {
+		t.Fatal(result.Error)
+	}
+	var listed struct {
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(result.Result.(json.RawMessage), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed.Total != 2 {
+		t.Fatalf("expected two todos after three calls, got %d", listed.Total)
+	}
+	stored, err := os.ReadFile(filepath.Join(data, "todo", "storage.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries map[string]json.RawMessage
+	if err := json.Unmarshal(stored, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected one storage entry per todo, got %d entries", len(entries))
+	}
+}
+
+func TestPluginCanContributeToolsWithoutViews(t *testing.T) {
+	plugins := t.TempDir()
+	dir := filepath.Join(plugins, "test-tools")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{
+		"plugin.json": `{
+			"id": "test-tools",
+			"name": "Test tools",
+			"version": "1.0.0",
+			"api": 1,
+			"description": "Sample tool plugin",
+			"icon": "plugin-addon-puzzle",
+			"worker": "worker.js",
+			"capabilities": ["agent.tools"],
+			"contributes": {"tools": [{
+				"name": "echo",
+				"title": "Echo",
+				"description": "Echo text.",
+				"inputSchema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}}
+			}]}
+		}`,
+		"worker.js": `export const tools = { echo: ({ text }, context) => ({ text, threadId: context.threadId }) };`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h, err := newHost(plugins, t.TempDir(), "", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.close()
+	catalog := h.dispatch(t.Context(), request{Method: "tools.list"}).Result.([]toolDescriptor)
+	if len(catalog) != 1 || catalog[0].Name != "test_tools__echo" {
+		t.Fatalf("unexpected tool catalog: %+v", catalog)
+	}
+	call := request{Method: "tools.invoke", Params: json.RawMessage(`{"name":"test_tools__echo","input":{"text":"hello"},"context":{"threadId":"thread-echo"}}`)}
+	result := h.dispatch(t.Context(), call)
+	if result.Error != nil || string(result.Result.(json.RawMessage)) != `{"text":"hello","threadId":"thread-echo"}` {
+		t.Fatalf("unexpected echo response: %+v", result)
+	}
+	call.Method = "views.call"
+	if result := h.dispatch(t.Context(), call); result.Error == nil || result.Error.Code != "plugin_not_enabled" {
+		t.Fatalf("tool-only plugin accepted a view call: %+v", result)
+	}
+}
