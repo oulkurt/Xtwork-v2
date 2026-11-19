@@ -6,7 +6,7 @@
 
 ## Context
 
-T3 已提供 React 界面、可单独运行的 Node/Effect 服务端和任务编排。桌面需要原生窗口和系统能力。规划明确批准更换外壳，保留 T3 的界面和服务端。 [外壳设计](../04-mygo外壳.md) · [架构分层](../01-架构.md#1-分层)
+T3 已提供 React 界面、可单独运行的 Node/Effect 服务端和任务编排。桌面需要原生窗口和系统能力。规划明确批准更换外壳，保留 T3 的界面和服务端。 [外壳设计](../plan/04-mygo外壳.md) · [架构分层](../plan/01-架构.md#1-分层)
 
 ## Problem
 
@@ -15,11 +15,11 @@ T3 已提供 React 界面、可单独运行的 Node/Effect 服务端和任务编
 ## Considered Alternatives
 
 - 沿用 T3 的 Electron 壳。它已有完整桥接和启动实现，可作接口参照。
-- 用 mygo 构建系统 WebView 壳，复用 T3 的 React、Node 和任务编排。旧 xtwork 的原生界面可参考。 [上游范围](../02-上游与改造层.md) · [旧版架构](../01-架构.md#8-与-xtwork-架构的差异)
+- 用 mygo 构建系统 WebView 壳，复用 T3 的 React、Node 和任务编排。旧 xtwork 的原生界面可参考。 [上游范围](../plan/02-上游与改造层.md) · [旧版架构](../plan/01-架构.md#8-与-xtwork-架构的差异)
 
 ## Decision
 
-采用 mygo/Go 桌面壳，负责窗口、原生集成、服务端启动监管和 `DesktopBridge`。T3 继续拥有会话、编排、持久化和工具入口，插件和运行时接入服务端。 [职责边界](../04-mygo外壳.md#1-职责边界) · [v2 的起点](../12-从xtwork迁移.md#v2-的起点)
+采用 mygo/Go 桌面壳，负责窗口、原生集成、服务端启动监管和 `DesktopBridge`。T3 继续拥有会话、编排、持久化和工具入口，插件和运行时接入服务端。 [职责边界](../plan/04-mygo外壳.md#1-职责边界) · [v2 的起点](../plan/12-从xtwork迁移.md#v2-的起点)
 
 ## Consequences and Trade-offs
 

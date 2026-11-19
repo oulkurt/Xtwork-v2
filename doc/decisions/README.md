@@ -1,10 +1,10 @@
 # Architecture Decision Records
 
-[DECISIONS.md](../../DECISIONS.md) 是决策入口。`AGENTS.md` 的「冲突处理」规定何时暂停受影响工作、核对已有决定和更新相关记录。ADR 保存单项重大取舍的证据、后果和演变。规划的接口细节留在 [规划文档](../../README.md#文档地图)，实现的构建与验收留在 `doc/`。
+[DECISIONS.md](../../DECISIONS.md) 是决策入口。`AGENTS.md` 的「冲突处理」规定何时暂停受影响工作、核对已有决定和更新相关记录。ADR 保存单项重大取舍的证据、后果和演变。实现说明和规划从 [文档首页](../README.md) 查阅。
 
 ## 创建与更新
 
-1. 从 [模板](template.md) 复制，使用下一个未用过的三位编号。文件名为 `NNN-short-topic.md`，记录标识为 `ADR-NNN`。按主题写一项长期取舍。`PD-NN` 表示待确认的项目决策，和 `docs/02` 中已有的上游补丁 `P-NN` 分开。
+1. 从 [模板](template.md) 复制，使用下一个未用过的三位编号。文件名为 `NNN-short-topic.md`，记录标识为 `ADR-NNN`。按主题写一项长期取舍。`PD-NN` 表示待确认的项目决策，`P-NN` 表示上游补丁。 [补丁清单](../plan/02-上游与改造层.md#4-补丁清单初稿)
 2. 为新提案填 `Proposed`，链接到 [Pending Decisions](../../DECISIONS.md#pending-decisions)。引用带日期的讨论、固定提交或明确标注的规范，把实现证据与批准依据各自注明。沿用已有 Q 编号。
 3. 有明确批准记录后更新为 `Accepted`，记下批准出处，将记录从待决策移入当前生效。方案被明确否决时用 `Rejected`，移出待决策并保留理由。
 4. 用新 ADR 替代已生效决定时，让新旧记录互相链接，把旧记录改为 `Superseded` 并移入历史索引。保留原决定和依据。
