@@ -1,0 +1,1109 @@
+{
+  "title": "xtwork_v2 · 通用任务工作台",
+  "summary": "对照 T3 Code 的首页与设置，试用聊天记事、引用笔记和远程连接入口。演示使用示例数据。",
+  "stage": "prototype",
+  "version": 1,
+  "changes": [
+    {
+      "area": "frontend",
+      "change": "modified",
+      "text": "新对话默认直接开始，PR 和 Issues 的入口收进设置。"
+    },
+    {
+      "area": "flow",
+      "change": "added",
+      "text": "聊天记待办和日程，显示写入结果和撤销入口。"
+    },
+    {
+      "area": "frontend",
+      "change": "added",
+      "text": "用 @ 引用笔记，发送前可移除。"
+    },
+    {
+      "area": "frontend",
+      "change": "added",
+      "text": "在设置里连接飞书试点。"
+    }
+  ],
+  "questions": [
+    {
+      "id": "q-02",
+      "q": "除了 Pull requests 和 Issues，哪些入口也要放进开发者功能？",
+      "options": [
+        "先只收这两项",
+        "同时收起终端、分支和工作树"
+      ]
+    },
+    {
+      "id": "q-06",
+      "q": "明确的待办和日程需要先确认吗？",
+      "options": [
+        "直接记并提供撤销",
+        "每次先确认再写入"
+      ]
+    },
+    {
+      "id": "q-04",
+      "q": "哪个平台适合作为第一条远程连接？",
+      "options": [
+        "飞书",
+        "企业微信",
+        "微信",
+        "钉钉"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "id": "home",
+      "name": "首页 · 新对话",
+      "route": "/",
+      "width": 1120,
+      "root": {
+        "id": "home-root",
+        "type": "page",
+        "label": "新对话",
+        "component": "<AppSidebarLayout> AppSidebarLayout.tsx",
+        "layout": "row",
+        "children": [
+          {
+            "id": "home-sidebar",
+            "type": "sidebar",
+            "label": "侧栏",
+            "component": "<Sidebar> Sidebar.tsx",
+            "w": "1/4",
+            "children": [
+              {
+                "id": "new-chat",
+                "type": "button",
+                "label": "新对话",
+                "on": [
+                  {
+                    "action": "show",
+                    "target": "composer"
+                  }
+                ],
+                "component": "<Sidebar> 新建对话",
+                "change": "modified",
+                "before": {
+                  "fn": "选择新对话范围"
+                },
+                "fn": "projects.ensureScratch() → 新对话",
+                "note": "直接从免项目工作区开始，也可以自行选择文件夹。"
+              },
+              {
+                "id": "chat-list",
+                "type": "list",
+                "label": "最近对话",
+                "component": "<Sidebar> 对话列表"
+              },
+              {
+                "id": "plugin-entries",
+                "type": "navigation-menu",
+                "label": "工作工具",
+                "change": "added",
+                "component": "<PluginNavigation> 侧栏插槽",
+                "children": [
+                  {
+                    "id": "todo-panel-entry",
+                    "type": "button",
+                    "label": "待办",
+                    "on": [
+                      {
+                        "action": "open",
+                        "target": "todo-panel"
+                      }
+                    ]
+                  },
+                  {
+                    "id": "calendar-panel-entry",
+                    "type": "button",
+                    "label": "日程",
+                    "on": [
+                      {
+                        "action": "open",
+                        "target": "calendar-panel"
+                      }
+                    ]
+                  },
+                  {
+                    "id": "notes-panel-entry",
+                    "type": "button",
+                    "label": "笔记",
+                    "on": [
+                      {
+                        "action": "open",
+                        "target": "notes-panel"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "id": "utility-menu",
+                "type": "footer",
+                "label": "设置和用量",
+                "component": "<SidebarUtilityMenu> SidebarChrome.tsx",
+                "children": [
+                  {
+                    "id": "settings-entry",
+                    "type": "button",
+                    "label": "设置",
+                    "on": [
+                      {
+                        "action": "navigate",
+                        "target": "settings"
+                      }
+                    ]
+                  },
+                  {
+                    "id": "home-pr",
+                    "type": "button",
+                    "label": "Pull requests",
+                    "change": "removed",
+                    "component": "<SidebarUtilityItem> SidebarChrome.tsx",
+                    "note": "Pull requests 的入口迁到设置中的开发者功能。"
+                  },
+                  {
+                    "id": "home-issues",
+                    "type": "button",
+                    "label": "Issues",
+                    "change": "removed",
+                    "component": "<SidebarUtilityItem> SidebarChrome.tsx",
+                    "note": "Issues 的入口迁到设置中的开发者功能。"
+                  },
+                  {
+                    "id": "usage-entry",
+                    "type": "button",
+                    "label": "用量"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "chat-main",
+            "type": "panel",
+            "label": "对话",
+            "component": "<ChatView> ChatView.tsx",
+            "children": [
+              {
+                "id": "chat-header",
+                "type": "header",
+                "label": "新对话",
+                "component": "<ChatView> 对话头部"
+              },
+              {
+                "id": "timeline",
+                "type": "scroll-area",
+                "label": "对话记录",
+                "component": "<ChatView> 消息时间线",
+                "children": [
+                  {
+                    "id": "todo-receipt",
+                    "type": "card",
+                    "label": "待办",
+                    "hidden": true,
+                    "change": "added",
+                    "component": "<PluginActionReceipt> 插件结果",
+                    "children": [
+                      {
+                        "id": "todo-added",
+                        "type": "text",
+                        "label": "已加入待办 · 周五前发季度报告",
+                        "states": {
+                          "undone": {
+                            "label": "已撤销"
+                          },
+                          "saved": {
+                            "label": "已加入待办 · 周五前发季度报告"
+                          }
+                        }
+                      },
+                      {
+                        "id": "todo-receipt-open",
+                        "type": "button",
+                        "label": "打开",
+                        "on": [
+                          {
+                            "action": "open",
+                            "target": "todo-panel"
+                          }
+                        ]
+                      },
+                      {
+                        "id": "todo-receipt-undo",
+                        "type": "button",
+                        "label": "撤销",
+                        "on": [
+                          {
+                            "action": "state",
+                            "target": "todo-added",
+                            "state": "undone"
+                          },
+                          {
+                            "action": "hide",
+                            "target": "todo-receipt-open"
+                          },
+                          {
+                            "action": "hide",
+                            "target": "todo-receipt-undo"
+                          },
+                          {
+                            "action": "hide",
+                            "target": "todo-list"
+                          },
+                          {
+                            "action": "show",
+                            "target": "todo-empty"
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "id": "calendar-receipt",
+                    "type": "card",
+                    "label": "日程",
+                    "hidden": true,
+                    "change": "added",
+                    "component": "<PluginActionReceipt> 插件结果",
+                    "children": [
+                      {
+                        "id": "calendar-added",
+                        "type": "text",
+                        "label": "已加入日程 · 明天 15:00–16:00 评审",
+                        "states": {
+                          "undone": {
+                            "label": "已撤销"
+                          },
+                          "saved": {
+                            "label": "已加入日程 · 明天 15:00–16:00 评审"
+                          }
+                        }
+                      },
+                      {
+                        "id": "calendar-receipt-open",
+                        "type": "button",
+                        "label": "打开",
+                        "on": [
+                          {
+                            "action": "open",
+                            "target": "calendar-panel"
+                          }
+                        ]
+                      },
+                      {
+                        "id": "calendar-receipt-undo",
+                        "type": "button",
+                        "label": "撤销",
+                        "on": [
+                          {
+                            "action": "state",
+                            "target": "calendar-added",
+                            "state": "undone"
+                          },
+                          {
+                            "action": "hide",
+                            "target": "calendar-receipt-open"
+                          },
+                          {
+                            "action": "hide",
+                            "target": "calendar-receipt-undo"
+                          },
+                          {
+                            "action": "hide",
+                            "target": "calendar-list"
+                          },
+                          {
+                            "action": "show",
+                            "target": "calendar-empty"
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "id": "note-reply",
+                    "type": "text",
+                    "label": "总结已生成 · 来源《季度复盘》",
+                    "hidden": true,
+                    "change": "added",
+                    "component": "<ChatView> 助手消息的笔记来源"
+                  }
+                ]
+              },
+              {
+                "id": "composer",
+                "type": "form",
+                "label": "给助手发消息",
+                "component": "<ComposerPromptEditorTiptap> 对话输入",
+                "children": [
+                  {
+                    "id": "composer-input",
+                    "type": "textarea",
+                    "label": "消息",
+                    "text": "说说你想完成什么",
+                    "states": {
+                      "note": {
+                        "text": "帮我总结这篇笔记"
+                      },
+                      "default": {
+                        "text": "说说你想完成什么"
+                      }
+                    }
+                  },
+                  {
+                    "id": "note-context",
+                    "type": "row",
+                    "label": "已引用笔记",
+                    "hidden": true,
+                    "change": "added",
+                    "component": "<ComposerContextLabel> ComposerContextLabel.tsx",
+                    "children": [
+                      {
+                        "id": "note-chip",
+                        "type": "tag",
+                        "label": "季度复盘.md"
+                      },
+                      {
+                        "id": "note-remove",
+                        "type": "button",
+                        "label": "移除引用",
+                        "on": [
+                          {
+                            "action": "hide",
+                            "target": "note-context"
+                          },
+                          {
+                            "action": "hide",
+                            "target": "send-note"
+                          },
+                          {
+                            "action": "state",
+                            "target": "composer-input",
+                            "state": "default"
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "id": "composer-actions",
+                    "type": "toolbar",
+                    "label": "消息操作",
+                    "children": [
+                      {
+                        "id": "context-picker",
+                        "type": "button",
+                        "label": "@ 引用",
+                        "on": [
+                          {
+                            "action": "open",
+                            "target": "note-picker"
+                          }
+                        ],
+                        "component": "<ComposerPromptEditorTiptap> 上下文选择器",
+                        "change": "modified",
+                        "before": {
+                          "label": "@",
+                          "fn": null
+                        },
+                        "fn": "context.search(query)",
+                        "note": "现有 @ 选择器增加已授权笔记、待办和日程。"
+                      },
+                      {
+                        "id": "folder-picker",
+                        "type": "button",
+                        "label": "选择工作文件夹",
+                        "on": [
+                          {
+                            "action": "open",
+                            "target": "pick-folder"
+                          }
+                        ],
+                        "change": "added",
+                        "component": "<Button> 对话工作区",
+                        "fn": "desktopBridge.pickFolder()",
+                        "states": {
+                          "selected": {
+                            "label": "工作资料"
+                          }
+                        }
+                      },
+                      {
+                        "id": "send-note",
+                        "type": "button",
+                        "label": "发送笔记总结请求",
+                        "on": [
+                          {
+                            "action": "show",
+                            "target": "note-reply"
+                          },
+                          {
+                            "action": "hide",
+                            "target": "note-context"
+                          },
+                          {
+                            "action": "hide",
+                            "target": "send-note"
+                          },
+                          {
+                            "action": "state",
+                            "target": "composer-input",
+                            "state": "default"
+                          }
+                        ],
+                        "hidden": true,
+                        "change": "added",
+                        "component": "<Button> 发送带引用的消息"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "id": "samples",
+                "type": "toolbar",
+                "label": "示例任务",
+                "change": "added",
+                "component": "<StarterTasks> 空状态示例",
+                "children": [
+                  {
+                    "id": "sample-todo",
+                    "type": "button",
+                    "label": "试记一条待办",
+                    "on": [
+                      {
+                        "action": "show",
+                        "target": "todo-receipt"
+                      },
+                      {
+                        "action": "state",
+                        "target": "todo-added",
+                        "state": "saved"
+                      },
+                      {
+                        "action": "show",
+                        "target": "todo-receipt-open"
+                      },
+                      {
+                        "action": "show",
+                        "target": "todo-receipt-undo"
+                      },
+                      {
+                        "action": "show",
+                        "target": "todo-list"
+                      },
+                      {
+                        "action": "hide",
+                        "target": "todo-empty"
+                      }
+                    ]
+                  },
+                  {
+                    "id": "sample-calendar",
+                    "type": "button",
+                    "label": "试加一项日程",
+                    "on": [
+                      {
+                        "action": "show",
+                        "target": "calendar-receipt"
+                      },
+                      {
+                        "action": "state",
+                        "target": "calendar-added",
+                        "state": "saved"
+                      },
+                      {
+                        "action": "show",
+                        "target": "calendar-receipt-open"
+                      },
+                      {
+                        "action": "show",
+                        "target": "calendar-receipt-undo"
+                      },
+                      {
+                        "action": "show",
+                        "target": "calendar-list"
+                      },
+                      {
+                        "action": "hide",
+                        "target": "calendar-empty"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "overlays": [
+        {
+          "id": "todo-panel",
+          "type": "drawer",
+          "label": "待办",
+          "trigger": [
+            "todo-panel-entry",
+            "todo-receipt-open"
+          ],
+          "change": "added",
+          "component": "<Drawer> 待办面板",
+          "children": [
+            {
+              "id": "todo-list",
+              "type": "list",
+              "label": "未完成",
+              "items": [
+                "周五前发季度报告"
+              ],
+              "hidden": true
+            },
+            {
+              "id": "todo-empty",
+              "type": "text",
+              "label": "暂无待办"
+            },
+            {
+              "id": "todo-panel-close",
+              "type": "button",
+              "label": "返回对话",
+              "on": [
+                {
+                  "action": "close"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "calendar-panel",
+          "type": "drawer",
+          "label": "日程",
+          "trigger": [
+            "calendar-panel-entry",
+            "calendar-receipt-open"
+          ],
+          "change": "added",
+          "component": "<Drawer> 日程面板",
+          "children": [
+            {
+              "id": "calendar-list",
+              "type": "list",
+              "label": "明天",
+              "items": [
+                "15:00–16:00 · 和小周开评审会"
+              ],
+              "hidden": true
+            },
+            {
+              "id": "calendar-empty",
+              "type": "text",
+              "label": "明天暂无日程"
+            },
+            {
+              "id": "calendar-panel-close",
+              "type": "button",
+              "label": "返回对话",
+              "on": [
+                {
+                  "action": "close"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "notes-panel",
+          "type": "drawer",
+          "label": "笔记",
+          "trigger": "notes-panel-entry",
+          "change": "added",
+          "component": "<Drawer> 笔记面板",
+          "children": [
+            {
+              "id": "vault-name",
+              "type": "text",
+              "label": "工作笔记"
+            },
+            {
+              "id": "vault-list",
+              "type": "list",
+              "label": "最近笔记",
+              "items": [
+                "季度复盘.md",
+                "项目周会.md"
+              ]
+            },
+            {
+              "id": "notes-panel-close",
+              "type": "button",
+              "label": "返回对话",
+              "on": [
+                {
+                  "action": "close"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "note-picker",
+          "type": "popover",
+          "label": "引用资料",
+          "trigger": "context-picker",
+          "change": "added",
+          "component": "<Popover> 插件上下文选择器",
+          "children": [
+            {
+              "id": "note-search",
+              "type": "input",
+              "label": "搜索资料",
+              "text": "标题或关键词"
+            },
+            {
+              "id": "choose-review-note",
+              "type": "button",
+              "label": "笔记 · 季度复盘",
+              "on": [
+                {
+                  "action": "show",
+                  "target": "note-context"
+                },
+                {
+                  "action": "state",
+                  "target": "composer-input",
+                  "state": "note"
+                },
+                {
+                  "action": "show",
+                  "target": "send-note"
+                },
+                {
+                  "action": "close"
+                }
+              ],
+              "fn": "context.resolve(id)"
+            }
+          ]
+        },
+        {
+          "id": "pick-folder",
+          "type": "dialog",
+          "label": "选择工作文件夹",
+          "trigger": "folder-picker",
+          "change": "added",
+          "component": "<Dialog> 文件夹选择演示",
+          "children": [
+            {
+              "id": "folder-choice",
+              "type": "text",
+              "label": "工作资料"
+            },
+            {
+              "id": "folder-cancel",
+              "type": "button",
+              "label": "取消",
+              "on": [
+                {
+                  "action": "close"
+                }
+              ]
+            },
+            {
+              "id": "folder-confirm",
+              "type": "button",
+              "label": "使用此文件夹",
+              "on": [
+                {
+                  "action": "state",
+                  "target": "folder-picker",
+                  "state": "selected"
+                },
+                {
+                  "action": "close"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "settings",
+      "name": "设置 · 通用与开发者",
+      "route": "/settings",
+      "width": 1120,
+      "root": {
+        "id": "settings-root",
+        "type": "page",
+        "label": "设置",
+        "component": "<SettingsPanels> SettingsPanels.tsx",
+        "layout": "row",
+        "children": [
+          {
+            "id": "settings-sidebar",
+            "type": "sidebar",
+            "label": "设置目录",
+            "component": "<SettingsSidebarNav> SettingsSidebarNav.tsx",
+            "w": "1/4",
+            "children": [
+              {
+                "id": "back-home",
+                "type": "button",
+                "label": "返回对话",
+                "on": [
+                  {
+                    "action": "navigate",
+                    "target": "home"
+                  }
+                ]
+              },
+              {
+                "id": "settings-nav",
+                "type": "navigation-menu",
+                "label": "设置",
+                "items": [
+                  "通用",
+                  "插件",
+                  "远程连接",
+                  "开发者功能"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "settings-main",
+            "type": "panel",
+            "label": "通用",
+            "component": "<SettingsPanels> 设置主区域",
+            "children": [
+              {
+                "id": "appearance",
+                "type": "section",
+                "label": "外观",
+                "component": "<SettingsPanels> 外观"
+              },
+              {
+                "id": "remote-section",
+                "type": "section",
+                "label": "远程连接",
+                "change": "added",
+                "component": "<RemoteConnectionsSettings> 设置",
+                "children": [
+                  {
+                    "id": "remote-state",
+                    "type": "text",
+                    "label": "飞书 · 未连接"
+                  },
+                  {
+                    "id": "connect-feishu",
+                    "type": "button",
+                    "label": "连接飞书",
+                    "on": [
+                      {
+                        "action": "open",
+                        "target": "feishu-dialog"
+                      }
+                    ]
+                  },
+                  {
+                    "id": "remote-others",
+                    "type": "text",
+                    "label": "候选平台 · 企业微信、微信、钉钉"
+                  }
+                ]
+              },
+              {
+                "id": "developer-toggle",
+                "type": "switch",
+                "label": "显示开发者功能",
+                "change": "added",
+                "component": "<Switch> 开发者功能",
+                "fn": "settings.developerFeatures.enabled",
+                "states": {
+                  "off": {
+                    "text": "关闭"
+                  },
+                  "on": {
+                    "text": "开启"
+                  }
+                },
+                "state": "off",
+                "on": [
+                  {
+                    "action": "state",
+                    "target": "developer-toggle"
+                  },
+                  {
+                    "action": "toggle",
+                    "target": "developer-panel"
+                  }
+                ]
+              },
+              {
+                "id": "developer-panel",
+                "type": "section",
+                "label": "开发者入口",
+                "hidden": true,
+                "component": "<DeveloperFeaturesSettings> 设置",
+                "children": [
+                  {
+                    "id": "settings-pr",
+                    "type": "button",
+                    "label": "Pull requests",
+                    "on": [
+                      {
+                        "action": "open",
+                        "target": "settings-pr-dialog"
+                      }
+                    ],
+                    "change": "added",
+                    "component": "<Button> 开发者功能入口",
+                    "fn": "navigate('/pull-requests')",
+                    "note": "保留原列表行为，首页收起这个入口。"
+                  },
+                  {
+                    "id": "settings-issues",
+                    "type": "button",
+                    "label": "Issues",
+                    "on": [
+                      {
+                        "action": "open",
+                        "target": "settings-issues-dialog"
+                      }
+                    ],
+                    "change": "added",
+                    "component": "<Button> 开发者功能入口",
+                    "fn": "navigate('/issues')",
+                    "note": "保留原列表行为，首页收起这个入口。"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "overlays": [
+        {
+          "id": "feishu-dialog",
+          "type": "dialog",
+          "label": "连接飞书 · 试点",
+          "trigger": "connect-feishu",
+          "change": "added",
+          "component": "<Dialog> 连接飞书",
+          "children": [
+            {
+              "id": "feishu-name",
+              "type": "text",
+              "label": "在飞书里打开已配置的机器人，再发送绑定码。"
+            },
+            {
+              "id": "feishu-code",
+              "type": "text",
+              "label": "示例绑定码　361 725"
+            },
+            {
+              "id": "feishu-close",
+              "type": "button",
+              "label": "返回设置",
+              "on": [
+                {
+                  "action": "close"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "settings-pr-dialog",
+          "type": "dialog",
+          "label": "Pull requests",
+          "trigger": "settings-pr",
+          "component": "<PullRequestsPage> 上游列表",
+          "children": [
+            {
+              "id": "pr-list-preview",
+              "type": "list",
+              "label": "拉取请求列表"
+            },
+            {
+              "id": "pr-close",
+              "type": "button",
+              "label": "返回设置",
+              "on": [
+                {
+                  "action": "close"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "settings-issues-dialog",
+          "type": "dialog",
+          "label": "Issues",
+          "trigger": "settings-issues",
+          "component": "<IssuesPage> 上游列表",
+          "children": [
+            {
+              "id": "issues-list-preview",
+              "type": "list",
+              "label": "问题列表"
+            },
+            {
+              "id": "issues-close",
+              "type": "button",
+              "label": "返回设置",
+              "on": [
+                {
+                  "action": "close"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "id": "record-action",
+      "name": "聊天记待办",
+      "change": "added",
+      "steps": [
+        {
+          "id": "todo-say",
+          "actor": "user",
+          "text": "周五前把季度报告发给负责人",
+          "node": "sample-todo"
+        },
+        {
+          "id": "todo-write",
+          "actor": "backend",
+          "text": "助手调用工具，插件宿主写入待办",
+          "fn": "todo__create"
+        },
+        {
+          "id": "todo-ack",
+          "actor": "frontend",
+          "text": "显示已保存、打开和撤销",
+          "node": "todo-receipt"
+        }
+      ]
+    },
+    {
+      "id": "schedule-event",
+      "name": "聊天记日程",
+      "change": "added",
+      "steps": [
+        {
+          "id": "calendar-say",
+          "actor": "user",
+          "text": "明天下午三点到四点开评审会",
+          "node": "sample-calendar"
+        },
+        {
+          "id": "calendar-write",
+          "actor": "backend",
+          "text": "读取当前时区，写入正确日期的日程",
+          "fn": "app__current_time → calendar__create"
+        },
+        {
+          "id": "calendar-ack",
+          "actor": "frontend",
+          "text": "显示已保存的起止时间",
+          "node": "calendar-receipt"
+        }
+      ]
+    },
+    {
+      "id": "cite-note",
+      "name": "引用 Obsidian 笔记",
+      "change": "added",
+      "steps": [
+        {
+          "id": "note-pick",
+          "actor": "user",
+          "text": "选中一篇已授权的笔记",
+          "node": "choose-review-note"
+        },
+        {
+          "id": "note-send",
+          "actor": "frontend",
+          "text": "发送消息和用户选中的笔记内容",
+          "node": "send-note",
+          "fn": "obsidian-note → composer context"
+        },
+        {
+          "id": "note-answer",
+          "actor": "frontend",
+          "text": "展示总结和笔记来源",
+          "node": "note-reply"
+        }
+      ]
+    },
+    {
+      "id": "remote-connect",
+      "name": "连接飞书试点",
+      "change": "added",
+      "steps": [
+        {
+          "id": "feishu-open",
+          "actor": "user",
+          "text": "在设置开启飞书连接",
+          "node": "connect-feishu"
+        },
+        {
+          "id": "feishu-pair",
+          "actor": "external",
+          "text": "在已配置机器人私聊里绑定用户",
+          "node": "feishu-dialog"
+        },
+        {
+          "id": "feishu-dispatch",
+          "actor": "backend",
+          "text": "接收任务，转入产品对话，返回最终结果",
+          "fn": "agent.thread.send"
+        }
+      ]
+    }
+  ],
+  "backend": [
+    {
+      "id": "scratch-service",
+      "kind": "service",
+      "name": "新对话入口",
+      "items": [
+        {
+          "id": "scratch-default",
+          "kind": "function",
+          "name": "projects.ensureScratch()",
+          "note": "在用户选择文件夹前使用上游已有的免项目工作区。",
+          "change": "added"
+        }
+      ]
+    },
+    {
+      "id": "plugin-bridge",
+      "kind": "service",
+      "name": "插件桥",
+      "change": "added",
+      "items": [
+        {
+          "id": "tool-contract",
+          "kind": "api",
+          "name": "MCP 插件工具",
+          "note": "待办、日程、笔记走统一的宿主权限与状态。"
+        },
+        {
+          "id": "context-contract",
+          "kind": "api",
+          "name": "context.search / context.resolve",
+          "note": "返回用户可见、可移除的上下文条目。"
+        }
+      ]
+    }
+  ]
+}
