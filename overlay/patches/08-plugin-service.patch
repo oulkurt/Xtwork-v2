@@ -1,0 +1,27 @@
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -89,6 +89,7 @@
+ import * as ProjectSettingsOverrideSweep from "./provider/ProjectSettingsOverrideSweep.ts";
+ import * as TerminalManager from "./terminal/Manager.ts";
+ import * as McpHttpServer from "./mcp/McpHttpServer.ts";
++import * as XtworkPlugins from "./mcp/XtworkPluginService.ts";
+ import * as PeerForwarding from "./peer/PeerForwarding.ts";
+ import * as RemoteDelegation from "./peer/RemoteDelegation.ts";
+ import * as PeerLinkRequests from "./peer/PeerLinkRequests.ts";
+@@ -851,6 +852,7 @@
+     ServerHttp.layerOtlpTracesProxyRoute,
+     ServerHttp.layerAssetRoute,
+     ServerHttp.layerAttachmentUploadRoute,
++    XtworkPlugins.route,
+     GuestHttp.layer,
+     DeviceHubProxy.layer,
+     ServerBrowserStream.routeLayer,
+@@ -903,6 +905,7 @@
+   Layer.provide(PreviewAutomationBroker.layer),
+   Layer.provide(ServerSelfUpdate.layer.pipe(Layer.provide(layerDesktopAppUpdate))),
+   Layer.provide(layerCommandReadiness),
++  Layer.provide(XtworkPlugins.layer),
+   Layer.provide(ServerHttp.layerBrowserApiCors),
+   Layer.provide(ServerHttp.layerHttpCompression),
+ );

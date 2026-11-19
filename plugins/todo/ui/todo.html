@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-Hans">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<style>
+  :root { color-scheme: light dark; font: 14px system-ui, sans-serif; color: CanvasText; }
+  body { margin: 0; padding: 0 24px 24px; }
+  form { display: flex; gap: 8px; }
+  input, button { box-sizing: border-box; padding: 8px 10px; font: inherit; border: 1px solid color-mix(in srgb, CanvasText 22%, transparent); border-radius: 6px; }
+  input { flex: 1; min-width: 0; background: transparent; color: inherit; }
+  button { cursor: pointer; color: ButtonText; background: ButtonFace; }
+  button:disabled { opacity: .6; cursor: progress; }
+  p { margin: 16px 0 8px; color: color-mix(in srgb, CanvasText 70%, transparent); }
+  ul { list-style: none; margin: 12px 0 0; padding: 0; }
+  li { padding: 11px 0; border-bottom: 1px solid color-mix(in srgb, CanvasText 15%, transparent); overflow-wrap: anywhere; }
+  small { margin-inline-start: 8px; color: color-mix(in srgb, CanvasText 60%, transparent); }
+</style>
+<form>
+  <input name="title" aria-label="待办内容" required maxlength="200" placeholder="新增待办">
+  <button type="submit">添加</button>
+</form>
+<p role="status">正在读取待办…</p>
+<ul aria-label="未完成"></ul>
+<script>
+  const channel = "xtwork:todo";
+  const form = document.querySelector("form");
+  const field = form.elements.namedItem("title");
+  const submit = form.querySelector("button");
+  const status = document.querySelector("p");
+  const items = document.querySelector("ul");
+  let nextId = 0;
+  const pending = new Map();
+
+  function call(method, title) {
+    const id = ++nextId;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      parent.postMessage({ channel, id, method, title }, "*");
+    });
+  }
+
+  async function refresh() {
+    try {
+      const result = await call("list");
+      const open = result.items.filter((item) => !item.done);
+      items.replaceChildren(...open.map((item) => {
+        const row = document.createElement("li");
+        row.textContent = item.title;
+        if (item.due) {
+          const due = document.createElement("small");
+          due.textContent = [item.due, item.time].filter(Boolean).join(" ");
+          row.append(due);
+        }
+        return row;
+      }));
+      status.textContent = open.length ? "未完成" : "暂无待办";
+    } catch (error) {
+      status.textContent = error.message;
+    }
+  }
+
+  window.addEventListener("message", (event) => {
+    const payload = event.data;
+    if (event.source !== parent || payload?.channel !== channel) return;
+    if (payload.theme === "dark" || payload.theme === "light") {
+      document.documentElement.style.colorScheme = payload.theme;
+      void refresh();
+      return;
+    }
+    const request = pending.get(payload.id);
+    if (!request) return;
+    pending.delete(payload.id);
+    if (payload.error) request.reject(new Error(payload.error));
+    else request.resolve(payload.value);
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const title = field.value.trim();
+    if (!title || submit.disabled) return;
+    submit.disabled = true;
+    try {
+      await call("create", title);
+      form.reset();
+      await refresh();
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      submit.disabled = false;
+      field.focus();
+    }
+  });
+</script>
+</html>

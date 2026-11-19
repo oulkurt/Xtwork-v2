@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/pingdotgg/t3code.git",
+  "commit": "3ce2145864f1e8b822cc8dff9c8cfdf39d9e450b",
+  "node": "26.13.1",
+  "nodeMacArm64Sha256": "af6202f5370a3a5209e85dc543758dfd9f44c8726626a236730cd603a67a8559",
+  "mygo": "v0.10.0",
+  "mygoCommit": "ebde9399baf2734b3361856a53f4036859973d1d"
+}

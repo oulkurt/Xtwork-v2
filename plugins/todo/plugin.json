@@ -1,0 +1,104 @@
+{
+  "id": "todo",
+  "name": "待办",
+  "version": "1.0.0",
+  "api": 1,
+  "description": "管理待办事项。",
+  "icon": "plugin-addon-puzzle",
+  "worker": "worker.js",
+  "capabilities": [
+    "storage",
+    "agent.tools"
+  ],
+  "contributes": {
+    "tools": [
+      {
+        "name": "create",
+        "title": "新建待办",
+        "description": "Create a todo with a title and optional notes, group, local due date, time, and priority.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "Item title."
+            },
+            "notes": {
+              "type": "string",
+              "maxLength": 2000
+            },
+            "group": {
+              "type": "string",
+              "maxLength": 40
+            },
+            "due": {
+              "type": "string",
+              "description": "User local timezone date YYYY-MM-DD, or empty to clear."
+            },
+            "time": {
+              "type": "string",
+              "description": "User local timezone time HH:MM; requires due, or empty to clear."
+            },
+            "priority": {
+              "type": "string",
+              "enum": [
+                "none",
+                "low",
+                "medium",
+                "high"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "title"
+          ]
+        },
+        "confirm": false
+      },
+      {
+        "name": "list",
+        "title": "列出待办",
+        "description": "List todos by filter and optional group. Today and week use the user local timezone; week includes today and the following six days.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filter": {
+              "type": "string",
+              "enum": [
+                "all",
+                "today",
+                "week",
+                "done",
+                "overdue"
+              ]
+            },
+            "group": {
+              "type": "string",
+              "maxLength": 40
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50,
+              "description": "Maximum items to return; default 50."
+            }
+          },
+          "additionalProperties": false
+        },
+        "confirm": false
+      }
+    ],
+    "views": [
+      {
+        "id": "todo",
+        "title": "待办",
+        "placement": "panel",
+        "entry": "ui/todo.html"
+      }
+    ]
+  }
+}
