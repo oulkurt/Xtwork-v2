@@ -121,6 +121,122 @@ func TestTodoViewCanLoadPastFirstPage(t *testing.T) {
 	}
 }
 
+func TestTodoViewMutationsShareToolStorage(t *testing.T) {
+	plugins, err := filepath.Abs("../plugins")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := newHost(plugins, t.TempDir(), "", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.close()
+
+	call := func(method, params string) json.RawMessage {
+		t.Helper()
+		result := h.dispatch(t.Context(), request{Method: method, Params: json.RawMessage(params)})
+		if result.Error != nil {
+			t.Fatal(result.Error)
+		}
+		return result.Result.(json.RawMessage)
+	}
+	created := call("tools.invoke", `{"name":"todo__create","input":{"title":"Draft","due":"2030-01-01"}}`)
+	var item struct {
+		ID    string `json:"id"`
+		Title string `json:"title"`
+		Done  bool   `json:"done"`
+	}
+	if err := json.Unmarshal(created, &item); err != nil {
+		t.Fatal(err)
+	}
+	if item.ID == "" || item.Title != "Draft" || item.Done {
+		t.Fatalf("unexpected created todo: %+v", item)
+	}
+
+	timed := fmt.Sprintf(`{"name":"todo__update","input":{"id":%q,"time":"09:30"}}`, item.ID)
+	var timedResult struct {
+		Time string `json:"time"`
+	}
+	if err := json.Unmarshal(call("views.call", timed), &timedResult); err != nil {
+		t.Fatal(err)
+	}
+	if timedResult.Time != "09:30" {
+		t.Fatalf("time-only update was not applied: %+v", timedResult)
+	}
+	updated := fmt.Sprintf(`{"name":"todo__update","input":{"id":%q,"title":"Shipped","due":""}}`, item.ID)
+	var cleared struct {
+		Due  string `json:"due"`
+		Time string `json:"time"`
+	}
+	if err := json.Unmarshal(call("views.call", updated), &cleared); err != nil {
+		t.Fatal(err)
+	}
+	if cleared.Due != "" || cleared.Time != "" {
+		t.Fatalf("clearing due did not clear time: %+v", cleared)
+	}
+	invalid := fmt.Sprintf(`{"name":"todo__update","input":{"id":%q,"time":"09:30"}}`, item.ID)
+	if result := h.dispatch(t.Context(), request{Method: "views.call", Params: json.RawMessage(invalid)}); result.Error == nil {
+		t.Fatal("time without due was accepted")
+	}
+	completed := fmt.Sprintf(`{"name":"todo__complete","input":{"id":%q}}`, item.ID)
+	var done struct {
+		Done   bool   `json:"done"`
+		DoneAt string `json:"doneAt"`
+	}
+	if err := json.Unmarshal(call("views.call", completed), &done); err != nil {
+		t.Fatal(err)
+	}
+	if !done.Done || done.DoneAt == "" {
+		t.Fatalf("todo was not completed: %+v", done)
+	}
+	reopened := fmt.Sprintf(`{"name":"todo__complete","input":{"id":%q,"done":false}}`, item.ID)
+	var open struct {
+		Done   bool   `json:"done"`
+		DoneAt string `json:"doneAt"`
+	}
+	if err := json.Unmarshal(call("views.call", reopened), &open); err != nil {
+		t.Fatal(err)
+	}
+	if open.Done || open.DoneAt != "" {
+		t.Fatalf("todo was not reopened: %+v", open)
+	}
+	call("views.call", completed)
+	listed := call("views.call", `{"name":"todo__list","input":{"filter":"done"}}`)
+	var page struct {
+		Total int `json:"total"`
+		Items []struct {
+			Title string `json:"title"`
+			Due   string `json:"due"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(listed, &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].Title != "Shipped" || page.Items[0].Due != "" {
+		t.Fatalf("mutation was not visible in done list: %+v", page)
+	}
+	deleted := fmt.Sprintf(`{"name":"todo__delete","input":{"id":%q}}`, item.ID)
+	var deletion struct {
+		Deleted bool `json:"deleted"`
+	}
+	if err := json.Unmarshal(call("views.call", deleted), &deletion); err != nil {
+		t.Fatal(err)
+	}
+	if !deletion.Deleted {
+		t.Fatalf("todo was not deleted: %+v", deletion)
+	}
+	var afterDelete struct {
+		Total int               `json:"total"`
+		Items []json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(call("views.call", `{"name":"todo__list","input":{"filter":"done"}}`), &afterDelete); err != nil {
+		t.Fatal(err)
+	}
+	if afterDelete.Total != 0 || len(afterDelete.Items) != 0 {
+		t.Fatalf("deleted todo remained in storage: %+v", afterDelete)
+	}
+}
+
 func TestRepeatedThreadToolInvocationIsIdempotent(t *testing.T) {
 	plugins, err := filepath.Abs("../plugins")
 	if err != nil {
