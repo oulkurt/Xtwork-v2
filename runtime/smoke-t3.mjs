@@ -1,21 +1,20 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
-import { access, mkdir, mkdtemp, open, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-const [serverArg, dimArg, pluginHostArg] = process.argv.slice(2);
-if (!serverArg || !dimArg || !pluginHostArg) {
+const [serverArg, piArg, pluginHostArg] = process.argv.slice(2);
+if (!serverArg || !piArg || !pluginHostArg) {
   throw new Error(
-    "Usage: node runtime/smoke-t3.mjs <T3 bin.mjs> <Dim binary> <plugin host binary>",
+    "Usage: node runtime/smoke-t3.mjs <T3 bin.mjs> <bundled Pi launcher> <plugin host binary>",
   );
 }
 
-// Dim's macOS Unix socket needs a short canonical path.
 const scratch = await mkdtemp("/tmp/xtw-smoke-");
 const dataDir = join(scratch, "data");
 const project = join(scratch, "project");
@@ -25,7 +24,7 @@ const todoTitle = "Xtwork smoke test todo";
 const env = {
   ...process.env,
   T3CODE_TELEMETRY_ENABLED: "false",
-  XTWORK_DIM_BINARY: resolve(dimArg),
+  XTWORK_PI_BINARY: resolve(piArg),
   XTWORK_PLUGIN_HOST_BIN: resolve(pluginHostArg),
   XTWORK_PLUGINS_DIR: fileURLToPath(new URL("../plugins/", import.meta.url)),
   XTWORK_PLUGIN_DATA_DIR: join(dataDir, "userdata", "plugins"),
@@ -58,6 +57,9 @@ async function startServer() {
   const exited = once(child, "exit");
   await log.close();
   const stop = async () => {
+    const { stdout } = await promisify(execFile)("ps", ["-axo", "pid=,ppid="]);
+    const children = stdout.trim().split("\n").map((row) => row.trim().split(/\s+/).map(Number))
+      .filter(([, parent]) => parent === child.pid);
     child.kill("SIGTERM");
     const timeout = setTimeout(() => child.kill("SIGKILL"), 20_000);
     try {
@@ -70,9 +72,9 @@ async function startServer() {
     } finally {
       clearTimeout(timeout);
     }
-    await assert.rejects(access(join(dataDir, "runtime", "dim", "rust", "daemon.sock")), {
-      code: "ENOENT",
-    });
+    for (const [pid] of children) {
+      assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, `T3 left child ${pid} running`);
+    }
   };
 
   try {
@@ -123,33 +125,35 @@ try {
   await mkdir(project);
   stop = await startServer();
   const settings = JSON.parse(await readFile(join(dataDir, "userdata", "settings.json"), "utf8"));
-  assert.deepEqual(settings.defaultModelSelection, { instanceId: "xtworkDim", model: "default" });
-  assert.equal(settings.providerInstances.xtworkDim.config.source, "local");
-  assert.equal(settings.providerInstances.xtworkDim.environment, undefined);
+  assert.deepEqual(settings.defaultModelSelection, { instanceId: "xtworkPi", model: "xtwork/standard" });
+  assert.equal(settings.providerInstances.xtworkPi.driver, "pi");
+  assert.equal(settings.providerInstances.xtworkPi.environment, undefined);
 
   const created = await turn(
     `Use the todo plugin to save one new todo exactly titled "${todoTitle}".`,
   );
   const { thread } = await cli("thread", "show", created.threadId);
-  assert.equal(thread.providerInstanceId, "xtworkDim");
+  assert.equal(thread.providerInstanceId, "xtworkPi");
   const storagePath = join(env.XTWORK_PLUGIN_DATA_DIR, "todo", "storage.json");
   const records = JSON.parse(await readFile(storagePath, "utf8"));
   const todos = Object.values(records).filter((item) => item.title === todoTitle);
   assert.equal(todos.length, 1);
-  assert.match(todos[0].id, /^req-[a-f0-9]{64}$/, "The Dim MCP request did not get a retry key");
+  assert.match(todos[0].id, /^req-[a-f0-9]{64}$/, "The Pi MCP request did not get a retry key");
   await stop();
   stop = undefined;
 
   stop = await startServer();
-  const listed = await turn(
+  const listed = await cli(
+    "thread", "send", "--wait", created.threadId,
     "Use the todo list tool to list the saved todos. Reply with their exact titles.",
   );
-  assert.ok(listed.reply.includes(todoTitle), "The new T3 session did not read the saved todo");
+  assert.equal(listed.status, "completed", listed.error ?? "The Pi session did not resume");
+  assert.ok(listed.reply.includes(todoTitle), "The resumed Pi session did not read the saved todo");
   await stop();
   stop = undefined;
   succeeded = true;
   console.log(
-    "Default Dim created a retry-safe todo through T3 MCP, read it after restart, and shut down cleanly.",
+    "Bundled Pi created a retry-safe todo through T3 MCP, read it in the same thread after restart, and shut down cleanly.",
   );
 } finally {
   if (stop) await stop().catch(() => {});

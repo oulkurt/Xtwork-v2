@@ -58,7 +58,7 @@ func startBackend(parent context.Context, cfg config) (*backend, error) {
 	listener.Close()
 	origin := fmt.Sprintf("http://127.0.0.1:%d", port)
 	secret := hex.EncodeToString(randBytes(32))
-	if err := os.MkdirAll(cfg.dataDir, 0700); err != nil {
+	if err := os.MkdirAll(filepath.Join(cfg.dataDir, "workspace"), 0700); err != nil {
 		return nil, err
 	}
 	logPath := filepath.Join(cfg.dataDir, "backend.log")
@@ -104,7 +104,7 @@ func superviseBackend(ctx context.Context, cfg config, bootstrap desktopBootstra
 			return
 		}
 		cmd := exec.Command(cfg.node, cfg.serverEntry, "--bootstrap-fd", "0")
-		cmd.Dir = filepath.Dir(cfg.serverEntry)
+		cmd.Dir = filepath.Join(cfg.dataDir, "workspace")
 		cmd.Stdin = &data
 		cmd.Stdout, cmd.Stderr = log, log
 		cmd.Env = cfg.backendEnvironment()

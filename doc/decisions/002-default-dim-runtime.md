@@ -1,7 +1,7 @@
 # ADR-002 · 内置 Rust 版 Dim 作为默认助手
 
 - **Date** 2026-11-19
-- **Status** Accepted
+- **Status** Superseded by [ADR-009](009-default-pi-runtime.md)（2026-11-20）
 - **Evidence** Confirmed
 
 ## Context

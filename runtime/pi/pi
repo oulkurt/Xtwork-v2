@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+runtime_dir=${0%/*}
+exec "$runtime_dir/../../node/bin/node" "$runtime_dir/launch.mjs" "$@"

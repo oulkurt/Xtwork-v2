@@ -1,0 +1,135 @@
+diff --git a/apps/server/src/provider/ProviderInstanceRegistryHydration.ts b/apps/server/src/provider/ProviderInstanceRegistryHydration.ts
+index f1f0ba8b..f3f49c90 100644
+--- a/apps/server/src/provider/ProviderInstanceRegistryHydration.ts
++++ b/apps/server/src/provider/ProviderInstanceRegistryHydration.ts
+@@ -32,6 +32,7 @@ import type * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
+ import type * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
+ import * as ServerConfig from "../config.ts";
+ import type * as PortScanner from "../preview/PortScanner.ts";
++import { PI_DRIVER, PI_INSTANCE_ID } from "../xtwork/bundledPiSettings.ts";
+
+ type ProviderInstanceRegistryHydrationEnv =
+   | Exclude<
+@@ -54,8 +55,17 @@ type ProviderInstanceRegistryHydrationEnv =
+
+ export const deriveProviderInstanceConfigMap = (
+   settings: ServerSettings,
++  bundledPi?: Settings.ServerSettingsService["Service"]["bundledPi"],
+ ): ProviderInstanceConfigMap => {
+   const merged: Record<string, ProviderInstanceConfig> = { ...settings.providerInstances };
++  const pi = merged[PI_INSTANCE_ID];
++  if (pi?.driver === PI_DRIVER && bundledPi !== undefined) {
++    merged[PI_INSTANCE_ID] = {
++      ...pi,
++      config: bundledPi.config,
++      environment: bundledPi.environment,
++    };
++  }
+
+   for (const driver of BUILT_IN_DRIVERS) {
+     if (driver.metadata.hasDefaultInstance === false) continue;
+@@ -148,7 +158,7 @@ export const layerSettingsWatcher = (
+           serverSettings.getSettings.pipe(
+             Effect.flatMap((current) =>
+               Effect.gen(function* () {
+-                yield* mutator.reconcile(deriveProviderInstanceConfigMap(current));
++                yield* mutator.reconcile(deriveProviderInstanceConfigMap(current, serverSettings.bundledPi));
+                 // Reconcile leaves instances parked on an unreadable secret alone,
+                 // and a corrected secret provider is what can make them readable.
+                 const next = vaultConfigs(current);
+@@ -187,7 +197,7 @@ export const layer: Layer.Layer<
+     const initialConfigMap =
+       initialSettings === undefined
+         ? ({} as ProviderInstanceConfigMap)
+-        : deriveProviderInstanceConfigMap(initialSettings);
++        : deriveProviderInstanceConfigMap(initialSettings, serverSettings.bundledPi);
+
+     // Drivers launch from the host environment, minus launch overrides a policy ignores.
+     const hostEnvironment = ManagedProviders.providerHostEnvironment(
+diff --git a/apps/server/src/serverSettings.ts b/apps/server/src/serverSettings.ts
+index e720fea5..e06fc7e0 100644
+--- a/apps/server/src/serverSettings.ts
++++ b/apps/server/src/serverSettings.ts
+@@ -29,6 +29,7 @@ import * as Deferred from "effect/Deferred";
+ import * as Duration from "effect/Duration";
+ import * as Equal from "effect/Equal";
+ import * as Effect from "effect/Effect";
++import * as HostProcess from "@t3tools/shared/HostProcess";
+ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+ import * as Exit from "effect/Exit";
+ import * as FileSystem from "effect/FileSystem";
+@@ -56,6 +57,8 @@ import {
+ } from "@t3tools/shared/serverSettings";
+ import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
+ import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
++import { seedBundledPi } from "./xtwork/bundledPiSettings.ts";
++import { startBundledPi } from "./xtwork/gateway.ts";
+ import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
+ import {
+   readSecretFieldValues,
+@@ -260,6 +263,7 @@ export class ServerSettingsService extends Context.Service<
+
+     /** The administrator's policy as clients see it; absent when unmanaged. */
+     readonly managedPolicy?: ManagedPolicySummary | undefined;
++    readonly bundledPi?: Awaited<ReturnType<typeof startBundledPi>> | undefined;
+
+     readonly getSettings: Effect.Effect<ServerSettings, ServerSettingsError>;
+
+@@ -668,8 +672,25 @@ function foldLegacyProjectSettings(
+   };
+ }
+
++class BundledPiError extends Schema.TaggedError<
++  BundledPiError,
++  { readonly brand: unique symbol }
++>()("BundledPiError", { message: Schema.String, cause: Schema.Defect() }) {}
++
+ const make = Effect.gen(function* () {
+-  const { settingsPath } = yield* ServerConfig.ServerConfig;
++  const { baseDir, settingsPath } = yield* ServerConfig.ServerConfig;
++  const environment = yield* HostProcess.Environment;
++  const binaryPath = environment.XTWORK_PI_BINARY;
++  const bundledPi = binaryPath
++    ? yield* Effect.acquireRelease(
++        Effect.tryPromise({
++          try: () => startBundledPi(binaryPath, baseDir, environment),
++          catch: (cause) =>
++            new BundledPiError({ message: "Could not start the built-in assistant.", cause }),
++        }).pipe(Effect.orDie),
++        (runtime) => Effect.promise(() => runtime.close()),
++      )
++    : undefined;
+   const fs = yield* FileSystem.FileSystem;
+   const pathService = yield* Path.Path;
+   const secretStore = yield* ServerSecretStore.ServerSecretStore;
+@@ -790,7 +811,8 @@ const make = Effect.gen(function* () {
+     let legacySourceControl: Parameters<typeof migrateLegacySourceControlSettings>[1] = {};
+     let parseFailure = Option.none<unknown>();
+
+-    if (yield* readConfigExists) {
++    const hasSettings = yield* readConfigExists;
++    if (hasSettings) {
+       const raw = yield* readRawConfig;
+       const parsed = decodeSettingsFileJsonExit(raw);
+       const decoded = Exit.isFailure(parsed)
+@@ -915,8 +937,11 @@ const make = Effect.gen(function* () {
+     const sourceControlMigration = hasLegacySourceControl
+       ? migrateLegacySourceControlSettings(folded, legacySourceControl)
+       : { settings: folded, secretMoves: [] };
++    const settingsWithRuntime = bundledPi === undefined
++      ? sourceControlMigration.settings
++      : seedBundledPi(sourceControlMigration.settings, !hasSettings);
+     const migrated = settingsFileTrusted
+-      ? yield* moveInlineSettingsSecrets(sourceControlMigration.settings)
++      ? yield* moveInlineSettingsSecrets(settingsWithRuntime)
+       : folded;
+     if (
+       migrated !== loaded ||
+@@ -1374,6 +1399,7 @@ const make = Effect.gen(function* () {
+     managedPolicy,
+     start,
+     ready: Deferred.await(startedDeferred),
++    bundledPi,
+     getSettings: getMaterializedSettings,
+     updateSettings: (patch) =>
+       updateAndPersistSettings(patch, (current) =>

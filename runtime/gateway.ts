@@ -1,18 +1,15 @@
 // @effect-diagnostics nodeBuiltinImport:off globalFetch:off -- The standalone gateway uses Node HTTP streams.
-import { execFile } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { constants } from "node:fs";
 import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { promisify } from "node:util";
-import modelTemplate from "./model.json" with { type: "json" };
-
-export const XTWORK_DIM_INSTANCE_ID = "xtworkDim";
-const GATEWAY_TOKEN_ENV = "XTWORK_DIM_GATEWAY_TOKEN";
+const GATEWAY_TOKEN_ENV = "XTWORK_MODEL_GATEWAY_TOKEN";
+export const MODEL_PROVIDER = "xtwork";
+export const STANDARD_MODEL = "standard";
 const MAGPIE_URL = "http://127.0.0.1:3425/v1";
 const MAGPIE_MODEL = "our-free-model/hy4-flash-free";
 const REQUEST_LIMIT = 16 * 1024 * 1024;
@@ -67,7 +64,7 @@ async function completion(
     body === null ||
     typeof body !== "object" ||
     !("model" in body) ||
-    body.model !== "standard"
+    body.model !== STANDARD_MODEL
   ) {
     rejectRequest(response, 400, "The Xtwork gateway accepts the standard model.");
     return;
@@ -105,13 +102,11 @@ async function completion(
   }
 }
 
-export async function startDimRuntime(binaryPath: string, dataDir: string, env = process.env) {
-  const commandPath = resolve(binaryPath);
-  await access(commandPath, constants.X_OK);
-  const runtimeDir = join(dataDir, "runtime");
-  const dimHome = join(runtimeDir, "dim");
-  const modelPath = join(runtimeDir, "model.json");
-  const temporaryPath = join(runtimeDir, `model-${randomUUID()}.tmp`);
+export async function startBundledPi(binaryPath: string, dataDir: string, env = process.env) {
+  const launcher = resolve(binaryPath);
+  const shellPath = join(dirname(launcher), "pi-shell");
+  await Promise.all([access(launcher, constants.X_OK), access(shellPath, constants.X_OK)]);
+  const agentDir = join(dataDir, "runtime", "pi");
   const upstreamBase = new URL(env.XTWORK_MODEL_UPSTREAM_URL || MAGPIE_URL);
   if (
     !["http:", "https:"].includes(upstreamBase.protocol) ||
@@ -148,40 +143,55 @@ export async function startDimRuntime(binaryPath: string, dataDir: string, env =
     const address = server.address();
     if (!address || typeof address === "string")
       throw new Error("Cannot bind the Xtwork model gateway.");
-    const modelConfig = {
-      ...modelTemplate,
-      providers: modelTemplate.providers.map((provider) => ({
-        ...provider,
-        baseUrl: `http://127.0.0.1:${address.port}/v1`,
-      })),
-    };
-    await mkdir(dimHome, { recursive: true, mode: 0o700 });
-    await writeFile(temporaryPath, JSON.stringify(modelConfig, null, 2) + "\n", { mode: 0o600 });
-    await rename(temporaryPath, modelPath);
+    await mkdir(agentDir, { recursive: true, mode: 0o700 });
+    await writeRuntimeConfig(join(agentDir, "models.json"), {
+      providers: {
+        [MODEL_PROVIDER]: {
+          api: "openai-completions",
+          apiKey: `$${GATEWAY_TOKEN_ENV}`,
+          baseUrl: `http://127.0.0.1:${address.port}/v1`,
+          models: [{
+            id: STANDARD_MODEL,
+            name: "标准",
+            contextWindow: 131072,
+            maxTokens: 8192,
+            input: ["text"],
+          }],
+        },
+      },
+    });
+    await writeRuntimeConfig(join(agentDir, "settings.json"), { shellPath });
   } catch (cause) {
     await closeGateway();
-    await rm(temporaryPath, { force: true });
     throw cause;
   }
 
   return {
     config: {
-      source: "local",
-      commandPath,
-      commandArgs: ["acp", "--home", dimHome, "--model-config", modelPath],
+      binaryPath: launcher,
+      launchArgs: [
+        `--provider ${MODEL_PROVIDER} --model ${STANDARD_MODEL}`,
+        "--offline --no-approve --no-extensions --no-skills --no-prompt-templates",
+        '--append-system-prompt "You are the built-in assistant in 小瞳 Work. Help the user with everyday tasks."',
+      ].join(" "),
     },
     environment: [
       { name: GATEWAY_TOKEN_ENV, value: gateway.token, sensitive: true },
-      { name: "DIMCODE_UPDATE_CHECK", value: "0", sensitive: false },
+      { name: "PI_CODING_AGENT_DIR", value: agentDir, sensitive: false },
+      { name: "PI_CODING_AGENT_SESSION_DIR", value: join(agentDir, "sessions"), sensitive: false },
+      { name: "PI_SKIP_VERSION_CHECK", value: "1", sensitive: false },
+      { name: "PI_TELEMETRY", value: "0", sensitive: false },
     ],
-    async close() {
-      try {
-        await promisify(execFile)(commandPath, ["daemon", "stop", "--home", dimHome], {
-          timeout: 8000,
-        });
-      } finally {
-        await closeGateway();
-      }
-    },
+    close: closeGateway,
   };
+}
+
+async function writeRuntimeConfig(path: string, config: object) {
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true });
+  }
 }
