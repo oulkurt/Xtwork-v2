@@ -16,6 +16,10 @@ Web 侧 `applyAppearancePluginTheme` 只接受共享主题角色和合法主题�
 
 外观插件没有 iframe、JavaScript、HTML 或任意 CSS 注入入口。
 
+## 功能插件模态视图
+
+`PluginModalHost` 基于现有 `AppRouteModal`，使用相同的遮罩、Esc、焦点回收和关闭按钮。它只允许一个插件模态视图处于活动状态，并把内容放在工作区顶部工具栏的安全区下面。内置待办面板已经切换到这个承载层，因此关闭按钮不会和桌面侧栏按钮重叠。
+
 ## 插件列表请求
 
 插件宿主的 JSONL 请求 `plugins.list` 返回统一快照。功能插件和外观插件都包含 `pluginId`、`name`、`version`、`kind` 和 `state`。功能插件额外返回 `capabilities`、`tools`、`view`，外观插件额外返回 `theme`。
@@ -31,7 +35,15 @@ go vet ./...
 前端主题应用器的测试在生成的 T3 worktree 中运行：
 
 ```sh
-bun test apps/web/src/appearancePlugin.test.ts
+cd apps/web
+bunx vp test run --project unit src/appearancePlugin.test.ts
+```
+
+待办面板和模态承载的浏览器验证：
+
+```sh
+cd apps/web
+bunx vp test run --project browser src/components/plugins/TodoPanel.browser.test.tsx src/components/AppRouteModal.browser.test.tsx
 ```
 
 ## 当前范围
