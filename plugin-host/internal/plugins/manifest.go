@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	v1 "github.com/oulkurt/Xtwork-v2/plugin-host/protocol/v1"
+	v2 "github.com/oulkurt/Xtwork-v2/plugin-host/protocol/v2"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -26,6 +27,7 @@ type Manifest struct {
 	Name         string        `json:"name"`
 	Version      string        `json:"version"`
 	API          int           `json:"api"`
+	Kind         string        `json:"kind"`
 	Description  string        `json:"description"`
 	Icon         string        `json:"icon"`
 	Worker       string        `json:"worker"`
@@ -35,6 +37,12 @@ type Manifest struct {
 type Contributions struct {
 	Tools []Tool `json:"tools"`
 	Views []View `json:"views"`
+	Theme *Theme `json:"theme"`
+}
+
+type Theme struct {
+	ID     string            `json:"id"`
+	Tokens map[string]string `json:"tokens"`
 }
 type Tool struct {
 	Name        string          `json:"name"`
@@ -54,8 +62,14 @@ type noNetwork struct{}
 
 func (noNetwork) Load(string) (any, error) { return nil, ErrInvalid }
 
-func newManifestSchema() (*jsonschema.Schema, error) {
-	schemaData, err := v1.Schemas.ReadFile("plugin-manifest.schema.json")
+func newManifestSchema(api int) (*jsonschema.Schema, error) {
+	schemas := v1.Schemas
+	resource := "urn:xtwork:protocol:v1:plugin-manifest"
+	if api == 2 {
+		schemas = v2.Schemas
+		resource = "urn:xtwork:protocol:v2:plugin-manifest"
+	}
+	schemaData, err := schemas.ReadFile("plugin-manifest.schema.json")
 	if err != nil {
 		return nil, err
 	}
@@ -66,15 +80,33 @@ func newManifestSchema() (*jsonschema.Schema, error) {
 	compiler := jsonschema.NewCompiler()
 	compiler.DefaultDraft(jsonschema.Draft2020)
 	compiler.UseLoader(noNetwork{})
-	if err = compiler.AddResource("urn:xtwork:protocol:v1:plugin-manifest", doc); err != nil {
+	if err = compiler.AddResource(resource, doc); err != nil {
 		return nil, err
 	}
-	return compiler.Compile("urn:xtwork:protocol:v1:plugin-manifest")
+	return compiler.Compile(resource)
 }
 
 // Validate 校验整个目录和 manifest；调用方仅使用经过校验的副本。
 func Validate(files fs.FS) (Manifest, error) {
-	schema, err := newManifestSchema()
+	manifestFile, err := files.Open("plugin.json")
+	if err != nil {
+		return Manifest{}, err
+	}
+	raw, err := readBounded(manifestFile, maxBytes)
+	closeErr := manifestFile.Close()
+	if err != nil {
+		return Manifest{}, err
+	}
+	if closeErr != nil {
+		return Manifest{}, closeErr
+	}
+	var header struct {
+		API int `json:"api"`
+	}
+	if err := json.Unmarshal(raw, &header); err != nil {
+		return Manifest{}, err
+	}
+	schema, err := newManifestSchema(header.API)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -210,6 +242,9 @@ func validateManifest(files fs.FS, schema *jsonschema.Schema) (Manifest, error) 
 	if err = jsonv2.Unmarshal(raw, &result, jsonv2.RejectUnknownMembers(true)); err != nil {
 		problems.add("plugin.json", "", "Manifest structure is invalid: "+err.Error())
 		return Manifest{}, problems.err()
+	}
+	if result.API == 1 {
+		result.Kind = "functional"
 	}
 	if result.Worker != "" && requireFile(files, result.Worker) != nil {
 		problems.add("plugin.json", "/worker", "Worker file is missing or invalid.")
