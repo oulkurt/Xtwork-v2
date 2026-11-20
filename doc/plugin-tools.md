@@ -11,7 +11,7 @@
 - `todo__delete` 删除待办。
 - 待办工具和面板使用同一份插件存储，宿主重启后仍可读回。
 - MCP 工具只在本机对话会话中可调用。禁用 `todo` 后不会注册工具，也不会接受调用。
-- Dim 在同一个 MCP 会话重发同一条 JSON-RPC 请求时，`todo__create` 返回原来的待办。T3 将会话、工具名和请求 ID 转成 `context.operationKey`。待办用这个键生成记录 ID，只写一次。新请求可以创建同名待办。
+- Pi 在同一个 MCP 会话重发同一条 JSON-RPC 请求时，`todo__create` 返回原来的待办。T3 将会话、工具名和请求 ID 转成 `context.operationKey`。待办用这个键生成记录 ID，只写一次。新请求可以创建同名待办。
 
 ## 当前边界
 
@@ -30,4 +30,4 @@ go vet ./...
 go test -race ./...
 ```
 
-集成测试覆盖纯工具插件注册、worker 调用、重试、同名新建、持久化、禁用和分页。桌面文档中的 smoke 命令会用 Dim 创建待办，检查 MCP 生成的操作键，再重启服务读回该记录。 [桌面预览](desktop-foundation.md#待办插件)
+集成测试覆盖纯工具插件注册、worker 调用、重试、同名新建、持久化、禁用和分页。桌面文档中的 smoke 命令会用内置 Pi 创建待办，检查 MCP 生成的操作键，再重启服务并在原线程读回该记录。 [桌面预览](desktop-foundation.md#待办插件)

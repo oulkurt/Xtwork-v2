@@ -31,7 +31,7 @@
 
 ## Related Decisions
 
-- [ADR-002 · 默认运行时](002-default-dim-runtime.md)
+- [ADR-009 · 默认运行时](009-default-pi-runtime.md)
 - [ADR-005 · 独立搭建 v2](005-clean-v2-start.md)
 - [ADR-007 · 插件契约与权限](007-plugin-contract.md)
 - [决策索引](../../DECISIONS.md)

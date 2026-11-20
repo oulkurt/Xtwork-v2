@@ -45,7 +45,9 @@ const runtimeDir = join(root, "runtime");
 if (existsSync(join(runtimeDir, "gateway.ts"))) {
   const target = join(t3, "apps/server/src/xtwork");
   mkdirSync(target, { recursive: true });
-  for (const file of ["gateway.ts", "model.json"]) cpSync(join(runtimeDir, file), join(target, file));
+  for (const file of ["gateway.ts", "bundledPiSettings.ts", "bundledPiSettings.test.ts"]) {
+    cpSync(join(runtimeDir, file), join(target, file));
+  }
 }
 cpSync(join(root, "plugins", "todo", "ui", "todo.html"), join(t3, "apps/web/src/components/plugins/todo.html"));
 

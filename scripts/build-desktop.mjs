@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { cpSync, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { brand, build, lock, overlay, readJson, root, run, t3 } from "./project.mjs";
 
@@ -69,7 +69,10 @@ const mygoModule = execFileSync("go", ["list", "-m", "-f", "{{.Dir}}", "github.c
 }).trim();
 cpSync(join(mygoModule, "LICENSE"), join(resources, "LICENSE.MyGo"));
 
-run(process.execPath, [join(root, "runtime", "install-dim.mjs"), runtime]);
+const pi = join(runtime, "pi");
+cpSync(join(root, "runtime", "pi"), pi, { recursive: true });
+run("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: pi });
+for (const binary of ["pi", "pi-shell"]) chmodSync(join(pi, binary), 0o755);
 const pluginHost = join(resources, "plugin-host");
 mkdirSync(pluginHost);
 run("go", ["build", "-trimpath", "-o", join(pluginHost, "xtwork-plugin-host"), "."], { cwd: join(root, "plugin-host") });
@@ -100,6 +103,7 @@ const app = join(release, `${brand.displayName}.app`);
 run("codesign", ["--verify", "--strict", app]);
 const appResources = join(app, "Contents", "Resources");
 run(join(appResources, "node", "bin", "node"), [join(appResources, "server", "dist", "bin.mjs"), "--version"]);
+run(join(appResources, "runtime", "pi", "pi"), ["--version"]);
 
 if (upload) {
   const manifestName = `update-${platform}.json`;

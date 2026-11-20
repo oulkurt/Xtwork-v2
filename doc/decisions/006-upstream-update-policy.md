@@ -33,6 +33,6 @@ v2 保留上游 T3，品牌、运行时和插件桥由 overlay 适配。工作�
 ## Related Decisions
 
 - [ADR-001 · 桌面与服务端边界](001-desktop-architecture.md)
-- [ADR-002 · 默认运行时](002-default-dim-runtime.md)
+- [ADR-009 · 默认运行时](009-default-pi-runtime.md)
 - [历史候选 H-03](../../DECISIONS.md#历史决策与已撤回的候选)
 - [决策索引](../../DECISIONS.md)

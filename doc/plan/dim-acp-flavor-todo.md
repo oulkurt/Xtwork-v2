@@ -1,5 +1,7 @@
 # Dim ACP flavor 待办
 
+> **历史记录（2026-11-20 归档）。** Dim 方向已被 Pi 方案替代。下文保留原先的决策、调研和未执行的验收。现行设计见 [03 内置运行时 · Pi](03-内置运行时-Pi.md) 和 [ADR-009](../decisions/009-default-pi-runtime.md)。
+
 > 目标是让 bundled Dim 复用 T3 的统一 Timeline，同时保留 ACP 通用适配的升级边界。
 > 当前设计已经通过 Astra 与 Gemini 4 Neon 的独立评审。实现前置条件如下。
 

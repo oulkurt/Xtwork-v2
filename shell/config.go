@@ -100,7 +100,7 @@ func (cfg config) backendEnvironment() []string {
 		"XTWORK_BRAND_CONFIG="+cfg.brandFile,
 	)
 	for key, path := range map[string]string{
-		"XTWORK_DIM_BINARY":      filepath.Join(cfg.resources, "runtime", "dimcode"),
+		"XTWORK_PI_BINARY":       filepath.Join(cfg.resources, "runtime", "pi", "pi"),
 		"XTWORK_PLUGIN_HOST_BIN": filepath.Join(cfg.resources, "plugin-host", "xtwork-plugin-host"),
 		"XTWORK_PLUGINS_DIR":     filepath.Join(cfg.resources, "plugins"),
 	} {

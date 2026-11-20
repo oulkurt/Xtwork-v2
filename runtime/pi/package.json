@@ -1,0 +1,7 @@
+{
+  "name": "xtwork-bundled-pi",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.2"
+  },
+  "private": true
+}
