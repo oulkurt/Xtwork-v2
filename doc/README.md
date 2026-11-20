@@ -25,6 +25,7 @@ mygo 外壳管理本机 T3 Node 服务，WebView 加载服务提供的 React 界
 
 - [桌面预览、构建与更新](desktop-foundation.md)
 - [工具型插件和待办](plugin-tools.md)
+- [插件 v2 第一阶段](plugin-v2.md)
 - [界面配色](ui-appearance.md)
 
 ## 设计与验收
