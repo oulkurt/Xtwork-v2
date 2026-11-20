@@ -16,24 +16,35 @@ const piSelection: ModelSelection = {
   model: `${MODEL_PROVIDER}/${STANDARD_MODEL}`,
 };
 
+const modelSelectionKeys = [
+  "defaultModelSelection",
+  "fallbackModelSelection",
+  "textGenerationModelSelection",
+  "sourceControlWriterModelSelection",
+  "reviewGuideModelSelection",
+  "speechPostProcessingModelSelection",
+] as const;
+type ModelSelectionKey = (typeof modelSelectionKeys)[number];
+
+function migrateModelSelections(settings: Partial<Pick<ServerSettings, ModelSelectionKey>>) {
+  const migrated: Partial<Record<ModelSelectionKey, ModelSelection>> = {};
+  for (const key of modelSelectionKeys) {
+    if (settings[key]?.instanceId === DIM_INSTANCE_ID) migrated[key] = piSelection;
+  }
+  return migrated;
+}
+
 export function seedBundledPi(settings: ServerSettings, firstRun: boolean): ServerSettings {
   const { [DIM_INSTANCE_ID]: dim, ...providers } = settings.providerInstances;
   const upgradingDim = dim?.driver === "acpRegistry" && dim.config !== undefined;
   if (!firstRun && !upgradingDim) return settings;
 
-  const defaultModelSelection = settings.defaultModelSelection;
-  const fallbackModelSelection = settings.fallbackModelSelection;
   const projectSettingsOverrides = Object.fromEntries(
     Object.entries(settings.projectSettingsOverrides).map(([id, overrides]) => {
       const { [DIM_INSTANCE_ID]: dimOverride, ...providers } = overrides.providerInstances ?? {};
       return [id, {
         ...overrides,
-        ...(overrides.defaultModelSelection?.instanceId === DIM_INSTANCE_ID
-          ? { defaultModelSelection: piSelection }
-          : {}),
-        ...(overrides.textGenerationModelSelection?.instanceId === DIM_INSTANCE_ID
-          ? { textGenerationModelSelection: piSelection }
-          : {}),
+        ...migrateModelSelections(overrides),
         ...(dimOverride === undefined ? {} : {
           providerInstances: { ...providers, [PI_INSTANCE_ID]: providers[PI_INSTANCE_ID] ?? dimOverride },
         }),
@@ -43,16 +54,8 @@ export function seedBundledPi(settings: ServerSettings, firstRun: boolean): Serv
 
   return {
     ...settings,
-    defaultModelSelection:
-      (firstRun && defaultModelSelection === null) || defaultModelSelection?.instanceId === DIM_INSTANCE_ID
-        ? piSelection
-        : defaultModelSelection,
-    fallbackModelSelection:
-      fallbackModelSelection?.instanceId === DIM_INSTANCE_ID ? piSelection : fallbackModelSelection,
-    textGenerationModelSelection:
-      settings.textGenerationModelSelection.instanceId === DIM_INSTANCE_ID
-        ? piSelection
-        : settings.textGenerationModelSelection,
+    ...migrateModelSelections(settings),
+    ...(firstRun && settings.defaultModelSelection === null ? { defaultModelSelection: piSelection } : {}),
     projectSettingsOverrides,
     providerInstances: {
       ...providers,
