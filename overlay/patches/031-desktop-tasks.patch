@@ -1,0 +1,453 @@
+diff --git a/apps/web/src/components/CommandPalette.tsx b/apps/web/src/components/CommandPalette.tsx
+index a7a86ca2..98d3f8e9 100644
+--- a/apps/web/src/components/CommandPalette.tsx
++++ b/apps/web/src/components/CommandPalette.tsx
+@@ -280,9 +280,6 @@ import type { ChatComposerHandle } from "./chat/ChatComposer";
+ import { pickableProjectGroups } from "@t3tools/client-runtime/state/project-grouping";
+ import { buildSidebarProjectPickerEntries } from "../sidebarProjectGrouping";
+ import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
+-import { readPullRequestListPreferences } from "~/components/pullRequest/pullRequestListPreferences";
+-import { readIssueListPreferences } from "~/components/issue/issueListPreferences";
+-import { IssueGlyph } from "~/components/issue/issuePresentation";
+ import { useThreadRouteTarget } from "../hooks/useThreadRouteTarget";
+ import { threadRecentUse } from "@t3tools/shared/paletteSearch";
+ 
+@@ -1662,51 +1659,6 @@ function OpenCommandPaletteDialog(props: {
+ 
+   actionItems.push(themeEditorItem);
+ 
+-  if (environments.some((environment) => environment.serverConfig !== null)) {
+-    actionItems.push({
+-      kind: "action",
+-      value: "action:pull-requests",
+-      searchTerms: [
+-        ...new Set(
+-          sourceControlClients.definitions.flatMap((definition) => {
+-            const shortLabel = definition.changeRequest.shortLabel.toLowerCase();
+-            return [
+-              definition.changeRequest.plural,
+-              `${shortLabel}s`,
+-              shortLabel,
+-              ...definition.label.toLowerCase().split(/[^a-z0-9]+/u),
+-            ].filter(Boolean);
+-          }),
+-        ),
+-        "review",
+-        "merge",
+-        "branch",
+-      ],
+-      title: gt("Open pull requests"),
+-      icon: <PullRequestGlyph.pullRequest className={ITEM_ICON_CLASS} />,
+-      run: async () => {
+-        await navigate({ to: "/pull-requests", search: readPullRequestListPreferences() });
+-      },
+-    });
+-  }
+-
+-  if (
+-    environments.some(
+-      (environment) => environment.serverConfig?.environment.capabilities.issues === true,
+-    )
+-  ) {
+-    actionItems.push({
+-      kind: "action",
+-      value: "action:issues",
+-      searchTerms: ["issues", "issue", "bugs", "tracker", "github", "triage"],
+-      title: gt("Open issues"),
+-      icon: <IssueGlyph.issue className={ITEM_ICON_CLASS} />,
+-      run: async () => {
+-        await navigate({ to: "/issues", search: readIssueListPreferences() });
+-      },
+-    });
+-  }
+-
+   actionItems.push({
+     kind: "action",
+     value: "action:use-in-another-app",
+@@ -1876,8 +1828,7 @@ function OpenCommandPaletteDialog(props: {
+               {
+                 value: NEW_THREAD_IN_GROUP,
+                 label: gt("Projects"),
+-                // Every project archived and no "No project" home leaves only adding one.
+-                items: projectThreadItems.length > 0 ? projectThreadItems : [addProjectAction],
++                items: [...projectThreadItems, addProjectAction],
+               },
+             ]
+           : currentView?.groups[0]?.value === "themes"
+diff --git a/apps/web/src/components/NoProjectsHero.tsx b/apps/web/src/components/NoProjectsHero.tsx
+index cea7285d..b06ff8ad 100644
+--- a/apps/web/src/components/NoProjectsHero.tsx
++++ b/apps/web/src/components/NoProjectsHero.tsx
+@@ -15,8 +15,11 @@ export function NoProjectsHero() {
+   const gt = useGT();
+   const contentArea = workspaceAreaProps("home", 1, gt("Home"));
+   const primaryEnvironmentId = usePrimaryEnvironmentId();
+-  const { scratchEnvironmentId, startScratchThread } = useScratchProject();
+-  const scratchTargetEnvironmentId = scratchEnvironmentId(primaryEnvironmentId);
++  const { primaryScratchEnvironmentId, scratchEnvironmentId, startScratchThread } =
++    useScratchProject();
++  const scratchTargetEnvironmentId = isElectron
++    ? primaryScratchEnvironmentId()
++    : scratchEnvironmentId(primaryEnvironmentId);
+ 
+   return (
+     <SidebarInset
+diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
+index 7157e7aa..f7c793ea 100644
+--- a/apps/web/src/components/Sidebar.tsx
++++ b/apps/web/src/components/Sidebar.tsx
+@@ -171,6 +171,7 @@ import {
+   resolveThreadRouteTarget,
+ } from "../threadRoutes";
+ import type { SidebarThreadSummary } from "../types";
++import { useScratchProject } from "../hooks/useScratchProject";
+ import { isScratchProject } from "@t3tools/client-runtime/state/projects";
+ import { cn } from "~/lib/utils";
+ import { ProjectEnvironmentBadge } from "./ProjectEnvironmentBadge";
+@@ -2945,7 +2946,19 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+ 
+   const showJumpHints = useThreadJumpHintsVisible(keybindings, routeThreadRef);
+ 
++  const { primaryScratchEnvironmentId, startScratchThread } = useScratchProject();
++  const desktopScratchEnvironment = isElectron ? primaryScratchEnvironmentId() : null;
++
+   const handleNewThreadClick = (event?: ReactMouseEvent) => {
++    if (isElectron) {
++      if (isMobile) setOpenMobile(false);
++      if (event?.shiftKey || desktopScratchEnvironment === null) {
++        openCommandPalette({ open: "new-thread-in" });
++      } else {
++        void startScratchThread(desktopScratchEnvironment);
++      }
++      return;
++    }
+     if (
+       shouldCreateNewThreadInCurrentProject(
+         event?.shiftKey ?? false,
+diff --git a/apps/web/src/components/sidebar/SidebarThreadHeader.tsx b/apps/web/src/components/sidebar/SidebarThreadHeader.tsx
+index 85836a5e..443549c7 100644
+--- a/apps/web/src/components/sidebar/SidebarThreadHeader.tsx
++++ b/apps/web/src/components/sidebar/SidebarThreadHeader.tsx
+@@ -1,3 +1,4 @@
++import { isElectron } from "../../env";
+ import { useGT } from "gt-react";
+ import { FolderPlusIcon, SearchIcon, SquarePenIcon, XIcon } from "lucide-react";
+ import {
+@@ -110,7 +111,12 @@ export function SidebarThreadHeader({
+         <SidebarHeaderIconButton
+           label={gt("New thread")}
+           tooltip={
+-            showNewThreadInProjectHint ? (
++            isElectron ? (
++              <span className="flex flex-col gap-0.5">
++                <span>{newThreadLabel}</span>
++                <span className="text-muted-foreground">{gt("Choose a folder: Shift+click")}</span>
++              </span>
++            ) : showNewThreadInProjectHint ? (
+               <span className="flex flex-col gap-0.5">
+                 <span>{newThreadLabel}</span>
+                 <span className="text-muted-foreground">
+diff --git a/apps/web/src/hooks/useScratchProject.test.ts b/apps/web/src/hooks/useScratchProject.test.ts
+index 103f66ba..da2f20dd 100644
+--- a/apps/web/src/hooks/useScratchProject.test.ts
++++ b/apps/web/src/hooks/useScratchProject.test.ts
+@@ -35,6 +35,12 @@ function actions(
+ }
+ 
+ describe("scratchEnvironmentId", () => {
++  it("keeps the default desktop draft on the primary environment", () => {
++    expect(actions(local, "/local/scratch").primaryScratchEnvironmentId()).toBe(local);
++    expect(actions(local, null).primaryScratchEnvironmentId()).toBeNull();
++    expect(actions(null, null).primaryScratchEnvironmentId()).toBeNull();
++  });
++
+   it("prefers the primary environment over the one on screen", () => {
+     expect(actions(local, "/local/scratch").scratchEnvironmentId(remote)).toBe(local);
+     expect(actions(local, "/local/scratch").scratchEnvironmentId(null)).toBe(local);
+diff --git a/apps/web/src/hooks/useScratchProject.ts b/apps/web/src/hooks/useScratchProject.ts
+index 8cf6db23..2bf2b341 100644
+--- a/apps/web/src/hooks/useScratchProject.ts
++++ b/apps/web/src/hooks/useScratchProject.ts
+@@ -51,10 +51,15 @@ export function createScratchProjectActions(input: {
+     return availableScratchWorkspaceRoot(environment?.connection.phase, environment?.serverConfig);
+   };
+ 
++  const primaryScratchEnvironmentId = (): EnvironmentId | null => {
++    const primary = input.primaryEnvironmentId();
++    return scratchWorkspaceRootFor(primary) === null ? null : primary;
++  };
++
+   // The primary (local) environment wins; `fallback` only applies when it offers no scratch root.
+   const scratchEnvironmentId = (fallback: EnvironmentId | null): EnvironmentId | null => {
+-    const primary = input.primaryEnvironmentId();
+-    if (primary !== null && scratchWorkspaceRootFor(primary) !== null) return primary;
++    const primary = primaryScratchEnvironmentId();
++    if (primary !== null) return primary;
+     if (fallback !== null && scratchWorkspaceRootFor(fallback) !== null) return fallback;
+     const offering = [...input.environments()].filter(
+       (entry) => scratchWorkspaceRootFor(entry.environmentId) !== null,
+@@ -84,14 +89,20 @@ export function createScratchProjectActions(input: {
+     const project = await openScratchProject(environmentId);
+     if (project) {
+       await input
+-        .handleNewThread(scopeProjectRef(project.environmentId, project.id))
++        .handleNewThread(scopeProjectRef(project.environmentId, project.id), { envMode: "local" })
+         .catch((error: unknown) =>
+           reportScratchFailure(m(msg("Could not start without a project")), error),
+         );
+     }
+   };
+ 
+-  return { scratchWorkspaceRootFor, scratchEnvironmentId, openScratchProject, startScratchThread };
++  return {
++    scratchWorkspaceRootFor,
++    primaryScratchEnvironmentId,
++    scratchEnvironmentId,
++    openScratchProject,
++    startScratchThread,
++  };
+ }
+ 
+ export function useScratchProject() {
+diff --git a/apps/web/src/i18n/translations/zh.json b/apps/web/src/i18n/translations/zh.json
+index d6e5cd9a..7d6d9a22 100644
+--- a/apps/web/src/i18n/translations/zh.json
++++ b/apps/web/src/i18n/translations/zh.json
+@@ -1,4 +1,10 @@
+ {
++  "5e9f71cf85a0f561": "选择文件夹（按住 Shift 点击）",
++  "5177af5c20a8900e": "开发者功能",
++  "0dd9a71a71480ddd": "显示开发者功能",
++  "ffc9887a29eaf0da": "打开 Pull requests",
++  "8a8a22f305dc4b1b": "打开 Issues",
++  "5163608072836eed": "请重试打开新对话。",
+   "23be753133ae6950": "会话",
+   "0001ae5846061bb6": "{machine} 上的会话",
+   "eef7f4dacbc3c3f2": "机器",
+diff --git a/apps/web/src/routes/__root.tsx b/apps/web/src/routes/__root.tsx
+index 3cbef773..8217cd60 100644
+--- a/apps/web/src/routes/__root.tsx
++++ b/apps/web/src/routes/__root.tsx
+@@ -227,12 +227,12 @@ function RootRouteBranch() {
+         </>
+       ) : (
+         <FirstRunGate
+-          enabled={primaryEnvironmentAuthenticated}
++          enabled={primaryEnvironmentAuthenticated && !isElectron}
+           hostedStatic={authGateState.status === "hosted-static"}
+         >
+           {appHosts}
+           {primaryEnvironmentAuthenticated ? (
+-            <EventRouter skipInitialBootstrapNavigation={returningFromWelcome} />
++            <EventRouter skipInitialBootstrapNavigation={returningFromWelcome || isElectron} />
+           ) : null}
+           {appShell}
+         </FirstRunGate>
+diff --git a/apps/web/src/routes/_chat.index.tsx b/apps/web/src/routes/_chat.index.tsx
+index 2e6ee538..62d5a3d5 100644
+--- a/apps/web/src/routes/_chat.index.tsx
++++ b/apps/web/src/routes/_chat.index.tsx
+@@ -13,6 +13,7 @@ import { HostedEmptyState } from "../components/HostedEmptyState";
+ import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "../components/ui/empty";
+ import { SidebarInset } from "../components/ui/sidebar";
+ import { WorkspacePageHeader } from "../components/WorkspacePageHeader";
++import { useScratchProject } from "../hooks/useScratchProject";
+ import { useNewThreadHandler } from "../hooks/useHandleNewThread";
+ import {
+   readProject,
+@@ -31,7 +32,49 @@ function ChatIndexRouteView() {
+     if (environments.length === 0) return <HostedEmptyState />;
+   }
+ 
+-  return <IndexDraftLanding />;
++  return isElectron ? <DesktopDraftLanding /> : <IndexDraftLanding />;
++}
++
++function DesktopDraftLanding() {
++  const { openScratchProject, primaryScratchEnvironmentId } = useScratchProject();
++  const environmentId = primaryScratchEnvironmentId();
++  const bootstrapped = useAllEnvironmentShellsBootstrapped();
++  const handleNewThread = useNewThreadHandler();
++  const router = useRouter();
++  const [retry, setRetry] = useState(0);
++  const [failedAttempt, setFailedAttempt] = useState<number | null>(null);
++  const openDraft = useEffectEvent(async (target: NonNullable<typeof environmentId>) => {
++    const project = await openScratchProject(target);
++    if (router.state.location.pathname !== "/") return true;
++    if (project === null) return false;
++    return (
++      (await handleNewThread(scopeProjectRef(project.environmentId, project.id), {
++        envMode: "local",
++        replace: true,
++      })) !== null || router.state.location.pathname !== "/"
++    );
++  });
++
++  useEffect(() => {
++    if (environmentId === null) return;
++    let active = true;
++    void openDraft(environmentId).then(
++      (opened) => {
++        if (active && !opened) setFailedAttempt(retry);
++      },
++      () => {
++        if (active) setFailedAttempt(retry);
++      },
++    );
++    return () => {
++      active = false;
++    };
++  }, [environmentId, retry]);
++
++  if (failedAttempt === retry) {
++    return <DraftStartError onRetry={() => setRetry((attempt) => attempt + 1)} />;
++  }
++  return environmentId === null && bootstrapped ? <NoProjectsHero /> : null;
+ }
+ 
+ function IndexDraftLanding() {
+@@ -107,7 +150,7 @@ function DraftStartError({ onRetry }: { readonly onRetry: () => void }) {
+             <T>Couldn’t start a new thread</T>
+           </EmptyTitle>
+           <EmptyDescription>
+-            <T>The project is still available. Try opening the draft again.</T>
++            <T>Try opening the draft again.</T>
+           </EmptyDescription>
+           <div className="mt-5 flex justify-center">
+             <Button size="sm" onClick={onRetry}>
+diff --git a/apps/web/src/shortcuts/chatRouteCommands.ts b/apps/web/src/shortcuts/chatRouteCommands.ts
+index d01abf10..eb05fb3b 100644
+--- a/apps/web/src/shortcuts/chatRouteCommands.ts
++++ b/apps/web/src/shortcuts/chatRouteCommands.ts
+@@ -4,6 +4,7 @@ import { msg } from "gt-react";
+ 
+ import { stackedThreadToast, toastManager } from "~/components/ui/toast";
+ import { m } from "~/i18n/messages";
++import { isElectron } from "../env";
+ import { isPreviewAvailableFor } from "../browser/previewRuntime";
+ import { isCommandPaletteOpen, openCommandPalette } from "../commandPaletteBus";
+ import { useComposerDraftStore } from "../composerDraftStore";
+@@ -140,6 +141,13 @@ export function installChatRouteCommands(router: AnyRouter): () => void {
+         void scratch.startScratchThread(environmentId);
+       },
+       "chat.new": (event) => {
++        const desktopScratchEnvironment = isElectron ? scratch.primaryScratchEnvironmentId() : null;
++        if (isElectron) {
++          claim(event);
++          if (desktopScratchEnvironment === null) openCommandPalette({ open: "new-thread-in" });
++          else void scratch.startScratchThread(desktopScratchEnvironment);
++          return;
++        }
+         const groups = readProjectGroups();
+         if (
+           !shouldCreateNewThreadInCurrentProject(
+diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
+index 678f5829..b661b0a3 100644
+--- a/packages/contracts/src/settings.ts
++++ b/packages/contracts/src/settings.ts
+@@ -1364,6 +1364,7 @@ export const CloudSpeechCredentials = Schema.Struct({
+ });
+ 
+ export const ServerSettings = Schema.Struct({
++  developerFeaturesEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+   // Null means unmigrated; empty is authoritative and must not resurrect cleared preferences.
+   favorites: Schema.NullOr(ModelFavorites).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+   providerModelPreferences: Schema.NullOr(ProviderModelPreferences).pipe(
+@@ -1802,6 +1803,7 @@ const ModelSelectionPatch = Schema.Struct({
+ });
+ 
+ export const ServerSettingsPatch = Schema.Struct({
++  developerFeaturesEnabled: Schema.optionalKey(Schema.Boolean),
+   setModelFavorites: Schema.optionalKey(
+     Schema.Array(Schema.Struct({ ...ModelFavorite.fields, favorite: Schema.Boolean })),
+   ),
+diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
+index e0a12417..96b821ea 100644
+--- a/apps/web/src/components/settings/SettingsPanels.tsx
++++ b/apps/web/src/components/settings/SettingsPanels.tsx
+@@ -1,3 +1,4 @@
++import { DeveloperFeaturesSettings } from "./DeveloperFeaturesSettings";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { m as resolveMessage } from "~/i18n/messages";
+ import { useAtomValue } from "@effect/atom-react";
+@@ -838,6 +839,7 @@ export function GeneralSettingsPanel() {
+ 
+   return (
+     <SettingsPageContainer>
++      <DeveloperFeaturesSettings />
+       <SettingsSection id="notifications" title={gt("Notifications")}>
+         <NotificationSettings />
+         <SettingsRow
+diff --git a/apps/web/src/components/sidebar/SidebarChrome.tsx b/apps/web/src/components/sidebar/SidebarChrome.tsx
+index 1dbc9b9f..47990d61 100644
+--- a/apps/web/src/components/sidebar/SidebarChrome.tsx
++++ b/apps/web/src/components/sidebar/SidebarChrome.tsx
+@@ -14,7 +14,6 @@ import {
+ } from "../../navigationHistory";
+ import { primaryServerKeybindingsAtom } from "../../state/server";
+ import { cn } from "../../lib/utils";
+-import { useIssuesSupported, usePullRequestsSupported } from "../../state/environments";
+ import { T3Wordmark } from "../T3Wordmark";
+ import {
+   resolveEnvironmentIdentificationPillLabel,
+@@ -33,14 +32,10 @@ import {
+   useSidebar,
+ } from "../ui/sidebar";
+ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+-import { readPullRequestListPreferences } from "../pullRequest/pullRequestListPreferences";
+-import { readIssueListPreferences } from "../issue/issueListPreferences";
+-import { IssueGlyph } from "../issue/issuePresentation";
+ import { isSidebarUtilityPage, useNavigateToMainApp } from "./mainAppLocation";
+ import { SidebarThreadUndoNotice } from "./SidebarThreadUndoNotice";
+ import { SidebarProviderUpdatePill } from "./SidebarProviderUpdatePill";
+ import { SidebarUpdateArchitectureWarning, SidebarUpdatePill } from "./SidebarUpdatePill";
+-import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
+ import { observeResize } from "~/lib/observeResize";
+ 
+ export const SidebarChromeHeader = memo(function SidebarChromeHeader({
+@@ -233,24 +228,11 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
+   const isOnUtilityPage = useLocation({
+     select: (location) => isSidebarUtilityPage(location.pathname),
+   });
+-  const pullRequestsSupported = usePullRequestsSupported();
+-  const issuesSupported = useIssuesSupported();
+   const closeMobileSidebar = () => {
+     if (isMobile) {
+       setOpenMobile(false);
+     }
+   };
+-  const handlePullRequestsClick = () => {
+-    closeMobileSidebar();
+-    void navigate({
+-      to: "/pull-requests",
+-      search: readPullRequestListPreferences(),
+-    });
+-  };
+-  const handleIssuesClick = () => {
+-    closeMobileSidebar();
+-    void navigate({ to: "/issues", search: readIssueListPreferences() });
+-  };
+   const handleSettingsClick = () => {
+     closeMobileSidebar();
+     void navigate({ to: "/settings" });
+@@ -286,20 +268,6 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
+             label={gt("Settings")}
+             onClick={handleSettingsClick}
+           />
+-          {pullRequestsSupported ? (
+-            <SidebarUtilityItem
+-              icon={<PullRequestGlyph.pullRequest />}
+-              label={gt("Pull requests")}
+-              onClick={handlePullRequestsClick}
+-            />
+-          ) : null}
+-          {issuesSupported ? (
+-            <SidebarUtilityItem
+-              icon={<IssueGlyph.issue />}
+-              label={gt("Issues", { $context: "sidebar link to the list of issues" })}
+-              onClick={handleIssuesClick}
+-            />
+-          ) : null}
+           <SidebarUtilityItem
+             icon={<ChartNoAxesColumnIcon />}
+             label={gt("Usage")}
