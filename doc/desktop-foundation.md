@@ -12,6 +12,14 @@ open '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'
 
 省略 `--skip-dmg` 可生成 DMG。独立 Node、T3 服务端及前端、Pi 和 moejs 插件宿主一起打包。Pi 通过随包启动器复用 Node。mygo 在本机启动服务端，用同源 WebView 加载界面。应用数据在 `~/Library/Application Support/Xtwork-v2`。用 `XTWORK_DATA_DIR` 可指定独立测试目录。
 
+## 通用任务首页
+
+桌面首启直接打开本机的免项目草稿。点击侧栏「新建对话」或按 `⌘N` 也会进入免项目草稿。按住 Shift 点击「新建对话」，或用草稿里的文件夹选择器，可以在现有文件夹中开始任务。已有对话仍从侧栏打开。
+
+免项目对话共用应用数据目录下的 `scratch`。需要独立保存文件的任务可以选择不同的文件夹。测试首启时，把 `XTWORK_DATA_DIR` 指到 Git 仓库外的空目录。
+
+「设置 → 通用 → 开发者功能」默认关闭，打开后可进入 Pull requests 和 Issues 的完整列表。开关保存在本机服务端设置中。终端、文件夹与编辑器操作继续通过原来的入口访问。
+
 ## 测试模型
 
 新会话默认选内置助手。T3 通过 `provider-pi` 和 stdio RPC 启动随包 Pi。`runtime/pi/models.json` 指向服务端本机网关。网关将 `standard` 映射到内测模型。Pi 会话保存在 `runtime/pi/sessions`，桌面服务进程以应用数据目录内的 `workspace` 为工作目录。默认上游是 `http://127.0.0.1:3425/v1` 的 Magpie，默认模型是 `our-free-model/hy4-flash-free`。
