@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -234,6 +235,83 @@ func TestTodoViewMutationsShareToolStorage(t *testing.T) {
 	}
 	if afterDelete.Total != 0 || len(afterDelete.Items) != 0 {
 		t.Fatalf("deleted todo remained in storage: %+v", afterDelete)
+	}
+}
+
+func TestTodoSearchAndUndoCreation(t *testing.T) {
+	plugins, err := filepath.Abs("../plugins")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := newHost(plugins, t.TempDir(), "", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.close()
+
+	call := func(method, params string, target any) {
+		t.Helper()
+		result := h.dispatch(t.Context(), request{Method: method, Params: json.RawMessage(params)})
+		if result.Error != nil {
+			t.Fatal(result.Error)
+		}
+		if err := json.Unmarshal(result.Result.(json.RawMessage), target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type todo struct {
+		ID        string `json:"id"`
+		CreatedAt string `json:"createdAt"`
+	}
+	createInput := func(title string) string {
+		return fmt.Sprintf(`{"name":"todo__create","input":{"title":%q},"context":{"threadId":"thread-a","operationKey":%q}}`, title, strings.ReplaceAll(strings.ToLower(title), " ", "-"))
+	}
+	create := func(title string) todo {
+		t.Helper()
+		var item todo
+		call("tools.invoke", createInput(title), &item)
+		return item
+	}
+	undo := func(item todo) bool {
+		t.Helper()
+		var result struct {
+			Deleted bool `json:"deleted"`
+		}
+		call("views.call", fmt.Sprintf(`{"name":"todo__delete","input":{"id":%q,"undoCreatedAt":%q}}`, item.ID, item.CreatedAt), &result)
+		return result.Deleted
+	}
+
+	original := create("Quarterly report")
+	changed := create("Send slides")
+	var page struct {
+		Items []todo `json:"items"`
+	}
+	call("views.call", `{"name":"todo__list","input":{"query":"REPORT"}}`, &page)
+	if len(page.Items) != 1 || page.Items[0].ID != original.ID {
+		t.Fatalf("unexpected title search results: %+v", page.Items)
+	}
+	var completed todo
+	call("views.call", fmt.Sprintf(`{"name":"todo__complete","input":{"id":%q}}`, changed.ID), &completed)
+	if undo(changed) {
+		t.Fatal("undo removed a todo that had already changed")
+	}
+	call("tools.invoke", fmt.Sprintf(`{"name":"todo__list","input":{"id":%q}}`, changed.ID), &page)
+	if len(page.Items) != 1 || page.Items[0].ID != changed.ID {
+		t.Fatal("completed todo could not be read by reference")
+	}
+	if !undo(original) || !undo(original) {
+		t.Fatal("undo did not succeed on an unchanged todo and its retry")
+	}
+	var replay struct {
+		Undone bool `json:"undone"`
+	}
+	call("tools.invoke", createInput("Quarterly report"), &replay)
+	if !replay.Undone {
+		t.Fatal("replayed creation restored a todo that the user undid")
+	}
+	call("tools.invoke", fmt.Sprintf(`{"name":"todo__list","input":{"id":%q}}`, original.ID), &page)
+	if len(page.Items) != 0 {
+		t.Fatalf("undone todo remained: %+v", page.Items)
 	}
 }
 
