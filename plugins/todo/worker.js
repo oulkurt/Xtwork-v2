@@ -9,6 +9,7 @@ const fields = [
   "priority",
 ];
 const key = (id) => `item:${id}`;
+const undoKey = (id) => `undo:${id}`;
 const dateKey = (date) =>
   `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 const length = (s) => Array.from(s).length;
@@ -71,6 +72,7 @@ async function create(input, context) {
     id = `req-${context.operationKey}`;
     const previous = await xtwork.storage.get(key(id));
     if (previous) return previous;
+    if (await xtwork.storage.get(undoKey(id))) return { id, undone: true };
   }
   if ((await xtwork.storage.list("item:")).length >= 1000)
     throw new Error("The 1000 item limit has been reached.");
@@ -103,6 +105,7 @@ function select(items, input = {}) {
     throw new Error("filter must be all, today, week, done, or overdue.");
   if (input.group !== undefined && typeof input.group !== "string")
     throw new Error("group must be a string.");
+  const query = (input.query || "").trim().toLowerCase();
   const now = new Date(),
     today = dateKey(now),
     end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 6),
@@ -110,6 +113,7 @@ function select(items, input = {}) {
   return items
     .filter(
       (item) =>
+        (!query || item.title.toLowerCase().includes(query)) &&
         (input.group === undefined || item.group === input.group) &&
         (filter === "done"
           ? item.done
@@ -171,6 +175,20 @@ const actions = {
   delete: async (input) => {
     validateId(input);
     const current = await xtwork.storage.get(key(input.id));
+    if (input.undoCreatedAt !== undefined) {
+      if (!current) return { id: input.id, deleted: true };
+      if (
+        !current.sourceThreadId ||
+        current.createdAt !== input.undoCreatedAt ||
+        current.updatedAt !== input.undoCreatedAt ||
+        current.done
+      ) {
+        return { id: input.id, deleted: false };
+      }
+      if (input.id.startsWith("req-")) {
+        await xtwork.storage.set(undoKey(input.id), true);
+      }
+    }
     if (!current) throw new Error("Todo not found.");
     await xtwork.storage.delete(key(input.id));
     return { id: input.id, deleted: true };
@@ -182,7 +200,9 @@ const actions = {
     if (!Number.isInteger(offset) || offset < 0 || offset > 1000)
       throw new Error("offset must be an integer from 0 to 1000.");
     if (typeof fullNotes !== "boolean") throw new Error("fullNotes must be a boolean.");
-    const items = select(await all(), input);
+    const items = input.id
+      ? [await xtwork.storage.get(key(input.id))].filter(Boolean)
+      : select(await all(), input);
     const result = [];
     let size = 0;
     for (const item of items.slice(offset, offset + limit)) {
