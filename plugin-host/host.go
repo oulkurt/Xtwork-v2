@@ -20,17 +20,35 @@ import (
 )
 
 type host struct {
-	executable string
-	codec      *protocol.Codec
-	catalog    []toolDescriptor
-	tools      map[string]toolEntry
-	plugins    []*pluginEntry
+	executable  string
+	codec       *protocol.Codec
+	catalog     []toolDescriptor
+	tools       map[string]toolEntry
+	plugins     []*pluginEntry
+	appearances []appearanceEntry
 }
 
 type pluginEntry struct {
-	load    protocol.PluginLoadRequest
-	storage *pluginStorage
-	worker  *workerClient
+	snapshot pluginSnapshot
+	load     protocol.PluginLoadRequest
+	storage  *pluginStorage
+	worker   *workerClient
+}
+
+type appearanceEntry struct {
+	snapshot pluginSnapshot
+}
+
+type pluginSnapshot struct {
+	PluginID     string         `json:"pluginId"`
+	Name         string         `json:"name"`
+	Version      string         `json:"version"`
+	Kind         string         `json:"kind"`
+	State        string         `json:"state"`
+	Capabilities []string       `json:"capabilities"`
+	Tools        []string       `json:"tools"`
+	View         bool           `json:"view"`
+	Theme        *plugins.Theme `json:"theme,omitempty"`
 }
 
 type toolDescriptor struct {
@@ -84,7 +102,7 @@ func newHost(pluginsDir, dataDir, disabled, zone string) (*host, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read built-in plugins: %w", err)
 	}
-	h := &host{executable: exe, codec: codec, catalog: []toolDescriptor{}, tools: map[string]toolEntry{}}
+	h := &host{executable: exe, codec: codec, catalog: []toolDescriptor{}, tools: map[string]toolEntry{}, appearances: []appearanceEntry{}}
 	disabledIDs := strings.Split(disabled, ",")
 	for _, dir := range dirs {
 		if !dir.IsDir() || strings.HasPrefix(dir.Name(), ".") || slices.Contains(disabledIDs, dir.Name()) {
@@ -106,12 +124,31 @@ func (h *host) loadPlugin(files fs.FS, id, dataDir, zone string) error {
 	if manifest.ID != id {
 		return errors.New("directory must match plugin id")
 	}
+	if manifest.Kind == "appearance" {
+		h.appearances = append(h.appearances, appearanceEntry{snapshot: pluginSnapshot{
+			PluginID: id,
+			Name:     manifest.Name,
+			Version:  manifest.Version,
+			Kind:     manifest.Kind,
+			State:    "ready",
+			Theme:    manifest.Contributes.Theme,
+		}})
+		return nil
+	}
 	for _, capability := range manifest.Capabilities {
 		if capability != "storage" && capability != "agent.tools" {
 			return fmt.Errorf("unsupported capability %q", capability)
 		}
 	}
-	plugin := &pluginEntry{load: protocol.PluginLoadRequest{
+	plugin := &pluginEntry{snapshot: pluginSnapshot{
+		PluginID:     id,
+		Name:         manifest.Name,
+		Version:      manifest.Version,
+		Kind:         manifest.Kind,
+		State:        "stopped",
+		Capabilities: append([]string(nil), manifest.Capabilities...),
+		View:         len(manifest.Contributes.Views) > 0,
+	}, load: protocol.PluginLoadRequest{
 		PluginID: id, API: manifest.API, Entry: manifest.Worker,
 		Capabilities: manifest.Capabilities, TimeZone: zone, View: len(manifest.Contributes.Views) > 0,
 		Files: []protocol.PluginFile{}, Tools: []string{},
@@ -153,6 +190,7 @@ func (h *host) loadPlugin(files fs.FS, id, dataDir, zone string) error {
 			return fmt.Errorf("compile %s input schema: %w", name, err)
 		}
 		plugin.load.Tools = append(plugin.load.Tools, tool.Name)
+		plugin.snapshot.Tools = append(plugin.snapshot.Tools, name)
 		h.catalog = append(h.catalog, toolDescriptor{name, tool.Title, tool.Description, tool.InputSchema})
 		h.tools[name] = toolEntry{plugin, tool.Name, schema}
 	}
@@ -217,6 +255,15 @@ func (h *host) serve(ctx context.Context, input io.Reader, output io.Writer) err
 func (h *host) dispatch(ctx context.Context, req request) response {
 	resp := response{ID: req.ID}
 	switch req.Method {
+	case "plugins.list":
+		result := make([]pluginSnapshot, 0, len(h.plugins)+len(h.appearances))
+		for _, plugin := range h.plugins {
+			result = append(result, plugin.snapshot)
+		}
+		for _, appearance := range h.appearances {
+			result = append(result, appearance.snapshot)
+		}
+		resp.Result = result
 	case "tools.list":
 		resp.Result = h.catalog
 	case "tools.invoke", "views.call":

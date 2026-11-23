@@ -426,3 +426,39 @@ func TestPluginCanContributeToolsWithoutViews(t *testing.T) {
 		t.Fatalf("tool-only plugin accepted a view call: %+v", result)
 	}
 }
+
+func TestAppearancePluginRegistersWithoutWorker(t *testing.T) {
+	plugins := t.TempDir()
+	dir := filepath.Join(plugins, "paper-dark")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{
+		"id":"paper-dark",
+		"name":"Paper dark",
+		"version":"1.0.0",
+		"api":2,
+		"kind":"appearance",
+		"description":"Static theme",
+		"icon":"palette",
+		"contributes":{"theme":{"id":"paper-dark","tokens":{"background":"#101010","foreground":"#f7f7f7"}}}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "plugin.json"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h, err := newHost(plugins, t.TempDir(), "", "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.close()
+	snapshots, ok := h.dispatch(t.Context(), request{Method: "plugins.list"}).Result.([]pluginSnapshot)
+	if !ok || len(snapshots) != 1 {
+		t.Fatalf("unexpected plugin snapshots: %+v", snapshots)
+	}
+	if snapshots[0].Kind != "appearance" || snapshots[0].Theme == nil {
+		t.Fatalf("unexpected appearance snapshot: %+v", snapshots[0])
+	}
+	if len(h.plugins) != 0 {
+		t.Fatalf("appearance plugin started a functional runtime: %+v", h.plugins)
+	}
+}
