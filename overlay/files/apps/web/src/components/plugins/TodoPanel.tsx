@@ -1,9 +1,9 @@
 import { ListTodoIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { readDesktopPrimaryBearerToken } from "../../environments/primary/desktopAuth";
-import { Sheet, SheetHeader, SheetPopup, SheetTitle } from "../ui/sheet";
 import { SidebarMenuButton, SidebarMenuItem } from "../ui/sidebar";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { PluginModalHost } from "./PluginModalHost";
 import todoView from "./todo.html?raw";
 import { openTodoPanelEvent } from "./TodoActionReceipt";
 
@@ -123,29 +123,24 @@ export function TodoPanel() {
           <TooltipPopup side="top">待办</TooltipPopup>
         </Tooltip>
       </SidebarMenuItem>
-      <Sheet open={open} onOpenChange={setOpen}>
-        <SheetPopup className="mt-[calc(var(--workspace-controls-top)+var(--workspace-topbar-height))]">
-          <SheetHeader>
-            <SheetTitle>待办</SheetTitle>
-          </SheetHeader>
-          <iframe
-            ref={iframe}
-            title="待办事项"
-            sandbox="allow-scripts allow-forms"
-            srcDoc={todoView}
-            className="min-h-0 w-full flex-1 border-0"
-            onLoad={() =>
-              iframe.current?.contentWindow?.postMessage(
-                {
-                  channel,
-                  theme: document.documentElement.classList.contains("dark") ? "dark" : "light",
-                },
-                "*",
-              )
-            }
-          />
-        </SheetPopup>
-      </Sheet>
+      <PluginModalHost open={open} label="待办" title="待办" onOpenChange={setOpen}>
+        <iframe
+          ref={iframe}
+          title="待办事项"
+          sandbox="allow-scripts allow-forms"
+          srcDoc={todoView}
+          className="min-h-0 w-full flex-1 border-0"
+          onLoad={() =>
+            iframe.current?.contentWindow?.postMessage(
+              {
+                channel,
+                theme: document.documentElement.classList.contains("dark") ? "dark" : "light",
+              },
+              "*",
+            )
+          }
+        />
+      </PluginModalHost>
     </>
   );
 }
