@@ -38,13 +38,50 @@ it("creates and edits todos through forms inside the sandboxed panel", async () 
   await title.fill("Draft");
   await userEvent.keyboard("{Enter}");
   await vi.waitFor(() =>
-    expect(request).toHaveBeenCalledWith("/api/xtwork/todo", expect.objectContaining({ method: "POST" })),
+    expect(request).toHaveBeenCalledWith(
+      "/api/xtwork/todo",
+      expect.objectContaining({ method: "POST" }),
+    ),
   );
 
   await panel.getByRole("button", { name: "编辑" }).click();
   await panel.getByRole("textbox", { name: "标题" }).fill("Ready");
   await panel.getByRole("button", { name: "保存" }).click();
   await vi.waitFor(() =>
-    expect(request).toHaveBeenCalledWith("/api/xtwork/todo", expect.objectContaining({ method: "PATCH" })),
+    expect(request).toHaveBeenCalledWith(
+      "/api/xtwork/todo",
+      expect.objectContaining({ method: "PATCH" }),
+    ),
   );
+});
+
+it("keeps the close button below the workspace toolbar", async () => {
+  const fetch = window.fetch.bind(window);
+  using request = vi
+    .spyOn(window, "fetch")
+    .mockImplementation(async (url, options) =>
+      String(url).startsWith("/api/xtwork/todo")
+        ? Response.json({ items: [], nextOffset: null })
+        : fetch(url, options),
+    );
+  await using screen = await render(
+    <SidebarProvider>
+      <button className="fixed right-3 top-0 z-50 h-[var(--workspace-topbar-height)]">
+        Workspace sidebar
+      </button>
+      <SidebarMenu>
+        <TodoPanel />
+      </SidebarMenu>
+    </SidebarProvider>,
+  );
+
+  await screen.getByRole("button", { name: "待办", exact: true }).click();
+  const close = screen.getByRole("button", { name: "Close" });
+  const toolbar = screen.getByText("Workspace sidebar").element();
+  expect(close.element().getBoundingClientRect().top).toBeGreaterThanOrEqual(
+    toolbar.getBoundingClientRect().bottom,
+  );
+  await close.click();
+  await expect.element(page.getByTitle("待办事项")).not.toBeInTheDocument();
+  expect(request).toHaveBeenCalled();
 });

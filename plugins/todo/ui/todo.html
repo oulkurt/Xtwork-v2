@@ -17,9 +17,6 @@
   }
   * { box-sizing: border-box; }
   body { margin: 0; padding: 20px 22px 28px; }
-  header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
-  h1 { font-size: 22px; letter-spacing: -0.02em; margin: 0; }
-  #count { color: var(--muted); font-size: 12px; }
   #create-form { display: flex; gap: 8px; }
   #create-form > button { flex: 0 0 auto; }
   input, textarea, select, button { box-sizing: border-box; font: inherit; border-radius: 8px; }
@@ -68,11 +65,6 @@
   }
 </style>
 <body>
-  <header>
-    <h1>待办</h1>
-    <span id="count" aria-live="polite"></span>
-  </header>
-
   <form id="create-form">
     <input id="new-title" name="title" aria-label="待办内容" required maxlength="200" placeholder="接下来要做什么？">
     <button class="primary" type="submit">添加</button>
@@ -110,7 +102,6 @@
   const form = document.querySelector("#create-form");
   const field = document.querySelector("#new-title");
   const status = document.querySelector("#status");
-  const count = document.querySelector("#count");
   const items = document.querySelector("#items");
   const empty = document.querySelector("#empty");
   const more = document.querySelector("#more");
@@ -208,7 +199,6 @@
       row.append(check, content, actions);
       return row;
     }));
-    count.textContent = loadedItems.length ? `${loadedItems.length}${nextOffset === null ? "" : "+"} 项` : "";
     empty.hidden = loadedItems.length !== 0;
     if (!loadedItems.length) empty.textContent = activeFilter === "done" ? "还没有已完成的待办" : "这里还没有待办";
     setStatus(loadedItems.length ? (activeFilter === "done" ? "已完成" : "未完成") : "");

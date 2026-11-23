@@ -1,10 +1,11 @@
 import { ListTodoIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { readDesktopPrimaryBearerToken } from "../../environments/primary/desktopAuth";
-import { Sheet, SheetHeader, SheetPopup, SheetTitle } from "../ui/sheet";
 import { SidebarMenuButton, SidebarMenuItem } from "../ui/sidebar";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { PluginModalHost } from "./PluginModalHost";
 import todoView from "./todo.html?raw";
+import { openTodoPanelEvent } from "./TodoActionReceipt";
 
 const channel = "xtwork:todo";
 
@@ -18,13 +19,20 @@ export function TodoPanel() {
     async function receive(event: MessageEvent) {
       const frame = iframe.current?.contentWindow;
       const request = event.data;
-      if (!frame || event.source !== frame || event.origin !== "null" ||
-          request?.channel !== channel || !Number.isSafeInteger(request.id)) return;
+      if (
+        !frame ||
+        event.source !== frame ||
+        event.origin !== "null" ||
+        request?.channel !== channel ||
+        !Number.isSafeInteger(request.id)
+      )
+        return;
 
       const method = request.method;
       const creating = method === "create";
       const listing = method === "list";
-      const mutating = creating || method === "update" || method === "complete" || method === "delete";
+      const mutating =
+        creating || method === "update" || method === "complete" || method === "delete";
       if (!creating && !listing && !mutating) return;
       const title = typeof request.title === "string" ? request.title.trim() : "";
       if (creating && (title.length < 1 || title.length > 200)) return;
@@ -68,7 +76,11 @@ export function TodoPanel() {
                 ...(typeof request.priority === "string" ? { priority: request.priority } : {}),
               }
             : method === "complete"
-              ? { action: "complete", id, ...(typeof request.done === "boolean" ? { done: request.done } : {}) }
+              ? {
+                  action: "complete",
+                  id,
+                  ...(typeof request.done === "boolean" ? { done: request.done } : {}),
+                }
               : { id };
         const response = await fetch(url, {
           headers,
@@ -87,9 +99,12 @@ export function TodoPanel() {
       }
     }
 
+    const openPanel = () => setOpen(true);
+    window.addEventListener(openTodoPanelEvent, openPanel);
     window.addEventListener("message", receive);
     return () => {
       active = false;
+      window.removeEventListener(openTodoPanelEvent, openPanel);
       window.removeEventListener("message", receive);
     };
   }, []);
@@ -98,30 +113,34 @@ export function TodoPanel() {
     <>
       <SidebarMenuItem className="shrink-0">
         <Tooltip>
-          <TooltipTrigger render={
-            <SidebarMenuButton aria-label="待办" size="icon" onClick={() => setOpen(true)}>
-              <ListTodoIcon />
-            </SidebarMenuButton>
-          } />
+          <TooltipTrigger
+            render={
+              <SidebarMenuButton aria-label="待办" size="icon" onClick={() => setOpen(true)}>
+                <ListTodoIcon />
+              </SidebarMenuButton>
+            }
+          />
           <TooltipPopup side="top">待办</TooltipPopup>
         </Tooltip>
       </SidebarMenuItem>
-      <Sheet open={open} onOpenChange={setOpen}>
-        <SheetPopup>
-          <SheetHeader><SheetTitle>待办</SheetTitle></SheetHeader>
-          <iframe
-            ref={iframe}
-            title="待办事项"
-            sandbox="allow-scripts allow-forms"
-            srcDoc={todoView}
-            className="min-h-0 w-full flex-1 border-0"
-            onLoad={() => iframe.current?.contentWindow?.postMessage({
-              channel,
-              theme: document.documentElement.classList.contains("dark") ? "dark" : "light",
-            }, "*")}
-          />
-        </SheetPopup>
-      </Sheet>
+      <PluginModalHost open={open} label="待办" title="待办" onOpenChange={setOpen}>
+        <iframe
+          ref={iframe}
+          title="待办事项"
+          sandbox="allow-scripts allow-forms"
+          srcDoc={todoView}
+          className="min-h-0 w-full flex-1 border-0"
+          onLoad={() =>
+            iframe.current?.contentWindow?.postMessage(
+              {
+                channel,
+                theme: document.documentElement.classList.contains("dark") ? "dark" : "light",
+              },
+              "*",
+            )
+          }
+        />
+      </PluginModalHost>
     </>
   );
 }
