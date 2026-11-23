@@ -1,0 +1,388 @@
+diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
+index bee84d71..f4662076 100644
+--- a/apps/server/src/orchestration-v2/ProjectionStore.ts
++++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
+@@ -1,3 +1,4 @@
++import { readTodoCreateReceipt } from "@t3tools/shared/xtworkTodoReceipt";
+ import type { ProjectThreadAwarenessV2Input } from "@t3tools/shared/agentAwareness";
+ import { applyOrchestrationV2ThreadVisit, pendingGuestMessageCount } from "@t3tools/contracts";
+ import { applyThreadPullRequestLinkUpdate } from "../sourceControl/threadPullRequests.ts";
+@@ -3071,7 +3072,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+                 ${event.payload.status},
+                 ${updatedAt},
+                 ${payloadJson},
+-                ${event.payload.type === "dynamic_tool" && isInlineWorkOutput(payloadJson) ? 1 : 0}
++                ${
++                  event.payload.type === "dynamic_tool" &&
++                  (isInlineWorkOutput(payloadJson) || readTodoCreateReceipt(event.payload) !== null)
++                    ? 1
++                    : 0
++                }
+               )
+               ON CONFLICT(turn_item_id)
+               DO UPDATE SET
+diff --git a/apps/server/src/orchestration-v2/WireProjection.ts b/apps/server/src/orchestration-v2/WireProjection.ts
+index 218632be..610a4fd6 100644
+--- a/apps/server/src/orchestration-v2/WireProjection.ts
++++ b/apps/server/src/orchestration-v2/WireProjection.ts
+@@ -1,3 +1,4 @@
++import { readTodoCreateReceipt } from "@t3tools/shared/xtworkTodoReceipt";
+ import type {
+   CheckpointId,
+   MessageId,
+@@ -194,7 +195,9 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
+       };
+     case "dynamic_tool": {
+       const { output: rawOutput, ...projected } = item;
+-      const output = compactDynamicToolOutput(rawOutput);
++      const receipt = readTodoCreateReceipt(item);
++      const output =
++        receipt === null ? compactDynamicToolOutput(rawOutput) : { structuredContent: receipt };
+       return {
+         ...projected,
+         input: summarizeDynamicValue(item.input),
+diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
+index 603edc06..31b33d1a 100644
+--- a/apps/web/src/components/chat/ChatComposer.tsx
++++ b/apps/web/src/components/chat/ChatComposer.tsx
+@@ -291,6 +291,7 @@ import {
+ } from "./preparingComposerImages";
+ import { ComposerControlsBar } from "./ComposerControlsBar";
+ import { composerCommandKeyHandler } from "./composerCommandKey";
++import { todoContextRecords, todoContextReference } from "../plugins/todoContext";
+ import { usePromptSuggestion } from "./usePromptSuggestion";
+ import { useFreshSessionArmed } from "./freshSessionArms";
+ 
+@@ -1126,7 +1127,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+       composerPreviewAnnotations.length +
+       composerReviewComments.length +
+       composerThreadContexts.length +
+-      composerEnvironmentContexts.length,
++      composerEnvironmentContexts.length +
++      todoContextRecords(prompt).length,
+   });
+   const composerTriggerKind = composerTrigger?.kind ?? null;
+   const compactSlashCommandAvailable =
+@@ -1961,6 +1963,28 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+     });
+     const { snapshot, trigger } = resolveActiveComposerTrigger();
+     if (!trigger) return;
++    if (item.type === "todo-item") {
++      if (
++        trigger.kind !== "path" ||
++        !composerMenuItemsRef.current.some((candidate) => candidate.id === item.id)
++      ) {
++        return;
++      }
++      const replacement = `${todoContextReference(item.todoId, item.label)} `;
++      const end = extendReplacementRangeForTrailingSpace(
++        snapshot.value,
++        trigger.rangeEnd,
++        replacement,
++      );
++      if (
++        applyPromptReplacement(trigger.rangeStart, end, replacement, {
++          expectedText: snapshot.value.slice(trigger.rangeStart, end),
++        })
++      ) {
++        setComposerHighlightedItemId(null);
++      }
++      return;
++    }
+     if (item.type === "path") {
+       if (!isPathSuggestionCurrent(item.searchTarget, trigger, environmentId, gitCwd)) return;
+       const replacement = `${serializeComposerFileLink(item.path)} `;
+diff --git a/apps/web/src/components/chat/ComposerCommandMenu.tsx b/apps/web/src/components/chat/ComposerCommandMenu.tsx
+index 50ee237c..3e5a2f42 100644
+--- a/apps/web/src/components/chat/ComposerCommandMenu.tsx
++++ b/apps/web/src/components/chat/ComposerCommandMenu.tsx
+@@ -18,6 +18,7 @@ import {
+ import {
+   BlocksIcon,
+   FolderIcon,
++  ListTodoIcon,
+   MessagesSquareIcon,
+   PackageIcon,
+   SettingsIcon,
+@@ -39,6 +40,13 @@ import { ComposerBanner } from "./ComposerBanner";
+ import { resolvePullRequestState } from "../pullRequest/pullRequestPresentation";
+ 
+ export type ComposerCommandItem =
++  | {
++      id: string;
++      type: "todo-item";
++      todoId: string;
++      label: string;
++      description: string;
++    }
+   | {
+       id: string;
+       type: "path";
+@@ -241,6 +249,9 @@ const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
+           theme={props.resolvedTheme}
+         />
+       ) : null}
++      {props.item.type === "todo-item" ? (
++        <ListTodoIcon aria-hidden="true" className="size-4 shrink-0 text-secondary-label" />
++      ) : null}
+       {props.item.type === "thread" ? (
+         <MessagesSquareIcon aria-hidden="true" className="size-4 shrink-0 text-secondary-label" />
+       ) : null}
+diff --git a/apps/web/src/components/chat/MessagesTimeline.logic.ts b/apps/web/src/components/chat/MessagesTimeline.logic.ts
+index 8d282aff..af2f449c 100644
+--- a/apps/web/src/components/chat/MessagesTimeline.logic.ts
++++ b/apps/web/src/components/chat/MessagesTimeline.logic.ts
+@@ -1,3 +1,4 @@
++import { readTodoCreateReceipt } from "@t3tools/shared/xtworkTodoReceipt";
+ import * as DateTime from "effect/DateTime";
+ import { msg } from "gt-react";
+ import { worktreeSetupAgentStarted } from "@t3tools/client-runtime/worktree-setup";
+@@ -298,11 +299,16 @@ export function liveWorkEntryLabel(
+   return workEntryDisplayLabel(entry, workspaceRoot, resolve);
+ }
+ 
++function hasTodoReceipt(entry: WorkLogEntry): boolean {
++  return readTodoCreateReceipt(entry.projectedItem?.item ?? entry.structuredPayload) !== null;
++}
++
+ export function workEntryIsVisibleInGroup(
+   entry: WorkLogEntry,
+   expandedToolGroupEntry = false,
+ ): boolean {
+   if (entry.itemType === "reasoning") return Boolean(entry.detail?.trim());
++  if (hasTodoReceipt(entry)) return true;
+   return (
+     (expandedToolGroupEntry &&
+       (entry.toolLifecycleStatus === "inProgress" ||
+@@ -1731,6 +1737,7 @@ export function deriveMessagesTimelineRows(
+         entry.entry.itemType === "system_notice" ||
+         entry.entry.itemType === "notification" ||
+         entry.entry.itemType === "todo_list" ||
++        hasTodoReceipt(entry.entry) ||
+         entry.entry.questionAnswer !== undefined ||
+         isPendingApproval(entry.entry) ||
+         !runIdIsActiveResponse(entry.entry.runId) ||
+@@ -2047,6 +2054,7 @@ export function deriveMessagesTimelineRows(
+         timelineEntry.entry.itemType === "system_notice" ||
+         timelineEntry.entry.itemType === "notification" ||
+         timelineEntry.entry.itemType === "todo_list" ||
++        hasTodoReceipt(timelineEntry.entry) ||
+         timelineEntry.entry.questionAnswer !== undefined
+       ) {
+         nextRows.push({
+@@ -2073,6 +2081,7 @@ export function deriveMessagesTimelineRows(
+           nextEntry.entry.itemType === "system_notice" ||
+           nextEntry.entry.itemType === "notification" ||
+           nextEntry.entry.itemType === "todo_list" ||
++          hasTodoReceipt(nextEntry.entry) ||
+           nextEntry.entry.questionAnswer !== undefined ||
+           isPendingApproval(nextEntry.entry) ||
+           activeWorkEntryIds.has(nextEntry.id) ||
+diff --git a/apps/web/src/components/chat/TimelineWorkEntryRow.tsx b/apps/web/src/components/chat/TimelineWorkEntryRow.tsx
+index 385123fb..82121c37 100644
+--- a/apps/web/src/components/chat/TimelineWorkEntryRow.tsx
++++ b/apps/web/src/components/chat/TimelineWorkEntryRow.tsx
+@@ -1,3 +1,7 @@
++import { isElectron } from "../../env";
++import { usePrimaryEnvironmentId } from "../../state/environments";
++import { readTodoCreateReceipt } from "@t3tools/shared/xtworkTodoReceipt";
++import { TodoActionReceipt } from "../plugins/TodoActionReceipt";
+ import { TimelinePendingApprovalRow } from "./TimelinePendingApprovalRow";
+ import { WorkLogDetails, WorkLogRow } from "./WorkLog";
+ import {
+@@ -227,7 +231,12 @@ type WorkEntryRowProps = {
+ 
+ export const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: WorkEntryRowProps) {
+   const ctx = use(TimelineRowCtx);
+-  const item = props.workEntry.projectedItem?.item;
++  const primaryEnvironmentId = usePrimaryEnvironmentId();
++  const item = props.workEntry.projectedItem?.item ?? props.workEntry.structuredPayload;
++  if (isElectron && ctx.activeThreadEnvironmentId === primaryEnvironmentId) {
++    const todo = readTodoCreateReceipt(item);
++    if (todo) return <TodoActionReceipt key={todo.id} item={todo} />;
++  }
+   const childThreadId =
+     item?.type === "notification" ? notificationChildThreadId(item.source) : undefined;
+   if (item?.type !== "notification" || childThreadId === undefined) {
+diff --git a/apps/web/src/components/chat/UserMessageContextChips.tsx b/apps/web/src/components/chat/UserMessageContextChips.tsx
+index ad758848..906bc82c 100644
+--- a/apps/web/src/components/chat/UserMessageContextChips.tsx
++++ b/apps/web/src/components/chat/UserMessageContextChips.tsx
+@@ -1,3 +1,5 @@
++import { TodoContextChip } from "../plugins/TodoContextChip";
++import { todoContextKind } from "../plugins/todoContext";
+ import { msg, T, useGT, useMessages } from "gt-react";
+ import type { MessageResolver } from "~/i18n/messages";
+ import { useNativeFileDrag } from "../../useNativeFileDrag";
+@@ -573,6 +575,8 @@ export function UserMessageContextReferenceChip(props: {
+     contextId: props.reference.contextId as ComposerContextId,
+     label: props.reference.label,
+   });
++  if (props.reference.kind === todoContextKind)
++    return <TodoContextChip label={props.reference.label} />;
+   return userMessageContextPresentationRegistry.render(props.reference.kind, props.record, {
+     environmentId: activeThreadEnvironmentId,
+     reference: props.reference,
+diff --git a/apps/web/src/components/chat/useComposerMenuItems.ts b/apps/web/src/components/chat/useComposerMenuItems.ts
+index 330e3125..ae15e94a 100644
+--- a/apps/web/src/components/chat/useComposerMenuItems.ts
++++ b/apps/web/src/components/chat/useComposerMenuItems.ts
+@@ -48,6 +48,7 @@ import {
+   matchesPullRequestQuery,
+   rankPullRequestMatches,
+ } from "../pullRequest/pullRequestList.logic";
++import { useTodoMentions } from "../plugins/useTodoMentions";
+ import type { ComposerCommandItem } from "./ComposerCommandMenu";
+ import { matchComposerModelItems } from "./composerModelMentions";
+ import type { ModelEsque } from "./providerIconUtils";
+@@ -125,6 +126,10 @@ export function useComposerMenuItems({
+   const settledPullRequestTextQuery =
+     pullRequestTextQuery === debouncedPullRequestTextQuery ? pullRequestTextQuery : null;
+   const isPathTrigger = composerTriggerKind === "path";
++  const todoMentions = useTodoMentions(
++    environmentId,
++    isPathTrigger && questionAttachmentTarget === null ? pathTriggerQuery : null,
++  );
+   const environmentThreadShells = useVisibleThreadShells(isPathTrigger);
+   // Mounts older settled threads matching the mention, here and on linked machines, which shells
+   // may leave out.
+@@ -212,6 +217,7 @@ export function useComposerMenuItems({
+     if (!composerTrigger) return [];
+     if (composerTrigger.kind === "path") {
+       return [
++        ...todoMentions,
+         ...matchComposerThreadItems(
+           {
+             shells: environmentThreadShells,
+diff --git a/apps/web/src/components/chat/useComposerSend.ts b/apps/web/src/components/chat/useComposerSend.ts
+index 43f2082e..8de742ad 100644
+--- a/apps/web/src/components/chat/useComposerSend.ts
++++ b/apps/web/src/components/chat/useComposerSend.ts
+@@ -1,3 +1,4 @@
++import { todoContextRecords } from "../plugins/todoContext";
+ import { msg } from "gt-react";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { m } from "~/i18n/messages";
+@@ -590,7 +591,8 @@ export function useComposerSend(input: ComposerSendInput) {
+           sendCtx.previewAnnotations.length +
+           sendCtx.reviewComments.length +
+           sendCtx.threadContexts.length +
+-          sendCtx.environmentContexts.length,
++          sendCtx.environmentContexts.length +
++          todoContextRecords(prompt).length,
+       });
+       // An answer's text and attachments live in the question's draft, apart from this one.
+       if (
+@@ -651,6 +653,7 @@ export function useComposerSend(input: ComposerSendInput) {
+             text: snapshot.messageText || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
+             context: buildMessageContext({
+               ...snapshot,
++              prompt: snapshot.messageText,
+               attachments: snapshot.attachments.map((attachment, index) => ({
+                 attachment,
+                 attachmentId: attachmentIds[index]!,
+@@ -832,7 +835,8 @@ export function useComposerSend(input: ComposerSendInput) {
+         composerPreviewAnnotations.length +
+         composerReviewComments.length +
+         composerThreadContexts.length +
+-        composerEnvironmentContexts.length,
++        composerEnvironmentContexts.length +
++        todoContextRecords(promptForSend).length,
+     });
+     const feedbackCommand =
+       ctxSelectedProvider === "codex" &&
+@@ -994,6 +998,7 @@ export function useComposerSend(input: ComposerSendInput) {
+     // rebinds them to the persisted id.
+     const buildOutgoingMessageContext = (attachmentIds: ReadonlyArray<string>) =>
+       buildMessageContext({
++        prompt: messageTextForSend,
+         terminalContexts: composerTerminalContextsSnapshot,
+         reviewComments: composerReviewCommentsSnapshot,
+         previewAnnotations: composerPreviewAnnotationsSnapshot,
+diff --git a/apps/web/src/components/chat/useQueuedRunEdit.ts b/apps/web/src/components/chat/useQueuedRunEdit.ts
+index 61907b93..5991c4d8 100644
+--- a/apps/web/src/components/chat/useQueuedRunEdit.ts
++++ b/apps/web/src/components/chat/useQueuedRunEdit.ts
+@@ -1,3 +1,4 @@
++import { todoContextKind } from "../plugins/todoContext";
+ import { msg } from "gt-react";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { m } from "~/i18n/messages";
+@@ -153,11 +154,13 @@ async function submitQueuedRunEdit(input: {
+     const keptRecords = (editing.context?.records ?? []).filter(
+       (record) =>
+         !isDraftOwnedRecord(record) &&
++        record.kind !== todoContextKind &&
+         (!("attachmentId" in record) ||
+           editing.existingAttachments.some((attachment) => attachment.id === record.attachmentId)),
+     );
+     const newRecords =
+       buildMessageContext({
++        prompt: editText,
+         terminalContexts: content.terminalContexts.filter(
+           (context) => context.text.trim().length > 0,
+         ),
+diff --git a/apps/web/src/components/composerContextPresentation.tsx b/apps/web/src/components/composerContextPresentation.tsx
+index ab7ce9b4..c64d2f4e 100644
+--- a/apps/web/src/components/composerContextPresentation.tsx
++++ b/apps/web/src/components/composerContextPresentation.tsx
+@@ -12,6 +12,8 @@ import { MessageCircleIcon, MousePointerClickIcon } from "lucide-react";
+ import { createContext, type ReactElement, type ReactNode, use } from "react";
+ import { msg, T, useGT, useMessages } from "gt-react";
+ import type { MessageResolver } from "../i18n/messages";
++import { TodoContextChip } from "./plugins/TodoContextChip";
++import { todoContextKind } from "./plugins/todoContext";
+ import { ComposerContextActionsContext } from "./composerContextActions";
+ 
+ import type { ComposerFileAttachment, ComposerImageAttachment } from "~/composerDraftStore";
+@@ -583,6 +585,7 @@ export function ComposerContextReferenceChip(props: {
+   label: string;
+ }): ReactElement {
+   const records = use(ComposerContextRecordsContext);
++  if (props.kind === todoContextKind) return <TodoContextChip label={props.label} />;
+   return composerContextPresentationRegistry.render(props.kind, records.get(props.contextId), {
+     label: props.label,
+   });
+diff --git a/apps/web/src/lib/composerContextRecords.ts b/apps/web/src/lib/composerContextRecords.ts
+index 31b72397..a9dee297 100644
+--- a/apps/web/src/lib/composerContextRecords.ts
++++ b/apps/web/src/lib/composerContextRecords.ts
+@@ -48,6 +48,7 @@ import {
+   type TerminalContextDraft,
+ } from "./terminalContext";
+ import type { ReviewCommentContext } from "~/reviewCommentContext";
++import { todoContextRecords } from "../components/plugins/todoContext";
+ import type { MessageResolver } from "~/i18n/messages";
+ import { changeRequestTermKind } from "~/components/pullRequest/changeRequestTerm";
+ 
+@@ -524,6 +525,7 @@ export function attachmentContextRecord(
+ }
+ 
+ export function buildMessageContext(input: {
++  prompt?: string;
+   terminalContexts: ReadonlyArray<TerminalContextDraft>;
+   reviewComments: ReadonlyArray<ReviewCommentContext>;
+   previewAnnotations: ReadonlyArray<PreviewAnnotationPayload>;
+@@ -550,6 +552,7 @@ export function buildMessageContext(input: {
+     ),
+     ...(input.attachments ?? []).map(attachmentContextRecord),
+   ];
++  if (input.prompt) records.push(...todoContextRecords(input.prompt));
+   return records.length === 0 ? undefined : { version: 1, records };
+ }
+ 
+diff --git a/packages/shared/package.json b/packages/shared/package.json
+index 781d1a4e..5a322788 100644
+--- a/packages/shared/package.json
++++ b/packages/shared/package.json
+@@ -147,6 +147,10 @@
+       "types": "./src/terminalOutput.ts",
+       "import": "./src/terminalOutput.ts"
+     },
++    "./xtworkTodoReceipt": {
++      "types": "./src/xtworkTodoReceipt.ts",
++      "import": "./src/xtworkTodoReceipt.ts"
++    },
+     "./toolOutput": {
+       "types": "./src/toolOutput.ts",
+       "import": "./src/toolOutput.ts"

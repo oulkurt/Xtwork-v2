@@ -4,7 +4,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import { McpSchema, McpServer } from "effect/ai";
+import { McpSchema, McpServer, Tool } from "effect/ai";
 import { HttpServerRequest } from "effect/http";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import { isRecord } from "./XtworkPluginHost.ts";
@@ -50,14 +50,16 @@ export const layer = Layer.effectDiscard(
       catch: pluginHostError,
     });
     for (const tool of tools) {
+      const readOnly = tool.name === "todo__list";
       yield* server.addTool({
         tool: new McpSchema.Tool({
           name: tool.name,
           title: tool.title,
           description: tool.description,
           inputSchema: tool.inputSchema,
+          ...(readOnly ? { annotations: { readOnlyHint: true } } : {}),
         }),
-        annotations: Context.empty(),
+        annotations: readOnly ? Context.add(Context.empty(), Tool.Readonly, true) : Context.empty(),
         handle: (input) =>
           Effect.withFiber((fiber) => {
             const thread = Option.getOrUndefined(

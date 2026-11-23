@@ -79,6 +79,7 @@ const serveTodo = Effect.fn("XtworkPlugins.serveTodo")(function* (
   const url = requestUrl(request);
   if (Option.isNone(url)) return errorResponse("Invalid request URL.", 400);
   const filter = url.value.searchParams.get("filter") ?? "all";
+  const query = url.value.searchParams.get("query");
   const fullNotes = url.value.searchParams.get("fullNotes") === "true";
   if (listing && !filters.includes(filter)) return errorResponse("Invalid todo filter.", 400);
   const offset = Number(url.value.searchParams.get("offset") ?? 0);
@@ -86,7 +87,12 @@ const serveTodo = Effect.fn("XtworkPlugins.serveTodo")(function* (
     return errorResponse("Invalid todo offset.", 400);
   }
   const input = listing
-    ? Option.some({ filter, offset, ...(fullNotes ? { fullNotes: true } : {}) })
+    ? Option.some({
+        filter,
+        offset,
+        ...(fullNotes ? { fullNotes: true } : {}),
+        ...(query === null ? {} : { query, limit: 8 }),
+      })
     : yield* request.json.pipe(
         Effect.provideService(HttpServerRequest.MaxBodySize, ByteSize.kibibytes(16)),
         Effect.flatMap(decodeJson),

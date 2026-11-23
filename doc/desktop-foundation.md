@@ -12,6 +12,14 @@ open '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'
 
 省略 `--skip-dmg` 可生成 DMG。独立 Node、T3 服务端及前端、Pi 和 moejs 插件宿主一起打包。Pi 通过随包启动器复用 Node。mygo 在本机启动服务端，用同源 WebView 加载界面。应用数据在 `~/Library/Application Support/Xtwork-v2`。用 `XTWORK_DATA_DIR` 可指定独立测试目录。
 
+## 通用任务首页
+
+桌面首启直接打开本机的免项目草稿。点击侧栏「新建对话」或按 `⌘N` 也会进入免项目草稿。按住 Shift 点击「新建对话」，或用草稿里的文件夹选择器，可以在现有文件夹中开始任务。已有对话仍从侧栏打开。
+
+免项目对话共用应用数据目录下的 `scratch`。需要独立保存文件的任务可以选择不同的文件夹。测试首启时，把 `XTWORK_DATA_DIR` 指到 Git 仓库外的空目录。
+
+「设置 → 通用 → 开发者功能」默认关闭，打开后可进入 Pull requests 和 Issues 的完整列表。开关保存在本机服务端设置中。终端、文件夹与编辑器操作继续通过原来的入口访问。
+
 ## 测试模型
 
 新会话默认选内置助手。T3 通过 `provider-pi` 和 stdio RPC 启动随包 Pi。`runtime/pi/models.json` 指向服务端本机网关。网关将 `standard` 映射到内测模型。Pi 会话保存在 `runtime/pi/sessions`，桌面服务进程以应用数据目录内的 `workspace` 为工作目录。默认上游是 `http://127.0.0.1:3425/v1` 的 Magpie，默认模型是 `our-free-model/hy4-flash-free`。
@@ -24,7 +32,7 @@ open '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'
 
 待办的 worker 和加载逻辑来自旧 xtwork 的 moejs 插件运行时。T3 启动独立 Go 宿主，经 JSONL 查询和调用工具。Pi 会话通过 T3 注入的 MCP 扩展发现 `todo__create`、`todo__list`、`todo__update`、`todo__complete` 和 `todo__delete`。侧栏的「待办」面板经同一宿主读取和修改待办。面板在不透明源 iframe 中运行，宿主页面转发固定的读写消息。
 
-验证时在对话里说「记一条待办：周五前发季度报告」，打开「待办」查看结果，重开应用再检查一次。可通过 `XTWORK_PLUGINS_DISABLED=todo` 验证禁用状态。日程、Obsidian 和其它插件后续按工具、界面的顺序接入。
+验证时在对话里说「记一条待办：周五前发季度报告」，对话会显示待办操作回执。通过回执打开面板或撤销，再打开「待办」查看结果，重开应用再检查一次。输入 @ 搜索待办标题，可以把待办引用到下一条消息。可通过 `XTWORK_PLUGINS_DISABLED=todo` 验证禁用状态。日程、Obsidian 和其它插件后续按工具、界面的顺序接入。
 
 这一版支持创建、筛选、编辑、完成和删除。聊天创建的记录带对话来源。待办面板每次读取一页，可以用「加载更多」查看后续记录。提醒留待对应插件能力接入。
 
@@ -52,7 +60,7 @@ XTWORK_MODEL_UPSTREAM_MODEL=auto/deepseek-v4.1-flash \
 
 - 2026-11-20 构建并验证 Apple Silicon `.app` 签名。在 `PATH=/usr/bin:/bin` 下使用包内 Node、Pi 和 Go 宿主运行冒烟。Pi 经 Magpie 的 DeepSeek 线路调用待办工具，重启后在同一线程读回，去重键有效。
 - 使用旧 Dim Alpha 冒烟数据副本升级。旧对话保持 Dim 归属，待办和自选模型仍可用，新对话使用 Pi。连续重启两次，迁移后的设置保持一致。
-- Pi RPC 实测流式文本增量、取消后上游断开、默认模型发现和 Bash 令牌过滤。锁定 T3 的 `provider-pi` 测试通过 244 项。桌面取消按钮、交互审批和正式发布仍按 [里程碑](plan/10-里程碑与验收.md) 验收。
+- Pi RPC 实测流式文本增量、取消后上游断开、默认模型发现和 Bash 令牌过滤。锁定 T3 的 `provider-pi` 测试通过 244 项。待办面板的标题栏避开桌面右上角控制区，@ 待办引用会保存 todo-item 记录。桌面取消按钮、交互审批和正式发布仍按 [里程碑](plan/10-里程碑与验收.md) 验收。
 
 ### Dim Alpha 历史验收
 
