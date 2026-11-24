@@ -20,7 +20,7 @@ moejs 和首发内置插件范围已经明确。规划提出由 T3 服务端监�
 
 ## Decision
 
-候选边界是由 T3 负责会话鉴权、MCP 和 UI 接入，Go 宿主负责解析 manifest、裁决能力、监管 worker 和写入插件数据。规划要求插件通过宿主申请能力，把文件、网络、进程和凭据的原始权限留在受信代码。冻结前确认 PD-01 的协议与升级范围，以及 Q-04、Q-09、Q-10 的远程和第三方信任边界。 [插件设计](../plan/05-插件系统.md) · [待决策事项](../../DECISIONS.md#pending-decisions)
+候选边界是由 T3 负责会话鉴权、MCP 和 UI 接入，Go 宿主负责解析 manifest、裁决能力、监管 worker 和写入插件数据。规划要求插件通过宿主申请能力，把文件、网络、进程和凭据的原始权限留在受信代码。冻结前确认 PD-01 的协议与升级范围，以及 Q-09、Q-10 的 IM 卡片审批与第三方信任边界（IM 远程连接已由 [ADR-011](011-mingle-im-bridge.md) 独立为 T3 侧受信 `im-bridge` 服务，保持 moejs 沙箱零网络与零凭据边界）。 [插件设计](../plan/05-插件系统.md) · [待决策事项](../../DECISIONS.md#pending-decisions)
 
 ## Consequences and Trade-offs
 
@@ -36,5 +36,6 @@ moejs 和首发内置插件范围已经明确。规划提出由 T3 服务端监�
 
 - [ADR-003 · 内置插件与共享上下文](003-bundled-plugins.md)
 - [ADR-005 · 独立搭建 v2](005-clean-v2-start.md)
+- [ADR-011 · 基于 Mingle 渠道层的 IM 远程连接服务](011-mingle-im-bridge.md)
 - [待决策事项](../../DECISIONS.md#pending-decisions)
 - [决策索引](../../DECISIONS.md)

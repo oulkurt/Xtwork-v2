@@ -7,7 +7,7 @@
 - v2 取代 xtwork。保留 T3 Code 的 React 界面、Node 服务端和任务编排，桌面壳使用 mygo。预览锁定 `v0.10.0`。[构建版本锁](upstream.lock)
 - 随应用内置 Pi 作为默认助手，通过 T3 原生 Pi 适配层接入。日常界面使用自有品牌，第三方许可随安装包发布。[运行时设计](doc/plan/03-内置运行时-Pi.md)
 - 默认首页以通用任务为主。Pull requests 和 Issues 的入口放到设置内的开发者功能区。[通用任务规划](doc/plan/08-通用任务化改造.md)
-- 用 moejs 做插件。待办、日程和 Obsidian 进入首发验收。飞书、企业微信、微信、钉钉是远程连接的候选，具体功能仍待讨论。
+- 用 moejs 做功能插件；待办、日程和 Obsidian 进入首发验收。IM 远程连接复用 Mingle（MIT）渠道层与伴侣范式，以 T3 侧独立 Node 服务提供，首发飞书、微信（iLink）和企业微信。[远程连接决策](doc/decisions/011-mingle-im-bridge.md)
 - v2 独立搭建。历史 `xtwork_mygo` 只提供可选参考，旧外壳、本地补丁和数据迁移都不构成开工依赖。
 
 ## 运行桌面预览
