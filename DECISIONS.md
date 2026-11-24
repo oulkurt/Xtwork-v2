@@ -18,10 +18,12 @@
 | --- | --- | --- |
 | [ADR-001](doc/decisions/001-desktop-architecture.md) | T3 Code 的 React 界面和 Node/Effect 服务端负责交互、编排和持久化。mygo/Go 外壳负责窗口、原生集成和服务端生命周期。 | Confirmed |
 | [ADR-009](doc/decisions/009-default-pi-runtime.md) | 随产品打包 Pi 作为默认助手，复用 T3 的原生 Pi 适配和会话工具桥。 | Confirmed |
-| [ADR-003](doc/decisions/003-bundled-plugins.md) | 以 moejs 提供与对话共享上下文的插件。待办、日程、Obsidian 进入首发验收。远程连接是插件方向，平台范围另定。 | Confirmed |
+| [ADR-003](doc/decisions/003-bundled-plugins.md) | 以 moejs 提供与对话共享上下文的功能插件，待办、日程、Obsidian 进入首发验收；远程连接架构与首发范围由 [ADR-011](doc/decisions/011-mingle-im-bridge.md) 承接。 | Confirmed |
 | [ADR-004](doc/decisions/004-general-task-experience.md) | 默认首页服务通用任务。Pull requests 和 Issues 的入口放在设置的开发者功能区。 | Confirmed |
 | [ADR-005](doc/decisions/005-clean-v2-start.md) | v2 取代 xtwork，独立搭建并使用独立数据目录。旧实现可作参考，旧数据导入单独决定。 | Confirmed |
 | [ADR-006](doc/decisions/006-upstream-update-policy.md) | 等 T3 Code 官方稳定版发布后再评估上游升级。影响已发布版本的严重安全修复可以提前同步。 | Confirmed |
+| [ADR-010](doc/decisions/010-plugin-v2-runtime.md) | 插件 v2 采用单一目录与功能/外观双轨运行时，功能视图复用 `AppRouteModal`。 | Confirmed |
+| [ADR-011](doc/decisions/011-mingle-im-bridge.md) | 复用 Mingle（MIT）渠道层与状态机，在 T3 侧以独立 Node `im-bridge` 提供内置 IM 远程连接服务，首发飞书/微信/企微，第一版开放私聊与群聊 `@`，对齐 Mingle 伴侣范式并以危险工具 Owner 批准和提示词注入四层防御守住安全边界。 | Confirmed |
 
 ## 技术基线与契约
 
@@ -38,19 +40,18 @@ Pi 的桌面预览结果记录在实现说明。Windows、正式模型授权与�
 
 ## Pending Decisions
 
-下表中的 Q 编号沿用 [产品决策清单](doc/plan/11-风险与待定.md#产品决策清单)。Q-11 已有明确决定，见 [ADR-006](doc/decisions/006-upstream-update-policy.md)。
+下表中的 Q 编号沿用 [产品决策清单](doc/plan/11-风险与待定.md#产品决策清单)。Q-11 已有明确决定（[ADR-006](doc/decisions/006-upstream-update-policy.md)），Q-04 已有明确决定（[ADR-011](doc/decisions/011-mingle-im-bridge.md)）。
 
 | ID | 需要项目负责人确认 | 证据 | 相关 ADR |
 | --- | --- | --- | --- |
 | Q-01 | 对外品牌名、图标、应用标识与发布源。 | Unknown · 预览使用临时配置 | [ADR-009](doc/decisions/009-default-pi-runtime.md) · [ADR-005](doc/decisions/005-clean-v2-start.md) |
 | Q-02 | 除 PR 和 Issues 之外，哪些入口归入开发者功能。 | Unknown | [ADR-004](doc/decisions/004-general-task-experience.md) |
 | Q-03 | 首发模型由产品提供还是自带 Key，以及账号、凭据和模型数据留存边界。 | Unknown · 两条路径已有设计 | [ADR-008](doc/decisions/008-model-gateway.md) |
-| Q-04 | 首个 IM 平台与开放范围，包含绑定和文本闭环。 | Unknown · 飞书是候选 | [ADR-003](doc/decisions/003-bundled-plugins.md) · [ADR-007](doc/decisions/007-plugin-contract.md) |
 | Q-05 | 是否导入旧数据，包含待办、日程、对话历史和授权的范围。 | Unknown | [ADR-005](doc/decisions/005-clean-v2-start.md) |
 | Q-06 | 相对时间或模糊意图的自动录入、澄清和撤销规则。 | Unknown · 预览支持创建与查询 | [ADR-003](doc/decisions/003-bundled-plugins.md) |
-| Q-07 | 默认是否后台运行，离线后怎样补提醒。 | Unknown | [ADR-001](doc/decisions/001-desktop-architecture.md) · [ADR-003](doc/decisions/003-bundled-plugins.md) |
+| Q-07 | 默认是否后台运行，离线后怎样补提醒。 | Unknown · ADR-011 约定绑定 IM 后引导开启 | [ADR-001](doc/decisions/001-desktop-architecture.md) · [ADR-003](doc/decisions/003-bundled-plugins.md) · [ADR-011](doc/decisions/011-mingle-im-bridge.md) |
 | Q-08 | Obsidian 首发是否开放写入。 | Unknown · 读取与引用进入验收 | [ADR-003](doc/decisions/003-bundled-plugins.md) |
-| Q-09 | 是否从 IM 审批，以及可审批的动作范围。 | Unknown | [ADR-007](doc/decisions/007-plugin-contract.md) |
+| Q-09 | IM 平台内卡片审批的开放范围与防重体验（危险操作必须由 Owner 批准已在 ADR-011 确认）。 | Unknown · 飞书卡片待真机验收 | [ADR-007](doc/decisions/007-plugin-contract.md) · [ADR-011](doc/decisions/011-mingle-im-bridge.md) |
 | Q-10 | 第三方插件分发和插件工坊的范围、时点与信任要求。 | Unknown | [ADR-007](doc/decisions/007-plugin-contract.md) |
 | Q-12 | 首发平台、架构与正式制品范围。 | Unknown · macOS arm64 有预览证据 | [ADR-001](doc/decisions/001-desktop-architecture.md) |
 | PD-01 | 冻结 v2 插件契约、授权与存储兼容边界。 | Unknown · 公开契约尚未冻结，有预览实现 | [ADR-007](doc/decisions/007-plugin-contract.md) |

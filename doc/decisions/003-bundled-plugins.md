@@ -19,11 +19,11 @@
 
 ## Decision
 
-使用 moejs。内置待办、日程、Obsidian 与对话共享 agent 上下文及各自的插件状态。对话中的写入反馈来自插件的实际执行结果。远程连接沿用插件方向，平台、功能和审批范围另行确认。 [内置插件行为](../plan/06-内置插件-待办日程笔记.md) · [远程连接](../plan/07-远程连接插件.md)
+使用 moejs。内置待办、日程、Obsidian 与对话共享 agent 上下文及各自的插件状态。对话中的写入反馈来自插件的实际执行结果。远程连接后续由 [ADR-011](011-mingle-im-bridge.md) 承接，改由 T3 侧独立受信 Node 服务 `im-bridge` 提供并收口首发范围（Q-04）。 [内置插件行为](../plan/06-内置插件-待办日程笔记.md) · [远程连接](../plan/07-远程连接插件.md)
 
 ## Consequences and Trade-offs
 
-桌面预览已接通待办创建、分页查询与持久化。日程、Obsidian、撤销、默认后台与 IM 范围仍按里程碑和 Q-04、Q-06–Q-09 决定。 [桌面预览待办](https://github.com/oulkurt/Xtwork-v2/blob/488b882a6e6d24b379384b33eb6cec667574c2f5/doc/desktop-foundation.md#待办插件) · [功能验收](../plan/10-里程碑与验收.md) · [待决策事项](../../DECISIONS.md#pending-decisions)
+桌面预览已接通待办创建、分页查询与持久化。日程、Obsidian、撤销、默认后台与 IM 卡片审批仍按里程碑和 Q-06–Q-09 决定（IM 远程连接架构与 Q-04 首发范围见 [ADR-011](011-mingle-im-bridge.md)）。 [桌面预览待办](https://github.com/oulkurt/Xtwork-v2/blob/488b882a6e6d24b379384b33eb6cec667574c2f5/doc/desktop-foundation.md#待办插件) · [功能验收](../plan/10-里程碑与验收.md) · [待决策事项](../../DECISIONS.md#pending-decisions)
 
 ## Migration Implications
 
@@ -34,4 +34,5 @@
 - [ADR-009 · 默认运行时](009-default-pi-runtime.md)
 - [ADR-005 · 独立搭建 v2](005-clean-v2-start.md)
 - [ADR-007 · 插件契约与权限](007-plugin-contract.md)
+- [ADR-011 · 基于 Mingle 渠道层的 IM 远程连接服务](011-mingle-im-bridge.md)
 - [决策索引](../../DECISIONS.md)
