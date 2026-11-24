@@ -50,7 +50,7 @@ export function TodoPanel() {
 
       try {
         const token = await readDesktopPrimaryBearerToken();
-        if (!token) throw new Error("请先连接本机服务");
+        if (!token) return reply({ error: "请先连接本机服务" });
         const headers = new Headers({ Authorization: `Bearer ${token}` });
         if (mutating) headers.set("Content-Type", "application/json");
         const url = listing
@@ -92,7 +92,7 @@ export function TodoPanel() {
             : {}),
         });
         const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "待办服务暂不可用");
+        if (!response.ok) return reply({ error: String(result.error || "待办服务暂不可用") });
         reply({ value: result });
       } catch (error) {
         reply({ error: error instanceof Error ? error.message : "待办服务暂不可用" });

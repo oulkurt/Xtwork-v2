@@ -32,10 +32,9 @@ export function useTodoMentions(environmentId: EnvironmentId, query: string | nu
           headers: { Authorization: `Bearer ${token}` },
           signal: controller.signal,
         });
-        if (!response.ok) throw new Error("Todo suggestions unavailable");
-        const { items } = (await response.json()) as {
-          items: Array<{ id: unknown; title: unknown }>;
-        };
+        const { items } = response.ok
+          ? ((await response.json()) as { items: Array<{ id: unknown; title: unknown }> })
+          : { items: [] };
         if (!controller.signal.aborted) {
           setResult({
             query: localQuery,

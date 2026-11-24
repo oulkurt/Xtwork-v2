@@ -18,11 +18,13 @@ open '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'
 
 免项目对话共用应用数据目录下的 `scratch`。需要独立保存文件的任务可以选择不同的文件夹。测试首启时，把 `XTWORK_DATA_DIR` 指到 Git 仓库外的空目录。
 
-「设置 → 通用 → 开发者功能」默认关闭，打开后可进入 Pull requests 和 Issues 的完整列表。开关保存在本机服务端设置中。终端、文件夹与编辑器操作继续通过原来的入口访问。
+「设置 → 通用 → 开发者功能」默认关闭，设置由本机服务端保存。普通模式保留本地文件夹、改动对比和检查点、用量、待办、定时任务、技能和外观。输入框只有内置助手的标准模型可用时会收起模型选择器。普通模式新建定时任务使用所选文件夹和内置助手，编辑已有任务会保留它原来的工作区和模型。
+
+开启后，终端、分支与工作树、编辑器、克隆和外部运行时恢复显示。Pull requests 和 Issues 可从「设置 → 通用 → 开发者功能」或 `⌘K` 打开。侧栏底部提供待办、设置和用量入口。mygo 不提供浏览器预览、手机配对、SSH、WSL、Tailscale、服务端暴露、CLI 安装和 SnapShot。
 
 ## 测试模型
 
-新会话默认选内置助手。T3 通过 `provider-pi` 和 stdio RPC 启动随包 Pi。`runtime/pi/models.json` 指向服务端本机网关。网关将 `standard` 映射到内测模型。Pi 会话保存在 `runtime/pi/sessions`，桌面服务进程以应用数据目录内的 `workspace` 为工作目录。默认上游是 `http://127.0.0.1:3425/v1` 的 Magpie，默认模型是 `our-free-model/hy4-flash-free`。
+新对话默认选内置助手。T3 通过 `provider-pi` 和 stdio RPC 启动随包 Pi。`runtime/pi/models.json` 指向服务端本机网关。网关将 `standard` 映射到内测模型。Pi 会话保存在 `runtime/pi/sessions`，桌面服务进程以应用数据目录内的 `workspace` 为工作目录。默认上游是 `http://127.0.0.1:3425/v1` 的 Magpie，默认模型是 `our-free-model/hy4-flash-free`。
 
 在终端设置 `XTWORK_MODEL_UPSTREAM_MODEL=auto/deepseek-v4.1-flash`，再直接运行 `.app/Contents/MacOS/` 下的可执行文件，可用 Magpie 的 DeepSeek 线路。`XTWORK_MODEL_UPSTREAM_URL` 可指定其它 Chat Completions 服务，`XTWORK_MODEL_UPSTREAM_KEY_FILE` 可指向只供服务端读取的密钥文件。凭据和一次性网关令牌保存在进程侧。
 
@@ -58,7 +60,17 @@ XTWORK_MODEL_UPSTREAM_MODEL=auto/deepseek-v4.1-flash \
 
 ## 验收
 
-- 2026-11-20 构建并验证 Apple Silicon `.app` 签名。在 `PATH=/usr/bin:/bin` 下使用包内 Node、Pi 和 Go 宿主运行冒烟。Pi 经 Magpie 的 DeepSeek 线路调用待办工具，重启后在同一线程读回，去重键有效。
+M1 界面回归用随包 Node、Pi 和待办宿主启动真实本机服务。Chromium 加载产包页面和 `shell/preload.js`，文件夹选择器使用临时测试文件夹，Pi 连接本地测试模型。测试覆盖首启草稿、开发者开关刷新后保持、PR 和 Issues 导航、普通模式的改动对比、定时任务表单、待办新增和简体中文入口。运行方式如下。
+
+```sh
+node scripts/build-server.mjs
+node scripts/build-desktop.mjs --skip-dmg
+node scripts/test-desktop-ui.mjs
+```
+
+截图写入 `.build/desktop-ui/`。2026-11-24 验收通过 Apple Silicon 应用签名、前端类型检查、6,993 项 Web 单元与浏览器测试、Pi 设置测试及两组 Go 测试。签名发布、实际模型授权和干净机器安装按发布验收执行。
+
+- 2026-11-20 构建并验证 Apple Silicon `.app` 签名。在 `PATH=/usr/bin:/bin` 下使用包内 Node、Pi 和 Go 宿主运行冒烟。Pi 经 Magpie 的 DeepSeek 线路调用待办工具，重启后在同一对话读回，去重键有效。
 - 使用旧 Dim Alpha 冒烟数据副本升级。旧对话保持 Dim 归属，待办和自选模型仍可用，新对话使用 Pi。连续重启两次，迁移后的设置保持一致。
 - Pi RPC 实测流式文本增量、取消后上游断开、默认模型发现和 Bash 令牌过滤。锁定 T3 的 `provider-pi` 测试通过 244 项。待办面板的标题栏避开桌面右上角控制区，@ 待办引用会保存 todo-item 记录。桌面取消按钮、交互审批和正式发布仍按 [里程碑](plan/10-里程碑与验收.md) 验收。
 

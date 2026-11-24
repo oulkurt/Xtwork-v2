@@ -1,16 +1,12 @@
-import { useAtomValue } from "@effect/atom-react";
 import { AuthSettingsWriteScope } from "@t3tools/contracts";
-import { Atom } from "effect/reactivity";
 import { useNavigate } from "@tanstack/react-router";
 import { useGT } from "gt-react";
 import { useUpdateEnvironmentSettings } from "../../hooks/useSettings";
 import {
-  useEnvironments,
-  useIssuesSupported,
-  usePrimaryEnvironmentId,
-  usePullRequestsSupported,
-} from "../../state/environments";
-import { serverEnvironment } from "../../state/server";
+  useDeveloperFeatures,
+  useDeveloperFeaturesEnvironmentId,
+} from "../../hooks/useDeveloperFeatures";
+import { useIssuesSupported, usePullRequestsSupported } from "../../state/environments";
 import { useEnvironmentScope } from "../../state/session";
 import { readIssueListPreferences } from "../issue/issueListPreferences";
 import { readPullRequestListPreferences } from "../pullRequest/pullRequestListPreferences";
@@ -18,26 +14,11 @@ import { Button } from "../ui/button";
 import { Switch } from "../ui/switch";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
 
-const unavailableDeveloperSettings = Atom.make(null);
-
 export function DeveloperFeaturesSettings() {
   const gt = useGT();
   const navigate = useNavigate();
-  const primaryEnvironmentId = usePrimaryEnvironmentId();
-  const { environments } = useEnvironments();
-  const environmentId =
-    primaryEnvironmentId ??
-    environments.find(
-      (environment) =>
-        environment.connection.phase === "connected" && environment.serverConfig !== null,
-    )?.environmentId ??
-    null;
-  const enabled = useAtomValue(
-    environmentId === null
-      ? unavailableDeveloperSettings
-      : serverEnvironment.settingsValueAtom(environmentId),
-    (settings) => settings?.developerFeaturesEnabled ?? false,
-  );
+  const environmentId = useDeveloperFeaturesEnvironmentId();
+  const enabled = useDeveloperFeatures();
   const canWrite = useEnvironmentScope(environmentId, AuthSettingsWriteScope);
   const updateSettings = useUpdateEnvironmentSettings(environmentId);
   const pullRequestsSupported = usePullRequestsSupported();

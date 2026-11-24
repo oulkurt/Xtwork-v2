@@ -49,6 +49,10 @@ type backend struct {
 	expiresAt time.Time
 }
 
+func backendLogPath(dataDir string) string {
+	return filepath.Join(dataDir, "backend.log")
+}
+
 func startBackend(parent context.Context, cfg config) (*backend, error) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -61,7 +65,7 @@ func startBackend(parent context.Context, cfg config) (*backend, error) {
 	if err := os.MkdirAll(filepath.Join(cfg.dataDir, "workspace"), 0700); err != nil {
 		return nil, err
 	}
-	logPath := filepath.Join(cfg.dataDir, "backend.log")
+	logPath := backendLogPath(cfg.dataDir)
 	log, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, err

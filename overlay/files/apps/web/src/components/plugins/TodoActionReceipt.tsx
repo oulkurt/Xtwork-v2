@@ -17,13 +17,19 @@ export function TodoActionReceipt({ item }: { item: TodoCreateReceipt }) {
     setStatus("pending");
     try {
       const token = await readDesktopPrimaryBearerToken();
-      if (!token) throw new Error("Todo service unavailable");
+      if (!token) {
+        setStatus("failed");
+        return;
+      }
       const response = await fetch("/api/xtwork/todo", {
         method: "DELETE",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ id: item.id, undoCreatedAt: item.createdAt }),
       });
-      if (!response.ok) throw new Error("Todo undo failed");
+      if (!response.ok) {
+        setStatus("failed");
+        return;
+      }
       const result = (await response.json()) as { deleted?: boolean };
       setStatus(result.deleted === true ? "undone" : "changed");
     } catch {

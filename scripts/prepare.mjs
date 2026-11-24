@@ -1,5 +1,6 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { brandTranslationCatalog, buildBrandedMessageKeys } from "./brandCatalog.mjs";
 import { brand, build, gitOutput, lock, overlay, readJson, root, run, source, t3 } from "./project.mjs";
 
 function overlayFile(relativePath, replacements) {
@@ -125,6 +126,16 @@ overlayFile("apps/server/src/cli/config.ts", [
 overlayFile("apps/web/src/legalLinks.ts", [
   ['"https://t3.codes/privacy-policy"', JSON.stringify(`https://github.com/${brand.repository}#数据与隐私`)],
 ]);
+overlayFile("apps/web/src/lib/bootError.ts", [
+  [
+    'const DOWNLOAD_URL = "https://t3.codes/download";',
+    `const DOWNLOAD_URL = ${JSON.stringify(`https://github.com/${brand.repository}/releases`)};`,
+  ],
+  [
+    'const ISSUE_URL = "https://github.com/pingdotgg/t3code/issues/new";',
+    `const ISSUE_URL = ${JSON.stringify(`${brand.supportUrl}/new`)};`,
+  ],
+]);
 const settingsPath = "apps/web/src/components/settings/SettingsPanels.tsx";
 const settingsSource = readFileSync(join(t3, settingsPath), "utf8");
 const desktopTrack = settingsSource.match(/\{hasDesktopBridge \? \(\n        <SettingsRow\n          \{\.\.\.setting\("update-track"\)\}[\s\S]+?\) : selectedHostedAppChannel/)
@@ -154,6 +165,85 @@ overlayFile(settingsPath, [
   ['        <MobileAppSettingsRow />\n', ""],
   ['See your agents, import projects, and set up your phone.', 'See your agents and import projects.'],
   ['Notices for dependencies, assets, and optional tools used by T3 Code.', 'Open-source notices for dependencies, assets, and optional tools.'],
+]);
+
+const webSource = join(t3, "apps/web/src");
+const translationsDir = join(webSource, "i18n", "translations");
+const brandSourceDirs = [
+  webSource,
+  join(t3, "packages/client-runtime/src"),
+  join(t3, "packages/shared/src"),
+];
+const brandedMessageKeys = buildBrandedMessageKeys(readJson(join(translationsDir, "en.json")), brand.name);
+for (const dir of brandSourceDirs) {
+  for (const entry of readdirSync(dir, { recursive: true, withFileTypes: true })) {
+    if (
+      !entry.isFile() ||
+      !/\.(?:tsx?|json)$/.test(entry.name) ||
+      /(?:test|fixture|OpenSourceLicenses)\b/.test(entry.name)
+    ) {
+      continue;
+    }
+    const path = join(entry.parentPath, entry.name);
+    const original = readFileSync(path, "utf8");
+    let branded = original;
+    if (entry.parentPath === translationsDir) {
+      const catalog = brandTranslationCatalog(JSON.parse(original), brand.name, brandedMessageKeys);
+      branded = `${JSON.stringify(catalog, null, 2)}\n`;
+    } else if (original.includes("T3 Code")) {
+      branded = original.replaceAll("T3 Code", () => brand.name);
+    }
+    if (branded !== original) writeFileSync(path, branded);
+  }
+}
+for (const path of [
+  "apps/server/src/orchestration-v2/Orchestrator.ts",
+  "apps/server/src/orchestration-v2/ProviderTurnStartService.ts",
+  "apps/server/src/orchestration-v2/PullRequestWatchReactor.ts",
+  "apps/server/src/orchestration-v2/UserFacingErrors.ts",
+  "apps/server/src/orchestration-v2/RestartContinuation.ts",
+  "apps/server/src/orchestration-v2/ContextHandoffService.ts",
+  "apps/server/src/orchestration-v2/pullRequestWatch.ts",
+  "apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts",
+  "apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts",
+  "apps/server/src/textGeneration/textGeneratorDrivers.ts",
+  "apps/server/src/desktopUpdate/DesktopAppUpdate.ts",
+  "apps/server/src/provider/AntigravityInstallation.ts",
+  "apps/server/src/provider/AntigravityProvider.ts",
+  "apps/server/src/provider/ClaudeProvider.ts",
+  "apps/server/src/provider/CodexInstallation.ts",
+  "apps/server/src/provider/CodexAuthCallbackPage.ts",
+  "apps/server/src/provider/ProviderAuthService.ts",
+  "apps/server/src/provider/providerCompatibility.ts",
+  "apps/server/src/provider/providerInstallation.ts",
+  "apps/server/src/provider/providerMaintenanceRunner.ts",
+  "apps/server/src/persistence/Sqlite.ts",
+  "apps/server/src/persistence/DatabaseMaintenance.ts",
+  "apps/server/src/persistence/DatabaseStorage.ts",
+  "apps/server/src/serverOwnership.ts",
+  "apps/server/src/project/ManagedProjectFolders.ts",
+  "apps/server/src/preview/ServerBrowserPage.ts",
+  "apps/server/src/device/SshDeviceHost.ts",
+  "apps/server/src/cloud/cliAuthHtml.ts",
+  "apps/server/src/cloud/relayResponse.ts",
+  "apps/server/src/cloud/selfUpdate.ts",
+  "apps/server/src/cli/app.ts",
+  "packages/provider-pi/src/server/status.ts",
+  "packages/provider-kiro/src/server/status.ts",
+  "packages/provider-acp-registry/src/server/driver.ts",
+  "packages/provider-cursor/src/server/textGeneration.ts",
+  "packages/provider-grok/src/server/status.ts",
+  "packages/provider-fx/src/server/status.ts",
+  "packages/provider-muse/src/server/status.ts",
+  "packages/provider-opencode/src/server/status.ts",
+]) {
+  overlayFile(path, [["T3 Code", brand.name]]);
+}
+overlayFile("apps/server/src/provider/CodexProvider.ts", [
+  ["Codex is disabled in T3 Code settings.", `Codex is disabled in ${brand.name} settings.`],
+]);
+overlayFile("packages/provider-cursor/src/server/status.ts", [
+  ["Cursor is disabled in T3 Code settings.", `Cursor is disabled in ${brand.name} settings.`],
 ]);
 
 const publicDir = join(t3, "apps/web/public");

@@ -64,21 +64,25 @@ func run() error {
 	return mygo.App.Run()
 }
 
-func (d *Desktop) openWindow(brand branding) {
-	lang := mygo.App.PreferredLanguages()
+func (d *Desktop) preloadInit(brand branding, lang []string) map[string]any {
 	if lang == nil {
 		lang = []string{}
 	}
-	init, err := json.Marshal(map[string]any{
+	return map[string]any{
 		"origin":             d.server.origin,
 		"wsOrigin":           "ws" + d.server.origin[len("http"):],
 		"bootstrapToken":     bootstrapToken(d.server.secret, time.Now()),
 		"platform":           runtime.GOOS,
 		"preferredLanguages": lang,
+		"backendLogPath":     backendLogPath(d.dataDir),
 		"branding": map[string]string{
 			"baseName": brand.Name, "displayName": brand.DisplayName, "stageLabel": brand.StageLabel,
 		},
-	})
+	}
+}
+
+func (d *Desktop) openWindow(brand branding) {
+	init, err := json.Marshal(d.preloadInit(brand, mygo.App.PreferredLanguages()))
 	if err != nil {
 		panic(err) // All values above are JSON strings or string arrays.
 	}

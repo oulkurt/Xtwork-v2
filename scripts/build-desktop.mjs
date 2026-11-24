@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { chmodSync, cpSync, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { assertNoLeakedUserVisibleBrand } from "./brandCatalog.mjs";
 import { brand, build, lock, overlay, readJson, root, run, t3 } from "./project.mjs";
 
 if (process.platform !== "darwin" || process.arch !== "arm64") {
@@ -102,6 +103,7 @@ run("go", ["run", `github.com/egoist/mygo/cmd/mygo@${lock.mygo}`, ...flags], { c
 const app = join(release, `${brand.displayName}.app`);
 run("codesign", ["--verify", "--strict", app]);
 const appResources = join(app, "Contents", "Resources");
+assertNoLeakedUserVisibleBrand(join(appResources, "server", "dist"));
 run(join(appResources, "node", "bin", "node"), [join(appResources, "server", "dist", "bin.mjs"), "--version"]);
 run(join(appResources, "runtime", "pi", "pi"), ["--version"]);
 
