@@ -1,0 +1,371 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import type { InboundMessage } from "../src/channels/channel.ts";
+import { CLAIM_TTL_MS } from "../src/core/access.ts";
+import { makeIdempotencyKey, MAX_PERSON_NOTE_BYTES, Store } from "../src/store/store.ts";
+
+function msg(overrides: Partial<InboundMessage> = {}): InboundMessage {
+  return {
+    platformId: overrides.platformId ?? "pm-1",
+    chat: overrides.chat ?? { platformId: "chat-1", kind: "group", name: "Ops Group" },
+    sender: overrides.sender ?? { id: "user-2", name: "Bob", isBot: false },
+    text: overrides.text ?? "hello world",
+    attachments: overrides.attachments ?? [],
+    addressedToBot: overrides.addressedToBot ?? false,
+    sentAt: overrides.sentAt ?? 1_700_000_000_000,
+    ...(overrides.replyTo ? { replyTo: overrides.replyTo } : {}),
+    ...(overrides.mentioned !== undefined ? { mentioned: overrides.mentioned } : {}),
+    ...(overrides.earlier ? { earlier: overrides.earlier } : {}),
+  };
+}
+
+describe("SQLite store invariants (ADR-011 S5/S6)", () => {
+  it("enforces gate-before-background and FTS5 trigram search over allowed chats only", () => {
+    const store = new Store(":memory:");
+    try {
+      const conn = store.createConnection({
+        platform: "feishu",
+        secretRef: "sec:1",
+        lifecycleState: "active",
+        ownerId: "owner-1",
+        askAll: true,
+      });
+
+      // 1. Unapproved group background message MUST be dropped (not stored, not searchable!)
+      const bgDrop = store.ingestInbound(
+        conn.id,
+        "org",
+        msg({ platformId: "m-unapproved-bg", text: "secret project omega chatter", addressedToBot: false }),
+      );
+      assert.equal(bgDrop.kind, "unapproved_background_dropped");
+      assert.equal(store.search("project omega").length, 0);
+      assert.equal(store.listUnackedTriggers().length, 0);
+
+      // 2. Unapproved group trigger message is stored ONLY as `held` (not in FTS5, not in unacked triggers!)
+      const held = store.ingestInbound(
+        conn.id,
+        "org",
+        msg({ platformId: "m-held-1", text: "please inspect omega budget", addressedToBot: true }),
+      );
+      assert.equal(held.kind, "held");
+      assert.equal(store.search("omega budget").length, 0);
+      assert.equal(store.listUnackedTriggers().length, 0);
+
+      // 3. Approve the group -> admit held trigger -> now searchable AND in unacked triggers
+      store.setChatAccess(held.chat.id, "allowed");
+      store.moveInbound([held.message.id], "admit");
+      assert.equal(store.search("omega budget").length, 1);
+      assert.equal(store.listUnackedTriggers().length, 1);
+
+      // 4. Allowed group background chatter enters FTS5 + unseen(), NEVER enters listUnackedTriggers()
+      const allowedBg = store.ingestInbound(
+        conn.id,
+        "org",
+        msg({
+          platformId: "m-bg-1",
+          text: "关于季度发布计划的讨论",
+          addressedToBot: false,
+          sentAt: 1_700_000_005_000,
+        }),
+      );
+      assert.equal(allowedBg.kind, "background");
+      assert.equal(allowedBg.message.state, "ignored");
+      assert.equal(store.search("季度发布").length, 1);
+      // Short 2-char CJK fallback search works over allowed chats!
+      assert.equal(store.search("季度").length, 1);
+      assert.equal(store.unseen(held.chat.id, 1_700_000_010_000), 1);
+      assert.equal(store.listUnackedTriggers().length, 1); // still only m-held-1
+
+      // 5. Blocked contact's messages NEVER enter background search or unacked triggers
+      const badContact = store.touchContact(conn.id, "bad-user", "Mallory");
+      store.setContactAccess(badContact.id, "blocked");
+      const blocked = store.ingestInbound(
+        conn.id,
+        "org",
+        msg({
+          platformId: "m-blocked-1",
+          sender: { id: "bad-user", name: "Mallory", isBot: false },
+          text: "malicious payload injection",
+          addressedToBot: true,
+        }),
+      );
+      assert.equal(blocked.kind, "blocked");
+      assert.equal(store.search("malicious").length, 0);
+      assert.equal(store.listUnackedTriggers().length, 1);
+
+      // 6. Blocking the group immediately purges its entries from FTS5!
+      store.setChatAccess(held.chat.id, "blocked");
+      assert.equal(store.search("季度发布").length, 0);
+      assert.equal(store.search("季度").length, 0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("enforces strict pairing isolation and 5-attempt lockout", () => {
+    let now = 1_700_000_000_000;
+    const store = new Store(":memory:", () => now);
+    try {
+      const conn = store.createConnection({
+        platform: "wecom",
+        secretRef: "sec:wecom",
+        lifecycleState: "pairing",
+        claimCode: "123456",
+        claimExpiresAt: now + CLAIM_TTL_MS,
+      });
+
+      // Group message with valid code is rejected and never wakes T3
+      const groupAttempt = store.ingestInbound(
+        conn.id,
+        "org",
+        msg({ platformId: "p1", chat: { platformId: "g1", kind: "group" }, text: "123456", addressedToBot: true }),
+      );
+      assert.equal(groupAttempt.kind, "pairing_rejected");
+      assert.equal(store.listUnackedTriggers().length, 0);
+
+      // 4 wrong DM codes increment attempts
+      for (let i = 1; i <= 4; i++) {
+        const bad = store.ingestInbound(
+          conn.id,
+          "org",
+          msg({ platformId: `bad-${i}`, chat: { platformId: "u1", kind: "dm" }, text: "999999", addressedToBot: true }),
+        );
+        assert.equal(bad.kind, "pairing_rejected");
+        assert.equal(store.connection(conn.id)?.claimAttempts, i);
+      }
+
+      // 5th wrong DM code invalidates claim code
+      const fifth = store.ingestInbound(
+        conn.id,
+        "org",
+        msg({ platformId: "bad-5", chat: { platformId: "u1", kind: "dm" }, text: "999999", addressedToBot: true }),
+      );
+      assert.equal(fifth.kind, "pairing_rejected");
+      assert.equal(store.connection(conn.id)?.claimCode, null);
+
+      // Refresh claim code -> valid DM claims owner -> transitions to active without waking T3!
+      store.updateConnection(conn.id, { claimCode: "778899", claimExpiresAt: now + CLAIM_TTL_MS, claimAttempts: 0 });
+      const claimed = store.ingestInbound(
+        conn.id,
+        "org",
+        msg({
+          platformId: "claim-ok",
+          chat: { platformId: "u_owner", kind: "dm" },
+          sender: { id: "u_owner", name: "Owner", isBot: false },
+          text: "778899",
+          addressedToBot: true,
+        }),
+      );
+      assert.equal(claimed.kind, "pairing_claimed");
+      assert.equal(store.connection(conn.id)?.lifecycleState, "active");
+      assert.equal(store.connection(conn.id)?.ownerId, "u_owner");
+      assert.equal(store.listUnackedTriggers().length, 0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("persists WeChat batch + dedup + cursor atomically and recovers unacked triggers", () => {
+    const store = new Store(":memory:");
+    try {
+      const conn = store.createConnection({
+        platform: "wechat",
+        secretRef: "sec:wx",
+        lifecycleState: "active",
+        ownerId: "wx_owner",
+      });
+
+      const batch1 = store.persistInboundBatch(conn.id, "owner", {
+        messages: [
+          msg({
+            platformId: "wx-1",
+            chat: { platformId: "wx_owner", kind: "dm" },
+            sender: { id: "wx_owner", name: "", isBot: false },
+            text: "Create a todo for tomorrow",
+            addressedToBot: true,
+          }),
+          // Duplicate inside same batch is deduplicated
+          msg({
+            platformId: "wx-1",
+            chat: { platformId: "wx_owner", kind: "dm" },
+            sender: { id: "wx_owner", name: "", isBot: false },
+            text: "Create a todo for tomorrow",
+            addressedToBot: true,
+          }),
+          // Stranger on owner-trust WeChat is held
+          msg({
+            platformId: "wx-2",
+            chat: { platformId: "wx_stranger", kind: "dm" },
+            sender: { id: "wx_stranger", name: "", isBot: false },
+            text: "Hi stranger",
+            addressedToBot: true,
+          }),
+        ],
+        nextCursor: "cursor-v1",
+      });
+
+      assert.equal(batch1.cursorUpdated, true);
+      assert.equal(store.getConnectionCursor(conn.id), "cursor-v1");
+      assert.deepEqual(
+        batch1.outcomes.map((o) => o.kind),
+        ["dispatch", "duplicate", "held"],
+      );
+
+      // Crash-recovery replay returns ONLY gate-approved unacked trigger `wx-1`, NEVER `held` `wx-2`!
+      const unacked = store.listUnackedTriggers();
+      assert.equal(unacked.length, 1);
+      assert.equal(unacked[0]!.platformMsgId, "wx-1");
+      assert.equal(unacked[0]!.idempotencyKey, makeIdempotencyKey(conn.id, "wx-1"));
+
+      // Once T3 acks it, it leaves unacked trigger queue
+      const acked = store.ackInbound(
+        { idempotencyKey: unacked[0]!.idempotencyKey! },
+        { t3ThreadId: "thread-1", t3TurnId: "turn-1" },
+      );
+      assert.equal(acked?.state, "delivered");
+      assert.equal(acked?.t3ThreadId, "thread-1");
+      assert.equal(store.listUnackedTriggers().length, 0);
+
+      // Transaction rollback safety: invalid connectionId rolls back without advancing anything
+      assert.throws(() =>
+        store.persistInboundBatch("missing-conn", "owner", {
+          messages: [msg({ platformId: "wx-9" })],
+          nextCursor: "cursor-bad",
+        }),
+      );
+      assert.equal(store.getConnectionCursor(conn.id), "cursor-v1");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("enforces agent linkContacts security invariant and 2 KB person note limit", () => {
+    const store = new Store(":memory:");
+    try {
+      const c1 = store.createConnection({ platform: "feishu", secretRef: "s1", lifecycleState: "active", ownerId: "u_owner_fs" });
+      const c2 = store.createConnection({ platform: "wechat", secretRef: "s2", lifecycleState: "active", ownerId: "u_owner_wx" });
+
+      const ownerFs = store.touchContact(c1.id, "u_owner_fs", "Owner FS");
+      const aliceFs = store.touchContact(c1.id, "u_alice_fs", "Alice FS");
+      const aliceWx = store.touchContact(c2.id, "u_alice_wx", "Alice WX");
+      store.setContactAccess(aliceFs.id, "allowed");
+      store.setContactAccess(aliceWx.id, null);
+
+      // Agent MUST NOT touch owner contacts
+      assert.throws(() => store.linkContacts([ownerFs.id, aliceFs.id], "agent"), /owner contact/i);
+
+      // Owner can link owner + non-owner or two owner accounts, then agent MUST NOT merge into that person
+      const ownerWx = store.touchContact(c2.id, "u_owner_wx", "Owner WX");
+      store.linkContacts([ownerFs.id, ownerWx.id], "owner");
+      assert.throws(() => store.linkContacts([ownerWx.id, aliceWx.id], "agent"), /owner contact/i);
+
+      // Agent CAN link two non-owner contacts, and access permissions are NEVER transferred!
+      const person = store.linkContacts([aliceFs.id, aliceWx.id], "agent");
+      assert.equal(store.contact(aliceFs.id)?.personId, person.id);
+      assert.equal(store.contact(aliceWx.id)?.personId, person.id);
+      assert.equal(store.contact(aliceFs.id)?.linkedBy, "agent");
+      assert.equal(store.contact(aliceWx.id)?.linkedBy, "agent");
+      // Permission invariance: aliceWx remains undecided (`null`), NOT promoted to `"allowed"`!
+      assert.equal(store.contact(aliceFs.id)?.access, "allowed");
+      assert.equal(store.contact(aliceWx.id)?.access, null);
+
+      // Note <= 2 KB succeeds; > 2 KB throws
+      store.updatePerson(person.id, { note: "x".repeat(MAX_PERSON_NOTE_BYTES) });
+      assert.throws(() => store.updatePerson(person.id, { note: "x".repeat(MAX_PERSON_NOTE_BYTES + 1) }), /2048/);
+
+      // Regression (#22.3): agent merging an owner-linked person must NOT downgrade `linked_by = 'owner'` to `'agent'`
+      const bob1 = store.touchContact(c1.id, "u_bob_1", "Bob 1");
+      const bob2 = store.touchContact(c2.id, "u_bob_2", "Bob 2");
+      const bob3 = store.touchContact(c1.id, "u_bob_3", "Bob 3");
+      store.linkContacts([bob1.id, bob2.id], "owner");
+      assert.equal(store.contact(bob1.id)?.linkedBy, "owner");
+      assert.equal(store.contact(bob2.id)?.linkedBy, "owner");
+
+      // Create separate person for bob3, then have agent merge bob3 + bob1
+      store.ensurePerson(bob3.id);
+      store.linkContacts([bob3.id, bob1.id], "agent");
+      assert.equal(store.contact(bob1.id)?.linkedBy, "owner");
+      assert.equal(store.contact(bob2.id)?.linkedBy, "owner");
+      assert.equal(store.contact(bob3.id)?.linkedBy, "agent");
+      // Agent MUST STILL be blocked from unlinking owner-linked contacts!
+      assert.throws(() => store.unlinkContact(bob1.id, "agent"), /owner/i);
+      assert.throws(() => store.unlinkContact(bob2.id, "agent"), /owner/i);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("blocks unseen/search/attachment on child threads when parent group is blocked (#22.2)", () => {
+    const store = new Store(":memory:");
+    try {
+      const conn = store.createConnection({
+        platform: "feishu",
+        secretRef: "s-parent",
+        lifecycleState: "active",
+        ownerId: "owner-1",
+        askAll: false,
+      });
+      const parent = store.upsertChat({ connectionId: conn.id, platformId: "grp-parent", kind: "group", name: "Parent" });
+      store.setChatAccess(parent.id, "allowed");
+      const threadMsg = store.ingestInbound(
+        conn.id,
+        "org",
+        msg({
+          platformId: "thr-bg-1",
+          chat: { platformId: "grp-parent:root1", kind: "thread", parent: { platformId: "grp-parent", name: "Parent" } },
+          text: "thread confidential update",
+          addressedToBot: false,
+          sentAt: 1_700_000_005_000,
+        }),
+      );
+      assert.equal(threadMsg.kind, "background");
+      assert.equal(store.unseen(threadMsg.chat.id, 1_700_000_010_000), 1);
+      assert.equal(store.search("confidential").length, 1);
+
+      // Block parent group -> child thread becomes blocked too!
+      store.setChatAccess(parent.id, "blocked");
+      assert.equal(store.isChatBlocked(threadMsg.chat.id), true);
+      assert.equal(store.unseen(threadMsg.chat.id, 1_700_000_010_000), 0);
+      assert.equal(store.search("confidential").length, 0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("includes contactId on heldMessages so held DMs can be approved by contact", () => {
+    const store = new Store(":memory:");
+    try {
+      const conn = store.createConnection({
+        platform: "wechat",
+        secretRef: "sec:held-dm",
+        lifecycleState: "active",
+        ownerId: "wx_owner",
+      });
+      const held = store.ingestInbound(
+        conn.id,
+        "owner",
+        msg({
+          platformId: "dm-held-1",
+          chat: { platformId: "wx_alice", kind: "dm" },
+          sender: { id: "wx_alice", name: "Alice", isBot: false },
+          text: "Hi, can I chat?",
+          addressedToBot: true,
+        }),
+      );
+      assert.equal(held.kind, "held");
+      const list = store.heldMessages(conn.id);
+      assert.equal(list.length, 1);
+      assert.equal(list[0]!.chat.kind, "dm");
+      assert.ok(list[0]!.contactId, "held DM must expose contactId");
+
+      store.setContactAccess(list[0]!.contactId!, "allowed");
+      const toAdmit = store.heldMessagesForContact(list[0]!.contactId!);
+      assert.equal(toAdmit.length, 1);
+      store.moveInbound([toAdmit[0]!.id], "admit");
+      assert.equal(store.heldMessages(conn.id).length, 0);
+      assert.equal(store.listUnackedTriggers(conn.id).length, 1);
+    } finally {
+      store.close();
+    }
+  });
+});
