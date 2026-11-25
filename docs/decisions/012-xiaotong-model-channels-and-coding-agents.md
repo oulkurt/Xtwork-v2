@@ -1,7 +1,7 @@
 # ADR-012 · M1 重构：内置助手「小瞳」、多渠道模型平面、六大编码 Agent 一键安装与 Coding Agent 委派
 
 - **Date** 2026-11-25
-- **Status** Accepted（演进并细化 [ADR-004](004-general-task-experience.md)、[ADR-008](008-model-gateway.md)、[ADR-009](009-default-pi-runtime.md)，协同 [ADR-011](011-mingle-im-bridge.md)；M1b-Gate 1 已于 [PR #24](https://github.com/oulkurt/Xtwork-v2/pull/24) 合入 `main`，M1c-Gate 1 已于 [PR #26](https://github.com/oulkurt/Xtwork-v2/pull/26) 合入 `main`；M1b-Gate 2 与 M1c-Gate 2 在途）
+- **Status** Accepted（演进并细化 [ADR-004](004-general-task-experience.md)、[ADR-008](008-model-gateway.md)、[ADR-009](009-default-pi-runtime.md)，协同 [ADR-011](011-mingle-im-bridge.md)；M1b Gate 1/2 已于 [PR #24](https://github.com/oulkurt/Xtwork-v2/pull/24)、[PR #28](https://github.com/oulkurt/Xtwork-v2/pull/28) 合入 `main`，M1c Gate 1/2 已于 [PR #26](https://github.com/oulkurt/Xtwork-v2/pull/26)、[PR #29](https://github.com/oulkurt/Xtwork-v2/pull/29) 合入 `main`，待真实线上账号与干净机器实跑验收）
 - **Evidence** Confirmed · 2026-11-25 项目负责人确认采用「小瞳」命名并批准本方案；代码约束核对自 Electron 版 `xiaotong_work`（历史参考仓库，Pi `0.87.1`）、锁定上游 `t3code@3ce21458`、随包 Pi `1.5.2` 及官方 ACP Registry（`v1.0.0`），并经 Claude Opus 5.5 架构审查修订定稿。
 
 > **证据分层约定**：文中引用的供应商契约与 OIDC 协议来自 Electron 版 `xiaotong_work`（Pi `0.87.1`）；T3/Pi 约束经 `t3code@3ce21458` 与随包 Pi `1.5.2` 源码静态核实；六款外部编码 Agent 的官方安装命令、`dsh --profile acp` 真实行为及新链路端到端表现均属**待实跑验证项**，验收通过前不计入已确认能力。

@@ -10,18 +10,10 @@ const EXTERNAL_SCHEMES = [
   "t3-context://",
 ];
 
-/**
- * GitHub-compatible Markdown heading slugifier supporting Unicode/CJK headings
- * and snake_case identifiers (e.g. `# API_KEY` -> `api_key`).
- */
 export function slugifyHeading(rawHeading) {
   let text = rawHeading.trim();
-  // Remove trailing ATX closing hashes (e.g. "## Title ##")
   text = text.replace(/\s+#+\s*$/, "");
-  // Unwrap Markdown links [label](url) -> label
   text = text.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
-  // Remove inline code backticks and emphasis markers (*, ~), plus edge-only underscore emphasis
-  // while preserving literal underscores inside identifiers such as API_KEY.
   text = text.replace(/[`*~]/g, "");
   text = text.replace(/(^|[\s(（【「『])_{1,2}(?=\S)(.+?)(?<=\S)_{1,2}(?=$|[\s.,;:!?)\]）】」』])/g, "$1$2");
   text = text.toLowerCase();
@@ -37,9 +29,6 @@ export function slugifyHeading(rawHeading) {
   return out;
 }
 
-/**
- * Splits Markdown into lines while tracking fenced code blocks (` ``` ` / ` ~~~ `).
- */
 function scanMarkdownLines(content) {
   const lines = content.split(/\r?\n/);
   const result = [];
@@ -63,10 +52,6 @@ function scanMarkdownLines(content) {
   return result;
 }
 
-/**
- * Masks inline code spans (including multi-backtick spans containing inner backticks,
- * e.g. `` `` `code` `` ``) with spaces so link/path parsing ignores code literals.
- */
 export function stripInlineCode(line) {
   let out = "";
   let i = 0;
@@ -105,10 +90,6 @@ export function stripInlineCode(line) {
   return out;
 }
 
-/**
- * Extracts GitHub-style heading anchors with collision-safe deduplication:
- * e.g. `# 计划`, `# 计划-1`, `# 计划` -> `计划`, `计划-1`, `计划-2`.
- */
 export function extractHeadingSlugs(content) {
   const slugs = new Set();
   for (const { line, inCodeFence } of scanMarkdownLines(content)) {
@@ -135,8 +116,8 @@ function collectMarkdownFiles(rootDir) {
       files.push(join(rootDir, entry.name));
     }
   }
-  const docDir = join(rootDir, "doc");
-  if (existsSync(docDir)) {
+  const docsDir = join(rootDir, "docs");
+  if (existsSync(docsDir)) {
     const walk = (dir) => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         const full = join(dir, entry.name);
@@ -147,7 +128,7 @@ function collectMarkdownFiles(rootDir) {
         }
       }
     };
-    walk(docDir);
+    walk(docsDir);
   }
   return files.sort();
 }
@@ -160,7 +141,6 @@ function cleanHrefTarget(rawTarget) {
       return target.slice(1, endAngle).trim();
     }
   }
-  // Strip optional link title ("title" or 'title') separated by whitespace
   const titleIdx = target.search(/\s+(?:"[^"]*"|'[^']*')\s*$/);
   if (titleIdx !== -1) {
     target = target.slice(0, titleIdx).trim();
@@ -168,16 +148,10 @@ function cleanHrefTarget(rawTarget) {
   return target;
 }
 
-/**
- * Parses inline links `[label](href)`, image links `![alt](href)` (including nested
- * linked images such as `[![alt](img.svg)](page.md)` and balanced parentheses in paths),
- * and reference link definitions `[id]: href`.
- */
 export function extractLinks(line) {
   const clean = stripInlineCode(line);
   const links = [];
 
-  // Reference-style link definition: `  [id]: target "optional title"`
   const refDef = clean.match(/^\s{0,3}\[([^\]]+)\]:\s*(\S+(?:\s+(?:"[^"]*"|'[^']*'))?)\s*$/);
   if (refDef) {
     links.push({
@@ -200,7 +174,6 @@ export function extractLinks(line) {
         continue;
       }
 
-      // Find matching closing `]` (respecting nested brackets for images inside links)
       let depth = 0;
       let closeBracket = -1;
       for (let j = bracketStart; j < segment.length; j += 1) {
@@ -222,7 +195,6 @@ export function extractLinks(line) {
         continue;
       }
 
-      // Find matching closing `)` supporting balanced parentheses inside target URLs
       let parenDepth = 0;
       let closeParen = -1;
       for (let j = closeBracket + 1; j < segment.length; j += 1) {
@@ -252,7 +224,6 @@ export function extractLinks(line) {
         isImage,
         kind: isImage ? "image" : "inline",
       });
-      // Recursively scan inner label so linked images like `[![alt](img.svg)](doc.md)` check both targets.
       if (!isImage && label.includes("](")) {
         scanSegment(label);
       }
@@ -264,20 +235,14 @@ export function extractLinks(line) {
   return links;
 }
 
-/**
- * Extracts normalized reference-link labels actually referenced in body prose
- * (`[text][id]`, `[id][]`, or shortcut `[id]` outside definitions/inline links).
- */
 function extractUsedRefIds(line) {
   const clean = stripInlineCode(line);
   if (/^\s{0,3}\[[^\]]+\]:\s*\S/.test(clean)) return [];
   const used = [];
-  // Full/collapsed reference links: `[label][id]` or `[id][]`
   for (const m of clean.matchAll(/(?<!!)\[([^\]]+)\]\[([^\]]*)\]/g)) {
     const refId = (m[2] || m[1]).trim().toLowerCase();
     if (refId) used.push(refId);
   }
-  // Shortcut reference links: `[id]` not followed by `(` or `[`
   const withoutFull = clean.replace(/(?<!!)\[[^\]]+\]\[[^\]]*\]/g, "");
   for (const m of withoutFull.matchAll(/(?<!!)\[([^\]]+)\](?!\s*[(\[])/g)) {
     const refId = m[1].trim().toLowerCase();
@@ -331,7 +296,6 @@ export function checkRepositoryDocs(rootDir) {
         usedRefIds.add(refId);
       }
 
-      // 1. Reject machine-local file:/// or OS home directory absolute paths
       const hasLocalPath =
         /\bfile:\/\/\//i.test(line) ||
         /\/Users\/[A-Za-z0-9._-]+\//.test(line) ||
@@ -345,7 +309,6 @@ export function checkRepositoryDocs(rootDir) {
         });
       }
 
-      // 2. Reject references to untracked AGENTS.md if it does not exist in repo root
       if (!hasAgentsMd && /\bAGENTS\.md\b/.test(line)) {
         errors.push({
           rule: "missing-repo-file-ref",
@@ -355,7 +318,6 @@ export function checkRepositoryDocs(rootDir) {
         });
       }
 
-      // 3. Validate links, repo-boundary containment, heading anchors, and ADR-NNN label parity
       for (const { label, href, kind, refId } of extractLinks(line)) {
         if (!href || EXTERNAL_SCHEMES.some((scheme) => href.startsWith(scheme))) {
           continue;
@@ -419,9 +381,8 @@ export function checkRepositoryDocs(rootDir) {
           }
         }
 
-        // ADR label vs filename consistency (e.g. [ADR-013](../decisions/012-foo.md))
         const labelAdrMatch = label.match(/\bADR-(\d{3})\b/);
-        const targetAdrMatch = targetRel.match(/^doc\/decisions\/(\d{3})-[^/]+\.md$/);
+        const targetAdrMatch = targetRel.match(/^docs\/decisions\/(\d{3})-[^/]+\.md$/);
         if (labelAdrMatch && targetAdrMatch && labelAdrMatch[1] !== targetAdrMatch[1]) {
           errors.push({
             rule: "adr-id-mismatch",
@@ -441,8 +402,7 @@ export function checkRepositoryDocs(rootDir) {
     linksByFileRel.set(fileRel, renderedTargets);
   }
 
-  // 4. ADR inventory checks: heading, status, and actual link indexing in DECISIONS.md
-  const decisionsDir = join(absRoot, "doc", "decisions");
+  const decisionsDir = join(absRoot, "docs", "decisions");
   const decisionsIndexLinks = linksByFileRel.get("DECISIONS.md") ?? new Set();
 
   if (existsSync(decisionsDir)) {
@@ -485,9 +445,8 @@ export function checkRepositoryDocs(rootDir) {
     }
   }
 
-  // 5. As-Built patch inventory parity between overlay/patches/*.patch and section 4 table of doc/plan/02-上游与改造层.md
   const patchesDir = join(absRoot, "overlay", "patches");
-  const overlayDocPath = join(absRoot, "doc", "plan", "02-上游与改造层.md");
+  const overlayDocPath = join(absRoot, "docs", "plan", "02-上游与改造层.md");
   if (existsSync(patchesDir) && existsSync(overlayDocPath)) {
     const actualPatches = readdirSync(patchesDir)
       .filter((name) => name.endsWith(".patch"))

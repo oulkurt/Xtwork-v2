@@ -1,8 +1,8 @@
 # ADR-008 · 正式模型网关的部署与凭据边界
 
 - **Date** 2026-11-19
-- **Status** Accepted（2026-11-25 由 [ADR-012](012-xiaotong-model-channels-and-coding-agents.md) 演进并细化为 4 协议 Proxy-Only 本机网关 + 单一硬化 OS SecretStore；M1b-Gate 1 底座已于 [PR #24](https://github.com/oulkurt/Xtwork-v2/pull/24) 合入 `main`，M1b-Gate 2 待真机验收）
-- **Evidence** Confirmed · 预览单路由网关在 PR #1 验证，多协议 Proxy-Only 底座与集成测试已在 PR #24 合入 `main`，企业微信 OIDC 与 19 类供应商真实账号实跑待 M1b-Gate 2 验收。
+- **Status** Accepted（2026-11-25 由 [ADR-012](012-xiaotong-model-channels-and-coding-agents.md) 演进并细化为 4 协议 Proxy-Only 本机网关 + 单一硬化 OS SecretStore；M1b Gate 1/2 代码与测试已于 [PR #24](https://github.com/oulkurt/Xtwork-v2/pull/24)、[PR #28](https://github.com/oulkurt/Xtwork-v2/pull/28) 合入 `main`，待真实线上账号实跑验收）
+- **Evidence** Confirmed · 预览单路由网关在 PR #1 验证，多协议 Proxy-Only 底座、企业微信 OIDC、19 类供应商目录与渠道 UI 已于 PR #24/#28 合入 `main`，真实供应商线上实跑待真机验收。
 
 ## Context
 
