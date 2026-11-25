@@ -609,6 +609,21 @@ describe("Sol Round 1 regression guards", () => {
           blockedAncestorThreadId: failingParent,
         });
 
+        // Fail closed when a referenced parentThreadId is missing (lookup returns null)!
+        const missingParent = ThreadId.make("parent-missing-null");
+        const missingParentCheck = yield* checkExternalDelegationAncestry({
+          threadId: ThreadId.make("child-of-missing-parent"),
+          initialLineage: { parentThreadId: missingParent },
+          isProtectedThread: () => false,
+          loadThreadLineage: () => Effect.succeed(null),
+        });
+        expect(missingParentCheck).toMatchObject({
+          blocked: true,
+          code: IM_DELEGATION_DENIED_CODE,
+          reason: "ancestry_lookup_failed",
+          blockedAncestorThreadId: missingParent,
+        });
+
         // Fail closed when ancestry depth exceeds the 64-hop verification cap with unvisited ancestors remaining!
         const deepChain = new Map<ThreadId, ThreadId | null>();
         for (let i = 0; i <= 70; i += 1) {
@@ -780,6 +795,31 @@ describe("Sol Round 1 regression guards", () => {
     expect(combinedTwoCategories.valid).toBe(false);
     if (!combinedTwoCategories.valid) {
       expect(combinedTwoCategories.missingSections).toEqual(["goal", "constraints"]);
+    }
+
+    // Stacked bracket/XML/label headings on the same line MUST NOT treat the second tag as body!
+    const stackedBracketTags = validateCodingAgentHandoffBrief(
+      "[Goal] [Scope]\n## Scope\nOnly touch auth.\n## Files\napps/server/src/auth.ts",
+    );
+    expect(stackedBracketTags.valid).toBe(false);
+    if (!stackedBracketTags.valid) {
+      expect(stackedBracketTags.missingSections).toEqual(["goal"]);
+    }
+
+    const stackedXmlTags = validateCodingAgentHandoffBrief(
+      "<goal> <scope>\n## Scope\nOnly touch auth.\n## Files\napps/server/src/auth.ts",
+    );
+    expect(stackedXmlTags.valid).toBe(false);
+    if (!stackedXmlTags.valid) {
+      expect(stackedXmlTags.missingSections).toEqual(["goal"]);
+    }
+
+    const stackedColonLabels = validateCodingAgentHandoffBrief(
+      "Goal: Scope:\n## Scope\nOnly touch auth.\n## Files\napps/server/src/auth.ts",
+    );
+    expect(stackedColonLabels.valid).toBe(false);
+    if (!stackedColonLabels.valid) {
+      expect(stackedColonLabels.missingSections).toEqual(["goal"]);
     }
   });
 });

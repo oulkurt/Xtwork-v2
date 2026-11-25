@@ -664,11 +664,11 @@ export const checkExternalDelegationAncestry = Effect.fn(
     enqueue(input.initialLineage?.rootThreadId);
   } else if (currentId) {
     const selfLookup = yield* lookupLineageSafely(currentId);
-    if (!selfLookup.ok) {
+    if (!selfLookup.ok || selfLookup.lineage === null) {
       return failClosedAncestry("ancestry_lookup_failed", currentId);
     }
-    enqueue(selfLookup.lineage?.parentThreadId);
-    enqueue(selfLookup.lineage?.rootThreadId);
+    enqueue(selfLookup.lineage.parentThreadId);
+    enqueue(selfLookup.lineage.rootThreadId);
   }
 
   let hops = 0;
@@ -691,11 +691,11 @@ export const checkExternalDelegationAncestry = Effect.fn(
     }
 
     const ancestorLookup = yield* lookupLineageSafely(ancestorId);
-    if (!ancestorLookup.ok) {
+    if (!ancestorLookup.ok || ancestorLookup.lineage === null) {
       return failClosedAncestry("ancestry_lookup_failed", ancestorId);
     }
-    enqueue(ancestorLookup.lineage?.parentThreadId);
-    enqueue(ancestorLookup.lineage?.rootThreadId);
+    enqueue(ancestorLookup.lineage.parentThreadId);
+    enqueue(ancestorLookup.lineage.rootThreadId);
   }
 
   const remainingUnvisited = queue.find((candidate) => !visited.has(candidate));
@@ -957,6 +957,22 @@ function parseSectionHeaderLine(rawLine: string): ParsedSectionHeader | null {
 }
 
 /**
+ * Rejects degenerate inline bodies that are themselves another section heading/tag
+ * (e.g., `[Goal] [Scope]`, `<goal> <files>`, `Goal: Scope:`, `## Goal: ## Scope`).
+ */
+function isInlineBodyAnotherHeadingOrTag(inlineBody: string): boolean {
+  const trimmed = inlineBody.trim();
+  if (trimmed.length === 0) return false;
+  const nested = parseSectionHeaderLine(trimmed);
+  if (nested === null) return false;
+  const nestedMatches = BRIEF_SECTION_RULES.filter((rule) =>
+    rule.headingPatterns.some((pattern) => pattern.test(nested.header)),
+  );
+  if (nestedMatches.length > 0) return true;
+  return nested.structuralHeading && !hasMeaningfulSectionBody(nested.inlineBody);
+}
+
+/**
  * Server-side ADR-012 §5.3 handoff brief validator: requires 3 distinct non-empty sections
  * (Goal, Constraints, Files) with at most one category matched per heading line.
  */
@@ -971,6 +987,11 @@ export function validateCodingAgentHandoffBrief(task: string): HandoffBriefValid
         rule.headingPatterns.some((pattern) => pattern.test(parsed.header)),
       );
       if (matchedRules.length === 1) {
+        if (isInlineBodyAnotherHeadingOrTag(parsed.inlineBody)) {
+          // Reject lines combining multiple section headers/tags such as `[Goal] [Scope]`.
+          currentSection = null;
+          continue;
+        }
         const matchedKey = matchedRules[0]!.key;
         currentSection = matchedKey;
         if (hasMeaningfulSectionBody(parsed.inlineBody)) {

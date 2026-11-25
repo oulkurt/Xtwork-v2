@@ -1,5 +1,5 @@
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
-index 8dcd025c..1a8b03ed 100644
+index 8dcd025c..352abf1f 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.ts
 +++ b/apps/server/src/mcp/OrchestratorMcpService.ts
 @@ -76,6 +76,7 @@ import {
@@ -37,7 +37,7 @@ index 8dcd025c..1a8b03ed 100644
    const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
    const gitDriver = yield* GitVcsDriver.GitVcsDriver;
    const serverSettings = yield* ServerSettings.ServerSettingsService;
-@@ -2677,10 +2690,150 @@ const make = Effect.gen(function* () {
+@@ -2677,10 +2690,178 @@ const make = Effect.gen(function* () {
        };
      }),
      delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
@@ -45,13 +45,25 @@ index 8dcd025c..1a8b03ed 100644
 +        const squashed = Cause.squash(cause);
 +        return squashed instanceof Error && squashed.name === "UnimplementedError";
 +      };
++      let shellLookupSupported = false;
 +      const loadLineageForAncestry = (tid: ThreadId) =>
 +        threadManagement.getThreadShell(tid).pipe(
-+          Effect.map((shell) => shell?.lineage ?? null),
-+          Effect.catchCauseIf(isUnimplementedMockDefect, () =>
-+            threadManagement
-+              .getThreadRecords(tid, [])
-+              .pipe(Effect.map((records) => records.thread.lineage ?? null)),
++          Effect.tap(() =>
++            Effect.sync(() => {
++              shellLookupSupported = true;
++            }),
++          ),
++          Effect.map((shell) => (shell !== null ? (shell.lineage ?? {}) : null)),
++          Effect.catchCauseIf(
++            (cause) => !shellLookupSupported && isUnimplementedMockDefect(cause),
++            () =>
++              threadManagement
++                .getThreadRecords(tid, [])
++                .pipe(
++                  Effect.map((records) =>
++                    records?.thread?.id === tid ? (records.thread.lineage ?? {}) : null,
++                  ),
++                ),
 +          ),
 +        );
 +      const imDelegationBlock = yield* checkExternalDelegationAncestry({
@@ -79,37 +91,53 @@ index 8dcd025c..1a8b03ed 100644
 +      // Fail closed if reading active run/message or server settings fails.
 +      const activeTurnCodingAgentOverride =
 +        callerScope.thread?.providerInstanceId === PI_INSTANCE_ID
-+          ? yield* threadManagement
-+              .getThreadRecords(callerScope.thread.threadId, ["runs"], {
-+                runStatuses: ThreadManagementService.ACTIVE_RUN_STATUSES,
-+              })
-+              .pipe(
-+                Effect.flatMap((records) => {
-+                  const activeRun = records.runs
-+                    .filter(ThreadManagementService.isActiveRun)
-+                    .toSorted((left, right) => right.ordinal - left.ordinal)[0];
-+                  if (activeRun?.userMessageId === undefined) {
-+                    return Effect.undefined;
-+                  }
-+                  return threadManagement
-+                    .getMessagesById(callerScope.thread!.threadId, [activeRun.userMessageId])
-+                    .pipe(
-+                      Effect.map(
-+                        (messages) =>
-+                          messages.get(activeRun.userMessageId)?.context?.codingAgentOverride,
-+                      ),
-+                    );
-+                }),
-+                Effect.catchCause((cause) =>
-+                  Effect.fail(
-+                    new OrchestratorMcpFailure({
-+                      code: "orchestration_error",
-+                      blocked: true,
-+                      message: `Unable to verify active turn codingAgentOverride (${errorMessage(Cause.squash(cause))}); refusing delegation fail-closed.`,
-+                    }),
-+                  ),
++          ? yield* Effect.gen(function* () {
++              const records = yield* threadManagement.getThreadRecords(
++                callerScope.thread!.threadId,
++                ["runs"],
++                { runStatuses: ThreadManagementService.ACTIVE_RUN_STATUSES },
++              );
++              const activeRun = records.runs
++                .filter(ThreadManagementService.isActiveRun)
++                .toSorted((left, right) => right.ordinal - left.ordinal)[0];
++              if (activeRun?.userMessageId === undefined) {
++                return { found: true as const, override: undefined };
++              }
++              const activeMessageId = activeRun.userMessageId;
++              const messages = yield* threadManagement.getMessagesById(
++                callerScope.thread!.threadId,
++                [activeMessageId],
++              );
++              const activeMessage = messages.get(activeMessageId);
++              if (activeMessage === undefined) {
++                return { found: false as const, activeMessageId };
++              }
++              return {
++                found: true as const,
++                override: activeMessage.context?.codingAgentOverride,
++              };
++            }).pipe(
++              Effect.catchCause((cause) =>
++                Effect.fail(
++                  new OrchestratorMcpFailure({
++                    code: "orchestration_error",
++                    blocked: true,
++                    message: `Unable to verify active turn codingAgentOverride (${errorMessage(Cause.squash(cause))}); refusing delegation fail-closed.`,
++                  }),
 +                ),
-+              )
++              ),
++              Effect.flatMap((result) =>
++                result.found
++                  ? Effect.succeed(result.override)
++                  : Effect.fail(
++                      new OrchestratorMcpFailure({
++                        code: "orchestration_error",
++                        blocked: true,
++                        message: `Unable to verify active turn codingAgentOverride (active turn user message "${result.activeMessageId}" was not found); refusing delegation fail-closed.`,
++                      }),
++                    ),
++              ),
++            )
 +          : undefined;
 +
 +      if (
@@ -132,7 +160,7 @@ index 8dcd025c..1a8b03ed 100644
 +      }
 +
 +      const loadSettingsFailClosed = () =>
-+        serverSettings.getSettings.pipe(
++        (serverSettings.getTrustedSettings ?? serverSettings.getSettings).pipe(
 +          Effect.mapError((cause) =>
 +            new OrchestratorMcpFailure({
 +              code: "orchestration_error",
@@ -188,7 +216,7 @@ index 8dcd025c..1a8b03ed 100644
        if (input.target !== undefined && environmentId !== undefined) {
          yield* requireCapability(callerScope);
          const scope = yield* requireThreadScope(callerScope, "delegate_task");
-@@ -2724,9 +2879,66 @@ const make = Effect.gen(function* () {
+@@ -2724,9 +2905,66 @@ const make = Effect.gen(function* () {
          operation: "delegate-task",
        });
        const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
@@ -256,7 +284,7 @@ index 8dcd025c..1a8b03ed 100644
          providers,
          skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
        });
-@@ -2742,30 +2954,79 @@ const make = Effect.gen(function* () {
+@@ -2742,30 +2980,79 @@ const make = Effect.gen(function* () {
        let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
        if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
          const project = yield* requireProject(parent.thread.projectId);
@@ -353,7 +381,7 @@ index 8dcd025c..1a8b03ed 100644
          workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
        }
 diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
-index 605f56f0..a4e7feea 100644
+index 52424db1..64694c7b 100644
 --- a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 +++ b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 @@ -1,9 +1,22 @@
@@ -407,7 +435,7 @@ index 605f56f0..a4e7feea 100644
 +        ) {
 +          return "";
 +        }
-+        const settings = yield* serverSettings.getSettings.pipe(
++        const settings = yield* (serverSettings.getTrustedSettings ?? serverSettings.getSettings).pipe(
 +          Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
 +        );
 +        if (settings.codingAgent.mode !== "provider") {
@@ -422,7 +450,7 @@ index 605f56f0..a4e7feea 100644
 +          loadThreadLineage: (tid) =>
 +            projectionStore
 +              .getThreadShell(tid)
-+              .pipe(Effect.map((shell) => shell?.lineage ?? null)),
++              .pipe(Effect.map((shell) => (shell !== null ? (shell.lineage ?? {}) : null))),
 +        });
 +        if (ancestryGuard.blocked) {
 +          return "";
@@ -500,7 +528,7 @@ index 605f56f0..a4e7feea 100644
            ? session
            : makeDeliverySession(session, startWithHandoffs);
 diff --git a/apps/server/src/serverSettings.ts b/apps/server/src/serverSettings.ts
-index 30fa1fc3..7b5aec0d 100644
+index 30fa1fc3..d2a33c9d 100644
 --- a/apps/server/src/serverSettings.ts
 +++ b/apps/server/src/serverSettings.ts
 @@ -63,6 +63,7 @@ import {
@@ -524,8 +552,75 @@ index 30fa1fc3..7b5aec0d 100644
      Effect.mapError(
        (cause) =>
          new ServerSettingsError({
+@@ -272,6 +277,12 @@ export class ServerSettingsService extends Context.Service<
+ 
+     readonly getSettings: Effect.Effect<ServerSettings, ServerSettingsError>;
+ 
++    /**
++     * Reads materialized settings while failing closed if `settings.json` could not be parsed
++     * (so security/routing guards never silently fall back to `auto` on corrupt settings files).
++     */
++    readonly getTrustedSettings?: Effect.Effect<ServerSettings, ServerSettingsError>;
++
+     readonly updateSettings: (
+       patch: ServerSettingsPatch,
+     ) => Effect.Effect<ServerSettings, ServerSettingsError>;
+@@ -1031,19 +1042,33 @@ const make = Effect.gen(function* () {
+     secretWriteGeneration++;
+     materialized = null;
+   });
++  const materializeCachedSettings = (source: ServerSettings) => {
++    if (materialized?.source === source) return Effect.succeed(materialized.value);
++    const generation = secretWriteGeneration;
++    return materializeSettingsSecrets(source).pipe(
++      Effect.map(toEffective),
++      Effect.tap((value) =>
++        Effect.sync(() => {
++          if (generation === secretWriteGeneration) materialized = { source, value };
++        }),
++      ),
++    );
++  };
+   const getMaterializedSettings = getSettingsFromCache.pipe(
+-    Effect.flatMap((source) => {
+-      if (materialized?.source === source) return Effect.succeed(materialized.value);
+-      const generation = secretWriteGeneration;
+-      return materializeSettingsSecrets(source).pipe(
+-        Effect.map(toEffective),
+-        Effect.tap((value) =>
+-          Effect.sync(() => {
+-            if (generation === secretWriteGeneration) materialized = { source, value };
+-          }),
+-        ),
+-      );
+-    }),
++    Effect.flatMap(materializeCachedSettings),
++  );
++  const getTrustedMaterializedSettings = Cache.get(settingsCache, cacheKey).pipe(
++    Effect.flatMap((loaded) =>
++      Option.isSome(loaded.parseFailure)
++        ? Effect.fail(
++            new ServerSettingsError({
++              settingsPath,
++              operation: "read-file",
++              cause: loaded.parseFailure.value,
++            }),
++          )
++        : materializeCachedSettings(loaded.settings),
++    ),
+   );
+ 
+   const materializeChanges = (changes: Stream.Stream<ServerSettings>) =>
+@@ -1418,6 +1443,7 @@ const make = Effect.gen(function* () {
+     ready: Deferred.await(startedDeferred),
+     bundledPi,
+     getSettings: getMaterializedSettings,
++    getTrustedSettings: getTrustedMaterializedSettings,
+     updateSettings: (patch) =>
+       updateAndPersistSettings(patch, (current) =>
+         ensureSecretProviderWritesAllowed(patch, settingsPath).pipe(
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index b984a694..3e68135e 100644
+index eca92416..25162f76 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
 @@ -71,6 +71,7 @@ import {
@@ -706,7 +801,7 @@ index 501d05d7..fe6007e4 100644
          {...searchableSetting("providers")}
          variant="plain"
 diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
-index 1384922a..53ff48a5 100644
+index 92fbf6f5..3f39abfc 100644
 --- a/apps/web/src/components/settings/settingsSearch.ts
 +++ b/apps/web/src/components/settings/settingsSearch.ts
 @@ -1030,6 +1030,14 @@ export const SETTINGS_SEARCH_ITEMS = [

@@ -43,7 +43,9 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import { imToolAllowed } from "../im/XtworkImMcp.ts";
 import { desktopContext, type TurnExecutionContext } from "../im/XtworkImSecurity.ts";
@@ -2933,6 +2935,243 @@ describe("M1c-Gate 2 integration: deterministic routing, workspace contract, can
             ),
         );
         expect(promptOnDeepChain).not.toContain("<coding_agent_delegation>");
+
+        // 4. Sol R3 fail-closed edge cases:
+        //    (a) Corrupt settings.json on disk via real ServerSettings.layer -> getTrustedSettings fails ->
+        //        local AND remote delegation refuse instead of silently falling back to `auto`!
+        let corruptSettingsDispatches = 0;
+        let corruptSettingsRemotes = 0;
+        const corruptBaseConfigLayer = Layer.fresh(
+          ServerConfig.layerTest(process.cwd(), { prefix: "xtwork-corrupt-settings-" }),
+        );
+        const realCorruptSettingsLayer = ServerSettings.layer.pipe(
+          Layer.provide(ServerSecretStore.layer),
+          Layer.provide(ManagedPolicy.layerTest()),
+          Layer.provide(Layer.fresh(SqlitePersistence.layerMemory)),
+          Layer.provideMerge(corruptBaseConfigLayer),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provide(NodeCrypto.layer),
+        );
+        yield* Effect.gen(function* () {
+          const config = yield* ServerConfig.ServerConfig;
+          NodeFS.mkdirSync(NodePath.dirname(config.settingsPath), { recursive: true });
+          NodeFS.writeFileSync(config.settingsPath, "{not-valid-json", "utf8");
+          const settingsSvc = yield* ServerSettings.ServerSettingsService;
+          // Standard getSettings returns safe defaults so server still boots...
+          const fallbackDefaults = yield* settingsSvc.getSettings;
+          expect(fallbackDefaults.codingAgent.mode).toBe("auto");
+          // ...while getTrustedSettings fails closed so delegation cannot silently fall back to `auto`!
+          const trustedErr = yield* settingsSvc.getTrustedSettings!.pipe(Effect.flip);
+          expect(trustedErr.operation).toBe("read-file");
+
+          const corruptMcpDeps = Layer.mergeAll(
+            NodeServices.layer,
+            NodeCrypto.layer,
+            Layer.succeed(ServerSettings.ServerSettingsService, settingsSvc),
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              hasReceipt: () => Effect.succeed(false),
+              isProviderInstanceEnabledForProject: () => Effect.succeed(true),
+              getThreadShell: () =>
+                Effect.succeed({
+                  id: parentThreadId,
+                  lineage: { parentThreadId: null, rootThreadId: parentThreadId },
+                } as never),
+              getMessagesById: () =>
+                Effect.succeed(new Map([[activeMsgId, { id: activeMsgId }]] as never)),
+              getThreadRecords: () =>
+                Effect.succeed({
+                  ...makeParentProjection(),
+                  runs: [
+                    {
+                      id: parentRunId,
+                      ordinal: 1,
+                      status: "running",
+                      rootNodeId: parentNodeId,
+                      providerInstanceId: PI_INSTANCE_ID,
+                      userMessageId: activeMsgId,
+                    },
+                  ],
+                } as unknown as OrchestrationV2ThreadProjection),
+              dispatch: () =>
+                Effect.sync(() => {
+                  corruptSettingsDispatches += 1;
+                  return { sequence: 1, storedEvents: [] } as never;
+                }),
+            }),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({
+              getProviders: Effect.succeed([readyPi, readyClaude, readyCodex]),
+            }),
+            makeAdapterRegistryLayer([PI_INSTANCE_ID, claudeId, codexId]),
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+            Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+            Layer.mock(ProjectService.ProjectService)({}),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(RemoteDelegation.RemoteDelegation)({
+              delegate: () =>
+                Effect.sync(() => {
+                  corruptSettingsRemotes += 1;
+                  return { taskId };
+                }),
+            }),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          );
+          yield* Effect.gen(function* () {
+            const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+            const localErr = yield* mcp
+              .delegateTask(makeScope(), {
+                task: STRUCTURED_BRIEF_EN,
+                target: { providerInstanceId: codexId },
+                clientRequestId: "corrupt-settings-local",
+              })
+              .pipe(Effect.flip);
+            expect(localErr.code).toBe("orchestration_error");
+            expect(localErr.blocked).toBe(true);
+
+            const remoteErr = yield* mcp
+              .delegateTask(makeScope(), {
+                task: STRUCTURED_BRIEF_EN,
+                target: {
+                  environmentId: EnvironmentId.make("env:remote-box"),
+                  providerInstanceId: codexId,
+                },
+                clientRequestId: "corrupt-settings-remote",
+              })
+              .pipe(Effect.flip);
+            expect(remoteErr.code).toBe("orchestration_error");
+            expect(remoteErr.blocked).toBe(true);
+            expect(corruptSettingsDispatches).toBe(0);
+            expect(corruptSettingsRemotes).toBe(0);
+          }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(corruptMcpDeps))));
+        }).pipe(Effect.provide(realCorruptSettingsLayer));
+
+        //    (b) Referenced ancestor returning `null` (not found) MUST fail closed in BOTH
+        //        OrchestratorMcpService (local + remote) AND ProviderTurnStartService!
+        const childOfMissing = ThreadId.make("thread:child-of-missing-ancestor");
+        const missingAncestor = ThreadId.make("thread:missing-ancestor-null");
+        let missingAncestorRemotes = 0;
+        const missingAncestorMcpDeps = Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          ServerSettings.layerTest({
+            codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+          }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (tid) =>
+              tid === childOfMissing
+                ? Effect.succeed({
+                    id: tid,
+                    lineage: { parentThreadId: missingAncestor },
+                  } as never)
+                : Effect.succeed(null),
+          }),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([readyPi, readyClaude]),
+          }),
+          makeAdapterRegistryLayer([PI_INSTANCE_ID, claudeId]),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({
+            delegate: () =>
+              Effect.sync(() => {
+                missingAncestorRemotes += 1;
+                return { taskId };
+              }),
+          }),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const remoteErr = yield* mcp
+            .delegateTask(makeScope({ threadId: childOfMissing }), {
+              task: STRUCTURED_BRIEF_EN,
+              target: {
+                environmentId: EnvironmentId.make("env:remote-box"),
+                providerInstanceId: claudeId,
+              },
+            })
+            .pipe(Effect.flip);
+          expect(remoteErr.code).toBe(IM_DELEGATION_DENIED_CODE);
+          expect(remoteErr.blocked).toBe(true);
+          expect(missingAncestorRemotes).toBe(0);
+        }).pipe(
+          Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(missingAncestorMcpDeps))),
+        );
+
+        const promptOnMissingAncestor = yield* runTurnWithAncestry(
+          childOfMissing,
+          missingAncestor,
+          () => Effect.succeed(null),
+        );
+        expect(promptOnMissingAncestor).not.toContain("<coding_agent_delegation>");
+
+        //    (c) Active run with `userMessageId` whose `getMessagesById` returns an empty Map
+        //        MUST fail closed on BOTH local AND remote delegation!
+        let missingMsgRemotes = 0;
+        const missingMsgMcpDeps = Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          ServerSettings.layerTest({
+            codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+          }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            hasReceipt: () => Effect.succeed(false),
+            isProviderInstanceEnabledForProject: () => Effect.succeed(true),
+            getThreadShell: () =>
+              Effect.succeed({
+                id: parentThreadId,
+                lineage: { parentThreadId: null, rootThreadId: parentThreadId },
+              } as never),
+            getMessagesById: () => Effect.succeed(new Map()),
+            getThreadRecords: () =>
+              Effect.succeed({
+                ...makeParentProjection(),
+                runs: [
+                  {
+                    id: parentRunId,
+                    ordinal: 1,
+                    status: "running",
+                    rootNodeId: parentNodeId,
+                    providerInstanceId: PI_INSTANCE_ID,
+                    userMessageId: activeMsgId,
+                  },
+                ],
+              } as unknown as OrchestrationV2ThreadProjection),
+          }),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([readyPi, readyClaude]),
+          }),
+          makeAdapterRegistryLayer([PI_INSTANCE_ID, claudeId]),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({
+            delegate: () =>
+              Effect.sync(() => {
+                missingMsgRemotes += 1;
+                return { taskId };
+              }),
+          }),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const remoteErr = yield* mcp
+            .delegateTask(makeScope(), {
+              task: STRUCTURED_BRIEF_EN,
+              target: {
+                environmentId: EnvironmentId.make("env:remote-box"),
+                providerInstanceId: claudeId,
+              },
+            })
+            .pipe(Effect.flip);
+          expect(remoteErr.code).toBe("orchestration_error");
+          expect(remoteErr.blocked).toBe(true);
+          expect(remoteErr.message).toContain("codingAgentOverride");
+          expect(missingMsgRemotes).toBe(0);
+        }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(missingMsgMcpDeps))));
       }),
   );
 });
