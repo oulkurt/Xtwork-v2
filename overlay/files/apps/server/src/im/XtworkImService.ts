@@ -8,6 +8,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
+import * as Semaphore from "effect/Semaphore";
 import { Headers, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { randomUUID } from "node:crypto";
 import { EnvironmentAuth, parseBearerToken } from "../auth/EnvironmentAuth.ts";
@@ -22,15 +23,21 @@ import { activeStatuses, decodeInbound, isTerminal, makeDispatcher, type ImDispa
 import { MAX_COMPANION_FILE_BYTES, XtworkImMemory, memoryScope } from "./XtworkImMemory.ts";
 import {
   DEFAULT_LEADER_ID,
+  containsLeaderArchivedError,
   containsLeaderPausedError,
   desktopContext,
   hashArgs,
   imError,
   ImApprovals,
   isImThread,
+  normalizeExecutionContext,
+  resolveProgressReportMode,
+  sanitizeImDelegationPolicy,
   untrustedEnvelope,
   type AwarenessScope,
+  type ImDelegationPolicy,
   type ImError,
+  type ImProgressReportMode,
   type ReplyAudience,
   type TurnExecutionContext,
 } from "./XtworkImSecurity.ts";
@@ -122,6 +129,7 @@ interface ImService {
   readonly orchestrator?: OrchestratorV2["Service"];
   readonly projects?: ManagedProjectFolders["Service"];
   readonly approvals: ImApprovals;
+  readonly pendingBindingSyncs?: Map<string, string>;
   readonly markReplySucceeded: (turnId: string) => void;
   readonly hasReplySucceeded: (turnId: string) => boolean;
   readonly eventsSince: (after: number) => ReadonlyArray<BridgeEvent>;
@@ -182,12 +190,23 @@ export const makeDeliverySync = (
   host: DeliveryWorkerHost,
   dispatch: Pick<ImDispatcher, "orchestrator" | "settle">,
   hasReplySucceeded: (turnId: string) => boolean,
+  resolveProgressMode?: (context: TurnExecutionContext) => ImProgressReportMode,
+  hasPendingApproval?: (runId: string) => boolean,
 ) => {
   const live = new Map<string, { text: string; liveId: string | null }>();
   const ackedInBridge = new Set<string>();
+  const blockedNotified = new Set<string>();
   const clearCaches = () => {
     live.clear();
     ackedInBridge.clear();
+    blockedNotified.clear();
+  };
+  const parseContextSafe = (raw: string): TurnExecutionContext | undefined => {
+    try {
+      return normalizeExecutionContext(JSON.parse(raw) as TurnExecutionContext);
+    } catch {
+      return undefined;
+    }
   };
   const sync = Effect.fnUntraced(function* (row: Effect.Success<ImDispatcher["unsettled"]>[number]) {
     const inbound = decodeInbound(row.payloadJson);
@@ -321,9 +340,40 @@ export const makeDeliverySync = (
         return;
       }
       ackedInBridge.delete(inbound.key);
+      blockedNotified.delete(inbound.key);
       yield* dispatch.settle(inbound.key);
       return;
     }
+    const rowContext = parseContextSafe(row.contextJson);
+    const reportMode: ImProgressReportMode =
+      resolveProgressMode && rowContext ? resolveProgressMode(rowContext) : "phase_summary";
+    const isBlocked =
+      run.status === "waiting" ||
+      (run.status === "running" && (hasPendingApproval?.(run.id) ?? false));
+    if (
+      !alreadyReplied &&
+      isBlocked &&
+      reportMode === "completion_and_blocked" &&
+      !blockedNotified.has(inbound.key)
+    ) {
+      const sent = yield* tryWork((signal) =>
+        host.request(
+          "messages.send",
+          {
+            chatId: inbound.chatId,
+            text: "任务等待桌面确认中，完成后将继续回报结果。",
+            operationKey: `${inbound.key}:blocked`,
+            preserveInboundState: true,
+          },
+          signal,
+        ),
+      ).pipe(Effect.result);
+      if (sent._tag === "Success" && classifyDeliverySendOutcome(sent.success) === "sent") {
+        blockedNotified.add(inbound.key);
+      }
+      return;
+    }
+    if (reportMode !== "phase_summary") return;
     if (alreadyReplied || run.status !== "running" || !text || text === current?.text) return;
     if (current === undefined) {
       const result = yield* tryWork((signal) =>
@@ -416,11 +466,15 @@ export const makeBridgeEventHandler = (
       if (accepted._tag === "Failure") {
         // S4/S14/S23: If a trigger raced with Leader pause (or pause -> resume), defer ONLY the
         // stamped inbound message and sync the connection's CURRENT active binding + pauseGeneration.
-        if (containsLeaderPausedError(accepted.failure)) {
+        if (containsLeaderPausedError(accepted.failure) || containsLeaderArchivedError(accepted.failure)) {
+          const isArchived = containsLeaderArchivedError(accepted.failure);
           const connId = typeof payload.connectionId === "string" ? payload.connectionId : undefined;
           const idempotencyKey = typeof payload.idempotencyKey === "string" ? payload.idempotencyKey : undefined;
           if (idempotencyKey) {
-            yield* callHost(host, "inbound.settle", { idempotencyKey, event: "pause" }).pipe(Effect.ignore);
+            yield* callHost(host, "inbound.settle", {
+              idempotencyKey,
+              event: isArchived ? "fail" : "pause",
+            }).pipe(Effect.ignore);
           }
           if (connId) {
             const activeBinding = yield* leaders.activeBindingForConnection(connId).pipe(Effect.orElseSucceed(() => undefined));
@@ -516,12 +570,54 @@ export const makeBridgeEventHandler = (
     }
   });
 
-const makeDeliveryWorker = (host: XtworkImBridgeHost, dispatch: ImDispatcher, hasReplySucceeded: (turnId: string) => boolean) => {
-  const { sync, clearCaches } = makeDeliverySync(host, dispatch, hasReplySucceeded);
+const makeDeliveryWorker = (
+  host: XtworkImBridgeHost,
+  dispatch: ImDispatcher,
+  leaders: LeaderStore,
+  approvals: ImApprovals,
+  pendingBindingSyncs: Map<string, string>,
+  hasReplySucceeded: (turnId: string) => boolean,
+) => {
+  const { sync, clearCaches } = makeDeliverySync(
+    host,
+    dispatch,
+    hasReplySucceeded,
+    (context) => resolveProgressReportMode(context, leaders.getImPolicySync(context.leaderId ?? DEFAULT_LEADER_ID)),
+    (runId) => approvals.hasPendingForRun(runId),
+  );
   return Effect.gen(function* () {
     if (!host.available) {
       clearCaches();
       return;
+    }
+    if (pendingBindingSyncs.size > 0) {
+      for (const [connectionId] of [...pendingBindingSyncs.entries()]) {
+        const bindingRes = yield* leaders.activeBindingForConnection(connectionId).pipe(Effect.result);
+        if (bindingRes._tag === "Failure") {
+          continue;
+        }
+        const binding = bindingRes.success;
+        if (!binding) {
+          pendingBindingSyncs.delete(connectionId);
+          continue;
+        }
+        const ownerRes = yield* leaders.getLeader(binding.leaderId).pipe(Effect.result);
+        if (ownerRes._tag === "Failure" || !ownerRes.success) {
+          continue;
+        }
+        const syncRes = yield* syncLeaderStateAndBindingsToBridge(host, ownerRes.success, [binding]).pipe(Effect.result);
+        const confirmed =
+          syncRes._tag === "Success"
+            ? extractConfirmedBindings(syncRes.success).get(binding.connectionId)
+            : undefined;
+        const tupleConfirmed = confirmed !== undefined && bindingMatchesConnection(confirmed, binding);
+        if (tupleConfirmed) {
+          const latestRes = yield* leaders.activeBindingForConnection(connectionId).pipe(Effect.result);
+          if (latestRes._tag === "Success" && latestRes.success?.bindingId === binding.bindingId) {
+            pendingBindingSyncs.delete(connectionId);
+          }
+        }
+      }
     }
     const rows = yield* dispatch.unsettled;
     yield* Effect.forEach(rows, (row) => sync(row).pipe(Effect.ignore), { concurrency: 4, discard: true });
@@ -530,6 +626,7 @@ const makeDeliveryWorker = (host: XtworkImBridgeHost, dispatch: ImDispatcher, ha
 
 export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
   const approvals = new ImApprovals();
+  const pendingBindingSyncs = new Map<string, string>();
   const events: BridgeEvent[] = [];
   const repliedTurns = new Set<string>();
   const projection = Option.getOrUndefined(yield* Effect.serviceOption(ProjectionStoreV2));
@@ -563,6 +660,7 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
 
   const defaultService: ImService = {
     approvals,
+    pendingBindingSyncs,
     ...(leaders ? { leaders } : {}),
     ...(projection ? { projection } : {}),
     ...(orchestrator ? { orchestrator } : {}),
@@ -675,7 +773,7 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
     Effect.catch(() => Effect.logWarning("An IM bridge notification could not be processed.")),
     Effect.forever,
   ));
-  yield* forkParked(makeDeliveryWorker(host, dispatch, defaultService.hasReplySucceeded));
+  yield* forkParked(makeDeliveryWorker(host, dispatch, leaders, approvals, pendingBindingSyncs, defaultService.hasReplySucceeded));
   return { ...defaultService, host, memory, dispatch };
 }));
 
@@ -707,7 +805,7 @@ const ensureLeaderDesktopThread = Effect.fnUntraced(function* (
     return yield* imError("Leader workspace service is unavailable.");
   }
   const leader = yield* service.leaders.getLeader(leaderId);
-  if (!leader) return yield* imError("Leader not found.");
+  if (!leader || leader.status === "archived") return yield* imError("Leader not found.");
   if (!forceNew && leader.pinnedThreadId) {
     const existing = yield* service.orchestrator.getThreadShell(ThreadId.make(leader.pinnedThreadId)).pipe(
       Effect.orElseSucceed(() => null),
@@ -790,19 +888,47 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
       }
     }
   }
+  let confirmedByConnId: ReadonlyMap<string, Record<string, unknown>> = new Map();
   if (service.host?.available && toSync.length > 0) {
-    yield* call(service.host, "connections.syncBindings", {
+    const syncRes = yield* call(service.host, "connections.syncBindings", {
       bindings: toSync,
       leaderStates,
       leaderPauseGenerations,
       leaderPausedById,
       leaderPauseVersions,
-    }).pipe(Effect.ignore);
+    }).pipe(Effect.result);
+    if (syncRes._tag === "Success") {
+      confirmedByConnId = extractConfirmedBindings(syncRes.success);
+    }
   }
   const refreshedBindings = yield* service.leaders.listBindings(leader.id);
-  const boundConnectionIds = new Set(refreshedBindings.map((b) => b.connectionId));
-  const connections = rawConnections.filter(
-    (conn) => isRecord(conn) && typeof conn.id === "string" && boundConnectionIds.has(conn.id),
+  const bindingByConnId = new Map(refreshedBindings.map((b) => [b.connectionId, b]));
+  const connections = yield* Effect.forEach(
+    rawConnections.filter((conn) => isRecord(conn) && typeof conn.id === "string" && bindingByConnId.has(conn.id)),
+    (conn) => {
+      if (!isRecord(conn) || typeof conn.id !== "string") return Effect.succeed(conn);
+      const b = bindingByConnId.get(conn.id);
+      if (!b) return Effect.succeed(conn);
+      const freshConn = confirmedByConnId.get(conn.id) ?? conn;
+      const tupleMatches = bindingMatchesConnection(freshConn, b);
+      if (tupleMatches) {
+        return clearPendingBindingSyncIfCurrent(service, b).pipe(
+          Effect.as({
+            ...freshConn,
+            syncPending: false,
+          }),
+        );
+      }
+      return markPendingBindingSyncIfCurrent(service, b).pipe(
+        Effect.as({
+          ...freshConn,
+          desiredLeaderId: b.leaderId,
+          desiredBindingId: b.bindingId,
+          desiredBindingEpoch: b.epoch,
+          syncPending: true,
+        }),
+      );
+    },
   );
   // S6: Query paused backlog strictly by stamped `leaderId` so rebinding preserves original Leader ownership.
   const pausedPending = service.host?.available
@@ -837,6 +963,187 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
   };
 });
 
+const syncLeaderStateAndBindingsToBridge = (
+  host: DeliveryWorkerHost,
+  leader: { readonly id: string; readonly status: string; readonly pauseGeneration: number; readonly pauseVersion: number },
+  bindings: ReadonlyArray<{ readonly connectionId: string; readonly leaderId: string; readonly bindingId: string; readonly epoch: number }>,
+) => {
+  const paused = leader.status === "paused";
+  const bindingsPayload = bindings.map((b) => ({
+    connectionId: b.connectionId,
+    leaderId: b.leaderId,
+    bindingId: b.bindingId,
+    bindingEpoch: b.epoch,
+    leaderPaused: paused,
+    pauseGeneration: leader.pauseGeneration,
+    pauseVersion: leader.pauseVersion,
+  }));
+  return callHost(host, "connections.syncBindings", {
+    bindings: bindingsPayload,
+    leaderStates: {
+      [leader.id]: {
+        paused,
+        pauseGeneration: leader.pauseGeneration,
+        pauseVersion: leader.pauseVersion,
+      },
+    },
+    leaderPauseGenerations: { [leader.id]: leader.pauseGeneration },
+    leaderPausedById: { [leader.id]: paused },
+    leaderPauseVersions: { [leader.id]: leader.pauseVersion },
+    ...(leader.id === DEFAULT_LEADER_ID
+      ? {
+          defaultLeaderPaused: paused,
+          defaultLeaderPauseGeneration: leader.pauseGeneration,
+          defaultLeaderPauseVersion: leader.pauseVersion,
+        }
+      : {}),
+  });
+};
+
+const extractConfirmedBindings = (value: unknown): ReadonlyMap<string, Record<string, unknown>> => {
+  const map = new Map<string, Record<string, unknown>>();
+  if (!isRecord(value) || !Array.isArray(value.connections)) return map;
+  for (const conn of value.connections) {
+    if (isRecord(conn) && typeof conn.id === "string") {
+      map.set(conn.id, conn);
+    }
+  }
+  return map;
+};
+
+const bindingMatchesConnection = (
+  conn: Record<string, unknown>,
+  binding: { readonly leaderId: string; readonly bindingId: string; readonly epoch: number },
+): boolean =>
+  conn.leaderId === binding.leaderId &&
+  conn.bindingId === binding.bindingId &&
+  conn.bindingEpoch === binding.epoch;
+
+const serviceLeaderLocks = new WeakMap<ImService, Map<string, Semaphore.Semaphore>>();
+const serviceHighestEpochByConn = new WeakMap<ImService, Map<string, number>>();
+
+const recordBindingEpoch = (service: ImService, connectionId: string, epoch: number): void => {
+  let epochs = serviceHighestEpochByConn.get(service);
+  if (!epochs) {
+    epochs = new Map();
+    serviceHighestEpochByConn.set(service, epochs);
+  }
+  const prev = epochs.get(connectionId) ?? 0;
+  if (epoch > prev) {
+    epochs.set(connectionId, epoch);
+  }
+};
+
+const getHighestBindingEpoch = (service: ImService, connectionId: string): number =>
+  serviceHighestEpochByConn.get(service)?.get(connectionId) ?? 0;
+
+const withLeaderLocks = <A, E, R>(
+  service: ImService,
+  leaderIds: readonly string[],
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> => {
+  const ordered = [...new Set(leaderIds.filter((id) => id.length > 0))].sort();
+  let locks = serviceLeaderLocks.get(service);
+  if (!locks) {
+    locks = new Map();
+    serviceLeaderLocks.set(service, locks);
+  }
+  let wrapped = effect;
+  for (let i = ordered.length - 1; i >= 0; i -= 1) {
+    const id = ordered[i]!;
+    let sem = locks.get(id);
+    if (!sem) {
+      sem = Semaphore.makeUnsafe(1);
+      locks.set(id, sem);
+    }
+    wrapped = sem.withPermit(wrapped);
+  }
+  return wrapped;
+};
+
+const withLeaderLock = <A, E, R>(
+  service: ImService,
+  leaderId: string,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> => withLeaderLocks(service, [leaderId], effect);
+
+const markPendingBindingSyncIfCurrent = Effect.fnUntraced(function* (
+  service: ImService,
+  binding: { readonly connectionId: string; readonly bindingId: string; readonly epoch: number },
+) {
+  if (!service.pendingBindingSyncs) return;
+  if (binding.epoch < getHighestBindingEpoch(service, binding.connectionId)) return;
+  if (!service.leaders) {
+    service.pendingBindingSyncs.set(binding.connectionId, binding.bindingId);
+    return;
+  }
+  const currentRes = yield* service.leaders.activeBindingForConnection(binding.connectionId).pipe(Effect.result);
+  if (binding.epoch < getHighestBindingEpoch(service, binding.connectionId)) return;
+  if (currentRes._tag === "Failure") {
+    service.pendingBindingSyncs.set(binding.connectionId, binding.bindingId);
+    return;
+  }
+  if (currentRes.success?.bindingId === binding.bindingId) {
+    service.pendingBindingSyncs.set(binding.connectionId, binding.bindingId);
+  }
+});
+
+const clearPendingBindingSyncIfCurrent = Effect.fnUntraced(function* (
+  service: ImService,
+  binding: { readonly connectionId: string; readonly bindingId: string; readonly epoch: number },
+) {
+  recordBindingEpoch(service, binding.connectionId, binding.epoch);
+  if (!service.pendingBindingSyncs) return;
+  if (!service.leaders) {
+    if (service.pendingBindingSyncs.get(binding.connectionId) === binding.bindingId) {
+      service.pendingBindingSyncs.delete(binding.connectionId);
+    }
+    return;
+  }
+  const currentRes = yield* service.leaders.activeBindingForConnection(binding.connectionId).pipe(Effect.result);
+  if (currentRes._tag === "Success" && currentRes.success?.bindingId === binding.bindingId) {
+    service.pendingBindingSyncs.delete(binding.connectionId);
+  }
+});
+
+const trySyncLeaderBindingsToBridge = Effect.fnUntraced(function* (
+  service: ImService,
+  leader: { readonly id: string; readonly status: string; readonly pauseGeneration: number; readonly pauseVersion: number },
+  bindings: ReadonlyArray<{ readonly connectionId: string; readonly leaderId: string; readonly bindingId: string; readonly epoch: number }>,
+) {
+  if (bindings.length === 0) {
+    return { synced: true, confirmedByConnId: new Map<string, Record<string, unknown>>() };
+  }
+  for (const binding of bindings) {
+    recordBindingEpoch(service, binding.connectionId, binding.epoch);
+  }
+  if (!service.host?.available) {
+    for (const binding of bindings) {
+      yield* markPendingBindingSyncIfCurrent(service, binding);
+    }
+    return { synced: false, confirmedByConnId: new Map<string, Record<string, unknown>>() };
+  }
+  const res = yield* syncLeaderStateAndBindingsToBridge(service.host, leader, bindings).pipe(Effect.result);
+  if (res._tag === "Success") {
+    const confirmedByConnId = extractConfirmedBindings(res.success);
+    let allConfirmed = true;
+    for (const binding of bindings) {
+      const confirmed = confirmedByConnId.get(binding.connectionId);
+      if (confirmed !== undefined && bindingMatchesConnection(confirmed, binding)) {
+        yield* clearPendingBindingSyncIfCurrent(service, binding);
+      } else {
+        allConfirmed = false;
+        yield* markPendingBindingSyncIfCurrent(service, binding);
+      }
+    }
+    return { synced: allConfirmed, confirmedByConnId };
+  }
+  for (const binding of bindings) {
+    yield* markPendingBindingSyncIfCurrent(service, binding);
+  }
+  return { synced: false, confirmedByConnId: new Map<string, Record<string, unknown>>() };
+});
+
 const serve = Effect.fnUntraced(function* (service: ImService) {
   const request = yield* HttpServerRequest.HttpServerRequest;
   if (parseBearerToken(request) === null) return failure("请先连接本机服务。", 401);
@@ -853,14 +1160,13 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
   const rawPath = url.pathname.slice("/api/xtwork/im/".length);
   const action = rawPath.replaceAll("/", ".");
   const isLeaderPath = rawPath === "leaders" || rawPath.startsWith("leaders/");
-  if ((isLeaderPath || ["approvals", "onboarding.events", "companion.role", "contacts", "people", "access", "paused"].includes(action)) &&
+  if ((isLeaderPath || ["approvals", "onboarding.events", "companion.role", "contacts", "people", "access", "paused", "connections.rebind"].includes(action)) &&
       session.value.subject !== "desktop-bootstrap") {
     return failure("请从本机桌面查看此数据。", 403);
   }
 
-  // Leader Control Plane HTTP endpoints (desktop-bootstrap Owner only).
   if (isLeaderPath) {
-    if (!service.leaders) return failure("Leader 服务暂不可用。", 503);
+    if (!service.leaders) return failure("领航者服务暂不可用。", 503);
     const segments = rawPath.split("/").filter(Boolean);
     const body = writing
       ? yield* request.json.pipe(
@@ -898,11 +1204,25 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
 
     if (writing && segments.length === 1) {
       const name = typeof params.name === "string" ? params.name : "";
-      if (!name.trim()) return failure("请填写 Leader 名字。", 400);
+      if (!name.trim()) return failure("请填写领航者名字。", 400);
       const roleText = typeof params.role === "string" ? params.role : undefined;
       if (roleText !== undefined && Buffer.byteLength(roleText, "utf8") > MAX_COMPANION_FILE_BYTES) {
         return failure("角色说明不能超过 64 KiB。", 400);
       }
+      const awarenessScope = isRecord(params.awarenessScope)
+        ? ({
+            kind:
+              params.awarenessScope.kind === "none" ||
+              params.awarenessScope.kind === "projects" ||
+              params.awarenessScope.kind === "all_local"
+                ? params.awarenessScope.kind
+                : "all_local",
+            projectIds: Array.isArray(params.awarenessScope.projectIds)
+              ? params.awarenessScope.projectIds.filter((id): id is string => typeof id === "string")
+              : [],
+          } satisfies AwarenessScope)
+        : undefined;
+      const imPolicy = isRecord(params.imPolicy) ? sanitizeImDelegationPolicy(params.imPolicy) : undefined;
       const newLeaderId = `leader-${randomUUID().slice(0, 8)}`;
       if (service.memory && roleText) {
         const writeRole = yield* tryWork(() => service.memory!.write("role", roleText, undefined, newLeaderId)).pipe(
@@ -918,6 +1238,8 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
           name,
           ...(typeof params.avatar === "string" ? { avatar: params.avatar } : {}),
           ...(roleText !== undefined ? { role: roleText } : {}),
+          ...(awarenessScope ? { awarenessScope } : {}),
+          ...(imPolicy ? { imPolicy } : {}),
         })
         .pipe(Effect.mapError((cause) => imError(cause)), Effect.result);
       if (created._tag === "Failure") {
@@ -945,6 +1267,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
               name: overview.leader.name,
               status: overview.leader.status,
               awarenessScope: overview.leader.awarenessScope,
+              imPolicy: overview.leader.imPolicy,
             },
             connections: overview.connections.map((conn) =>
               isRecord(conn)
@@ -984,98 +1307,240 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
       );
     }
 
+    if (writing && subAction === "archive") {
+      if (leaderId === DEFAULT_LEADER_ID) {
+        return failure("默认领航者不可归档。", 400);
+      }
+      const rebindToLeaderId =
+        typeof params.rebindToLeaderId === "string" && params.rebindToLeaderId.trim().length > 0
+          ? params.rebindToLeaderId.trim()
+          : undefined;
+      return yield* withLeaderLocks(
+        service,
+        rebindToLeaderId ? [leaderId, rebindToLeaderId] : [leaderId],
+        Effect.gen(function* () {
+          const leadersStore = service.leaders!;
+          const existingTarget = yield* leadersStore.getLeader(leaderId);
+          if (!existingTarget || existingTarget.status === "archived") {
+            return failure("找不到对应的领航者。", 404);
+          }
+          if (!service.host?.available) {
+            return failure("远程连接服务离线，无法确认暂停积压队列是否已清空，暂不可归档。", 503);
+          }
+          const checkEmptyPausedQueue = Effect.gen(function* () {
+            const pausedRes = yield* call(service.host!, "paused.list", { leaderId: existingTarget.id }).pipe(
+              Effect.result,
+            );
+            if (
+              pausedRes._tag === "Failure" ||
+              !isRecord(pausedRes.success) ||
+              !Array.isArray(pausedRes.success.items) ||
+              typeof pausedRes.success.heldCount !== "number"
+            ) {
+              return { ok: false as const, status: 503, message: "无法确认暂停积压与待审批消息状态，请稍后再尝试归档。" };
+            }
+            if (pausedRes.success.items.length > 0 || pausedRes.success.heldCount > 0) {
+              return {
+                ok: false as const,
+                status: 409,
+                message: "该领航者仍有暂停积压或待审批入站消息，请先在 Needs You / 访问审批中处理后再归档。",
+              };
+            }
+            return { ok: true as const };
+          });
+
+          const preQueueCheck = yield* checkEmptyPausedQueue;
+          if (!preQueueCheck.ok) {
+            return failure(preQueueCheck.message, preQueueCheck.status);
+          }
+
+          const listedRes = yield* call(service.host, "connections.list", {}).pipe(Effect.result);
+          if (listedRes._tag === "Failure" || !isRecord(listedRes.success) || !Array.isArray(listedRes.success.connections)) {
+            return failure("无法确认远程连接归属状态，请稍后再尝试归档。", 503);
+          }
+          const liveBridgeConns = listedRes.success.connections.filter(
+            (c): c is Record<string, unknown> & { readonly id: string } => isRecord(c) && typeof c.id === "string",
+          );
+          const liveBridgeConnIds = new Set(liveBridgeConns.map((c) => c.id));
+          const bridgePointingAtTarget = liveBridgeConns
+            .filter((c) => c.leaderId === existingTarget.id)
+            .map((c) => c.id);
+
+          const activeBindings = yield* leadersStore.listBindings(leaderId);
+          if (activeBindings.length > 0) {
+            if (!rebindToLeaderId) {
+              return failure("该领航者仍绑定着远程连接，请先换绑或指定接管领航者后再归档。", 409);
+            }
+            if (rebindToLeaderId === leaderId) {
+              return failure("目标领航者不能与待归档领航者相同。", 400);
+            }
+            const targetLeader = yield* leadersStore.getLeader(rebindToLeaderId);
+            if (!targetLeader || targetLeader.status === "archived") {
+              return failure("目标领航者不存在或已归档。", 400);
+            }
+          }
+
+          const reboundBindings = [];
+          for (const binding of activeBindings) {
+            const nextBinding = yield* leadersStore.rebindConnection(binding.connectionId, rebindToLeaderId!);
+            if (!nextBinding) {
+              return failure("目标领航者不存在或已归档。", 400);
+            }
+            recordBindingEpoch(service, nextBinding.connectionId, nextBinding.epoch);
+            reboundBindings.push(nextBinding);
+          }
+
+          const detachIds = new Set<string>([
+            ...reboundBindings.map((b) => b.connectionId).filter((id) => liveBridgeConnIds.has(id)),
+            ...bridgePointingAtTarget,
+            ...liveBridgeConns.map((c) => c.id),
+          ]);
+          for (const connId of detachIds) {
+            const currentBinding =
+              (yield* leadersStore.activeBindingForConnection(connId)) ??
+              (yield* leadersStore.ensureBinding(connId, DEFAULT_LEADER_ID));
+            recordBindingEpoch(service, currentBinding.connectionId, currentBinding.epoch);
+            if (currentBinding.leaderId === existingTarget.id) {
+              return failure("该领航者仍绑定着远程连接，请先换绑或指定接管领航者后再归档。", 409);
+            }
+            const ownerLeader = yield* leadersStore.getLeader(currentBinding.leaderId);
+            if (!ownerLeader) {
+              return failure("目标领航者不存在或已归档。", 503);
+            }
+            const { synced } = yield* trySyncLeaderBindingsToBridge(service, ownerLeader, [currentBinding]);
+            if (!synced) {
+              return failure("远程桥接尚未确认连接换绑完成，请稍后重试归档以避免暂停消息滞留。", 503);
+            }
+          }
+
+          const verifyListedRes = yield* call(service.host, "connections.list", {}).pipe(Effect.result);
+          if (
+            verifyListedRes._tag === "Failure" ||
+            !isRecord(verifyListedRes.success) ||
+            !Array.isArray(verifyListedRes.success.connections)
+          ) {
+            return failure("无法确认远程连接归属状态，请稍后再尝试归档。", 503);
+          }
+          if (
+            verifyListedRes.success.connections.some(
+              (c) => isRecord(c) && c.leaderId === existingTarget.id,
+            )
+          ) {
+            return failure("远程桥接仍有连接指向待归档领航者，请稍后重试归档。", 503);
+          }
+
+          const postQueueCheck = yield* checkEmptyPausedQueue;
+          if (!postQueueCheck.ok) {
+            return failure(postQueueCheck.message, postQueueCheck.status);
+          }
+
+          const archived = yield* leadersStore
+            .archiveLeader(leaderId)
+            .pipe(Effect.mapError((cause) => imError(cause)), Effect.result);
+          if (archived._tag === "Failure") {
+            const status = archived.failure.code === "LEADER_HAS_ACTIVE_BINDINGS" ? 409 : 400;
+            return failure(archived.failure.message, status);
+          }
+          if (!archived.success) {
+            return failure("找不到对应的领航者。", 404);
+          }
+          return response({ leader: archived.success.leader, reboundBindings, syncPending: false });
+        }),
+      );
+    }
+
     if (writing && subAction === "update") {
       const roleText = typeof params.role === "string" ? params.role : undefined;
       if (roleText !== undefined && Buffer.byteLength(roleText, "utf8") > MAX_COMPANION_FILE_BYTES) {
         return failure("角色说明不能超过 64 KiB。", 400);
       }
-      const existing = yield* service.leaders.getLeader(leaderId);
-      if (!existing) return failure("找不到对应的 Leader。", 404);
-      const awarenessScope = isRecord(params.awarenessScope)
-        ? ({
-            kind:
-              params.awarenessScope.kind === "none" ||
-              params.awarenessScope.kind === "projects" ||
-              params.awarenessScope.kind === "all_local"
-                ? params.awarenessScope.kind
-                : "all_local",
-            projectIds: Array.isArray(params.awarenessScope.projectIds)
-              ? params.awarenessScope.projectIds.filter((id): id is string => typeof id === "string")
-              : [],
-          } satisfies AwarenessScope)
-        : undefined;
-      // Write runtime ROLE.md BEFORE committing to SQLite so file-write errors fail closed
-      // and never leave the database and ROLE.md out of sync!
-      if (roleText !== undefined && service.memory) {
-        const writeRole = yield* tryWork(() => service.memory!.write("role", roleText, undefined, existing.id)).pipe(
-          Effect.result,
-        );
-        if (writeRole._tag === "Failure") {
-          return failure(writeRole.failure.message, 400);
-        }
-      }
-      const updated = yield* service.leaders.updateLeader(leaderId, {
-        ...(typeof params.name === "string" ? { name: params.name } : {}),
-        ...(typeof params.avatar === "string" ? { avatar: params.avatar } : {}),
-        ...(roleText !== undefined ? { role: roleText } : {}),
-        ...(awarenessScope ? { awarenessScope } : {}),
-      });
-      if (!updated) return failure("找不到对应的 Leader。", 404);
-      return response({ leader: updated });
+      return yield* withLeaderLock(
+        service,
+        leaderId,
+        Effect.gen(function* () {
+          const leadersStore = service.leaders!;
+          const existing = yield* leadersStore.getLeader(leaderId);
+          if (!existing || existing.status === "archived") return failure("找不到对应的领航者。", 404);
+          const awarenessScope = isRecord(params.awarenessScope)
+            ? ({
+                kind:
+                  params.awarenessScope.kind === "none" ||
+                  params.awarenessScope.kind === "projects" ||
+                  params.awarenessScope.kind === "all_local"
+                    ? params.awarenessScope.kind
+                    : "all_local",
+                projectIds: Array.isArray(params.awarenessScope.projectIds)
+                  ? params.awarenessScope.projectIds.filter((id): id is string => typeof id === "string")
+                  : [],
+              } satisfies AwarenessScope)
+            : undefined;
+          const imPolicy: ImDelegationPolicy | undefined = isRecord(params.imPolicy)
+            ? sanitizeImDelegationPolicy(params.imPolicy)
+            : undefined;
+          if (roleText !== undefined && service.memory) {
+            const writeRole = yield* tryWork(() => service.memory!.write("role", roleText, undefined, existing.id)).pipe(
+              Effect.result,
+            );
+            if (writeRole._tag === "Failure") {
+              return failure(writeRole.failure.message, 400);
+            }
+          }
+          const updated = yield* leadersStore.updateLeader(leaderId, {
+            ...(typeof params.name === "string" ? { name: params.name } : {}),
+            ...(typeof params.avatar === "string" ? { avatar: params.avatar } : {}),
+            ...(roleText !== undefined ? { role: roleText } : {}),
+            ...(awarenessScope ? { awarenessScope } : {}),
+            ...(imPolicy ? { imPolicy } : {}),
+          });
+          if (!updated) return failure("找不到对应的领航者。", 404);
+          if (
+            typeof params.name === "string" &&
+            params.name.trim().length > 0 &&
+            updated.name !== existing.name &&
+            updated.pinnedThreadId &&
+            service.orchestrator
+          ) {
+            yield* service.orchestrator
+              .dispatch({
+                type: "thread.metadata.update",
+                commandId: CommandId.make(`leader-rename:${updated.id}:${Date.now()}:${randomUUID().slice(0, 6)}`),
+                threadId: ThreadId.make(updated.pinnedThreadId),
+                title: updated.name,
+              })
+              .pipe(Effect.ignore);
+          }
+          return response({ leader: updated });
+        }),
+      );
     }
 
     if (writing && (subAction === "pause" || subAction === "resume")) {
       const nextPaused = subAction === "pause";
-      const updated = yield* service.leaders.updateLeader(leaderId, { status: nextPaused ? "paused" : "active" });
-      if (!updated) return failure("找不到对应的 Leader。", 404);
-      // S29: Always derive `paused` from the exact atomic row tuple returned by `updateLeader`
-      // so concurrent Pause/Resume calls can never pair a local boolean with another writer's version!
-      const updatedPaused = updated.status === "paused";
-      const bindings = yield* service.leaders.listBindings(updated.id);
-      let pausedPending: unknown[] = [];
-      if (service.host?.available) {
-        // S4/S23/S29: Reconcile binding + leaderPaused + pauseGeneration + pauseVersion for all bound connections.
-        const bindingsPayload = bindings.map((b) => ({
-          connectionId: b.connectionId,
-          leaderId: b.leaderId,
-          bindingId: b.bindingId,
-          bindingEpoch: b.epoch,
-          leaderPaused: updatedPaused,
-          pauseGeneration: updated.pauseGeneration,
-          pauseVersion: updated.pauseVersion,
-        }));
-        yield* call(service.host, "connections.syncBindings", {
-          bindings: bindingsPayload,
-          leaderStates: {
-            [updated.id]: {
-              paused: updatedPaused,
-              pauseGeneration: updated.pauseGeneration,
-              pauseVersion: updated.pauseVersion,
-            },
-          },
-          leaderPauseGenerations: { [updated.id]: updated.pauseGeneration },
-          leaderPausedById: { [updated.id]: updatedPaused },
-          leaderPauseVersions: { [updated.id]: updated.pauseVersion },
-          ...(updated.id === DEFAULT_LEADER_ID
-            ? {
-                defaultLeaderPaused: updatedPaused,
-                defaultLeaderPauseGeneration: updated.pauseGeneration,
-                defaultLeaderPauseVersion: updated.pauseVersion,
-              }
-            : {}),
-        }).pipe(Effect.ignore);
-        const listed = yield* call(service.host, "paused.list", { leaderId: updated.id }).pipe(
-          Effect.orElseSucceed(() => ({})),
-        );
-        if (isRecord(listed) && Array.isArray(listed.items)) pausedPending = listed.items;
-      }
-      return response({ leader: updated, pausedPending });
+      return yield* withLeaderLock(
+        service,
+        leaderId,
+        Effect.gen(function* () {
+          const leadersStore = service.leaders!;
+          const updated = yield* leadersStore.updateLeader(leaderId, { status: nextPaused ? "paused" : "active" });
+          if (!updated) return failure("找不到对应的领航者。", 404);
+          const bindings = yield* leadersStore.listBindings(updated.id);
+          let pausedPending: unknown[] = [];
+          if (service.host?.available) {
+            yield* syncLeaderStateAndBindingsToBridge(service.host, updated, bindings).pipe(Effect.ignore);
+            const listed = yield* call(service.host, "paused.list", { leaderId: updated.id }).pipe(
+              Effect.orElseSucceed(() => ({})),
+            );
+            if (isRecord(listed) && Array.isArray(listed.items)) pausedPending = listed.items;
+          }
+          return response({ leader: updated, pausedPending });
+        }),
+      );
     }
 
     if (writing && subAction === "paused-decide") {
       if (!service.host?.available) return failure("远程连接服务暂不可用。", 503);
       const leader = yield* service.leaders.getLeader(leaderId);
-      if (!leader) return failure("找不到对应的 Leader。", 404);
+      if (!leader) return failure("找不到对应的领航者。", 404);
       const allowedList = yield* call(service.host, "paused.list", { leaderId: leader.id }).pipe(
         Effect.map((val) => (isRecord(val) && Array.isArray(val.items) ? val.items : [])),
         Effect.orElseSucceed(() => []),
@@ -1090,7 +1555,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
         : [];
       const scopedIds = requestedIds.filter((id) => allowedIds.has(id));
       if (requestedIds.length > 0 && scopedIds.length === 0) {
-        return failure("所选积压消息不属于该 Leader。", 403);
+        return failure("所选积压消息不属于该领航者。", 403);
       }
       if (params.decision === "replay" && leader.status === "paused") {
         return response({
@@ -1115,6 +1580,8 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
 
     if (writing && subAction === "handoff") {
       if (!service.memory) return failure("伴侣记忆服务暂不可用。", 503);
+      const existing = yield* service.leaders.getLeader(leaderId);
+      if (!existing || existing.status === "archived") return failure("找不到对应的领航者。", 404);
       const summary = typeof params.summary === "string" ? params.summary.trim() : "";
       if (!summary) return failure("请提供交接摘要内容。", 400);
       const targetScope = yield* Effect.try({
@@ -1138,7 +1605,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
       );
     }
 
-    return failure("找不到对应的 Leader 操作。", 404);
+    return failure("找不到对应的领航者操作。", 404);
   }
 
   if (!writing && action === "status" && !service.host?.available) {
@@ -1197,19 +1664,83 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
   if (action === "companion.role" && service.memory) {
     const memory = service.memory;
     const leaderId = typeof params.leaderId === "string" ? params.leaderId : DEFAULT_LEADER_ID;
-    if (writing && typeof params.text !== "string") return failure("需要角色说明文本。", 400);
-    if (writing && typeof params.text === "string" && Buffer.byteLength(params.text, "utf8") > MAX_COMPANION_FILE_BYTES) {
+    if (!writing) {
+      const readRes = yield* tryWork(async () => ({ text: await memory.read("role", undefined, leaderId) })).pipe(
+        Effect.result,
+      );
+      if (readRes._tag === "Failure") return failure(readRes.failure.message, 400);
+      return response(readRes.success);
+    }
+    if (typeof params.text !== "string") return failure("需要角色说明文本。", 400);
+    const nextRoleText = params.text;
+    if (Buffer.byteLength(nextRoleText, "utf8") > MAX_COMPANION_FILE_BYTES) {
       return failure("角色说明不能超过 64 KiB。", 400);
     }
-    const roleResult = yield* tryWork(async () => {
-      if (typeof params.text === "string" && writing) await memory.write("role", params.text, undefined, leaderId);
-      return { text: await memory.read("role", undefined, leaderId) };
-    }).pipe(Effect.result);
-    if (roleResult._tag === "Failure") return failure(roleResult.failure.message, 400);
-    if (writing && typeof params.text === "string" && service.leaders) {
-      yield* service.leaders.updateLeader(leaderId, { role: params.text }).pipe(Effect.ignore);
+    return yield* withLeaderLock(
+      service,
+      leaderId,
+      Effect.gen(function* () {
+        if (service.leaders) {
+          const existingLeader = yield* service.leaders.getLeader(leaderId);
+          if (!existingLeader || existingLeader.status === "archived") {
+            return failure("找不到对应的领航者。", 404);
+          }
+        }
+        const roleResult = yield* tryWork(async () => {
+          await memory.write("role", nextRoleText, undefined, leaderId);
+          return { text: await memory.read("role", undefined, leaderId) };
+        }).pipe(Effect.result);
+        if (roleResult._tag === "Failure") return failure(roleResult.failure.message, 400);
+        if (service.leaders) {
+          const updated = yield* service.leaders
+            .updateLeader(leaderId, { role: nextRoleText })
+            .pipe(Effect.mapError((cause) => imError(cause)), Effect.result);
+          if (updated._tag === "Failure") {
+            return failure(updated.failure.message, 500);
+          }
+          if (!updated.success) {
+            return failure("找不到对应的领航者。", 404);
+          }
+        }
+        return response(roleResult.success);
+      }),
+    );
+  }
+  if (writing && action === "connections.rebind") {
+    if (!service.leaders) return failure("领航者服务暂不可用。", 503);
+    const connectionId = typeof params.connectionId === "string" ? params.connectionId.trim() : "";
+    const targetLeaderId = typeof params.leaderId === "string" ? params.leaderId.trim() : "";
+    if (!connectionId || connectionId.includes(":") || !targetLeaderId) {
+      return failure("请提供有效的连接标识与目标领航者。", 400);
     }
-    return response(roleResult.success);
+    return yield* withLeaderLock(
+      service,
+      targetLeaderId,
+      Effect.gen(function* () {
+        const leadersStore = service.leaders!;
+        const targetLeader = yield* leadersStore.getLeader(targetLeaderId);
+        if (!targetLeader || targetLeader.status === "archived") {
+          return failure("目标领航者不存在或已归档。", 404);
+        }
+        if (service.host?.available) {
+          const listed = yield* call(service.host, "connections.list", {}).pipe(
+            Effect.map((val) => (isRecord(val) && Array.isArray(val.connections) ? val.connections : undefined)),
+            Effect.orElseSucceed(() => undefined),
+          );
+          if (listed !== undefined && !listed.some((conn) => isRecord(conn) && conn.id === connectionId)) {
+            return failure("找不到对应的远程连接。", 404);
+          }
+        }
+        const binding = yield* leadersStore.rebindConnection(connectionId, targetLeader.id);
+        if (!binding) {
+          return failure("目标领航者不存在或已归档。", 404);
+        }
+        recordBindingEpoch(service, binding.connectionId, binding.epoch);
+        const freshLeader = (yield* leadersStore.getLeader(targetLeader.id)) ?? targetLeader;
+        const { synced } = yield* trySyncLeaderBindingsToBridge(service, freshLeader, [binding]);
+        return response({ binding, leader: freshLeader, syncPending: !synced });
+      }),
+    );
   }
   const method = writing ? writeMethods.has(action) ? action : undefined : readMethods.get(action);
   if (method === undefined) return failure("找不到远程连接操作。", 404);
@@ -1217,10 +1748,43 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
   const rpcParams = method === "people.link" || method === "people.unlink"
     ? { ...params, by: "owner" }
     : params;
-  return yield* call(service.host, method, rpcParams).pipe(Effect.match({
-    onSuccess: (value) => response(value),
-    onFailure: (error) => failure(error.message, 400),
-  }));
+  return yield* call(service.host, method, rpcParams).pipe(Effect.flatMap((value) => {
+    if (!writing && action === "connections" && service.leaders && isRecord(value) && Array.isArray(value.connections)) {
+      const leadersStore = service.leaders;
+      return Effect.forEach(value.connections, (conn) => {
+        if (!isRecord(conn) || typeof conn.id !== "string") return Effect.succeed(conn);
+        return Effect.gen(function* () {
+          const binding = yield* leadersStore.ensureBinding(conn.id as string, DEFAULT_LEADER_ID);
+          if (bindingMatchesConnection(conn, binding)) {
+            yield* clearPendingBindingSyncIfCurrent(service, binding);
+            return {
+              ...conn,
+              syncPending: false,
+            };
+          }
+          const ownerLeader = yield* leadersStore.getLeader(binding.leaderId);
+          const syncOut = ownerLeader
+            ? yield* trySyncLeaderBindingsToBridge(service, ownerLeader, [binding])
+            : { synced: false, confirmedByConnId: new Map<string, Record<string, unknown>>() };
+          const actualConn = syncOut.confirmedByConnId.get(conn.id as string) ?? conn;
+          if (syncOut.synced && bindingMatchesConnection(actualConn, binding)) {
+            return {
+              ...actualConn,
+              syncPending: false,
+            };
+          }
+          return {
+            ...actualConn,
+            desiredLeaderId: binding.leaderId,
+            desiredBindingId: binding.bindingId,
+            desiredBindingEpoch: binding.epoch,
+            syncPending: true,
+          };
+        }).pipe(Effect.orElseSucceed(() => conn));
+      }).pipe(Effect.map((connections) => response({ ...value, connections })));
+    }
+    return Effect.succeed(response(value));
+  }), Effect.catch((error) => Effect.succeed(failure(error.message, 400))));
 });
 
 export const route = Layer.unwrap(Effect.map(XtworkIm, (service) => Layer.mergeAll(

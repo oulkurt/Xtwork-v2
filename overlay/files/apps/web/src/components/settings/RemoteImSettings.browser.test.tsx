@@ -473,3 +473,60 @@ it("handles unbound event polls, stale manual failures, and live claim refresh/c
   connections = [{ id: "conn-wc-1", platform: "wecom", lifecycleState: "active", state: "connected", claimCode: null }];
   await expect.element(wecomCard.getByText("企业微信已连接")).toBeVisible();
 });
+
+it("lets users rebind an active IM connection between Navigators from RemoteImSettings", async () => {
+  stubDesktopBridge();
+  const rebindCalls: Array<Record<string, unknown>> = [];
+  let assignedLeaderId = "leader-default";
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const path = new URL(url, "http://localhost").pathname.replace(/^.*\/api\/xtwork\/im\//, "");
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : undefined;
+      const json = (data: unknown) =>
+        new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });
+
+      if (path === "status") return json({ state: "idle", lifecycle: "idle" });
+      if (path === "connections") {
+        return json({
+          connections: [
+            { id: "conn-feishu-1", platform: "feishu", lifecycleState: "active", state: "connected", leaderId: assignedLeaderId },
+          ],
+        });
+      }
+      if (path === "leaders") {
+        return json({
+          leaders: [
+            { leader: { id: "leader-default", name: "小瞳" } },
+            { leader: { id: "leader-eng", name: "研发领航者" } },
+          ],
+        });
+      }
+      if (path === "connections/rebind") {
+        rebindCalls.push(body ?? {});
+        assignedLeaderId = String(body?.leaderId ?? assignedLeaderId);
+        return json({ binding: { bindingId: "bind-2", leaderId: assignedLeaderId, epoch: 2 } });
+      }
+      if (path === "access") return json({ held: [] });
+      if (path === "approvals") return json({ approvals: [] });
+      if (path === "onboarding/events") return json({ events: [] });
+      return json({});
+    }),
+  );
+
+  await page.viewport(1280, 960);
+  await using _screen = await render(<RemoteImSettings />, {
+    router: "/settings/remote-connections",
+  });
+
+  await expect.element(page.getByText("可自由分配至 2 位领航者")).toBeVisible();
+  const rebindSelect = page.getByTestId("connection-rebind-conn-feishu-1");
+  await expect.element(rebindSelect).toBeVisible();
+  await rebindSelect.selectOptions("leader-eng");
+
+  await vi.waitFor(() => {
+    expect(rebindCalls).toEqual([{ connectionId: "conn-feishu-1", leaderId: "leader-eng" }]);
+  });
+});

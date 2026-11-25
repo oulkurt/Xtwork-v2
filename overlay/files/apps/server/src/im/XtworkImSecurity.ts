@@ -8,23 +8,32 @@ import { isRecord } from "./XtworkImBridgeHost.ts";
 
 export const DEFAULT_LEADER_ID = "leader-default";
 export const LEADER_PAUSED_ERROR = "LEADER_PAUSED";
+export const LEADER_ARCHIVED_ERROR = "LEADER_ARCHIVED";
 
-export function containsLeaderPausedError(error: unknown): boolean {
+function containsErrorMarker(error: unknown, marker: string): boolean {
   let current: unknown = error;
   for (let depth = 0; depth < 10 && current != null; depth++) {
     if (typeof current === "string") {
-      return current.includes(LEADER_PAUSED_ERROR);
+      return current.includes(marker);
     }
     if (typeof current === "object") {
       const rec = current as { readonly code?: unknown; readonly message?: unknown; readonly cause?: unknown };
-      if (rec.code === LEADER_PAUSED_ERROR) return true;
-      if (typeof rec.message === "string" && rec.message.includes(LEADER_PAUSED_ERROR)) return true;
+      if (rec.code === marker) return true;
+      if (typeof rec.message === "string" && rec.message.includes(marker)) return true;
       current = rec.cause;
       continue;
     }
     break;
   }
   return false;
+}
+
+export function containsLeaderPausedError(error: unknown): boolean {
+  return containsErrorMarker(error, LEADER_PAUSED_ERROR);
+}
+
+export function containsLeaderArchivedError(error: unknown): boolean {
+  return containsErrorMarker(error, LEADER_ARCHIVED_ERROR);
 }
 
 export type CompanionScope = "private" | `group:${string}`;
@@ -34,6 +43,119 @@ export type ReplyAudience = "local_only" | "owner_dm" | "group";
 export interface AwarenessScope {
   readonly kind: "none" | "all_local" | "projects";
   readonly projectIds: readonly string[];
+}
+
+export type ImDelegationMode = "always_ask" | "scoped_auto" | "deny";
+export type ImProgressReportMode = "silent" | "completion_and_blocked" | "phase_summary";
+
+export interface ImAudiencePolicy {
+  readonly delegationMode: ImDelegationMode;
+  readonly progressReportMode: ImProgressReportMode;
+  readonly allowedProjectIds: readonly string[];
+}
+
+export interface ImDelegationPolicy {
+  readonly ownerDm: ImAudiencePolicy;
+  readonly group: ImAudiencePolicy;
+}
+
+export const DEFAULT_IM_DELEGATION_POLICY: ImDelegationPolicy = Object.freeze({
+  ownerDm: Object.freeze({
+    delegationMode: "always_ask",
+    progressReportMode: "completion_and_blocked",
+    allowedProjectIds: Object.freeze([]),
+  }),
+  group: Object.freeze({
+    delegationMode: "always_ask",
+    progressReportMode: "completion_and_blocked",
+    allowedProjectIds: Object.freeze([]),
+  }),
+});
+
+function sanitizeProgressMode(value: unknown): ImProgressReportMode {
+  if (value === "silent" || value === "completion_and_blocked" || value === "phase_summary") {
+    return value;
+  }
+  return "completion_and_blocked";
+}
+
+function sanitizeProjectIds(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) return [];
+  const unique = new Set<string>();
+  for (const item of value) {
+    if (typeof item === "string") {
+      const trimmed = item.trim();
+      if (trimmed.length > 0) unique.add(trimmed);
+    }
+  }
+  return [...unique];
+}
+
+export function sanitizeImDelegationPolicy(raw: unknown): ImDelegationPolicy {
+  const input = isRecord(raw) ? raw : {};
+  const rawOwnerDm = isRecord(input.ownerDm) ? input.ownerDm : {};
+  const rawGroup = isRecord(input.group) ? input.group : {};
+  const ownerDmMode: ImDelegationMode =
+    rawOwnerDm.delegationMode === "scoped_auto" || rawOwnerDm.delegationMode === "deny"
+      ? rawOwnerDm.delegationMode
+      : "always_ask";
+  const groupMode: ImDelegationMode =
+    rawGroup.delegationMode === "deny" ? "deny" : "always_ask";
+  return {
+    ownerDm: {
+      delegationMode: ownerDmMode,
+      progressReportMode: sanitizeProgressMode(rawOwnerDm.progressReportMode),
+      allowedProjectIds: ownerDmMode === "scoped_auto" ? sanitizeProjectIds(rawOwnerDm.allowedProjectIds) : [],
+    },
+    group: {
+      delegationMode: groupMode,
+      progressReportMode: sanitizeProgressMode(rawGroup.progressReportMode),
+      allowedProjectIds: [],
+    },
+  };
+}
+
+export function evaluateImDelegationPolicy(input: {
+  readonly caller: TurnExecutionContext;
+  readonly policy: ImDelegationPolicy;
+  readonly targetProjectId?: string | null;
+}): { readonly decision: "allow" | "require_approval" | "deny"; readonly reason: string } {
+  const sanitized = sanitizeImDelegationPolicy(input.policy);
+  const { caller, targetProjectId } = input;
+  if (caller.source === "desktop" && caller.replyAudience === "local_only" && caller.senderRole === "owner") {
+    return { decision: "allow", reason: "Desktop owner supervisory action." };
+  }
+  if (caller.replyAudience === "group") {
+    if (sanitized.group.delegationMode === "deny") {
+      return { decision: "deny", reason: "Group cross-thread delegation is disabled by this Navigator's policy." };
+    }
+    return { decision: "require_approval", reason: "Group actions require explicit desktop Owner approval." };
+  }
+  if (caller.replyAudience === "owner_dm") {
+    if (sanitized.ownerDm.delegationMode === "deny") {
+      return { decision: "deny", reason: "Owner DM cross-thread delegation is disabled by this Navigator's policy." };
+    }
+    if (
+      sanitized.ownerDm.delegationMode === "scoped_auto" &&
+      typeof targetProjectId === "string" &&
+      targetProjectId.length > 0 &&
+      sanitized.ownerDm.allowedProjectIds.includes(targetProjectId)
+    ) {
+      return { decision: "allow", reason: "Target project is authorized by Owner DM scoped delegation policy." };
+    }
+    return { decision: "require_approval", reason: "Owner DM cross-thread delegation requires desktop Owner approval." };
+  }
+  return { decision: "deny", reason: "Unauthorized caller execution context." };
+}
+
+export function resolveProgressReportMode(
+  caller: TurnExecutionContext,
+  policy: ImDelegationPolicy,
+): ImProgressReportMode {
+  const sanitized = sanitizeImDelegationPolicy(policy);
+  if (caller.replyAudience === "group") return sanitized.group.progressReportMode;
+  if (caller.replyAudience === "owner_dm") return sanitized.ownerDm.progressReportMode;
+  return "phase_summary";
 }
 
 export type ThreadAccessAction = "status_read" | "history_read" | "send" | "share";
@@ -210,14 +332,14 @@ export function evaluateThreadAccess(input: {
   readonly callerLeaderId?: string;
   readonly awarenessScope: AwarenessScope;
   readonly ownerDmDesktopGrants?: ReadonlySet<string>;
+  readonly imPolicy?: ImDelegationPolicy;
   readonly target: ThreadAccessTarget;
   readonly action: ThreadAccessAction;
 }): { readonly allowed: boolean; readonly reason?: string } {
-  const { caller, awarenessScope, ownerDmDesktopGrants, target, action } = input;
+  const { caller, awarenessScope, ownerDmDesktopGrants, imPolicy, target, action } = input;
   const callerLeaderId = input.callerLeaderId ?? caller.leaderId ?? DEFAULT_LEADER_ID;
   const targetLeaderId = target.leaderId ?? DEFAULT_LEADER_ID;
 
-  // 1. Group callers: strictly confined to their own (leaderId, connectionId, chatId) group.
   if (caller.replyAudience === "group") {
     const sameGroup =
       target.isProtected &&
@@ -236,7 +358,6 @@ export function evaluateThreadAccess(input: {
     return { allowed: true };
   }
 
-  // 2. Owner DM callers: own Leader remote threads only; desktop local_only requires explicit grant.
   if (caller.replyAudience === "owner_dm") {
     if (target.isProtected) {
       if (targetLeaderId !== callerLeaderId) {
@@ -247,9 +368,19 @@ export function evaluateThreadAccess(input: {
       }
       return { allowed: true };
     }
+    const sanitizedPolicy = imPolicy ? sanitizeImDelegationPolicy(imPolicy) : undefined;
+    if (sanitizedPolicy?.ownerDm.delegationMode === "deny") {
+      return { allowed: false, reason: "Owner DM cross-thread access is disabled by this Navigator's policy." };
+    }
+    const grantedByPolicy =
+      action === "status_read" &&
+      sanitizedPolicy?.ownerDm.delegationMode === "scoped_auto" &&
+      Boolean(target.projectId) &&
+      sanitizedPolicy.ownerDm.allowedProjectIds.includes(target.projectId!);
     const granted =
       ownerDmDesktopGrants?.has(target.threadId) === true ||
-      (Boolean(target.projectId) && ownerDmDesktopGrants?.has(`project:${target.projectId}`) === true);
+      (Boolean(target.projectId) && ownerDmDesktopGrants?.has(`project:${target.projectId}`) === true) ||
+      grantedByPolicy;
     if (!granted) {
       return { allowed: false, reason: "Owner DM access to local desktop sessions is disabled by default." };
     }
@@ -404,6 +535,13 @@ export class ImApprovals {
 
   get(id: string): ApprovalRequest | undefined {
     return this.pending.get(id)?.request;
+  }
+
+  hasPendingForRun(runId: string): boolean {
+    for (const { request } of this.pending.values()) {
+      if (request.turnId === runId) return true;
+    }
+    return false;
   }
 
   /**

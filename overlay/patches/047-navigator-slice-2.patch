@@ -1,0 +1,520 @@
+diff --git a/apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts b/apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts
+index 725a15aa..6bf5401e 100644
+--- a/apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts
++++ b/apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts
+@@ -163,6 +163,9 @@ const make = Effect.gen(function* () {
+       if (projection.thread.titleRegeneration?.requestId !== input.requestId) {
+         return { status: "stale" as const };
+       }
++      if (input.threadId.startsWith("xtwork-leader-")) {
++        return { status: "unchanged" as const };
++      }
+ 
+       const project = yield* projects.get(projection.thread.projectId);
+       if (Option.isNone(project)) {
+@@ -230,7 +233,14 @@ const make = Effect.gen(function* () {
+         projectId: projection.thread.projectId,
+       });
+       const generatedTitle = result.title.trim();
+-      return generatedTitle === "New thread" ||
++      const lowerTitle = generatedTitle.toLowerCase();
++      const isDegenerateTitle =
++        generatedTitle.length === 0 ||
++        lowerTitle === "new thread" ||
++        lowerTitle === "unknown subject" ||
++        lowerTitle === "untitled" ||
++        lowerTitle === "untitled thread";
++      return isDegenerateTitle ||
+         (input.kind.type === "regenerate" && generatedTitle === projection.thread.title.trim())
+         ? { status: "unchanged" as const }
+         : { status: "renamed" as const, title: result.title };
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index aafca841..91a8301e 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -7,6 +7,7 @@ import { m } from "../i18n/messages";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { useGT, useMessages } from "gt-react";
+ import { ChildThreadApprovals } from "./chat/ChildThreadApprovals";
++import type { ReactNode } from "react";
+ import { LeaderSupervisoryBar } from "./leader/LeaderSupervisoryBar";
+ import { workspaceAreaProps } from "../lib/workspaceFocus";
+ import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
+@@ -3448,6 +3449,57 @@ export default function ChatView(props: ChatViewProps) {
+     addFolders: addDroppedFoldersToComposer,
+   });
+ 
++  const isNavigatorThread = activeThread.id.startsWith("xtwork-leader-");
++  const chatHeaderClassName = cn(
++    "relative bg-transparent [[data-panel-animations=true]_&]:motion-safe:transition-[padding-left] [[data-panel-animations=true]_&]:motion-safe:duration-(--panel-animation-duration) [[data-panel-animations=true]_&]:motion-safe:ease-out",
++    isElectron
++      ? cn(
++          "drag-region flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center px-3 sm:px-5",
++          reserveTitleBarControlInset &&
++            !inlineRightPanelOwnsTitleBar &&
++            "wco:pr-(--workspace-native-controls-inset)",
++        )
++      : "flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center pl-(--workspace-gutter-start) pr-(--workspace-gutter-end)",
++    COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
++  );
++  const renderChatHeaderShell = (headerContent: ReactNode) => (
++    <header
++      ref={threadPanelPopoverAnchorRef}
++      data-chat-header
++      data-navigator-header={isNavigatorThread ? "true" : undefined}
++      className={chatHeaderClassName}
++    >
++      {isElectron && rightPanelControlsAtRoot ? (
++        <span
++          aria-hidden
++          className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]"
++        />
++      ) : null}
++      {!rightPanelControlsAtRoot && !rightPanelControlsInPanel ? panelLayoutControls : null}
++      {showThreadDetails && inlineRightPanelOwnsTitleBar ? threadPanelHeaderControl : null}
++      {headerContent}
++    </header>
++  );
++
++  const chatHeaderNode = (
++    <ChatHeader
++      activeThreadEnvironmentId={activeThread.environmentId}
++      activeThreadId={activeThread.id}
++      isServerThread={isServerThread}
++      activeThreadTitle={activeThread.title}
++      activeThreadLinkOrigin={activeThreadShell?.linkOrigin?.label ?? null}
++      activeProject={activeProject ?? null}
++      parentThreadLink={headerParentThreadLink}
++      onOpenThread={onOpenRelatedThreadStable}
++      rightPanelOpen={inlineRightPanelOwnsTitleBar}
++      onNewThreadInProject={handleNewThreadInActiveProjectStable}
++      {...(activeDraftLogicalProjectKey
++        ? { onOpenProjectSettings: handleOpenDraftProjectSettingsStable }
++        : {})}
++      {...(threadFindEnabled ? { onFindInThread: openThreadFindStable } : {})}
++    />
++  );
++
+   const content = (
+     <div
+       ref={setWorkspaceLayoutElement}
+@@ -3471,54 +3523,19 @@ export default function ChatView(props: ChatViewProps) {
+         inert={rightPanelMaximized}
+         onMouseUp={preventMiddleClickPasteOutsideEditable}
+       >
+-        {embedded ? null : (
+-          <header
+-            ref={threadPanelPopoverAnchorRef}
+-            data-chat-header
+-            className={cn(
+-              "relative bg-background [[data-panel-animations=true]_&]:motion-safe:transition-[padding-left] [[data-panel-animations=true]_&]:motion-safe:duration-(--panel-animation-duration) [[data-panel-animations=true]_&]:motion-safe:ease-out",
+-              isElectron
+-                ? cn(
+-                    "drag-region flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center px-3 sm:px-5",
+-                    reserveTitleBarControlInset &&
+-                      !inlineRightPanelOwnsTitleBar &&
+-                      "wco:pr-(--workspace-native-controls-inset)",
+-                  )
+-                : "flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center pl-(--workspace-gutter-start) pr-(--workspace-gutter-end)",
+-              COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
+-            )}
+-          >
+-            {isElectron && rightPanelControlsAtRoot ? (
+-              <span
+-                aria-hidden
+-                className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]"
+-              />
+-            ) : null}
+-            {!rightPanelControlsAtRoot && !rightPanelControlsInPanel ? panelLayoutControls : null}
+-            {showThreadDetails && inlineRightPanelOwnsTitleBar ? threadPanelHeaderControl : null}
+-            <ChatHeader
+-              activeThreadEnvironmentId={activeThread.environmentId}
+-              activeThreadId={activeThread.id}
+-              isServerThread={isServerThread}
+-              activeThreadTitle={activeThread.title}
+-              activeThreadLinkOrigin={activeThreadShell?.linkOrigin?.label ?? null}
+-              activeProject={activeProject ?? null}
+-              parentThreadLink={headerParentThreadLink}
+-              onOpenThread={onOpenRelatedThreadStable}
+-              rightPanelOpen={inlineRightPanelOwnsTitleBar}
+-              onNewThreadInProject={handleNewThreadInActiveProjectStable}
+-              {...(activeDraftLogicalProjectKey
+-                ? { onOpenProjectSettings: handleOpenDraftProjectSettingsStable }
+-                : {})}
+-              {...(threadFindEnabled ? { onFindInThread: openThreadFindStable } : {})}
+-            />
+-          </header>
++        {embedded ? null : isNavigatorThread ? (
++          <LeaderSupervisoryBar
++            key={`${activeThread.environmentId}:${activeThread.id}`}
++            threadId={activeThread.id}
++            environmentId={activeThread.environmentId}
++            rightPanelOpen={inlineRightPanelOwnsTitleBar}
++            renderHeader={renderChatHeaderShell}
++            fallbackHeader={chatHeaderNode}
++          />
++        ) : (
++          renderChatHeaderShell(chatHeaderNode)
+         )}
+ 
+-        <LeaderSupervisoryBar
+-          threadId={activeThread.id}
+-          environmentId={activeThread.environmentId}
+-        />
+         <div className="relative flex min-h-0 min-w-0 flex-1">
+           <ThreadFindCanvas
+             findOptions={{
+diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
+index a4c79d63..dd3b9866 100644
+--- a/apps/web/src/components/Sidebar.tsx
++++ b/apps/web/src/components/Sidebar.tsx
+@@ -3004,6 +3004,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+         className="min-h-full"
+         fixedHeader={
+           <SidebarGroup className="z-[1]">
++            <LeaderSidebarSlot onPinnedThreadIdsChange={setLeaderPinnedThreadIds} />
+             <SidebarThreadHeader
+               hasProjects={projectGroups.length > 0}
+               projectScope={
+@@ -3243,7 +3244,6 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+         }
+       >
+         <SidebarGroup className="flex-1" role="presentation">
+-          <LeaderSidebarSlot onPinnedThreadIdsChange={setLeaderPinnedThreadIds} />
+           {isSearchingThreads ? (
+             threadSearchResults.length > 0 ? (
+               <TooltipProvider
+diff --git a/apps/web/src/components/chat/ChatHeader.tsx b/apps/web/src/components/chat/ChatHeader.tsx
+index 133c80f3..6c7ba042 100644
+--- a/apps/web/src/components/chat/ChatHeader.tsx
++++ b/apps/web/src/components/chat/ChatHeader.tsx
+@@ -85,7 +85,12 @@ export const ChatHeader = memo(function ChatHeader({
+   onFindInThread,
+ }: ChatHeaderProps) {
+   const gt = useGT();
+-  const activeProjectName = activeProject?.isScratch ? gt("No project") : activeProject?.title;
++  const normalizedTitle = activeThreadTitle.trim();
++  const displayThreadTitle =
++    normalizedTitle.length === 0 || normalizedTitle.toLowerCase() === "unknown subject"
++      ? gt("New thread")
++      : activeThreadTitle;
++  const activeProjectName = activeProject?.isScratch ? undefined : activeProject?.title;
+   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
+   const interfaceFont = useClientSettings((settings) => settings.fontFamilySans);
+   const breadcrumbContainerRef = useRef<HTMLDivElement>(null);
+@@ -261,7 +266,7 @@ export const ChatHeader = memo(function ChatHeader({
+         ariaLabel={gt("Thread breadcrumb")}
+         className="flex-1 overflow-clip [overflow-clip-margin:2px]"
+       >
+-        {activeProject ? (
++        {activeProject && !activeProject.isScratch ? (
+           <>
+             <WorkspaceBreadcrumbItem className="shrink">
+               <Tooltip>
+@@ -359,7 +364,7 @@ export const ChatHeader = memo(function ChatHeader({
+                 render={
+                   <button
+                     type="button"
+-                    aria-label={gt("Thread actions for {title}", { title: activeThreadTitle })}
++                    aria-label={gt("Thread actions for {title}", { title: displayThreadTitle })}
+                     aria-haspopup="menu"
+                     onClick={openMenuFromTitle}
+                     onDoubleClick={canOperateThread ? handleTitleDoubleClick : undefined}
+@@ -367,8 +372,8 @@ export const ChatHeader = memo(function ChatHeader({
+                   />
+                 }
+               >
+-                <h2 className="min-w-0" dir={textDirection(activeThreadTitle)}>
+-                  <WorkspaceBreadcrumbText>{activeThreadTitle}</WorkspaceBreadcrumbText>
++                <h2 className="min-w-0" dir={textDirection(displayThreadTitle)}>
++                  <WorkspaceBreadcrumbText>{displayThreadTitle}</WorkspaceBreadcrumbText>
+                 </h2>
+                 <ChevronDownIcon
+                   aria-hidden
+@@ -376,22 +381,22 @@ export const ChatHeader = memo(function ChatHeader({
+                   className="size-3.5 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/thread-title:opacity-100 group-focus-visible/thread-title:opacity-100"
+                 />
+               </TooltipTrigger>
+-              <TooltipPopup side="top">{activeThreadTitle}</TooltipPopup>
++              <TooltipPopup side="top">{displayThreadTitle}</TooltipPopup>
+             </Tooltip>
+           ) : (
+             <Tooltip>
+               <TooltipTrigger
+                 render={
+                   <h2
+-                    aria-label={activeThreadTitle}
++                    aria-label={displayThreadTitle}
+                     className="min-w-0 flex-1"
+-                    dir={textDirection(activeThreadTitle)}
++                    dir={textDirection(displayThreadTitle)}
+                   />
+                 }
+               >
+-                <WorkspaceBreadcrumbText>{activeThreadTitle}</WorkspaceBreadcrumbText>
++                <WorkspaceBreadcrumbText>{displayThreadTitle}</WorkspaceBreadcrumbText>
+               </TooltipTrigger>
+-              <TooltipPopup side="top">{activeThreadTitle}</TooltipPopup>
++              <TooltipPopup side="top">{displayThreadTitle}</TooltipPopup>
+             </Tooltip>
+           )}
+           {renamingTitle === null && activeThreadLinkOrigin ? (
+diff --git a/apps/web/src/components/sidebar/SidebarThreadHeader.tsx b/apps/web/src/components/sidebar/SidebarThreadHeader.tsx
+index 443549c7..fab5a3e5 100644
+--- a/apps/web/src/components/sidebar/SidebarThreadHeader.tsx
++++ b/apps/web/src/components/sidebar/SidebarThreadHeader.tsx
+@@ -1,6 +1,7 @@
+ import { isElectron } from "../../env";
++import { useClientSettings } from "../../hooks/useSettings";
+ import { useGT } from "gt-react";
+-import { FolderPlusIcon, SearchIcon, SquarePenIcon, XIcon } from "lucide-react";
++import { FolderPlusIcon, PlusIcon, SearchIcon, XIcon } from "lucide-react";
+ import {
+   type ComponentProps,
+   type KeyboardEvent as ReactKeyboardEvent,
+@@ -52,17 +53,64 @@ export function SidebarThreadHeader({
+   onClearSearch,
+ }: SidebarThreadHeaderProps) {
+   const gt = useGT();
++  const language = useClientSettings((settings) => settings.language);
++  const sectionTitle = language === "en" ? "Threads" : "对话";
+   const resultsVisible = isSearching && searchResultCount > 0;
+-  // Shrinking results can remove the active option; never leave aria-activedescendant pointing at it.
+   const activeResultExists = resultsVisible && activeSearchResultIndex < searchResultCount;
+   const newThreadLabel = newThreadShortcutLabel
+     ? gt("New thread ({shortcut})", { shortcut: newThreadShortcutLabel })
+     : gt("New thread");
+ 
+   return (
+-    <div className="flex items-center gap-1">
+-      <div className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-sm font-medium text-sidebar-muted-foreground hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-within:bg-sidebar-row-hover focus-within:text-sidebar-foreground focus-within:ring-1 focus-within:ring-inset focus-within:ring-ring/70">
+-        <SearchIcon className="size-4 shrink-0 text-(--sidebar-icon-color)" />
++    <div className="flex flex-col gap-1.5" data-testid="sidebar-threads-section-header">
++      <div className="flex items-center justify-between gap-1 px-1">
++        <span
++          data-testid="sidebar-threads-heading"
++          className="text-[13px] font-semibold tracking-tight text-sidebar-foreground/90"
++        >
++          {sectionTitle}
++        </span>
++        <div className="flex shrink-0 items-center gap-0.5">
++          {hasProjects ? (
++            <>
++              {projectScope}
++              <SidebarHeaderIconButton label={gt("Add project")} onClick={onNewProject}>
++                <FolderPlusIcon />
++              </SidebarHeaderIconButton>
++            </>
++          ) : null}
++          <SidebarHeaderIconButton
++            label={gt("New thread")}
++            tooltip={
++              isElectron ? (
++                <span className="flex flex-col gap-0.5">
++                  <span>{newThreadLabel}</span>
++                  <span className="text-muted-foreground">{gt("Choose a folder: Shift+click")}</span>
++                </span>
++              ) : showNewThreadInProjectHint ? (
++                <span className="flex flex-col gap-0.5">
++                  <span>{newThreadLabel}</span>
++                  <span className="text-muted-foreground">
++                    {newThreadInProjectShortcutLabel
++                      ? gt("New thread in current project: Shift+click ({shortcut})", {
++                          shortcut: newThreadInProjectShortcutLabel,
++                        })
++                      : gt("New thread in current project: Shift+click")}
++                  </span>
++                </span>
++              ) : (
++                newThreadLabel
++              )
++            }
++            disabled={newThreadDisabled}
++            onClick={onNewThread}
++          >
++            <PlusIcon />
++          </SidebarHeaderIconButton>
++        </div>
++      </div>
++      <div className="flex h-8 min-w-0 items-center gap-2 rounded-lg px-2 py-1 text-sm font-medium text-sidebar-muted-foreground hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-within:bg-sidebar-row-hover focus-within:text-sidebar-foreground focus-within:ring-1 focus-within:ring-inset focus-within:ring-ring/70">
++        <SearchIcon className="size-3.5 shrink-0 text-(--sidebar-icon-color)" />
+         <SidebarInput
+           ref={searchInputRef}
+           nativeInput
+@@ -99,44 +147,6 @@ export function SidebarThreadHeader({
+           </Button>
+         ) : null}
+       </div>
+-      <div className="flex shrink-0 items-center">
+-        {hasProjects ? (
+-          <>
+-            {projectScope}
+-            <SidebarHeaderIconButton label={gt("Add project")} onClick={onNewProject}>
+-              <FolderPlusIcon />
+-            </SidebarHeaderIconButton>
+-          </>
+-        ) : null}
+-        <SidebarHeaderIconButton
+-          label={gt("New thread")}
+-          tooltip={
+-            isElectron ? (
+-              <span className="flex flex-col gap-0.5">
+-                <span>{newThreadLabel}</span>
+-                <span className="text-muted-foreground">{gt("Choose a folder: Shift+click")}</span>
+-              </span>
+-            ) : showNewThreadInProjectHint ? (
+-              <span className="flex flex-col gap-0.5">
+-                <span>{newThreadLabel}</span>
+-                <span className="text-muted-foreground">
+-                  {newThreadInProjectShortcutLabel
+-                    ? gt("New thread in current project: Shift+click ({shortcut})", {
+-                        shortcut: newThreadInProjectShortcutLabel,
+-                      })
+-                    : gt("New thread in current project: Shift+click")}
+-                </span>
+-              </span>
+-            ) : (
+-              newThreadLabel
+-            )
+-          }
+-          disabled={newThreadDisabled}
+-          onClick={onNewThread}
+-        >
+-          <SquarePenIcon />
+-        </SidebarHeaderIconButton>
+-      </div>
+     </div>
+   );
+ }
+diff --git a/apps/web/src/index.css b/apps/web/src/index.css
+index e8ded381..18a57cca 100644
+--- a/apps/web/src/index.css
++++ b/apps/web/src/index.css
+@@ -120,7 +120,8 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
+   --glass-opacity: 80%;
+   --glass-saturation: 1.14;
+   --desktop-window-right-resize-inset: 0px;
+-  --workspace-topbar-height: 52px;
++  --xtwork-window-topbar-height: 52px;
++  --workspace-topbar-height: var(--xtwork-window-topbar-height);
+   --workspace-controls-top: 0px;
+   --workspace-controls-left: calc(env(safe-area-inset-left) + 0.75rem);
+   --workspace-controls-right: calc(env(safe-area-inset-right) + 0.75rem);
+@@ -154,7 +155,8 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
+ 
+ .wco {
+   --native-titlebar-height: env(titlebar-area-height, 0px);
+-  --workspace-topbar-height: max(40px, env(titlebar-area-height, 52px));
++  --xtwork-window-topbar-height: max(40px, env(titlebar-area-height, 52px));
++  --workspace-topbar-height: var(--xtwork-window-topbar-height);
+   --workspace-controls-top: env(titlebar-area-y, 0px);
+   --workspace-controls-left: calc(env(titlebar-area-x, 0px) + 0.75rem);
+   --workspace-controls-right: calc(
+@@ -1370,13 +1372,21 @@ html[data-xtwork-wash] [data-slot="sidebar-inset"] {
+   html[data-xtwork-wash]
+     [data-slot="sidebar-wrapper"][data-sidebar-state="expanded"]:has([data-app-sidebar])
+     > [data-slot="sidebar-inset"] {
+-    max-height: calc(100dvh - 16px);
+-    margin: 8px 8px 8px 0;
++    --workspace-topbar-height: calc(var(--xtwork-window-topbar-height) - 14px);
++    max-height: calc(100dvh - 14px);
++    margin: 6px 8px 8px 0;
+     overflow: hidden;
+     border: 1px solid var(--contrast-border);
+     border-radius: 14px;
+   }
+ 
++  html[data-xtwork-wash]
++    [data-slot="sidebar-wrapper"][data-sidebar-state="expanded"]:has([data-app-sidebar])
++    > [data-slot="sidebar-inset"]
++    [data-workspace-titlebar-controls].fixed {
++    --workspace-topbar-height: var(--xtwork-window-topbar-height);
++  }
++
+   html[data-xtwork-wash] [data-app-sidebar][data-slot="sidebar-container"],
+   html[data-xtwork-wash] [data-workspace-area="settings-nav"] {
+     border-color: transparent;
+@@ -1456,46 +1466,38 @@ html[data-theme-token-probe] *::after {
+   top: calc(100% + 0.35rem);
+ }
+ 
+-/* Workspace actions use a small, separate chrome hierarchy. Keeping these
+-   roles explicit prevents the thread toolbar from falling back to the default
+-   dark-mode whites while preserving the same theme file across clients. */
+-html[data-theme-id] [data-chat-header] {
+-  background-color: var(--toolbar-background);
+-  color: var(--contrast-toolbar-foreground);
++html[data-theme-id] [data-chat-header],
++html[data-xtwork-wash] [data-chat-header] {
++  background-color: transparent;
++  color: var(--foreground);
+ }
+ 
+ html[data-theme-id] [data-chat-header] [data-slot="button"],
+ html[data-theme-id] [data-chat-header] [data-slot="menu-trigger"],
+-html[data-theme-id] [data-chat-header] [data-toolbar-control] {
+-  --control-icon-color: var(--contrast-toolbar-control-foreground);
+-  background-color: var(--toolbar-control);
+-  border-color: var(--contrast-toolbar-border);
+-  color: var(--contrast-toolbar-control-foreground);
+-}
+-
+-/* The panel layout toggles stay ghost: they render both inside the header and
+-   in the titlebar strip, so filling them would make them change appearance as
+-   the panel opens. They only take the themed foreground; hover and pressed
+-   keep the base ghost accent. The tooltip trigger's data-slot wins over the
+-   toggle's when the trigger renders the toggle, so match both. */
++html[data-theme-id] [data-chat-header] [data-toolbar-control],
++html[data-xtwork-wash] [data-chat-header] [data-slot="button"],
++html[data-xtwork-wash] [data-chat-header] [data-slot="menu-trigger"],
++html[data-xtwork-wash] [data-chat-header] [data-toolbar-control] {
++  --control-icon-color: var(--foreground);
++  background-color: transparent;
++  border-color: color-mix(in oklab, var(--foreground) 14%, transparent);
++  color: var(--foreground);
++}
++
+ html[data-theme-id] [data-panel-layout-controls] [data-slot="toggle"],
+ html[data-theme-id] [data-panel-layout-controls] [data-slot="tooltip-trigger"],
+ html[data-theme-id] [data-workspace-titlebar-controls] [data-slot="toggle"],
+ html[data-theme-id] [data-workspace-titlebar-controls] [data-slot="tooltip-trigger"] {
+-  --control-icon-color: var(--contrast-toolbar-foreground);
+-  color: var(--contrast-toolbar-foreground);
++  --control-icon-color: var(--foreground);
++  color: var(--foreground);
+ }
+ 
+ html[data-theme-id] [data-panel-layout-controls] [data-slot="toggle"]:disabled,
+ html[data-theme-id] [data-panel-layout-controls] [data-slot="tooltip-trigger"]:disabled,
+ html[data-theme-id] [data-workspace-titlebar-controls] [data-slot="toggle"]:disabled,
+ html[data-theme-id] [data-workspace-titlebar-controls] [data-slot="tooltip-trigger"]:disabled {
+-  --control-icon-color: color-mix(
+-    in oklab,
+-    var(--contrast-toolbar-foreground) 55%,
+-    var(--toolbar-background)
+-  );
+-  color: color-mix(in oklab, var(--contrast-toolbar-foreground) 55%, var(--toolbar-background));
++  --control-icon-color: color-mix(in oklab, var(--foreground) 45%, transparent);
++  color: color-mix(in oklab, var(--foreground) 45%, transparent);
+ }
+ 
+ html[data-theme-id] [data-chat-header] [data-slot="button"]:hover,
+@@ -1503,12 +1505,15 @@ html[data-theme-id] [data-chat-header] [data-slot="button"][data-pressed],
+ html[data-theme-id] [data-chat-header] [data-slot="menu-trigger"]:hover,
+ html[data-theme-id] [data-chat-header] [data-slot="menu-trigger"][data-pressed],
+ html[data-theme-id] [data-chat-header] [data-toolbar-control]:hover,
+-html[data-theme-id] [data-chat-header] [data-toolbar-control][data-pressed] {
+-  background-color: var(--toolbar-control-hover);
++html[data-theme-id] [data-chat-header] [data-toolbar-control][data-pressed],
++html[data-xtwork-wash] [data-chat-header] [data-slot="button"]:hover,
++html[data-xtwork-wash] [data-chat-header] [data-slot="menu-trigger"]:hover,
++html[data-xtwork-wash] [data-chat-header] [data-toolbar-control]:hover {
++  background-color: color-mix(in oklab, var(--foreground) 7%, transparent);
+ }
+ 
+ html[data-theme-id] [data-chat-header] [data-slot="separator"] {
+-  background-color: var(--contrast-toolbar-border);
++  background-color: color-mix(in oklab, var(--foreground) 14%, transparent);
+ }
+ 
+ /* Chat code blocks join the other code surfaces on the code tokens. The

@@ -1,7 +1,7 @@
 # ADR-013 · Leader（Captain 式主管实体）、侧栏置顶入口与 Mingle 能力移植边界
 
 - **Date** 2026-11-25
-- **Status** Accepted（Slice 1 已于 [PR #25](https://github.com/oulkurt/Xtwork-v2/pull/25) 合入 `main`；Stage 2/3 按排期推进）
+- **Status** Accepted（Slice 1 已于 [PR #25](https://github.com/oulkurt/Xtwork-v2/pull/25) 合入 `main`；Slice 2 与「领航者 / 对话」界面重构已完成实现与验证；Stage 3 按排期推进）
 - **Evidence** Confirmed · 2026-11-25 项目负责人批准方向并指示在 GPT-6.2 Astra 与 Claude Opus 5.5 达成一致后直接推进；经 Gemini 4 Neon、GPT-6.2 Astra（两轮）与 Claude Opus 5.5 核对锁定源码（`t3code@3ce2145`、`im-bridge`、`034-im-bridge.patch`、`035-pi-im-security-hook.patch`）后全面达成一致（`CONSENSUS: AGREED`）
 
 ## Context
@@ -100,6 +100,16 @@
 
 - **Stage 2**：简单「新建 Leader」入口与多 Leader 切换、Owner 私聊按项目/线程授权查桌面状态入口、外部会话扫描交接 UI、空闲 `tidy` 调度。
 - **Stage 3 / 后续验收**：复杂渠道换绑 UI、非 Pi 远程运行时（Claude Code / Codex 逐个补齐目录隔离与单次审批钩子后开放）、多机器受保护任务转发（硬不变量：目标主机或 Provider 无法验证执行策略时一律 fail-closed 拒绝）。
+
+### 7. Slice 2 增补与用户可见术语定名（2026-11-25）
+
+为对齐产品体验与双语一致性，Slice 2 在保持全部底层安全不变量与数据库/API 向后兼容的前提下，确认并落地以下五项增量：
+
+1. **统一领域术语（Ubiquitous Language）**：用户可见界面统一将 `Leader` 定名为中文 **「领航者」**、英文 **`Navigator` / `Navigators`**（上区分区标题用 `Navigators` 与下方 `Threads` 对称）；侧栏下方普通对话列表保持中文 **「对话」**（遵循术语规范，禁用「会话」「线程」）、英文 **`Threads`**。SQLite 表（`xtwork_leaders`、`xtwork_leader_bindings`、`xtwork_run_policies`）与 `/api/xtwork/im/leaders/*` 路由保持不变。
+2. **沉浸式透明顶栏与占位标题拦截**：`[data-chat-header]` 改为透明背景直接融合主题画布（消除浅色/渐变主题下的纯白截断条）；`xtwork-leader-*` 领航者线程隐藏普通面包屑并将领航者身份、状态、Needs You、暂停/恢复与管理收束为单一顶栏；`ChatHeader` 隐藏免项目草稿的 `无文件夹 /` 前缀；`ThreadTitleRegenerationService` 跳过 `xtwork-leader-*` 自动改名并拒绝 `Unknown Subject` / `Untitled` 等退化占位标题；领航者改名时同步更新对应置顶线程标题。
+3. **侧栏上下分栏（领航者 / 对话）**：桌面侧栏固定区清晰划分为上方 **「领航者」**（含 `+` 快捷创建与 `…` 菜单及领航者卡片列表）与下方 **「对话」**（含项目筛选、添加文件夹、新建对话与搜索框），避免入口混排。
+4. **多领航者归档与 IM 渠道换绑**：新增 `POST /api/xtwork/im/leaders/:id/archive`（禁止归档默认领航者 `leader-default`；若存在活跃连接，拒绝静默遗弃或按 `rebindToLeaderId` 在单事务内换绑并同步 `im-bridge`；若仍存在未处理的暂停积压消息则拒绝归档，防止积压失去操作入口；已归档领航者不可被迟到请求恢复或修改）与 `POST /api/xtwork/im/connections/rebind`（递增 `bindingEpoch`、签发新 `bindingId` 并实时下发 `connections.syncBindings`，同步失败时显式上报 `syncPending: true` 并由后台轮询持续补偿，历史归属与暂停积压保留原领航者）；领航者管理面板与「设置 → 远程连接」两处均提供换绑选择器，且 `GET /api/xtwork/im/connections` 自动补全活跃绑定归属。
+5. **IM 跨对话委派与进展汇报审批策略（`im_policy_json`）**：在 `xtwork_leaders` 持久化按受众（`ownerDm` / `group`）分级的 `imPolicy`，默认最小权限（`delegationMode: "always_ask"`、`progressReportMode: "completion_and_blocked"`）。服务端强制执行 **Capability Attenuation（权限收窄）**：`group` 受众永远不可开启 `scoped_auto` 或配置桌面 `allowedProjectIds`；新增只读 MCP 工具 `im__workspace_status`，在 Owner 私聊开启 `scoped_auto` 时仅对白名单文件夹放行状态查询，其余文件夹走单次桌面审批，`deny` 模式立即拒绝跨聊天与跨项目操作；`makeDeliverySync` 按受众 `progressReportMode` 控制 `phase_summary`（实时流式）、`completion_and_blocked`（检测到 `waiting` 或存在运行中待审批项时，通过 `messages.send({ preserveInboundState: true })` 发送阻塞提醒而不提前结算入站消息）与 `silent`（仅最终答复）。
 
 ## Consequences and Trade-offs
 

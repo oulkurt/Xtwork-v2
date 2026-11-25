@@ -1899,4 +1899,209 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
 
     await bridge.shutdown();
   });
+
+  it("preserves inbound delivered state when messages.send uses preserveInboundState for progress notices", async () => {
+    const notifications: RpcNotification[] = [];
+    const mock = createMockChannel({ platform: "feishu", trust: "org", onboardOwnerId: "u-owner" });
+    const store = new Store(":memory:");
+    const secrets = memorySecrets();
+    await secrets.set("sec:fs-progress", JSON.stringify({ appId: "a", appSecret: "s" }));
+    const conn = store.createConnection({
+      platform: "feishu",
+      secretRef: "sec:fs-progress",
+      lifecycleState: "active",
+      ownerId: "u-owner",
+    });
+
+    const bridge = new ImBridge({
+      store,
+      secrets,
+      channels: { feishu: mock.channel },
+      notify: (n) => notifications.push(n),
+    });
+    await bridge.start();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const ingested = store.ingestInbound(conn.id, "org", {
+      platformId: "pmsg-blocked-1",
+      chat: { platformId: "dm-owner", kind: "dm" },
+      sender: { id: "u-owner", name: "Owner", isBot: false },
+      text: "run deploy check",
+      attachments: [],
+      addressedToBot: true,
+      sentAt: 1_700_000_500_000,
+    });
+    assert.equal(ingested.kind, "dispatch");
+    if (ingested.kind !== "dispatch") throw new Error("Expected dispatch");
+    const msgId = ingested.message.id;
+    const chatId = ingested.message.chatId;
+    const idempotencyKey = ingested.message.idempotencyKey;
+
+    const ackRes = await bridge.handleRequest({
+      id: 50,
+      method: "inbound.ack",
+      params: { idempotencyKey, t3ThreadId: "xtwork-im-dm-1", t3TurnId: "run-blocked-1" },
+    });
+    assert.equal(ackRes.ok, true);
+    assert.equal(store.message(msgId)?.state, "delivered");
+
+    const noticeRes = await bridge.handleRequest({
+      id: 51,
+      method: "messages.send",
+      params: {
+        chatId,
+        text: "任务等待桌面确认中，完成后将继续回报结果。",
+        operationKey: `${idempotencyKey}:blocked`,
+        preserveInboundState: true,
+      },
+    });
+    assert.equal(noticeRes.ok, true);
+    assert.equal(store.message(msgId)?.state, "delivered");
+
+    const dupNoticeRes = await bridge.handleRequest({
+      id: 52,
+      method: "messages.send",
+      params: {
+        chatId,
+        text: "任务等待桌面确认中，完成后将继续回报结果。",
+        operationKey: `${idempotencyKey}:blocked`,
+        preserveInboundState: true,
+      },
+    });
+    assert.equal(dupNoticeRes.ok, true);
+    assert.equal(mock.sent.length, 1);
+    assert.equal(store.message(msgId)?.state, "delivered");
+
+    const ackAfterNotice = await bridge.handleRequest({
+      id: 53,
+      method: "inbound.ack",
+      params: { idempotencyKey, t3ThreadId: "xtwork-im-dm-1", t3TurnId: "run-blocked-1" },
+    });
+    assert.equal(ackAfterNotice.ok, true);
+    if (ackAfterNotice.ok) {
+      assert.equal((ackAfterNotice.result as { message?: { state?: string } }).message?.state, "delivered");
+    }
+
+    const finalReplyRes = await bridge.handleRequest({
+      id: 54,
+      method: "messages.reply",
+      params: {
+        messageId: msgId,
+        text: "最终部署检查结果：全部通过。",
+        operationKey: `${idempotencyKey}:final`,
+      },
+    });
+    assert.equal(finalReplyRes.ok, true);
+    assert.equal(mock.sent.length, 2);
+    assert.equal(mock.sent[1]?.text, "最终部署检查结果：全部通过。");
+    assert.equal(store.message(msgId)?.state, "replied");
+
+    await bridge.shutdown();
+  });
+
+  it("reports heldCount per Leader in paused.list even after the connection is rebound to another Leader", async () => {
+    const notifications: RpcNotification[] = [];
+    const mock = createMockChannel({ platform: "feishu", trust: "public", onboardOwnerId: "u-owner" });
+    const store = new Store(":memory:");
+    const secrets = memorySecrets();
+    await secrets.set("sec:fs-held-count", JSON.stringify({ appId: "a", appSecret: "s" }));
+    const conn = store.createConnection({
+      platform: "feishu",
+      secretRef: "sec:fs-held-count",
+      lifecycleState: "active",
+      ownerId: "u-owner",
+    });
+
+    const bridge = new ImBridge({
+      store,
+      secrets,
+      channels: { feishu: mock.channel },
+      notify: (n) => notifications.push(n),
+    });
+    await bridge.start();
+    await new Promise((r) => setTimeout(r, 20));
+
+    await bridge.handleRequest({
+      id: 60,
+      method: "connections.syncBindings",
+      params: {
+        bindings: [
+          {
+            connectionId: conn.id,
+            leaderId: "leader-a",
+            bindingId: "bind-a-1",
+            bindingEpoch: 1,
+            leaderPaused: true,
+            pauseGeneration: 1,
+            pauseVersion: 1,
+          },
+        ],
+        leaderStates: { "leader-a": { paused: true, pauseGeneration: 1, pauseVersion: 1 } },
+      },
+    });
+
+    const heldOutcome = store.ingestInbound(conn.id, "public", {
+      platformId: "pmsg-stranger-held-1",
+      chat: { platformId: "dm-stranger", kind: "dm" },
+      sender: { id: "u-stranger", name: "Stranger", isBot: false },
+      text: "hello while paused",
+      attachments: [],
+      addressedToBot: true,
+      sentAt: 1_700_000_600_000,
+    });
+    assert.equal(heldOutcome.kind, "held");
+    if (heldOutcome.kind !== "held") throw new Error("Expected held");
+
+    await bridge.handleRequest({
+      id: 61,
+      method: "connections.syncBindings",
+      params: {
+        bindings: [
+          {
+            connectionId: conn.id,
+            leaderId: "leader-b",
+            bindingId: "bind-b-2",
+            bindingEpoch: 2,
+            leaderPaused: false,
+            pauseGeneration: 0,
+            pauseVersion: 0,
+          },
+        ],
+        leaderStates: { "leader-b": { paused: false, pauseGeneration: 0, pauseVersion: 0 } },
+      },
+    });
+
+    const beforeApprove = await bridge.handleRequest({
+      id: 62,
+      method: "paused.list",
+      params: { leaderId: "leader-a" },
+    });
+    assert.equal(beforeApprove.ok, true);
+    if (beforeApprove.ok) {
+      const r = beforeApprove.result as { items: unknown[]; heldCount: number };
+      assert.equal(r.items.length, 0);
+      assert.equal(r.heldCount, 1);
+    }
+
+    const approveRes = await bridge.handleRequest({
+      id: 63,
+      method: "access.decide",
+      params: { targetKind: "contact", targetId: heldOutcome.contact.id, decision: "allowed" },
+    });
+    assert.equal(approveRes.ok, true);
+
+    const afterApprove = await bridge.handleRequest({
+      id: 64,
+      method: "paused.list",
+      params: { leaderId: "leader-a" },
+    });
+    assert.equal(afterApprove.ok, true);
+    if (afterApprove.ok) {
+      const r = afterApprove.result as { items: unknown[]; heldCount: number };
+      assert.equal(r.items.length, 1);
+      assert.equal(r.heldCount, 0);
+    }
+
+    await bridge.shutdown();
+  });
 });

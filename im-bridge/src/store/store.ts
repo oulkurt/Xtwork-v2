@@ -2076,6 +2076,15 @@ export class Store {
   }
 
   /** Paused backlog messages awaiting Owner review on resume, oldest first. */
+  heldMessageCountForLeader(leaderId: string): number {
+    const row = this.stmt(
+      `SELECT COUNT(*) AS count FROM messages
+       WHERE direction = 'in' AND state = 'held'
+         AND COALESCE(leader_id, 'leader-default') = ?`,
+    ).get(leaderId) as { count?: number } | undefined;
+    return Number(row?.count ?? 0);
+  }
+
   pausedPendingMessages(
     filter?: readonly string[] | { readonly connectionIds?: readonly string[]; readonly leaderId?: string },
   ): (Message & { readonly chat: Chat; readonly platform: Platform; readonly contact?: Contact })[] {
