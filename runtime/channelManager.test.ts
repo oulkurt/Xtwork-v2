@@ -1086,4 +1086,304 @@ describe("ChannelManager & Gateway/Live-Pi Coordinator (ADR-012 §2, §3.1–§3
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("compiles company channel with default strict URL validator, compiles default empty-baseUrl Copilot into gateway, fences detached OAuth refresh against logout, and stages secret rotation atomically on failed endpoint updates (capy-ai PR #28)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xtwork-cm-capy28-"));
+    try {
+      // 1. Company channel with DEFAULT assertStrictCompanyHttpsUrl (NO validateUrl override!)
+      // MUST NOT throw on string-vs-URL mismatch and MUST reach gateway & defaultModelSlug!
+      const companySecrets = memorySecrets();
+      await companySecrets.set(
+        "company:xiaotong-work-team",
+        JSON.stringify({
+          apiKey: "sk-company-strict-validator-123",
+          refreshToken: "rt-strict",
+          member: { subject: "sub-strict", name: "测试同学", userId: 7, username: "strict" },
+        }),
+      );
+      const companyGw = createFakeGateway();
+      const companyManager = new ChannelManager({
+        dataDir: join(dir, "company-default"),
+        secretStore: companySecrets,
+        gateway: companyGw.coordinator,
+      });
+      try {
+        const snap = await companyManager.initialize();
+        assert.equal(snap.companyAuth.phase, "signed-in");
+        assert.equal(snap.defaultModelSlug, `${COMPANY_CHANNEL_ID}/${COMPANY_DEFAULT_MODEL_ID}`);
+        const lastCompiled = companyGw.updates[companyGw.updates.length - 1] ?? [];
+        const compiledTeam = lastCompiled.find((c) => c.id === COMPANY_CHANNEL_ID);
+        assert.ok(compiledTeam, "Company channel must be compiled into gateway under default strict validator");
+        assert.equal(compiledTeam.baseUrl, "https://llm-api.sci-it.com/v1");
+      } finally {
+        await companyManager.close();
+      }
+
+      // 2. Default GitHub Copilot login (empty baseUrl) with DEFAULT assertSafeOutboundUrl
+      // (NO validateOutboundUrl override!) MUST compile into live gateway & register in oauthManager!
+      let copilotStubUrl = "";
+      const copilotStub = await startStubServer((req, res) => {
+        const url = new URL(req.url ?? "/", copilotStubUrl);
+        if (url.pathname === "/login/device/code") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              device_code: "gh-dc-default",
+              user_code: "GH-1111",
+              verification_uri: `${copilotStubUrl}/gh-verify`,
+              expires_in: 300,
+              interval: 1,
+            }),
+          );
+          return;
+        }
+        if (url.pathname === "/login/oauth/access_token") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ access_token: "gho_default_copilot_user" }));
+          return;
+        }
+        if (url.pathname === "/copilot_internal/v2/token") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              token: "tid=copilot-ok;proxy-ep=proxy.individual.githubcopilot.com",
+              expires_at: Math.floor(Date.now() / 1000) + 3600,
+            }),
+          );
+          return;
+        }
+        if (url.pathname === "/models") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              data: [
+                { id: "claude-sonnet-4.6", policy: { state: "enabled" }, model_picker_enabled: true },
+              ],
+            }),
+          );
+          return;
+        }
+        res.writeHead(404).end();
+      });
+      copilotStubUrl = copilotStub.url;
+
+      const copilotSecrets = memorySecrets();
+      const copilotGw = await startBundledPi("/bin/true", join(dir, "copilot-default"), {}, {
+        secretStore: copilotSecrets,
+        skipBinaryAccessCheck: true,
+      });
+      const copilotManager = new ChannelManager({
+        dataDir: join(dir, "copilot-default"),
+        secretStore: copilotGw.secretStore,
+        fence: copilotGw.fence,
+        oauthManager: copilotGw.oauthManager,
+        gateway: copilotGw,
+        // Intentionally omit validateOutboundUrl to exercise production default assertSafeOutboundUrl!
+        oauthEndpoints: {
+          validateDestination: () => undefined,
+          pollIntervalFloorMs: 5,
+          githubBaseUrl: copilotStubUrl,
+          githubApiBaseUrl: copilotStubUrl,
+          fetchImpl: async (input, init) => {
+            const rawUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+            if (rawUrl.includes("githubcopilot.com/models")) {
+              return await fetch(`${copilotStubUrl}/models`, init);
+            }
+            return await fetch(input, init);
+          },
+        },
+      });
+      try {
+        await copilotManager.initialize();
+        const session = await copilotManager.startOAuthLogin({ provider: "github-copilot" });
+        const done = await copilotManager.waitForOAuthSession(session.sessionId);
+        assert.equal(done?.phase, "succeeded");
+        assert.ok(done?.channelId);
+        const copilotId = done!.channelId!;
+        const stateAfterCopilot = copilotManager.getState();
+        assert.equal(stateAfterCopilot.zeroChannelState, false, "Default Copilot channel must reach live gateway");
+        assert.equal(stateAfterCopilot.defaultModelSlug, `${copilotId}/claude-sonnet-4.6`);
+        assert.ok(
+          copilotGw.oauthManager.getBindingId(copilotId),
+          "Default Copilot channel must be registered in active OAuthTokenManager",
+        );
+      } finally {
+        await copilotManager.close();
+        await copilotGw.close();
+        await copilotStub.close();
+      }
+
+      // 3. Detached OAuth refresh (channel NOT bound in OAuthTokenManager) MUST be fenced against
+      // concurrent logout: even if upstream refresh ignores AbortSignal and resolves AFTER logout
+      // deletes the secret, it MUST NOT write credentials back into SecretStore!
+      let refreshStarted!: () => void;
+      const refreshStartedPromise = new Promise<void>((resolve) => {
+        refreshStarted = resolve;
+      });
+      let releaseRefresh!: () => void;
+      const releaseRefreshPromise = new Promise<void>((resolve) => {
+        releaseRefresh = resolve;
+      });
+      let receivedRefreshSignalAborted = false;
+
+      const detachedSecrets = memorySecrets();
+      const detachedDir = join(dir, "detached-oauth-fence");
+      const detachedChannelsFile = join(detachedDir, "channels", "channels.json");
+      await mkdir(join(detachedDir, "channels"), { recursive: true });
+      await writeFile(
+        detachedChannelsFile,
+        JSON.stringify({
+          version: 1,
+          channels: [
+            {
+              id: "xai-detached",
+              name: "xAI Detached",
+              provider: "xai",
+              baseUrl: "https://api.x.ai/v1",
+              enabled: false,
+              secretRef: "oauth:xai:xai-detached",
+              models: [{ id: "grok-4", name: "Grok 4", enabled: true }],
+              createdAt: 1,
+              updatedAt: 1,
+            },
+          ],
+        }),
+        "utf8",
+      );
+      await detachedSecrets.set(
+        "oauth:xai:xai-detached",
+        JSON.stringify({
+          access: "xai-expired-token",
+          refresh: "xai-refresh-token",
+          expires: Date.now() - 10_000, // expired -> triggers refresh!
+        }),
+      );
+      const detachedManager = new ChannelManager({
+        dataDir: detachedDir,
+        secretStore: detachedSecrets,
+        // No gateway -> channel is NOT bound in oauthManager.active!
+        oauthEndpoints: {
+          validateDestination: () => undefined,
+          fetchImpl: async (_input, init) => {
+            init?.signal?.addEventListener("abort", () => {
+              receivedRefreshSignalAborted = true;
+            });
+            refreshStarted();
+            // Intentionally wait until AFTER logout completes and resolve a valid token payload
+            // even if signal aborted, proving write-back is still fenced!
+            await releaseRefreshPromise;
+            return new Response(
+              JSON.stringify({
+                access_token: "xai-resurrected-after-logout",
+                refresh_token: "xai-resurrected-rt",
+                expires_in: 3600,
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          },
+        },
+      });
+      try {
+        await detachedManager.initialize();
+        const testPromise = detachedManager.testChannel("xai-detached");
+        await refreshStartedPromise;
+
+        // Logout completes and deletes secret while detached refresh is in flight!
+        const afterLogout = await detachedManager.logoutOAuthChannel("xai-detached");
+        assert.equal(afterLogout.hasCredentials, false);
+        assert.equal(await detachedSecrets.get("oauth:xai:xai-detached"), undefined);
+        assert.equal(receivedRefreshSignalAborted, true, "Detached refresh AbortSignal must abort on logout");
+
+        // Now release the late upstream refresh response -> MUST fail fenced and NEVER restore secret!
+        releaseRefresh();
+        const testResult = await testPromise;
+        assert.equal(testResult.success, false);
+        assert.equal(
+          await detachedSecrets.get("oauth:xai:xai-detached"),
+          undefined,
+          "Late detached OAuth refresh must NEVER resurrect deleted SecretStore credentials",
+        );
+      } finally {
+        await detachedManager.close();
+      }
+
+      // 4. Failed endpoint update (ENOSPC on persistToDisk) MUST NOT overwrite old secretRef
+      // with the new destination's key; testChannel must continue sending ONLY the old key to old baseUrl!
+      const recordedAuthHeaders: Array<{ url: string; auth: string | null }> = [];
+      let failUpdatePersist = false;
+      const rotationSecrets = memorySecrets();
+      const rotationManager = new ChannelManager({
+        dataDir: join(dir, "atomic-rotation"),
+        secretStore: rotationSecrets,
+        fetchImpl: async (input, init) => {
+          const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+          const headers = new Headers(init?.headers);
+          recordedAuthHeaders.push({ url, auth: headers.get("authorization") });
+          return new Response(JSON.stringify({ data: [{ id: "gpt-5.4" }] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        },
+        onBeforePersistChannels: () => {
+          if (failUpdatePersist) throw new Error("ENOSPC: simulated disk full during endpoint update");
+        },
+      });
+      try {
+        await rotationManager.initialize();
+        const created = await rotationManager.createChannel({
+          name: "OpenAI Rotation",
+          provider: "openai",
+          baseUrl: "https://old.example.com/v1",
+          apiKey: "sk-old-endpoint-key",
+        });
+
+        // Simulate ENOSPC when switching baseUrl + providing new destination key
+        failUpdatePersist = true;
+        await assert.rejects(
+          () =>
+            rotationManager.updateChannel(created.id, {
+              baseUrl: "https://new.example.com/v1",
+              apiKey: "sk-new-destination-key",
+            }),
+          /ENOSPC/,
+        );
+
+        // Old baseUrl & old key must remain intact; testChannel MUST NOT send new key to old endpoint!
+        const afterFailed = rotationManager.listRedacted().find((c) => c.id === created.id);
+        assert.equal(afterFailed?.baseUrl, "https://old.example.com/v1");
+        assert.equal(await rotationSecrets.get(`channel:${created.id}`), "sk-old-endpoint-key");
+
+        recordedAuthHeaders.length = 0;
+        const testAfterFail = await rotationManager.testChannel(created.id);
+        assert.equal(testAfterFail.success, true);
+        assert.equal(recordedAuthHeaders.length, 1);
+        assert.ok(recordedAuthHeaders[0]!.url.startsWith("https://old.example.com/"));
+        assert.equal(recordedAuthHeaders[0]!.auth, "Bearer sk-old-endpoint-key");
+
+        // Now allow persistToDisk -> update commits new baseUrl + new key and retires old secretRef!
+        failUpdatePersist = false;
+        const committed = await rotationManager.updateChannel(created.id, {
+          baseUrl: "https://new.example.com/v1",
+          apiKey: "sk-new-destination-key",
+        });
+        assert.equal(committed.baseUrl, "https://new.example.com/v1");
+        assert.equal(
+          await rotationSecrets.get(`channel:${created.id}`),
+          undefined,
+          "Old secretRef must be retired after new endpoint + secret commit",
+        );
+
+        recordedAuthHeaders.length = 0;
+        const testAfterCommit = await rotationManager.testChannel(created.id);
+        assert.equal(testAfterCommit.success, true);
+        assert.equal(recordedAuthHeaders.length, 1);
+        assert.ok(recordedAuthHeaders[0]!.url.startsWith("https://new.example.com/"));
+        assert.equal(recordedAuthHeaders[0]!.auth, "Bearer sk-new-destination-key");
+      } finally {
+        await rotationManager.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

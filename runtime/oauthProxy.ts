@@ -1045,6 +1045,59 @@ export class OAuthTokenManager {
     }
   }
 
+  /**
+   * Resolve and, if expired, refresh OAuth credentials for a channel that may not currently
+   * have an active gateway route binding (e.g., disabled channel test or headless ChannelManager),
+   * reusing the exact same pending-delete guard, dual-fence lease (`channelId` + `secretRef`),
+   * abort propagation, single-flight refresh, and `secretRef`-serialized `writeIfCurrent` so
+   * concurrent logout/delete can NEVER be undone by a late fallback refresh write-back.
+   */
+  async getValidCredentialsDetached<T extends OAuthSubscriptionCredentials>(
+    config: RegisteredOAuthChannel<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const activeBinding = this.active.get(config.channelId);
+    if (
+      activeBinding &&
+      activeBinding.config.secretRef === config.secretRef &&
+      activeBinding.config.provider === config.provider
+    ) {
+      return await this.getValidCredentials<T>(config.channelId, {
+        ...(signal ? { signal } : {}),
+        expectedSecretRef: config.secretRef,
+        expectedProvider: config.provider,
+        expectedBindingId: activeBinding.bindingId,
+      });
+    }
+    const sanitizedConfig = stripInitialCredentials(config as unknown as RegisteredOAuthChannel);
+    const ephemeralRecord: OAuthBindingRecord = {
+      bindingId: randomUUID(),
+      fenceKey: sanitizedConfig.channelId,
+      secretRefFenceKey: secretRefFenceKeyFor(sanitizedConfig.secretRef),
+      priorFenceKeys: new Set(),
+      config: sanitizedConfig,
+    };
+    this.assertNotDeleting(sanitizedConfig.channelId, sanitizedConfig.secretRef);
+    const readLease = this.acquireDualLease(ephemeralRecord, signal);
+    try {
+      const current = await this.loadCredentials(ephemeralRecord, readLease);
+      this.assertNotDeleting(sanitizedConfig.channelId, sanitizedConfig.secretRef);
+      readLease.assertCurrent();
+      if (current.expires - this.now() > this.skewMs) {
+        return current as T;
+      }
+      return await this.refreshSerial<T>(ephemeralRecord, current, readLease);
+    } finally {
+      readLease.release();
+      if (!this.isSecretRefReferenced(sanitizedConfig.secretRef)) {
+        const state = this.secretRefStates.get(sanitizedConfig.secretRef);
+        if (state && !state.inflight) {
+          this.secretRefStates.delete(sanitizedConfig.secretRef);
+        }
+      }
+    }
+  }
+
   private async refreshSerial<T extends OAuthSubscriptionCredentials>(
     record: OAuthBindingRecord,
     fallback: OAuthSubscriptionCredentials,

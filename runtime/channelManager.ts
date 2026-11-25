@@ -818,32 +818,44 @@ export class ChannelManager {
 
     if (provider === "openai-codex") {
       return async (current, signal) =>
-        await refreshCodexOAuthToken(current as CodexOAuthCredentials, signal, {
-          fetchImpl,
-          ...(validateDestination ? { validateDestination } : {}),
-          ...(this.oauthEndpoints?.codexAuthBaseUrl
-            ? { tokenEndpoint: `${this.oauthEndpoints.codexAuthBaseUrl.replace(/\/+$/, "")}/oauth/token` }
-            : {}),
-          now,
-        });
+        await refreshCodexOAuthToken(
+          current as CodexOAuthCredentials,
+          AbortSignal.any([signal, AbortSignal.timeout(this.requestTimeoutMs)]),
+          {
+            fetchImpl,
+            ...(validateDestination ? { validateDestination } : {}),
+            ...(this.oauthEndpoints?.codexAuthBaseUrl
+              ? { tokenEndpoint: `${this.oauthEndpoints.codexAuthBaseUrl.replace(/\/+$/, "")}/oauth/token` }
+              : {}),
+            now,
+          },
+        );
     }
     if (provider === "github-copilot") {
       return async (current, signal) =>
-        await refreshGithubCopilotOAuthToken(current as GithubCopilotOAuthCredentials, signal, {
-          ...this.oauthEndpoints,
-          fetchImpl,
-          now,
-        });
+        await refreshGithubCopilotOAuthToken(
+          current as GithubCopilotOAuthCredentials,
+          AbortSignal.any([signal, AbortSignal.timeout(this.requestTimeoutMs)]),
+          {
+            ...this.oauthEndpoints,
+            fetchImpl,
+            now,
+          },
+        );
     }
     return async (current, signal) =>
-      await refreshXaiOAuthToken(current as XaiOAuthCredentials, signal, {
-        fetchImpl,
-        ...(validateDestination ? { validateDestination } : {}),
-        ...(this.oauthEndpoints?.xaiAuthBaseUrl
-          ? { tokenEndpoint: `${this.oauthEndpoints.xaiAuthBaseUrl.replace(/\/+$/, "")}/oauth2/token` }
-          : {}),
-        now,
-      });
+      await refreshXaiOAuthToken(
+        current as XaiOAuthCredentials,
+        AbortSignal.any([signal, AbortSignal.timeout(this.requestTimeoutMs)]),
+        {
+          fetchImpl,
+          ...(validateDestination ? { validateDestination } : {}),
+          ...(this.oauthEndpoints?.xaiAuthBaseUrl
+            ? { tokenEndpoint: `${this.oauthEndpoints.xaiAuthBaseUrl.replace(/\/+$/, "")}/oauth2/token` }
+            : {}),
+          now,
+        },
+      );
   }
 
   private async compileGatewayChannels(): Promise<GatewayChannelConfig[]> {
@@ -904,7 +916,11 @@ export class ChannelManager {
               refresh: this.buildOAuthRefresher(ch.provider),
             },
           });
-          this.assertOutbound(oauthCompiled.baseUrl);
+          if (oauthCompiled.baseUrl) {
+            this.assertOutbound(oauthCompiled.baseUrl);
+          } else if (ch.provider !== "github-copilot") {
+            continue;
+          }
           compiled.push(oauthCompiled);
         } catch {
           continue;
@@ -935,6 +951,7 @@ export class ChannelManager {
           apiKey,
           secretRef: ch.secretRef,
         });
+        if (!apiCompiled.baseUrl) continue;
         this.assertOutbound(apiCompiled.baseUrl);
         compiled.push(apiCompiled);
       } catch {
@@ -1259,10 +1276,13 @@ export class ChannelManager {
       }
 
       let nextSecretRef = current.secretRef;
+      let stagedSecretRef: string | undefined;
+      let retiredSecretRef: string | undefined;
+      const prevCredentialsPresence = this.credentialsPresence.get(current.id);
       const providerChanged = !isTeam && nextProvider !== current.provider;
       const baseUrlChanged =
         !isTeam && normalizeBaseUrl(nextBaseUrl) !== normalizeBaseUrl(current.baseUrl);
-      const hasStoredSecret = Boolean(current.secretRef || this.credentialsPresence.get(current.id));
+      const hasStoredSecret = Boolean(current.secretRef || prevCredentialsPresence);
 
       if (!isTeam && !nextIsOAuth) {
         const newSecret =
@@ -1278,7 +1298,11 @@ export class ChannelManager {
           if (nextProvider === "zhipu-coding-team" && !parseZhipuTeamCredentials(newSecret)) {
             throw new Error("智谱 Coding Plan 团队版凭据格式无效，请填写 API Key。");
           }
-          const ref = current.secretRef ?? `channel:${current.id}`;
+          // Stage any replacement secret under a fresh secretRef so a failed persistToDisk()
+          // can NEVER leave the old endpoint paired with the new destination's key!
+          const ref = current.secretRef
+            ? `channel:${current.id}:${randomUUID().slice(0, 8)}`
+            : `channel:${current.id}`;
           const lease = this.fence.acquire(current.id);
           try {
             await this.fence.writeIfCurrent(
@@ -1293,6 +1317,8 @@ export class ChannelManager {
           } finally {
             lease.release();
           }
+          stagedSecretRef = ref;
+          retiredSecretRef = current.secretRef;
           nextSecretRef = ref;
           this.credentialsPresence.set(current.id, true);
         }
@@ -1319,12 +1345,42 @@ export class ChannelManager {
 
       const prevRecord = this.channels[idx]!;
       this.channels[idx] = updated;
+      let persistedToDisk = false;
       try {
         await this.persistToDisk();
+        persistedToDisk = true;
         await this.syncGatewayAndNotify();
       } catch (error) {
-        this.channels[idx] = prevRecord;
+        let revertedOnDisk = !persistedToDisk;
+        if (persistedToDisk) {
+          this.channels[idx] = prevRecord;
+          try {
+            await this.persistToDisk();
+            revertedOnDisk = true;
+          } catch {
+            // Keep in-memory record aligned with disk's committed `(newBaseUrl, stagedSecretRef)` pair
+            // so neither memory nor disk can ever pair the old endpoint with the new key.
+            this.channels[idx] = updated;
+            revertedOnDisk = false;
+          }
+        }
+        if (revertedOnDisk) {
+          this.channels[idx] = prevRecord;
+          if (prevCredentialsPresence === undefined) {
+            this.credentialsPresence.delete(current.id);
+          } else {
+            this.credentialsPresence.set(current.id, prevCredentialsPresence);
+          }
+          if (stagedSecretRef) {
+            await this.secretStore.delete(stagedSecretRef).catch(() => undefined);
+          }
+        }
         throw error;
+      }
+
+      // Retire the old secretRef ONLY AFTER both metadata persistence and gateway sync committed.
+      if (retiredSecretRef && retiredSecretRef !== nextSecretRef) {
+        await this.secretStore.delete(retiredSecretRef).catch(() => undefined);
       }
 
       const redacted = this.listRedacted().find((c) => c.id === channelId);
@@ -1613,39 +1669,18 @@ export class ChannelManager {
     if (!isOAuthProviderType(channel.provider)) {
       throw new Error("该渠道不是 OAuth 订阅渠道。");
     }
-    // Prefer OAuthTokenManager (handles single-flight refresh & fence verification).
-    if (this.oauthManager.getBindingId(channel.id) !== undefined) {
-      return await this.oauthManager.getValidCredentials(
-        channel.id,
-        AbortSignal.timeout(this.requestTimeoutMs),
-      );
-    }
     if (!channel.secretRef) {
       throw new Error("请先完成 OAuth 订阅登录。");
     }
-    const raw = await this.readSecretValue(channel.secretRef);
-    if (!raw) {
-      throw new Error("未在钥匙串中找到该 OAuth 订阅凭据，请重新登录。");
-    }
-    const parsed = JSON.parse(raw) as OAuthSubscriptionCredentials;
-    if (parsed.expires - this.now() <= 60_000) {
-      const refresher = this.buildOAuthRefresher(channel.provider);
-      const refreshed = await refresher(parsed, AbortSignal.timeout(this.requestTimeoutMs));
-      const lease = this.fence.acquire(channel.id);
-      try {
-        await this.fence.writeIfCurrent(
-          this.secretStore,
-          channel.id,
-          channel.secretRef,
-          JSON.stringify(refreshed),
-          lease.generation,
-        );
-      } finally {
-        lease.release();
-      }
-      return refreshed;
-    }
-    return parsed;
+    return await this.oauthManager.getValidCredentialsDetached(
+      {
+        channelId: channel.id,
+        provider: channel.provider,
+        secretRef: channel.secretRef,
+        refresh: this.buildOAuthRefresher(channel.provider),
+      },
+      AbortSignal.timeout(this.requestTimeoutMs),
+    );
   }
 
   async testChannel(channelId: string): Promise<ChannelTestResult> {

@@ -616,7 +616,7 @@ export class CompanyAuthService {
   }
 
   validateEndpointUrl(url: string): void {
-    this.validateUrl(url, this.apiBase);
+    this.validateUrl(new URL(url), this.apiBase);
   }
 
   isSignedIn(): boolean {
