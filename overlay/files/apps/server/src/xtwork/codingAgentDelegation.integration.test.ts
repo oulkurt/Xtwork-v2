@@ -66,6 +66,8 @@ import * as RuntimePolicy from "../orchestration-v2/RuntimePolicy.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as TurnItemPositionStore from "../orchestration-v2/TurnItemPositionStore.ts";
+import * as WireProjection from "../orchestration-v2/WireProjection.ts";
+import { readCodingAgentBlockedResult } from "@t3tools/shared/xtworkCodingAgentBlocked";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as PeerLinkRequests from "../peer/PeerLinkRequests.ts";
 import * as PeerLinks from "../peer/PeerLinks.ts";
@@ -3172,6 +3174,181 @@ describe("M1c-Gate 2 integration: deterministic routing, workspace contract, can
           expect(remoteErr.message).toContain("codingAgentOverride");
           expect(missingMsgRemotes).toBe(0);
         }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(missingMsgMcpDeps))));
+
+        // 5. capy-ai PR #29 regressions:
+        //    (a) WireProjection.projectTurnItemForWire MUST preserve bounded `coding_agent_unavailable`
+        //        payloads (both live events & thread snapshots) so the UI action card renders!
+        const rawBlockedTurnItem = {
+          id: "item:blocked-delegate-1",
+          type: "dynamic_tool",
+          status: "completed",
+          toolName: "mcp__t3-code__delegate_task",
+          input: { task: STRUCTURED_BRIEF_EN },
+          output: {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  _tag: "OrchestratorMcpFailure",
+                  blocked: true,
+                  code: "coding_agent_unavailable",
+                  reason: "not_installed",
+                  instanceId: String(kimiId),
+                  displayName: "Kimi Code",
+                  canInstall: true,
+                  canLogin: false,
+                  message: "Kimi Code is not installed. ".repeat(40),
+                }),
+              },
+            ],
+          },
+        } as unknown as Parameters<typeof WireProjection.projectTurnItemForWire>[0];
+        const projectedOnce = WireProjection.projectTurnItemForWire(rawBlockedTurnItem);
+        const projectedTwice = WireProjection.projectTurnItemForWire(projectedOnce);
+        const parsedOnce = readCodingAgentBlockedResult(projectedOnce);
+        const parsedTwice = readCodingAgentBlockedResult(projectedTwice);
+        expect(parsedOnce).not.toBeNull();
+        expect(parsedOnce?.code).toBe("coding_agent_unavailable");
+        expect(parsedOnce?.instanceId).toBe(kimiId);
+        expect(parsedOnce?.reason).toBe("not_installed");
+        expect(parsedOnce?.canInstall).toBe(true);
+        expect(parsedOnce?.message.length).toBeLessThanOrEqual(600);
+        expect((projectedOnce as { readonly output?: { readonly isError?: boolean } }).output?.isError).toBe(true);
+        expect(parsedTwice).toEqual(parsedOnce);
+
+        //    (b) Retrying an accepted rewritten delegation with the same clientRequestId MUST
+        //        replay the accepted Claude task handle even when the original requested target
+        //        (Codex) is uninstalled!
+        const uninstalledCodex = makeProvider(codexId, "codex", "gpt-5.4", {
+          displayName: "Codex",
+          installed: false,
+          status: "warning",
+        });
+        const retryClientRequestId = "capy29-retry-rewritten-1";
+        const acceptedReceipts = new Set<CommandId>();
+        const retryStoredEvents: ReadonlyArray<OrchestrationV2StoredEvent> = [
+          {
+            event: {
+              type: "subagent.updated",
+              payload: {
+                id: taskId,
+                threadId: parentThreadId,
+                runId: parentRunId,
+                parentNodeId,
+                origin: "app_owned",
+                providerInstanceId: claudeId,
+                driver: "claudeAgent",
+                childThreadId,
+                model: "claude-sonnet-4-6",
+                status: "running",
+                result: null,
+              },
+            },
+          } as unknown as OrchestrationV2StoredEvent,
+        ];
+        let retryDispatchCount = 0;
+        const retryChildProjection = {
+          thread: {
+            id: childThreadId,
+            title: "Child Claude",
+            modelSelection: { instanceId: claudeId, model: "claude-sonnet-4-6" },
+            lineage: { parentThreadId, relationshipToParent: "subagent" },
+          },
+          runs: [{ id: childRunId, ordinal: 1, status: "running", rootNodeId: childNodeId }],
+          nodes: [{ id: childNodeId, runId: childRunId }],
+          subagents: [],
+          providerThreads: [],
+          providerTurns: [],
+          runtimeRequests: [],
+          contextTransfers: [],
+          messages: [],
+          turnItems: [],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const retryRewrittenDeps = Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          ServerSettings.layerTest({
+            codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+          }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            hasReceipt: (cmdId) => Effect.sync(() => acceptedReceipts.has(cmdId)),
+            isProviderInstanceEnabledForProject: () => Effect.succeed(true),
+            getThreadShell: (tid) =>
+              Effect.succeed({
+                id: tid,
+                lineage: { parentThreadId: null, rootThreadId: tid },
+              } as never),
+            getMessagesById: () =>
+              Effect.succeed(new Map([[activeMsgId, { id: activeMsgId }]] as never)),
+            getThreadRecords: (tid) =>
+              Effect.succeed(
+                tid === parentThreadId
+                  ? ({
+                      ...makeParentProjection({
+                        subagents:
+                          retryDispatchCount > 0 ? [retryStoredEvents[0]!.event.payload] : [],
+                      }),
+                      runs: [
+                        {
+                          id: parentRunId,
+                          ordinal: 1,
+                          status: "running",
+                          rootNodeId: parentNodeId,
+                          providerInstanceId: PI_INSTANCE_ID,
+                          userMessageId: activeMsgId,
+                        },
+                      ],
+                    } as unknown as OrchestrationV2ThreadProjection)
+                  : retryChildProjection,
+              ),
+            delegatedTaskResultPending: () => Effect.succeed(false),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                retryDispatchCount += 1;
+                const cmd = command as { readonly commandId: CommandId; readonly modelSelection?: { readonly instanceId: ProviderInstanceId } };
+                if (retryDispatchCount === 1) {
+                  // Initial dispatch MUST have rewritten uninstalled Codex to configured Claude!
+                  expect(cmd.modelSelection?.instanceId).toBe(claudeId);
+                  acceptedReceipts.add(cmd.commandId);
+                }
+                return { sequence: 1, storedEvents: retryStoredEvents } as never;
+              }),
+          }),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([readyPi, readyClaude, uninstalledCodex]),
+          }),
+          makeAdapterRegistryLayer([PI_INSTANCE_ID, claudeId, codexId]),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const first = yield* mcp.delegateTask(makeScope(), {
+            task: STRUCTURED_BRIEF_EN,
+            target: { providerInstanceId: codexId, model: "gpt-5.4" },
+            mode: "async",
+            clientRequestId: retryClientRequestId,
+          });
+          expect(first.providerInstanceId).toBe(claudeId);
+
+          // Simulate lost response and caller retry with identical uninstalled `codex` target + clientRequestId!
+          const retried = yield* mcp.delegateTask(makeScope(), {
+            task: STRUCTURED_BRIEF_EN,
+            target: { providerInstanceId: codexId, model: "gpt-5.4" },
+            mode: "async",
+            clientRequestId: retryClientRequestId,
+          });
+          expect(retried.taskId).toBe(first.taskId);
+          expect(retried.providerInstanceId).toBe(claudeId);
+          expect(retryDispatchCount).toBe(2);
+        }).pipe(
+          Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(retryRewrittenDeps))),
+        );
       }),
   );
 });

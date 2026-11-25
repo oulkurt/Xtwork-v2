@@ -11,7 +11,7 @@ index 2d7255e2..d0d48f73 100644
            Ref.updateAndGet(settings, (current) => ({
              ...current,
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
-index 8dcd025c..f773b06c 100644
+index 8dcd025c..bc0e6002 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.ts
 +++ b/apps/server/src/mcp/OrchestratorMcpService.ts
 @@ -76,6 +76,7 @@ import {
@@ -237,10 +237,25 @@ index 8dcd025c..f773b06c 100644
        if (input.target !== undefined && environmentId !== undefined) {
          yield* requireCapability(callerScope);
          const scope = yield* requireThreadScope(callerScope, "delegate_task");
-@@ -2724,9 +2914,66 @@ const make = Effect.gen(function* () {
+@@ -2724,48 +2914,195 @@ const make = Effect.gen(function* () {
          operation: "delegate-task",
        });
        const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
+-      const target = yield* resolveTargetRechecking({
+-        parent,
+-        target: input.target,
+-        providers,
+-        skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
+-      });
+-      const runtimeMode = yield* resolveRuntimeMode(
+-        parent.thread.runtimeMode,
+-        input.runtimeMode,
+-        target,
+-      );
+-      const interactionMode = yield* resolveInteractionMode(
+-        parent.thread.interactionMode,
+-        input.interactionMode,
+-      );
 +      let effectiveTarget = input.target;
 +      if (!isRetryOfAcceptedDelegation) {
 +        const currentSettings = yield* loadSettingsFailClosed();
@@ -298,14 +313,62 @@ index 8dcd025c..f773b06c 100644
 +          effectiveTarget = codingAgentResolution.target;
 +        }
 +      }
-       const target = yield* resolveTargetRechecking({
-         parent,
--        target: input.target,
-+        target: effectiveTarget,
-         providers,
-         skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
-       });
-@@ -2742,30 +2989,79 @@ const make = Effect.gen(function* () {
++      const resolvedEnvelope = isRetryOfAcceptedDelegation
++        ? yield* Effect.gen(function* () {
++            // Replay starts no new work; never trigger provider refresh probes on retry.
++            const target = yield* resolveTarget({
++              parent,
++              target: effectiveTarget,
++              providers,
++              skipProjectEnablementFilter: true,
++            });
++            const runtimeMode = yield* resolveRuntimeMode(
++              parent.thread.runtimeMode,
++              input.runtimeMode,
++              target,
++            );
++            const interactionMode = yield* resolveInteractionMode(
++              parent.thread.interactionMode,
++              input.interactionMode,
++            );
++            return {
++              modelSelection: target.modelSelection,
++              runtimeMode,
++              interactionMode,
++            };
++          }).pipe(
++            Effect.orElseSucceed(() => ({
++              // Replay of an already-accepted receipt: dispatch ignores these envelope fields
++              // and returns the persisted events for `commandId`, even when the original requested
++              // target (rewritten to the configured Coding Agent on initial acceptance) is unavailable.
++              modelSelection: parent.thread.modelSelection,
++              runtimeMode: parent.thread.runtimeMode,
++              interactionMode: parent.thread.interactionMode,
++            })),
++          )
++        : yield* Effect.gen(function* () {
++            const target = yield* resolveTargetRechecking({
++              parent,
++              target: effectiveTarget,
++              providers,
++              skipProjectEnablementFilter: false,
++            });
++            const runtimeMode = yield* resolveRuntimeMode(
++              parent.thread.runtimeMode,
++              input.runtimeMode,
++              target,
++            );
++            const interactionMode = yield* resolveInteractionMode(
++              parent.thread.interactionMode,
++              input.interactionMode,
++            );
++            return {
++              modelSelection: target.modelSelection,
++              runtimeMode,
++              interactionMode,
++            };
++          });
++      const { modelSelection, runtimeMode, interactionMode } = resolvedEnvelope;
        let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
        if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
          const project = yield* requireProject(parent.thread.projectId);
@@ -401,6 +464,15 @@ index 8dcd025c..f773b06c 100644
          }
          workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
        }
+@@ -2783,7 +3120,7 @@ const make = Effect.gen(function* () {
+           parentNodeId: parentRun.rootNodeId,
+           task: taskPrompt(input),
+           ...(input.title === undefined ? {} : { title: input.title }),
+-          modelSelection: target.modelSelection,
++          modelSelection,
+           runtimeMode,
+           interactionMode,
+           ...(workspaceStrategy === undefined ? {} : { workspaceStrategy }),
 diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 index 52424db1..9155e9fe 100644
 --- a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
@@ -563,6 +635,32 @@ index a17dde47..c5127065 100644
      updateSettings,
      updateProviderInstance: () => Effect.die("Unexpected provider mutation"),
      withSettingsSnapshot: (use) => Ref.get(settings).pipe(Effect.flatMap(use)),
+diff --git a/apps/server/src/orchestration-v2/WireProjection.ts b/apps/server/src/orchestration-v2/WireProjection.ts
+index 610a4fd6..d8939b28 100644
+--- a/apps/server/src/orchestration-v2/WireProjection.ts
++++ b/apps/server/src/orchestration-v2/WireProjection.ts
+@@ -1,4 +1,5 @@
+ import { readTodoCreateReceipt } from "@t3tools/shared/xtworkTodoReceipt";
++import { readCodingAgentBlockedResult } from "@t3tools/shared/xtworkCodingAgentBlocked";
+ import type {
+   CheckpointId,
+   MessageId,
+@@ -196,8 +197,14 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
+     case "dynamic_tool": {
+       const { output: rawOutput, ...projected } = item;
+       const receipt = readTodoCreateReceipt(item);
++      const blockedCodingAgent =
++        receipt === null ? readCodingAgentBlockedResult(item) : null;
+       const output =
+-        receipt === null ? compactDynamicToolOutput(rawOutput) : { structuredContent: receipt };
++        receipt !== null
++          ? { structuredContent: receipt }
++          : blockedCodingAgent !== null
++            ? { isError: true, structuredContent: blockedCodingAgent }
++            : compactDynamicToolOutput(rawOutput);
+       return {
+         ...projected,
+         input: summarizeDynamicValue(item.input),
 diff --git a/apps/server/src/provider/ProviderRegistry.test.ts b/apps/server/src/provider/ProviderRegistry.test.ts
 index 021c3ddb..000d4174 100644
 --- a/apps/server/src/provider/ProviderRegistry.test.ts
@@ -676,10 +774,10 @@ index 30fa1fc3..7c798f9b 100644
        updateAndPersistSettings(patch, (current) =>
          ensureSecretProviderWritesAllowed(patch, settingsPath).pipe(
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index eca92416..25162f76 100644
+index f3dd5a7c..aafca841 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -71,6 +71,7 @@ import {
+@@ -72,6 +72,7 @@ import {
    AuthPreviewOperateScope,
    AuthTerminalOperateScope,
    type AssistantCitation,
@@ -687,7 +785,7 @@ index eca92416..25162f76 100644
    type ResponseContextRecord,
    type ChatFileAttachment,
    isProviderNativeSubagentThread,
-@@ -1941,7 +1942,10 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1942,7 +1943,10 @@ export default function ChatView(props: ChatViewProps) {
      scheduleComposerFocusStable();
    };
    const insertArtifactTemplateStable = useStableCallback(insertArtifactTemplate);
@@ -699,7 +797,7 @@ index eca92416..25162f76 100644
      if (!isServerThread || activeThreadId === null) {
        throw new Error(gt("Messages from apps need a started thread."));
      }
-@@ -1949,7 +1953,21 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1950,7 +1954,21 @@ export default function ChatView(props: ChatViewProps) {
        environmentId,
        input: {
          threadId: activeThreadId,
@@ -857,10 +955,10 @@ index 501d05d7..fe6007e4 100644
          {...searchableSetting("providers")}
          variant="plain"
 diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
-index 92fbf6f5..3f39abfc 100644
+index fd5b7a7c..7f6eaeb7 100644
 --- a/apps/web/src/components/settings/settingsSearch.ts
 +++ b/apps/web/src/components/settings/settingsSearch.ts
-@@ -1030,6 +1030,14 @@ export const SETTINGS_SEARCH_ITEMS = [
+@@ -1033,6 +1033,14 @@ export const SETTINGS_SEARCH_ITEMS = [
      to: "/settings/snap-shot",
      targetId: "snap-shot-enabled",
    },
@@ -977,6 +1075,21 @@ index 836b473e..4eb65934 100644
  });
  export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
  
+diff --git a/packages/shared/package.json b/packages/shared/package.json
+index 5a322788..227993fc 100644
+--- a/packages/shared/package.json
++++ b/packages/shared/package.json
+@@ -151,6 +151,10 @@
+       "types": "./src/xtworkTodoReceipt.ts",
+       "import": "./src/xtworkTodoReceipt.ts"
+     },
++    "./xtworkCodingAgentBlocked": {
++      "types": "./src/xtworkCodingAgentBlocked.ts",
++      "import": "./src/xtworkCodingAgentBlocked.ts"
++    },
+     "./toolOutput": {
+       "types": "./src/toolOutput.ts",
+       "import": "./src/toolOutput.ts"
 diff --git a/packages/shared/src/serverSettings.ts b/packages/shared/src/serverSettings.ts
 index 023c6eb7..8fe569cb 100644
 --- a/packages/shared/src/serverSettings.ts

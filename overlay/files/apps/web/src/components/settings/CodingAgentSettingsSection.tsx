@@ -6,12 +6,15 @@ import {
   type CodingAgentSetting,
   type CodingAgentTurnOverride,
   type EnvironmentId,
-  type OrchestrationV2TurnItem,
   type ProviderInstanceConfig,
   type ServerProvider,
   type ServerSettingsPatch,
   resolveProviderInstanceEnabled,
 } from "@t3tools/contracts";
+import {
+  readCodingAgentBlockedResult,
+  type CodingAgentBlockedPayload,
+} from "@t3tools/shared/xtworkCodingAgentBlocked";
 import { useNavigate } from "@tanstack/react-router";
 import { useLocale } from "gt-react";
 import {
@@ -67,23 +70,14 @@ export type CodingAgentReadinessStatus =
   | "disabled"
   | "not_found";
 
+export { readCodingAgentBlockedResult, type CodingAgentBlockedPayload };
+
 export interface CodingAgentOption {
   readonly instanceId: ProviderInstanceId;
   readonly displayName: string;
   readonly readiness: CodingAgentReadinessStatus;
   readonly provider: ServerProvider | undefined;
   readonly models: ReadonlyArray<{ readonly slug: string; readonly name: string }>;
-}
-
-export interface CodingAgentBlockedPayload {
-  readonly blocked: true;
-  readonly code: "coding_agent_unavailable";
-  readonly reason: CodingAgentBlockedReason;
-  readonly instanceId: ProviderInstanceId;
-  readonly displayName: string;
-  readonly canInstall: boolean;
-  readonly canLogin: boolean;
-  readonly message: string;
 }
 
 function useIsZh(localeOverride?: string): boolean {
@@ -537,108 +531,6 @@ export function CodingAgentSettingsSection({
       ) : null}
     </SettingsSection>
   );
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-const VALID_BLOCKED_REASONS: ReadonlySet<string> = new Set([
-  "not_found",
-  "disabled",
-  "not_installed",
-  "update_required",
-  "not_authenticated",
-  "unavailable",
-]);
-
-function extractBlockedRecord(value: unknown, depth = 0): CodingAgentBlockedPayload | null {
-  if (depth > 5 || value == null) return null;
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
-    try {
-      return extractBlockedRecord(JSON.parse(trimmed), depth + 1);
-    } catch {
-      return null;
-    }
-  }
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      const rec = asRecord(entry);
-      const found =
-        extractBlockedRecord(rec?.text, depth + 1) ??
-        extractBlockedRecord(asRecord(rec?.content)?.text, depth + 1) ??
-        extractBlockedRecord(entry, depth + 1);
-      if (found) return found;
-    }
-    return null;
-  }
-  const record = asRecord(value);
-  if (!record) return null;
-  if (
-    record.code === "coding_agent_unavailable" &&
-    typeof record.instanceId === "string" &&
-    record.instanceId.trim().length > 0
-  ) {
-    const rawReason = typeof record.reason === "string" ? record.reason : "unavailable";
-    const reason: CodingAgentBlockedReason = VALID_BLOCKED_REASONS.has(rawReason)
-      ? (rawReason as CodingAgentBlockedReason)
-      : "unavailable";
-    const instanceId = ProviderInstanceId.make(record.instanceId.trim());
-    const displayName =
-      typeof record.displayName === "string" && record.displayName.trim().length > 0
-        ? record.displayName.trim()
-        : (KNOWN_AGENT_DISPLAY_NAMES[instanceId] ?? String(instanceId));
-    const message =
-      typeof record.message === "string" && record.message.trim().length > 0
-        ? record.message.trim()
-        : `Coding Agent ${displayName} is currently unavailable.`;
-    return {
-      blocked: true,
-      code: "coding_agent_unavailable",
-      reason,
-      instanceId,
-      displayName,
-      canInstall: record.canInstall === true,
-      canLogin: record.canLogin === true,
-      message,
-    };
-  }
-  return (
-    extractBlockedRecord(record.structuredContent, depth + 1) ??
-    extractBlockedRecord(record.content, depth + 1) ??
-    extractBlockedRecord(record.error, depth + 1)
-  );
-}
-
-function isDelegateTaskToolName(toolName: string | null | undefined): boolean {
-  if (!toolName) return false;
-  return (
-    toolName === "delegate_task" ||
-    toolName.endsWith("__delegate_task") ||
-    toolName.endsWith(".delegate_task") ||
-    toolName.endsWith("/delegate_task")
-  );
-}
-
-/**
- * Parses a blocked `coding_agent_unavailable` payload from a `delegate_task` turn item.
- */
-export function readCodingAgentBlockedResult(
-  item:
-    | (Pick<OrchestrationV2TurnItem, "type"> & {
-        readonly toolName?: string | null | undefined;
-        readonly output?: unknown;
-      })
-    | undefined,
-): CodingAgentBlockedPayload | null {
-  if (!item || item.type !== "dynamic_tool" || !isDelegateTaskToolName(item.toolName)) {
-    return null;
-  }
-  return extractBlockedRecord(item.output);
 }
 
 export interface CodingAgentBlockedActionCardProps {

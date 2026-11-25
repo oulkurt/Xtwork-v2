@@ -224,6 +224,19 @@ describe("CodingAgentBlockedActionCard", () => {
     expect(blocked?.instanceId).toBe(kimiId);
     expect(blocked?.reason).toBe("not_installed");
 
+    // Also verify wire-projected `{ isError: true, structuredContent }` shape emitted by WireProjection.projectTurnItemForWire!
+    const wireProjectedItem = {
+      type: "dynamic_tool",
+      toolName: "mcp__t3-code__delegate_task",
+      outputOmitted: true,
+      output: {
+        isError: true,
+        structuredContent: blocked,
+      },
+    } as unknown as OrchestrationV2TurnItem;
+    const blockedFromWire = readCodingAgentBlockedResult(wireProjectedItem);
+    expect(blockedFromWire).toEqual(blocked);
+
     const onOpenProviderSettings = vi.fn<(instanceId: ProviderInstanceId) => void>();
     const onFallbackToBuiltIn = vi.fn<
       (
