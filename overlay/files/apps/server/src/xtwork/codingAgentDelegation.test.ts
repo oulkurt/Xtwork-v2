@@ -851,7 +851,7 @@ describe("Sol Round 1 regression guards", () => {
       expect(mixedStackedLabelAndTag.missingSections).toEqual(["goal"]);
     }
 
-    // Normal prose containing a colon and keywords like "file" MUST still be accepted!
+    // Normal prose containing a colon, bold text, or Markdown link with keywords like "file" MUST still be accepted!
     const colonInNormalProse = validateCodingAgentHandoffBrief(
       [
         "Goal: Repair file uploads: preserve retry metadata.",
@@ -860,5 +860,32 @@ describe("Sol Round 1 regression guards", () => {
       ].join("\n"),
     );
     expect(colonInNormalProse).toEqual({ valid: true });
+
+    const colonWithBoldProse = validateCodingAgentHandoffBrief(
+      [
+        "Goal: Repair file uploads: **preserve retry metadata**",
+        "Scope: Keep API response shape backwards-compatible.",
+        "Files: apps/server/src/uploads.ts",
+      ].join("\n"),
+    );
+    expect(colonWithBoldProse).toEqual({ valid: true });
+
+    const colonWithMarkdownLink = validateCodingAgentHandoffBrief(
+      [
+        "Goal: Repair file uploads: [file upload spec](docs/uploads.md)",
+        "Scope: Keep API response shape backwards-compatible.",
+        "Files: apps/server/src/uploads.ts",
+      ].join("\n"),
+    );
+    expect(colonWithMarkdownLink).toEqual({ valid: true });
+
+    const directMarkdownLinkBody = validateCodingAgentHandoffBrief(
+      [
+        "Goal: [file upload spec](docs/uploads.md)",
+        "Scope: Keep API response shape backwards-compatible.",
+        "Files: apps/server/src/uploads.ts",
+      ].join("\n"),
+    );
+    expect(directMarkdownLinkBody).toEqual({ valid: true });
   });
 });

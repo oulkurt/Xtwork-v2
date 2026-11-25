@@ -917,9 +917,9 @@ function parseSectionHeaderLine(rawLine: string): ParsedSectionHeader | null {
     return { header: cleaned, inlineBody: "", structuralHeading: true };
   }
 
-  // XML/bracket tag: <goal> or [Goal]
+  // XML/bracket tag: <goal> or [Goal] (do NOT match Markdown links like `[spec](docs/a.md)`)
   const tagHeading =
-    /^(?:<([a-zA-Z_\u4e00-\u9fff][a-zA-Z0-9_\-\s\u4e00-\u9fff]{1,40})>|\[([^\]]{2,48})\])(?:\s*[:\uFF1A]?\s*(.*))?$/u.exec(
+    /^(?:<([a-zA-Z_\u4e00-\u9fff][a-zA-Z0-9_\-\s\u4e00-\u9fff]{1,40})>|\[([^\]]{2,48})\](?!\())(?:\s*[:\uFF1A]?\s*(.*))?$/u.exec(
       line,
     );
   if (tagHeading?.[1] || tagHeading?.[2]) {
@@ -959,10 +959,17 @@ function parseSectionHeaderLine(rawLine: string): ParsedSectionHeader | null {
   return null;
 }
 
+const EXPLICIT_SECTION_LABEL_TOKEN =
+  "(?:goals?|objectives?|acceptance(?:\\s+criteria)?|tasks?|requirements?|constraints?|scopes?|boundaries|rules?|non-?goals?|files?|file\\s+paths?|paths?|attachments?|targets?|目标|验收(?:标准)?|任务|需求|约束|范围|边界|限制|规则|文件路径|相关文件|涉及文件|文件|路径|附件|目录)";
+const EXPLICIT_SECTION_LABEL_PATTERN = new RegExp(
+  `^${EXPLICIT_SECTION_LABEL_TOKEN}(?:\\s*(?:&|\\/|and|与|和)\\s*${EXPLICIT_SECTION_LABEL_TOKEN})*$`,
+  "iu",
+);
+
 /**
- * Rejects degenerate inline bodies composed of stacked section headings/tags
+ * Rejects degenerate inline bodies composed of explicit stacked section headings/tags
  * (e.g., `[Goal] [Scope]`, `<goal> <files>`, `Goal: Scope:`, `Goal: Scope: Files:`, `## Goal: ## Scope`)
- * while preserving normal prose containing colons (e.g., `Goal: Repair file uploads: preserve retry metadata.`).
+ * while preserving normal prose containing colons, bold text, or Markdown links.
  */
 function isInlineBodyAnotherHeadingOrTag(inlineBody: string): boolean {
   let remaining = inlineBody.trim();
@@ -972,17 +979,14 @@ function isInlineBodyAnotherHeadingOrTag(inlineBody: string): boolean {
     if (nested === null) {
       return false;
     }
-    const nestedMatches = BRIEF_SECTION_RULES.filter((rule) =>
-      rule.headingPatterns.some((pattern) => pattern.test(nested.header)),
-    );
-    if (nested.structuralHeading) {
-      return nestedMatches.length > 0 || !hasMeaningfulSectionBody(nested.inlineBody);
-    }
-    if (nestedMatches.length === 0) {
+    if (!EXPLICIT_SECTION_LABEL_PATTERN.test(nested.header)) {
       return false;
     }
     sawNestedSectionHeader = true;
     remaining = nested.inlineBody.trim();
+    if (nested.structuralHeading) {
+      return true;
+    }
     if (!hasMeaningfulSectionBody(remaining)) {
       return true;
     }
