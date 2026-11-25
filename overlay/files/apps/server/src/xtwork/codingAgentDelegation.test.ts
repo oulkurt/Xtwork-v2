@@ -835,6 +835,22 @@ describe("Sol Round 1 regression guards", () => {
       expect(stackedColonLabels.missingSections).toEqual(["goal"]);
     }
 
+    const tripleStackedColonLabels = validateCodingAgentHandoffBrief(
+      "Goal: Scope: Files:\n## Scope\nOnly touch auth.\n## Files\napps/server/src/auth.ts",
+    );
+    expect(tripleStackedColonLabels.valid).toBe(false);
+    if (!tripleStackedColonLabels.valid) {
+      expect(tripleStackedColonLabels.missingSections).toEqual(["goal"]);
+    }
+
+    const mixedStackedLabelAndTag = validateCodingAgentHandoffBrief(
+      "Goal: Scope: [Files]\n## Scope\nOnly touch auth.\n## Files\napps/server/src/auth.ts",
+    );
+    expect(mixedStackedLabelAndTag.valid).toBe(false);
+    if (!mixedStackedLabelAndTag.valid) {
+      expect(mixedStackedLabelAndTag.missingSections).toEqual(["goal"]);
+    }
+
     // Normal prose containing a colon and keywords like "file" MUST still be accepted!
     const colonInNormalProse = validateCodingAgentHandoffBrief(
       [

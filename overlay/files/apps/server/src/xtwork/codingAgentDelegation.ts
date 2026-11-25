@@ -960,22 +960,34 @@ function parseSectionHeaderLine(rawLine: string): ParsedSectionHeader | null {
 }
 
 /**
- * Rejects degenerate inline bodies that are themselves another section heading/tag
- * (e.g., `[Goal] [Scope]`, `<goal> <files>`, `Goal: Scope:`, `## Goal: ## Scope`)
+ * Rejects degenerate inline bodies composed of stacked section headings/tags
+ * (e.g., `[Goal] [Scope]`, `<goal> <files>`, `Goal: Scope:`, `Goal: Scope: Files:`, `## Goal: ## Scope`)
  * while preserving normal prose containing colons (e.g., `Goal: Repair file uploads: preserve retry metadata.`).
  */
 function isInlineBodyAnotherHeadingOrTag(inlineBody: string): boolean {
-  const trimmed = inlineBody.trim();
-  if (trimmed.length === 0) return false;
-  const nested = parseSectionHeaderLine(trimmed);
-  if (nested === null) return false;
-  const nestedMatches = BRIEF_SECTION_RULES.filter((rule) =>
-    rule.headingPatterns.some((pattern) => pattern.test(nested.header)),
-  );
-  if (nested.structuralHeading) {
-    return nestedMatches.length > 0 || !hasMeaningfulSectionBody(nested.inlineBody);
+  let remaining = inlineBody.trim();
+  let sawNestedSectionHeader = false;
+  for (let depth = 0; depth < 8 && remaining.length > 0; depth += 1) {
+    const nested = parseSectionHeaderLine(remaining);
+    if (nested === null) {
+      return false;
+    }
+    const nestedMatches = BRIEF_SECTION_RULES.filter((rule) =>
+      rule.headingPatterns.some((pattern) => pattern.test(nested.header)),
+    );
+    if (nested.structuralHeading) {
+      return nestedMatches.length > 0 || !hasMeaningfulSectionBody(nested.inlineBody);
+    }
+    if (nestedMatches.length === 0) {
+      return false;
+    }
+    sawNestedSectionHeader = true;
+    remaining = nested.inlineBody.trim();
+    if (!hasMeaningfulSectionBody(remaining)) {
+      return true;
+    }
   }
-  return nestedMatches.length > 0 && !hasMeaningfulSectionBody(nested.inlineBody);
+  return sawNestedSectionHeader;
 }
 
 /**
