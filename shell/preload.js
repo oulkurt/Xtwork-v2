@@ -117,21 +117,6 @@
     cliCommand: { getState: unsupportedCli, install: unsupportedCli, uninstall: unsupportedCli, addToPath: unsupportedCli },
     webLinks: { setReady: noop, onOpen: onUnavailable },
     appActivation: { setReady: noop, complete: noop, onRequest: onUnavailable },
-    preview: {
-      setForwardedShortcuts: noop, createTab: noop, closeTab: noop, registerWebview: noop,
-      navigate: unavailable, goBack: noop, goForward: noop, refresh: noop, stopLoading: noop,
-      zoomIn: noop, zoomOut: noop, resetZoom: noop, setZoomFactor: noop, hardReload: noop,
-      setColorScheme: noop, setAudioMuted: noop, findInPage: noop, stopFindInPage: noop,
-      setShown: noop, setCaptureDrawn: noop, openDevTools: noop, clearCookies: noop, clearCache: noop,
-      getPreviewConfig: unavailable, listBrowserImportSources: empty, importBrowserCookies: unavailable,
-      setAnnotationTheme: noop, setAnnotationSendEnabled: noop,
-      annotationVoice: { onEvent: onUnavailable, update: noop }, pickElement: nothing,
-      cancelPickElement: noop, captureScreenshot: unavailable, revealArtifact: noop,
-      copyArtifactToClipboard: noop, pictureInPicture: { open: unavailable, close: noop },
-      recording: { onInput: onUnavailable, startScreencast: unavailable, stopScreencast: noop, save: unavailable },
-      onStateChange: onUnavailable, onPointerEvent: onUnavailable, onOpenLink: onUnavailable,
-      onFindResult: onUnavailable,
-    },
   }) });
 
   const titlebar = new CSSStyleSheet();

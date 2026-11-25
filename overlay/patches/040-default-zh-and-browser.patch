@@ -1,0 +1,421 @@
+diff --git a/apps/web/gt.config.json b/apps/web/gt.config.json
+index f1ab6e76..60907762 100644
+--- a/apps/web/gt.config.json
++++ b/apps/web/gt.config.json
+@@ -1,6 +1,6 @@
+ {
+   "defaultLocale": "en",
+-  "locales": ["de", "es", "fr", "ja", "ko", "pt-BR", "ru", "sv", "zh"],
++  "locales": ["zh"],
+   "src": [
+     "src/**/*.{ts,tsx}",
+     "../../packages/client-runtime/src/**/*.{ts,tsx}",
+diff --git a/apps/web/src/browser/ElectronBrowserHost.tsx b/apps/web/src/browser/ElectronBrowserHost.tsx
+index d71b7a2b..6c192c4e 100644
+--- a/apps/web/src/browser/ElectronBrowserHost.tsx
++++ b/apps/web/src/browser/ElectronBrowserHost.tsx
+@@ -12,6 +12,7 @@ import { type ComponentProps, useState } from "react";
+ 
+ import { primaryEnvironmentIdAtom } from "~/state/primaryEnvironment";
+ 
++import { isXtworkDesktop } from "~/desktopFeatureVisibility";
+ import { isElectron } from "~/env";
+ import { useClientSettingsHydrated } from "~/hooks/useSettings";
+ import { useDesktopHostedPreviewSessions } from "~/components/preview/usePreviewSession";
+@@ -131,7 +132,7 @@ export function ElectronBrowserHost() {
+   useDesktopHostedPreviewSessions(primaryEnvironmentId);
+   const sessions = hostedBrowserSessions(previewByThreadKey, primaryEnvironmentId);
+ 
+-  if (!isElectron) return null;
++  if (!isElectron || isXtworkDesktop()) return null;
+   return (
+     <div className="contents" data-electron-browser-host>
+       {sessions.map(({ threadRef, snapshot, runtimeTabId, pictureInPicture, zoomFactor }) => {
+diff --git a/apps/web/src/components/preview/agentOpenedPreviews.ts b/apps/web/src/components/preview/agentOpenedPreviews.ts
+index 8255cc48..7f890d33 100644
+--- a/apps/web/src/components/preview/agentOpenedPreviews.ts
++++ b/apps/web/src/components/preview/agentOpenedPreviews.ts
+@@ -12,6 +12,7 @@ import type {
+ } from "@t3tools/contracts";
+ import { AsyncResult } from "effect/reactivity";
+ 
++import { isXtworkDesktop } from "../../desktopFeatureVisibility";
+ import { getClientSettings } from "../../hooks/useSettings";
+ import {
+   browserMiniPlayerSource,
+@@ -260,11 +261,13 @@ export function startAgentOpenedPreviews(): () => void {
+       }
+     }
+   };
+-  const stopEnvironments = appAtomRegistry.subscribe(
+-    environmentSummaries.connectedEnvironmentIdsAtom,
+-    watchConnectedEnvironments,
+-    { immediate: true },
+-  );
++  const stopEnvironments = isXtworkDesktop()
++    ? () => {}
++    : appAtomRegistry.subscribe(
++        environmentSummaries.connectedEnvironmentIdsAtom,
++        watchConnectedEnvironments,
++        { immediate: true },
++      );
+   return () => {
+     stopIndex();
+     stopEnvironments();
+diff --git a/apps/web/src/components/settings/IntegrationsSettings.tsx b/apps/web/src/components/settings/IntegrationsSettings.tsx
+index 19755655..e11f9882 100644
+--- a/apps/web/src/components/settings/IntegrationsSettings.tsx
++++ b/apps/web/src/components/settings/IntegrationsSettings.tsx
+@@ -1412,51 +1412,55 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
+                 <T>You&rsquo;ve reached the profile limit</T>
+               </MenuItem>
+             ) : null}
+-            <MenuSeparator />
+-            <MenuGroup>
+-              <MenuGroupLabel>
+-                <T>Import from</T>
+-              </MenuGroupLabel>
+-              {cookieImportDenial !== undefined ? (
+-                <MenuItem disabled>{cookieImportDenial}</MenuItem>
+-              ) : sources === null ? (
+-                <MenuItem disabled>
+-                  <T>Looking for browsers…</T>
+-                </MenuItem>
+-              ) : importableSources.length === 0 ? (
+-                <MenuItem disabled>
+-                  <T>No supported browsers found</T>
+-                </MenuItem>
+-              ) : (
+-                <>
+-                  {importableSources.map((source) => (
+-                    <MenuItem
+-                      key={source.id}
+-                      disabled={!settingsHydrated || primaryEnvironment == null}
+-                      onClick={() => {
+-                        if (!settingsHydrated || primaryEnvironment == null) return;
+-                        setImportSession({
+-                          source,
+-                          environmentId: primaryEnvironment.environmentId,
+-                          environmentName: resolveEnvironmentOptionLabel({
+-                            isPrimary: true,
+-                            environmentId: primaryEnvironment.environmentId,
+-                            runtimeLabel: primaryEnvironment.label,
+-                          }),
+-                        });
+-                      }}
+-                    >
+-                      {source.name}
++            {previewBridge ? (
++              <>
++                <MenuSeparator />
++                <MenuGroup>
++                  <MenuGroupLabel>
++                    <T>Import from</T>
++                  </MenuGroupLabel>
++                  {cookieImportDenial !== undefined ? (
++                    <MenuItem disabled>{cookieImportDenial}</MenuItem>
++                  ) : sources === null ? (
++                    <MenuItem disabled>
++                      <T>Looking for browsers…</T>
+                     </MenuItem>
+-                  ))}
+-                  {primaryEnvironment == null ? (
++                  ) : importableSources.length === 0 ? (
+                     <MenuItem disabled>
+-                      <T>Connect to an environment to import cookies</T>
++                      <T>No supported browsers found</T>
+                     </MenuItem>
+-                  ) : null}
+-                </>
+-              )}
+-            </MenuGroup>
++                  ) : (
++                    <>
++                      {importableSources.map((source) => (
++                        <MenuItem
++                          key={source.id}
++                          disabled={!settingsHydrated || primaryEnvironment == null}
++                          onClick={() => {
++                            if (!settingsHydrated || primaryEnvironment == null) return;
++                            setImportSession({
++                              source,
++                              environmentId: primaryEnvironment.environmentId,
++                              environmentName: resolveEnvironmentOptionLabel({
++                                isPrimary: true,
++                                environmentId: primaryEnvironment.environmentId,
++                                runtimeLabel: primaryEnvironment.label,
++                              }),
++                            });
++                          }}
++                        >
++                          {source.name}
++                        </MenuItem>
++                      ))}
++                      {primaryEnvironment == null ? (
++                        <MenuItem disabled>
++                          <T>Connect to an environment to import cookies</T>
++                        </MenuItem>
++                      ) : null}
++                    </>
++                  )}
++                </MenuGroup>
++              </>
++            ) : null}
+           </MenuPopup>
+         </Menu>
+       }
+@@ -1721,7 +1725,7 @@ export function BrowserSettingsPanel() {
+       <SettingsSection id="browser-recordings" title={gt("Recordings")}>
+         <SettingsUnavailableGroup message={desktopOnlyMessage}>
+           <BrowserRecordingFrameRateSetting disabled={desktopOnly} />
+-          <BrowserRecordingInputSettings disabled={desktopOnly} />
++          {previewBridge ? <BrowserRecordingInputSettings disabled={desktopOnly} /> : null}
+         </SettingsUnavailableGroup>
+       </SettingsSection>
+     </SettingsPageContainer>
+diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
+index 2b0ddd8a..3aa2fd7f 100644
+--- a/apps/web/src/components/settings/SettingsPanels.tsx
++++ b/apps/web/src/components/settings/SettingsPanels.tsx
+@@ -120,8 +120,8 @@ import {
+   SettingsSection,
+ } from "./settingsLayout";
+ import { useSearchableSetting } from "./settingsSearch";
+-import { nativeLanguageName, SYSTEM_LANGUAGE } from "@t3tools/client-runtime/locales";
+-import { SUPPORTED_LOCALES } from "../../i18n/locales";
++import { nativeLanguageName } from "@t3tools/client-runtime/locales";
++import { DEFAULT_UI_LOCALE, resolveUiLocale, SUPPORTED_LOCALES } from "../../i18n/locales";
+ import { BackgroundActivitySettingsRow } from "./BackgroundActivitySettings";
+ import { AdvancedSettings } from "./AdvancedSettings";
+ import { PullRequestLinksOpenInAppSetting } from "./IntegrationsSettings";
+@@ -517,7 +517,7 @@ export function useSettingsRestore(onRestored?: () => void) {
+     DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode
+       ? [gt("Environment identification")]
+       : []),
+-    ...(settings.language !== DEFAULT_UNIFIED_SETTINGS.language ? [gt("Language")] : []),
++    ...(resolveUiLocale(settings.language) !== DEFAULT_UI_LOCALE ? [gt("Language")] : []),
+     ...(settings.timestampFormat !== DEFAULT_UNIFIED_SETTINGS.timestampFormat
+       ? [gt("Time format")]
+       : []),
+@@ -837,9 +837,7 @@ export function GeneralSettingsPanel() {
+   const lastEnabledProjectGroupingMode = useRef<SidebarProjectGroupingMode>(
+     readLastEnabledProjectGroupingMode(),
+   );
+-  const languageValue = SUPPORTED_LOCALES.includes(settings.language)
+-    ? settings.language
+-    : SYSTEM_LANGUAGE;
++  const languageValue = resolveUiLocale(settings.language);
+ 
+   return (
+     <SettingsPageContainer>
+@@ -1127,9 +1125,9 @@ export function GeneralSettingsPanel() {
+       <SettingsSection id="display" title={gt("Display")}>
+         <SettingsRow
+           {...setting("language")}
+-          description={<T>System default follows your browser or OS language.</T>}
++          description={gt("Choose the interface language.")}
+           resetAction={
+-            settings.language !== DEFAULT_UNIFIED_SETTINGS.language ? (
++            languageValue !== DEFAULT_UI_LOCALE ? (
+               <SettingResetButton
+                 ariaLabel={gt("Reset language to default")}
+                 onClick={() =>
+@@ -1150,16 +1148,9 @@ export function GeneralSettingsPanel() {
+               }}
+             >
+               <SelectTrigger size="sm" className="w-full sm:w-40" aria-label={gt("Language")}>
+-                <SelectValue>
+-                  {languageValue === SYSTEM_LANGUAGE
+-                    ? m(TIMESTAMP_FORMAT_LABELS.locale)
+-                    : nativeLanguageName(languageValue)}
+-                </SelectValue>
++                <SelectValue>{nativeLanguageName(languageValue)}</SelectValue>
+               </SelectTrigger>
+               <SelectPopup align="end" alignItemWithTrigger={false}>
+-                <SelectItem hideIndicator value={SYSTEM_LANGUAGE}>
+-                  {m(TIMESTAMP_FORMAT_LABELS.locale)}
+-                </SelectItem>
+                 {SUPPORTED_LOCALES.map((locale) => (
+                   <SelectItem hideIndicator key={locale} value={locale}>
+                     {nativeLanguageName(locale)}
+diff --git a/apps/web/src/i18n/initializeI18n.ts b/apps/web/src/i18n/initializeI18n.ts
+index dbcaec18..c61aa6d3 100644
+--- a/apps/web/src/i18n/initializeI18n.ts
++++ b/apps/web/src/i18n/initializeI18n.ts
+@@ -5,8 +5,11 @@ import { DEFAULT_LOCALE, SUPPORTED_LOCALES } from "./locales";
+ // English is the source text, so it never loads a chunk.
+ async function loadTranslations(locale: string): Promise<unknown> {
+   if (locale === DEFAULT_LOCALE) return {};
+-  const module: { default: unknown } = await import(`./translations/${locale}.json`);
+-  return module.default;
++  if (locale === "zh") {
++    const module: { default: unknown } = await import("./translations/zh.json");
++    return module.default;
++  }
++  return {};
+ }
+ 
+ /** Sets up GT's singletons. `onLocaleRequest` receives GT's own locale changes. */
+diff --git a/apps/web/src/i18n/locales.ts b/apps/web/src/i18n/locales.ts
+index 26ac5721..e2518996 100644
+--- a/apps/web/src/i18n/locales.ts
++++ b/apps/web/src/i18n/locales.ts
+@@ -1,4 +1,9 @@
+ import gtConfig from "../../gt.config.json";
+ 
+ export const DEFAULT_LOCALE = gtConfig.defaultLocale;
+-export const SUPPORTED_LOCALES: ReadonlyArray<string> = [DEFAULT_LOCALE, ...gtConfig.locales];
++export const DEFAULT_UI_LOCALE = "zh";
++export const SUPPORTED_LOCALES: ReadonlyArray<string> = [...gtConfig.locales, DEFAULT_LOCALE];
++
++export function resolveUiLocale(language: string): string {
++  return SUPPORTED_LOCALES.includes(language) ? language : DEFAULT_UI_LOCALE;
++}
+diff --git a/apps/web/src/i18n/runtime.ts b/apps/web/src/i18n/runtime.ts
+index 188d296b..84779251 100644
+--- a/apps/web/src/i18n/runtime.ts
++++ b/apps/web/src/i18n/runtime.ts
+@@ -1,13 +1,13 @@
+-import { resolveLocale } from "@t3tools/client-runtime/locales";
+ import { getTranslationsSnapshot } from "gt-react";
+ 
+ import {
++  ensureClientSettingsHydrated,
+   getClientSettings,
+   subscribeClientSettings,
+   updateClientSettings,
+ } from "../hooks/useSettings";
+ import { initializeI18n } from "./initializeI18n";
+-import { DEFAULT_LOCALE, SUPPORTED_LOCALES } from "./locales";
++import { DEFAULT_LOCALE, resolveUiLocale } from "./locales";
+ import { setActiveLocale } from "./messages";
+ 
+ type LocaleTranslations = Awaited<ReturnType<typeof getTranslationsSnapshot>>;
+@@ -52,15 +52,14 @@ function activateLocale(locale: string): void {
+   for (const listener of listeners) listener();
+ }
+ 
++function syncRequestedLocale(): Promise<void> {
++  const locale = requestedLocale;
++  return loadLocale(locale).then(() => activateLocale(locale));
++}
++
+ function applyLanguageSetting(): void {
+-  // Not desktopBridge.getSystemLocale(): that is the regional/time locale, not the UI language.
+-  requestedLocale = resolveLocale(
+-    getClientSettings().language,
+-    navigator.languages,
+-    SUPPORTED_LOCALES,
+-    DEFAULT_LOCALE,
+-  );
+-  void whenLocaleReady();
++  requestedLocale = resolveUiLocale(getClientSettings().language);
++  void syncRequestedLocale();
+ }
+ 
+ /** GT's own locale setters write the saved setting, which stays the only source of truth. */
+@@ -74,10 +73,10 @@ export function startI18n(): void {
+   applyLanguageSetting();
+ }
+ 
+-/** Resolves once the requested locale's translations are ready; immediate for English. */
+-export function whenLocaleReady(): Promise<void> {
+-  const locale = requestedLocale;
+-  return loadLocale(locale).then(() => activateLocale(locale));
++/** Resolves once settings hydrate and the active locale's translations are ready. */
++export async function whenLocaleReady(): Promise<void> {
++  await ensureClientSettingsHydrated().catch(() => undefined);
++  await syncRequestedLocale();
+ }
+ 
+ export function subscribeI18n(listener: () => void): () => void {
+diff --git a/apps/web/src/i18n/translations/zh.json b/apps/web/src/i18n/translations/zh.json
+index 7b3d1c61..4e2e6bd2 100644
+--- a/apps/web/src/i18n/translations/zh.json
++++ b/apps/web/src/i18n/translations/zh.json
+@@ -1,4 +1,5 @@
+ {
++  "ec12ab09b6db5c40": "选择界面显示语言。",
+   "d7e7974a9dfe58e5": "选择文件夹（按住 Shift 点击）",
+   "cf2e3864206551a5": "开发者功能",
+   "029c28229b003dbc": "显示开发者功能",
+diff --git a/apps/web/src/shortcuts/chatRouteCommands.test.ts b/apps/web/src/shortcuts/chatRouteCommands.test.ts
+index 3979368f..f9b20539 100644
+--- a/apps/web/src/shortcuts/chatRouteCommands.test.ts
++++ b/apps/web/src/shortcuts/chatRouteCommands.test.ts
+@@ -79,7 +79,6 @@ describe("new thread commands", () => {
+ 
+ describe("preview commands", () => {
+   it.each([
+-    { command: "preview.find", action: "find" },
+     { command: "preview.refresh", action: "refresh" },
+     { command: "preview.focusUrl", action: "focus-url" },
+   ] as const)("$command reaches the right panel on a draft thread", ({ command, action }) => {
+@@ -105,4 +104,33 @@ describe("preview commands", () => {
+ 
+     expect(dispatch).toHaveBeenCalledWith(action);
+   });
++
++  it("registers preview.find only when the Electron preview bridge is present", () => {
++    const draftId = DraftId.make("draft-1");
++    useComposerDraftStore
++      .getState()
++      .setProjectDraftThreadId(
++        { environmentId: EnvironmentId.make("local"), projectId: ProjectId.make("active") },
++        draftId,
++      );
++    using stack = new DisposableStack();
++    stack.defer(() => useComposerDraftStore.getState().clearDraftThread(draftId));
++    stack.defer(() => vi.unstubAllGlobals());
++    using _scope = vi.spyOn(session, "readEnvironmentScope").mockReturnValue(true);
++    using dispatch = vi.spyOn(previewActions, "dispatchPreviewAction").mockImplementation(() => {});
++    using register = vi.spyOn(dispatcher, "registerCommands").mockReturnValue(() => {});
++    const router = {
++      state: { matches: [{ routeId: "/_chat/draft/$draftId", params: { draftId } }] },
++    } as unknown as AnyRouter;
++    const event = { preventDefault: vi.fn(), stopPropagation: vi.fn() } as unknown as KeyboardEvent;
++
++    vi.stubGlobal("window", { desktopBridge: { xtwork: true } });
++    stack.defer(installChatRouteCommands(router));
++    expect(register.mock.calls[0]![0]["preview.find"]).toBeUndefined();
++
++    vi.stubGlobal("window", { desktopBridge: { preview: {} } });
++    stack.defer(installChatRouteCommands(router));
++    register.mock.calls[1]![0]["preview.find"]!(event);
++    expect(dispatch).toHaveBeenCalledWith("find");
++  });
+ });
+diff --git a/apps/web/src/shortcuts/chatRouteCommands.ts b/apps/web/src/shortcuts/chatRouteCommands.ts
+index eb05fb3b..44b6fe3d 100644
+--- a/apps/web/src/shortcuts/chatRouteCommands.ts
++++ b/apps/web/src/shortcuts/chatRouteCommands.ts
+@@ -20,6 +20,7 @@ import { createScratchProjectActions } from "../hooks/useScratchProject";
+ import { getClientSettings } from "../hooks/useSettings";
+ import { startNewThreadFromContext } from "../lib/chatThreadActions";
+ import { selectProjectGroupingSettings } from "@t3tools/client-runtime/state/project-grouping";
++import { isPreviewSupportedInRuntime } from "../previewStateStore";
+ import { selectActiveRightPanel, useRightPanelStore } from "../rightPanelStore";
+ import { appAtomRegistry } from "../rpc/atomRegistry";
+ import { buildSidebarProjectSnapshots } from "../sidebarProjectGrouping";
+@@ -185,7 +186,7 @@ export function installChatRouteCommands(router: AnyRouter): () => void {
+       "preview.zoomIn": previewCommand("zoom-in"),
+       "preview.zoomOut": previewCommand("zoom-out"),
+       "preview.resetZoom": previewCommand("reset-zoom"),
+-      "preview.find": previewCommand("find"),
++      ...(isPreviewSupportedInRuntime() ? { "preview.find": previewCommand("find") } : {}),
+     },
+     {
+       when: () =>
+diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
+index b661b0a3..836b473e 100644
+--- a/packages/contracts/src/settings.ts
++++ b/packages/contracts/src/settings.ts
+@@ -582,7 +582,7 @@ export const ClientSettingsSchema = Schema.Struct({
+   ),
+   speechCorrectionWord: SpeechCorrectionCue.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
+   // A locale code or "system". Open string so new locales and downgrades need no migration.
+-  language: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("en"))),
++  language: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("zh"))),
+   snapShotEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+   snapShotIncludeAccessibility: Schema.Boolean.pipe(
+     Schema.withDecodingDefault(Effect.succeed(true)),

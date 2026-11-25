@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { cp, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { assertNoLeakedUserVisibleBrand } from "./brandCatalog.mjs";
@@ -32,6 +33,33 @@ await mkdir(join(data, "workspace"), { recursive: true });
 await mkdir(folder);
 execFileSync("git", ["init", "-q", folder]);
 await writeFile(join(folder, "evidence.txt"), "Desktop diff verification\n");
+
+for (const candidate of [
+  join(homedir(), "Library", "Application Support", "Xtwork-v2", "tools", "chrome-headless-shell"),
+  join(homedir(), ".t3", "tools", "chrome-headless-shell"),
+]) {
+  if (existsSync(candidate)) {
+    await mkdir(join(data, "tools"), { recursive: true });
+    await cp(candidate, join(data, "tools", "chrome-headless-shell"), { recursive: true });
+    break;
+  }
+}
+
+const previewFixtureHtml = `<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>小瞳浏览器验证页</title></head>
+<body style="margin:0;padding:32px;font-family:sans-serif;background:#0f172a;color:#f8fafc;">
+  <h1>Xtwork Browser Verification</h1>
+  <p>ServerBrowser rendered inside ordinary desktop mode.</p>
+</body>
+</html>`;
+const previewFixtureServer = createServer((_request, response) => {
+  response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  response.end(previewFixtureHtml);
+});
+previewFixtureServer.listen(0, "127.0.0.1");
+await once(previewFixtureServer, "listening");
+const previewFixtureUrl = `http://127.0.0.1:${previewFixtureServer.address().port}/`;
 
 const modelReply = "Assistant reply from the local test model.";
 let modelRequests = 0;
@@ -184,7 +212,7 @@ try {
   const settingsNav = (path) => page.locator(`[data-settings-section="/settings/${path}"]`);
   const go = async (path) => page.goto(`${origin}/#${path}`);
   const developerNav = ["providers", "source-control", "worktrees"];
-  const unavailableNav = ["browser", "snap-shot", "connections", "access", "devices"];
+  const unavailableNav = ["snap-shot", "connections", "access", "devices"];
   async function checkSettings(enabled) {
     await developerToggle.waitFor({ state: "visible" });
     await developerToggle.and(page.locator(`[aria-checked="${enabled}"]`)).waitFor();
@@ -193,6 +221,7 @@ try {
     }
     for (const path of unavailableNav) assert.equal(await settingsNav(path).count(), 0, path);
     await settingsNav("diffs").waitFor({ state: "visible" });
+    await settingsNav("browser").waitFor({ state: "visible" });
     if (enabled) {
       await button("Open pull requests").waitFor({ state: "visible" });
       await button("Open issues").waitFor({ state: "visible" });
@@ -239,6 +268,36 @@ try {
   const draftPath = new URL(page.url()).hash.slice(1);
   assert.equal(await modelPicker.count(), 0);
   assert.equal(await terminal.count(), 0);
+  const initialChineseHome = await page.locator("body").innerText();
+  assert.match(initialChineseHome, /对话/);
+  assert.match(initialChineseHome, /文件夹/);
+  assert.doesNotMatch(initialChineseHome, /T3 Code|会话|线程|Try asking|Example tasks/i);
+  await page.screenshot({ path: join(testOutput, "ordinary-home-zh.png") });
+  console.log("Passed first-run default Chinese UI on clean draft.");
+
+  await go("/settings/general");
+  await page.getByRole("switch", { name: "显示开发者功能" }).waitFor({ state: "visible" });
+  await settingsNav("browser").waitFor({ state: "visible" });
+  const zhLanguagePicker = page.getByRole("combobox", { name: "语言", exact: true });
+  await zhLanguagePicker.waitFor({ state: "visible" });
+  assert.match(await zhLanguagePicker.innerText(), /中文（简体）/);
+  await zhLanguagePicker.click();
+  await page.getByRole("option", { name: "English", exact: true }).waitFor({ state: "visible" });
+  const languageOptions = await page.getByRole("option").allInnerTexts();
+  assert.deepEqual(
+    languageOptions.map((item) => item.trim()),
+    ["中文（简体）", "English"],
+  );
+  await page.getByRole("option", { name: "English", exact: true }).click();
+  await developerToggle.waitFor({ state: "visible" });
+  await page.reload();
+  await developerToggle.waitFor({ state: "visible" });
+  console.log("Passed two-language selector (zh/en) and persisted switch to English.");
+
+  await go(draftPath);
+  await page.locator("[data-chat-composer-form]").waitFor({ state: "visible" });
+  assert.equal(await modelPicker.count(), 0);
+  assert.equal(await terminal.count(), 0);
   assert.doesNotMatch(await page.locator("body").innerText(), /T3 Code|Try asking|Example tasks/i);
   await absent("Pull requests", "Issues");
   await checkPalette(false);
@@ -247,6 +306,62 @@ try {
   assert.equal(await page.locator('[data-terminal-open="true"]').count(), 0);
   await page.screenshot({ path: join(testOutput, "ordinary-home.png") });
   console.log("Passed clean first-run draft and ordinary command visibility.");
+
+  await button("Toggle right panel").click();
+  await page.getByRole("button", { name: /^Browser/ }).click();
+  const browserUrlInput = page.locator("[data-preview-url-input]");
+  await browserUrlInput.waitFor({ state: "visible" });
+  await page.waitForFunction(
+    () => {
+      const input = document.querySelector("[data-preview-url-input]");
+      return input instanceof HTMLInputElement && !input.disabled;
+    },
+    undefined,
+    { timeout: 60_000 },
+  );
+  await browserUrlInput.click();
+  await browserUrlInput.fill(previewFixtureUrl);
+  await browserUrlInput.press("Enter");
+  await page.waitForFunction(
+    () => {
+      const canvas = document.querySelector("canvas");
+      if (!(canvas instanceof HTMLCanvasElement) || canvas.width === 0 || canvas.height === 0) {
+        return false;
+      }
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return false;
+      const [r, g, b, a] = ctx.getImageData(
+        Math.floor(canvas.width * 0.75),
+        Math.floor(canvas.height * 0.75),
+        1,
+        1,
+      ).data;
+      // Fixture body background is #0f172a (15, 23, 42); allow JPEG compression tolerance.
+      return a === 255 && r < 40 && g < 50 && b > 25 && b < 70;
+    },
+    undefined,
+    { timeout: 60_000 },
+  );
+  await page.getByText("小瞳浏览器验证页", { exact: true }).waitFor({ timeout: 30_000 });
+  await browserUrlInput.click();
+  await page.keyboard.press("Meta+f");
+  await delay(300);
+  assert.equal(await page.getByText("Find on page isn't available for this page").count(), 0);
+  await page.screenshot({ path: join(testOutput, "ordinary-browser.png") });
+  await button("Toggle right panel").click();
+  console.log("Passed ordinary-mode integrated ServerBrowser open and live page render on draft.");
+
+  await go("/settings/browser");
+  await page.getByRole("switch", { name: "Agent browser access" }).waitFor({ state: "visible" });
+  await button("Add profile").click();
+  await page.getByRole("menuitem", { name: "Blank profile", exact: true }).waitFor({
+    state: "visible",
+  });
+  assert.equal(await page.getByText("Looking for browsers…").count(), 0);
+  await page.keyboard.press("Escape");
+  assert.equal(await page.getByRole("switch", { name: "Show key presses in recordings" }).count(), 0);
+  await page.screenshot({ path: join(testOutput, "browser-settings.png") });
+  console.log("Passed ordinary-mode Browser settings panel.");
 
   await go("/settings/general");
   await checkSettings(false);
@@ -280,8 +395,6 @@ try {
   await page.waitForURL(/\/pull-requests/);
   await go(draftPath);
   await checkCloneSources(true);
-  await page.keyboard.press("Meta+Shift+j");
-  assert.equal(await page.getByRole("tab", { name: /browser/i }).count(), 0);
 
   await go("/settings/general");
   await developerToggle.click();
@@ -305,7 +418,8 @@ try {
   await page.getByText("evidence.txt", { exact: true }).first().waitFor();
   await button("Add panel surface").click();
   await page.getByRole("menuitem", { name: /^Diff/ }).waitFor();
-  for (const name of ["Browser", "Terminal", "Pull request", "Linked items", "Device"]) {
+  await page.getByRole("menuitem", { name: /^Browser/ }).waitFor();
+  for (const name of ["Terminal", "Pull request", "Linked items", "Device"]) {
     assert.equal(
       await page.getByRole("menuitem", { name: new RegExp(`^${name}`, "i") }).count(),
       0,
@@ -314,7 +428,9 @@ try {
   }
   await page.keyboard.press("Escape");
   await page.screenshot({ path: join(testOutput, "ordinary-diff.png") });
-  console.log("Passed local folder selection, the bundled Pi turn, and the ordinary Diff panel.");
+  await page.keyboard.press("Meta+Shift+j");
+  await page.locator("[data-preview-url-input]").waitFor({ state: "visible" });
+  console.log("Passed local folder selection, the bundled Pi turn, ordinary Diff/Browser panel menu, and Cmd+Shift+J shortcut.");
 
   await button("待办").click();
   await page.getByTitle("待办事项").waitFor({ state: "visible" });
@@ -342,6 +458,7 @@ try {
   await page.getByRole("combobox", { name: "Language", exact: true }).click();
   await page.getByRole("option", { name: /中文/ }).click();
   await page.getByRole("switch", { name: "显示开发者功能" }).waitFor();
+  await page.screenshot({ path: join(testOutput, "general-settings-zh.png") });
   await go("/");
   await page.waitForURL(/#\/draft\//);
   await page.locator("[data-chat-composer-form]").waitFor();
@@ -350,11 +467,10 @@ try {
   assert.match(chineseHome, /对话/);
   assert.match(chineseHome, /文件夹/);
   assert.doesNotMatch(chineseHome, /T3 Code|会话|线程/);
-  await page.screenshot({ path: join(testOutput, "ordinary-home-zh.png") });
-  console.log("Passed Chinese conversation, folder, and developer-switch labels.");
+  console.log("Passed switching back to Chinese conversation, folder, and developer-switch labels.");
 
   console.log(
-    "Verified first-run draft, developer switch persistence and routes, command palette, model picker, terminal and clone visibility, a Pi turn, Diff, branding, and the live todo plugin.",
+    "Verified default Chinese startup, zh/en language switcher, ordinary-mode ServerBrowser, Browser settings, developer switch persistence and routes, command palette, model picker, terminal and clone visibility, a Pi turn, Diff, branding, and the live todo plugin.",
   );
   succeeded = true;
 } catch (error) {
@@ -381,6 +497,8 @@ try {
     await exited;
     clearTimeout(timeout);
   }
+  previewFixtureServer.closeAllConnections();
+  await new Promise((resolve) => previewFixtureServer.close(resolve));
   model.closeAllConnections();
   await new Promise((resolve) => model.close(resolve));
   if (succeeded) await rm(state, { recursive: true, force: true });

@@ -23,8 +23,11 @@ it("keeps developer settings and commands behind the switch while leaving change
     expect(isDesktopShortcutVisible(command, true)).toBe(true);
   }
   expect(isDesktopShortcutVisible("diff.toggle", false)).toBe(true);
+  expect(isDesktopShortcutVisible("preview.toggle", false)).toBe(true);
+  expect(isDesktopShortcutVisible("preview.refresh", false)).toBe(true);
   expect(isDesktopShortcutVisible("usage.open", false)).toBe(true);
   expect(isDesktopSettingsPathVisible("/settings/diffs", false)).toBe(true);
+  expect(isDesktopSettingsPathVisible("/settings/browser", false)).toBe(true);
   expect(isDesktopSettingVisible({ to: "/settings/diffs", id: "proactive-panels" }, false)).toBe(
     false,
   );
@@ -32,7 +35,6 @@ it("keeps developer settings and commands behind the switch while leaving change
 
 it("does not publish unavailable shell functions in developer mode", () => {
   for (const to of [
-    "/settings/browser",
     "/settings/snap-shot",
     "/settings/connections",
     "/settings/access",
@@ -40,10 +42,22 @@ it("does not publish unavailable shell functions in developer mode", () => {
   ]) {
     expect(isDesktopSettingsPathVisible(to, true)).toBe(false);
   }
-  for (const id of ["cli-command", "mobile-app", "welcome-page"]) {
+  for (const id of [
+    "browser-recording-key-presses",
+    "browser-recording-mouse-presses",
+    "cli-command",
+    "mobile-app",
+    "welcome-page",
+  ]) {
     expect(isDesktopSettingVisible({ to: "/settings/about", id }, true)).toBe(false);
   }
-  expect(isDesktopShortcutVisible("preview.toggle", true)).toBe(false);
+  expect(isDesktopSettingVisible({ to: "/settings/browser", id: "browser-profiles" }, false)).toBe(
+    true,
+  );
+  expect(
+    isDesktopSettingVisible({ to: "/settings/browser", id: "browser-recording-key-presses" }, true),
+  ).toBe(false);
+  expect(isDesktopShortcutVisible("preview.find", true)).toBe(false);
 });
 
 it("omits the picker for the only built-in model and restores it when there is a choice", () => {

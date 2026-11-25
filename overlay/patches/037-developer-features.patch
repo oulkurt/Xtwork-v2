@@ -72,29 +72,8 @@ index 985347a6..d99d0ea9 100644
          );
        }).pipe(
          Effect.provide(
-diff --git a/apps/web/src/appInit.tsx b/apps/web/src/appInit.tsx
-index ae8e685c..02c12c28 100644
---- a/apps/web/src/appInit.tsx
-+++ b/apps/web/src/appInit.tsx
-@@ -1,3 +1,4 @@
-+import { isXtworkDesktop } from "./desktopFeatureVisibility";
- import {
-   scopedThreadKey,
-   scopeProjectRef,
-@@ -277,9 +278,9 @@ export function startAppServices(): AppRouter {
-   startBrowserChromeThemeSync(router);
-   startDefaultThemeAdoption();
-   startModelPreferencesMigration();
--  startAgentOpenedPreviews();
-+  if (!isXtworkDesktop()) startAgentOpenedPreviews();
-   if (isElectron) startElectronBrowserHost();
--  startPreviewTitleRecording();
-+  if (!isXtworkDesktop()) startPreviewTitleRecording();
-   startBrowserProfileReporting();
-   installChatRouteCommands(router);
-   installCommandPaletteCommands(router);
 diff --git a/apps/web/src/browser/previewRuntime.ts b/apps/web/src/browser/previewRuntime.ts
-index 7ca4a8a8..6ed7c742 100644
+index 7ca4a8a8..ec3aaa13 100644
 --- a/apps/web/src/browser/previewRuntime.ts
 +++ b/apps/web/src/browser/previewRuntime.ts
 @@ -1,6 +1,7 @@
@@ -105,33 +84,14 @@ index 7ca4a8a8..6ed7c742 100644
  import { isElectron } from "~/env";
  import { isPreviewSupportedInRuntime } from "~/previewStateStore";
  import { appAtomRegistry } from "~/rpc/atomRegistry";
-@@ -11,7 +12,7 @@ import {
- } from "~/state/entities";
- 
- export function previewRuntimeFor(environmentId: EnvironmentId): PreviewRuntime | undefined {
--  if (!readEnvironmentSupportsServerBrowser(environmentId)) return undefined;
-+  if (isXtworkDesktop() || !readEnvironmentSupportsServerBrowser(environmentId)) return undefined;
-   if (
-     isPreviewSupportedInRuntime() &&
-     environmentId !== appAtomRegistry.get(primaryEnvironmentIdAtom)
-@@ -33,12 +34,15 @@ export function alternatePreviewRuntime(
- }
- 
- export function isPreviewAvailableFor(environmentId: EnvironmentId): boolean {
--  return isPreviewSupportedInRuntime() || readEnvironmentSupportsServerBrowser(environmentId);
-+  return (
+@@ -48,6 +49,7 @@ export function rendersServerTabNatively(
+ ): boolean {
+   return (
+     isElectron &&
 +    !isXtworkDesktop() &&
-+    (isPreviewSupportedInRuntime() || readEnvironmentSupportsServerBrowser(environmentId))
-+  );
- }
- 
- export function usePreviewAvailable(environmentId: EnvironmentId | null): boolean {
-   const serverBrowser = useEnvironmentSupportsServerBrowser(environmentId);
--  return isPreviewSupportedInRuntime() || serverBrowser;
-+  return !isXtworkDesktop() && (isPreviewSupportedInRuntime() || serverBrowser);
- }
- 
- export function rendersServerTabNatively(
+     snapshot?.runtime === "server" &&
+     !snapshot.headless &&
+     primaryEnvironmentId !== null &&
 diff --git a/apps/web/src/cloud/publicConfig.ts b/apps/web/src/cloud/publicConfig.ts
 index ec9cf15b..7dacf751 100644
 --- a/apps/web/src/cloud/publicConfig.ts
@@ -185,7 +145,7 @@ index c4129edc..852237c9 100644
                    openInPreferredEditor(
                      markdownFileEditorTarget(fileLinkMeta, await resolveHostPath()),
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index a731a579..48aa99cd 100644
+index a731a579..a15da677 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
 @@ -1,3 +1,7 @@
@@ -224,25 +184,14 @@ index a731a579..48aa99cd 100644
    const activeThreadId = activeThread?.id ?? null;
    // Turn items can lag projection hydration; keep the environment locked through that gap.
    const activeMessageCount = isServerThread
-@@ -1037,7 +1044,8 @@ export default function ChatView(props: ChatViewProps) {
-   const activeEnvironmentServerBrowser = useEnvironmentSupportsServerBrowser(
-     activeThreadRef?.environmentId ?? null,
-   );
--  const browserAvailable = isPreviewSupportedInRuntime() || activeEnvironmentServerBrowser;
-+  const browserAvailable =
-+    !isXtworkDesktop() && (isPreviewSupportedInRuntime() || activeEnvironmentServerBrowser);
-   const activeThreadShell = serverThread;
-   const limitRecoveryRun =
-     serverRuntime?.status === "failed" && serverRuntime.lastErrorClass === "usage_limit"
-@@ -1107,12 +1115,24 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1107,12 +1114,23 @@ export default function ChatView(props: ChatViewProps) {
    );
    const canReuseTerminal = activeThreadKnownSessionsRaw !== null;
    const previewPanelOpen = activeRightPanelKind === "preview" && browserAvailable;
 +  const visibleRightPanelSurfaces = rightPanelState.surfaces.filter(
 +    ({ kind }) =>
 +      !isXtworkDesktop() ||
-+      (kind !== "preview" &&
-+        kind !== "device" &&
++      (kind !== "device" &&
 +        (developerFeatures ||
 +          !["terminal", "pull-request", "pull-requests", "issue"].includes(kind))),
 +  );
@@ -261,7 +210,7 @@ index a731a579..48aa99cd 100644
    };
    const rightPanelPresence = usePanelPresence(
      rightPanelOpen && activeThreadRef !== null,
-@@ -1234,6 +1254,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1234,6 +1252,7 @@ export default function ChatView(props: ChatViewProps) {
        activeProject,
        environmentById.get(activeProject.environmentId)?.serverConfig?.scratchWorkspaceRoot ?? null,
      );
@@ -269,7 +218,7 @@ index a731a579..48aa99cd 100644
    const logicalProjectEnvironments = useLogicalProjectEnvironments(
      activeProject,
      activeProjectIsScratch && draftId !== null,
-@@ -1278,12 +1299,20 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1278,12 +1297,20 @@ export default function ChatView(props: ChatViewProps) {
          worktreePath: activeThread?.worktreePath ?? null,
        })
      : null;
@@ -291,7 +240,7 @@ index a731a579..48aa99cd 100644
    const composerModelSelectionApplies = draftModelSelectionApplies(
      { modelSelectionExplicit: composerModelSelectionExplicit },
      threadHasStarted(activeThread),
-@@ -1301,7 +1330,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1301,7 +1328,7 @@ export default function ChatView(props: ChatViewProps) {
    });
    const modelPickerLockedProvider = supportsProviderSwitchingViaHandoff ? null : lockedProvider;
    const pullRequestsCapabilityKnown = serverConfig !== null;
@@ -300,7 +249,7 @@ index a731a579..48aa99cd 100644
    const attachmentEnvironmentConfig = environmentById.get(environmentId)?.serverConfig ?? null;
    const attachmentUploadsCapabilityKnown = attachmentEnvironmentConfig !== null;
    const supportsQuestionAttachments = attachmentEnvironmentConfig !== null;
-@@ -1699,13 +1728,16 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1699,13 +1726,16 @@ export default function ChatView(props: ChatViewProps) {
      useAtomValue(serverEnvironment.configValueAtom(openInEnvironmentId))?.availableEditors ?? [];
    const hostEnvironmentId = useAtomValue(hostEnvironmentIdAtom);
    const remoteOpenState = useRemoteOpenState(openInEnvironmentId);
@@ -324,7 +273,7 @@ index a731a579..48aa99cd 100644
    useOpenFavoriteEditorShortcut({
      enabled: showOpenInPicker && !backgroundThread,
      environmentId: openInEnvironmentId,
-@@ -1755,12 +1787,11 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1755,12 +1785,11 @@ export default function ChatView(props: ChatViewProps) {
      activeProviderStatus,
    );
    const providerStatusDismissed = useProviderStatusBannerDismissed(providerStatusDismissalKey);
@@ -342,7 +291,7 @@ index a731a579..48aa99cd 100644
    const hasTimelineTopBanner = Boolean(timelineThreadError) || visibleProviderStatus !== null;
    const activeProjectCwd = activeProject?.workspaceRoot ?? null;
    const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
-@@ -1802,6 +1833,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1802,6 +1831,7 @@ export default function ChatView(props: ChatViewProps) {
            reportedModelSelection,
          );
    const showComposerContextStrip =
@@ -350,22 +299,16 @@ index a731a579..48aa99cd 100644
      !embedded &&
      shouldShowComposerContextStrip({
        isDraftHeroState,
-@@ -1972,11 +2004,13 @@ export default function ChatView(props: ChatViewProps) {
-     scripts: activeProjectScripts,
-     settings,
-   });
--  const canOperatePreview = useEnvironmentScope(
-+  const hasPreviewScope = useEnvironmentScope(
-     activeThreadRef?.environmentId ?? null,
-     AuthPreviewOperateScope,
-   );
-+  const canOperatePreview = !isXtworkDesktop() && hasPreviewScope;
-   const shownPreviewMiniPlayer =
-+    !isXtworkDesktop() &&
+@@ -1980,7 +2010,7 @@ export default function ChatView(props: ChatViewProps) {
      activeThreadRef &&
      activePreviewMiniPlayer &&
      previewMiniPlayerVisible &&
-@@ -2007,7 +2041,7 @@ export default function ChatView(props: ChatViewProps) {
+-    (activePreviewMiniPlayer.source.kind === "device" || canOperatePreview)
++    (activePreviewMiniPlayer.source.kind === "device" ? !isXtworkDesktop() : canOperatePreview)
+       ? activePreviewMiniPlayer
+       : null;
+   const canvasPreview = useThreadPreviewCanvasSource(activeThreadRef, shownPreviewMiniPlayer);
+@@ -2007,7 +2037,7 @@ export default function ChatView(props: ChatViewProps) {
        threadPanelPresentation,
      ),
    );
@@ -374,7 +317,7 @@ index a731a579..48aa99cd 100644
    const visiblePullRequests = visibleThreadPullRequests(
      (activeThreadShell ?? activeThread)?.pullRequests ?? [],
    );
-@@ -2016,7 +2050,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2016,7 +2046,7 @@ export default function ChatView(props: ChatViewProps) {
      isServerThread && supportsThreadPullRequests && visiblePullRequestCount > 0;
    const linkedItemsSurfaceAvailable =
      pullRequestsSurfaceAvailable ||
@@ -383,7 +326,7 @@ index a731a579..48aa99cd 100644
    const { state: deviceState, loaded: deviceStateLoaded } = useDeviceState(
      activeThreadRef?.environmentId ?? null,
    );
-@@ -2585,7 +2619,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2585,7 +2615,7 @@ export default function ChatView(props: ChatViewProps) {
    const toggleKeepFullHistoryStable = useStableCallback(toggleKeepFullHistory);
    const armFreshSessionStable = useStableCallback(() => armFreshSession(routeThreadKey));
    const handleRestoreThreadBranch = () => {
@@ -392,7 +335,7 @@ index a731a579..48aa99cd 100644
      if (gitStatusQuery.data?.hasWorkingTreeChanges) {
        if (activeThreadKey !== null) openBranchRestoreConfirm(activeThreadKey);
        return;
-@@ -2693,7 +2727,12 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2693,7 +2723,12 @@ export default function ChatView(props: ChatViewProps) {
        freshSessionAvailable && freshSessionArmed && activePendingApproval === null
          ? [freshSessionBannerItem(() => disarmFreshSession(routeThreadKey), messages)]
          : [];
@@ -406,7 +349,7 @@ index a731a579..48aa99cd 100644
        return [
          ...feedbackBannerItems,
          ...fallbackItems,
-@@ -2774,6 +2813,36 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2774,6 +2809,36 @@ export default function ChatView(props: ChatViewProps) {
      }
    });
  
@@ -443,7 +386,7 @@ index a731a579..48aa99cd 100644
    useChatShortcuts({
      enabled: activeThreadId !== null && !backgroundThread,
      embedded,
-@@ -2789,7 +2858,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2789,7 +2854,7 @@ export default function ChatView(props: ChatViewProps) {
        focusComposerStable();
      },
      commands: {
@@ -452,7 +395,7 @@ index a731a579..48aa99cd 100644
        ...rightPanelShortcuts,
        ...threadLifecycleShortcuts,
        "thread.copyReference": ({ event }) => {
-@@ -3311,7 +3380,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3311,7 +3376,7 @@ export default function ChatView(props: ChatViewProps) {
              ? addPullRequestsSurfaceStable
              : undefined,
        }}
@@ -461,7 +404,7 @@ index a731a579..48aa99cd 100644
        files={{
          projectId: activeProject?.id,
          projectName: activeProject?.title ?? null,
-@@ -3324,6 +3393,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3324,6 +3389,7 @@ export default function ChatView(props: ChatViewProps) {
      />
    ) : null;
    const panelToggleControlProps = {
@@ -469,7 +412,7 @@ index a731a579..48aa99cd 100644
      terminalAvailable: activeProject !== null,
      terminalOpen: terminalUiState.terminalOpen,
      terminalShortcutLabel: shortcutLabelForCommand(keybindings, "terminal.toggle"),
-@@ -3341,7 +3411,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3341,7 +3407,7 @@ export default function ChatView(props: ChatViewProps) {
    const panelToggleControls = (
      <PanelLayoutControls
        {...panelToggleControlProps}
@@ -478,7 +421,7 @@ index a731a579..48aa99cd 100644
      />
    );
    const threadPanelHeaderControl = <ThreadPanelHeaderControl {...panelToggleControlProps} />;
-@@ -3367,7 +3437,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3367,7 +3433,7 @@ export default function ChatView(props: ChatViewProps) {
        ref={setWorkspaceLayoutElement}
        className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background"
      >
@@ -487,7 +430,7 @@ index a731a579..48aa99cd 100644
          <DeviceSetupDialogHost
            threadKey={activeThreadKey}
            threadRef={activeThreadRef}
-@@ -3409,7 +3479,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3409,7 +3475,7 @@ export default function ChatView(props: ChatViewProps) {
                />
              ) : null}
              {!rightPanelControlsAtRoot && !rightPanelControlsInPanel ? panelLayoutControls : null}
@@ -496,7 +439,7 @@ index a731a579..48aa99cd 100644
              <ChatHeader
                activeThreadEnvironmentId={activeThread.environmentId}
                activeThreadId={activeThread.id}
-@@ -3488,7 +3558,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3488,7 +3554,7 @@ export default function ChatView(props: ChatViewProps) {
                    citationHistory={citationHistory}
                    onCiteAssistantText={citeAssistantTextStable}
                    onReplyToResponse={replyToResponseStable}
@@ -505,7 +448,7 @@ index a731a579..48aa99cd 100644
                      ? { onRunShellCommand: parentPanel?.runShellCommand ?? runShellCommandStable }
                      : {})}
                    isWorking={isWorking}
-@@ -3924,84 +3994,90 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3924,84 +3990,90 @@ export default function ChatView(props: ChatViewProps) {
  
              {embedded ? null : (
                <>
@@ -673,7 +616,7 @@ index a731a579..48aa99cd 100644
  
                  <PullRequestThreadDialogHost
                    threadKey={activeThreadKey}
-@@ -4015,7 +4091,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -4015,7 +4087,7 @@ export default function ChatView(props: ChatViewProps) {
            </ThreadFindCanvas>
          </div>
  
@@ -682,7 +625,7 @@ index a731a579..48aa99cd 100644
            <ChatTerminalDrawers
              activeThreadKey={activeThreadKey}
              activeTerminalOpen={Boolean(terminalUiState.terminalOpen)}
-@@ -4087,7 +4163,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -4087,7 +4159,7 @@ export default function ChatView(props: ChatViewProps) {
            filesAvailable={activeProject !== null}
            pullRequestAvailable={pullRequestSurfaceAvailable}
            pullRequestsAvailable={linkedItemsSurfaceAvailable}
@@ -691,7 +634,7 @@ index a731a579..48aa99cd 100644
            sideChatAvailable={sideChat.available}
            sideChatDisabledReason={sideChatDisabledReason}
          >
-@@ -4101,7 +4177,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -4101,7 +4173,7 @@ export default function ChatView(props: ChatViewProps) {
          worktreePath={activeThread?.worktreePath ?? null}
          onConfirm={onConfirmRevertStable}
        />
@@ -701,7 +644,7 @@ index a731a579..48aa99cd 100644
        <ExpandedImageDialogHost threadKey={routeThreadKey} />
      </div>
 diff --git a/apps/web/src/components/CommandPalette.tsx b/apps/web/src/components/CommandPalette.tsx
-index 0ab99ce8..d442ccf9 100644
+index 0ab99ce8..f41cadf7 100644
 --- a/apps/web/src/components/CommandPalette.tsx
 +++ b/apps/web/src/components/CommandPalette.tsx
 @@ -1,3 +1,6 @@
@@ -755,15 +698,6 @@ index 0ab99ce8..d442ccf9 100644
      actionItems.push({
        kind: "action",
        value: "action:triage",
-@@ -1407,7 +1415,7 @@ function OpenCommandPaletteDialog(props: {
-     });
-   }
- 
--  if (activeThreadPreviewOpen && previewBridge) {
-+  if (!isXtworkDesktop() && activeThreadPreviewOpen && previewBridge) {
-     actionItems.push({
-       kind: "action",
-       value: "find-in-browser-page",
 @@ -1491,6 +1499,7 @@ function OpenCommandPaletteDialog(props: {
    }
  
@@ -963,7 +897,7 @@ index 77200799..e6f98b4a 100644
            const result = await openInPreferredEditor(targetPath);
            if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
 diff --git a/apps/web/src/components/RightPanelTabs.tsx b/apps/web/src/components/RightPanelTabs.tsx
-index 2ce8f22f..5cf543ca 100644
+index 2ce8f22f..7bb0670a 100644
 --- a/apps/web/src/components/RightPanelTabs.tsx
 +++ b/apps/web/src/components/RightPanelTabs.tsx
 @@ -1,3 +1,5 @@
@@ -972,15 +906,14 @@ index 2ce8f22f..5cf543ca 100644
  import { msg, T, useGT, useMessages } from "gt-react";
  import { m, type MessageResolver } from "../i18n/messages";
  import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
-@@ -323,6 +325,15 @@ function SurfaceMenuItem(props: {
+@@ -323,6 +325,14 @@ function SurfaceMenuItem(props: {
    return <DisabledReasonTooltip reason={props.disabledReason} trigger={item} />;
  }
  
 +function showSurfaceAction(action: { readonly label: string }, developerFeatures: boolean) {
 +  return (
 +    !isXtworkDesktop() ||
-+    (action.label !== "Browser" &&
-+      action.label !== "Device" &&
++    (action.label !== "Device" &&
 +      (developerFeatures || !["Terminal", "Pull request", "Linked items"].includes(action.label)))
 +  );
 +}
@@ -988,7 +921,7 @@ index 2ce8f22f..5cf543ca 100644
  function RightPanelEmptyState(props: {
    onAddBrowser: () => void;
    onAddBrowserInProfile: (profileId: string) => void;
-@@ -349,6 +360,7 @@ function RightPanelEmptyState(props: {
+@@ -349,6 +359,7 @@ function RightPanelEmptyState(props: {
    const messages = useMessages();
    const [highlight, setHighlight] = useState(-1);
  
@@ -996,7 +929,7 @@ index 2ce8f22f..5cf543ca 100644
    const actions = [
      {
        label: msg("Browser"),
-@@ -425,7 +437,8 @@ function RightPanelEmptyState(props: {
+@@ -425,7 +436,8 @@ function RightPanelEmptyState(props: {
  
    type SurfaceAction = (typeof actions)[number];
  
@@ -1006,7 +939,7 @@ index 2ce8f22f..5cf543ca 100644
    const highlightIndex =
      availableActions.length === 0 ? -1 : Math.min(highlight, availableActions.length - 1);
  
-@@ -501,7 +514,7 @@ function RightPanelEmptyState(props: {
+@@ -501,7 +513,7 @@ function RightPanelEmptyState(props: {
            <T>Open a surface</T>
          </h3>
          <div className="flex flex-col gap-0.5">
@@ -1015,7 +948,7 @@ index 2ce8f22f..5cf543ca 100644
              action.available ? (
                <div
                  key={action.label}
-@@ -1168,7 +1181,8 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
+@@ -1168,7 +1180,8 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
      });
    };
  
@@ -1025,7 +958,7 @@ index 2ce8f22f..5cf543ca 100644
      {
        label: msg("Browser"),
        icon: Globe2,
-@@ -1240,6 +1254,10 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
+@@ -1240,6 +1253,10 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
        : []),
    ] as const;
  
@@ -2312,7 +2245,7 @@ index e4e302a3..8b20e93c 100644
    return (
      <WorkspaceBreadcrumb ariaLabel={gt("Settings breadcrumb")}>
 diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
-index 96b821ea..6dc0b865 100644
+index dee62ac6..2b0ddd8a 100644
 --- a/apps/web/src/components/settings/SettingsPanels.tsx
 +++ b/apps/web/src/components/settings/SettingsPanels.tsx
 @@ -1,3 +1,5 @@
@@ -2321,7 +2254,7 @@ index 96b821ea..6dc0b865 100644
  import { DeveloperFeaturesSettings } from "./DeveloperFeaturesSettings";
  import { RemoteImSettings } from "./RemoteImSettings";
  import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
-@@ -458,7 +460,7 @@ function AboutVersionSection() {
+@@ -459,7 +461,7 @@ function AboutVersionSection() {
            }
          />
        ) : null}
@@ -2330,7 +2263,7 @@ index 96b821ea..6dc0b865 100644
        {switchChannel === null ? null : (
          <UpdateTrackSwitchDialog channel={switchChannel} onClose={() => setSwitchChannel(null)} />
        )}
-@@ -825,6 +827,7 @@ function AutoSettleDaysInput({
+@@ -826,6 +828,7 @@ function AutoSettleDaysInput({
  }
  
  export function GeneralSettingsPanel() {
@@ -2338,7 +2271,7 @@ index 96b821ea..6dc0b865 100644
    const gt = useGT();
    const m = useMessages();
    const setting = useSearchableSetting();
-@@ -1047,31 +1050,33 @@ export function GeneralSettingsPanel() {
+@@ -1049,31 +1052,33 @@ export function GeneralSettingsPanel() {
              />
            }
          />
@@ -2395,7 +2328,7 @@ index 96b821ea..6dc0b865 100644
          {isElectron ? (
            <SettingsRow
              {...setting("quit-confirmation")}
-@@ -1623,6 +1628,7 @@ function DiffColorsSettingsRow() {
+@@ -1625,6 +1630,7 @@ function DiffColorsSettingsRow() {
  }
  
  export function DiffsSettingsPanel() {
@@ -2403,7 +2336,7 @@ index 96b821ea..6dc0b865 100644
    const messages = useMessages();
    const setting = useSearchableSetting();
    const gt = useGT();
-@@ -1742,36 +1748,39 @@ export function DiffsSettingsPanel() {
+@@ -1744,36 +1750,39 @@ export function DiffsSettingsPanel() {
          <DiffColorsSettingsRow />
        </SettingsSection>
  
@@ -2471,7 +2404,7 @@ index 96b821ea..6dc0b865 100644
      </SettingsPageContainer>
    );
  }
-@@ -2302,6 +2311,7 @@ export function ThreadsSettingsPanel() {
+@@ -2304,6 +2313,7 @@ export function ThreadsSettingsPanel() {
  }
  
  export function MaintenanceSettingsPanel() {
@@ -2479,7 +2412,7 @@ index 96b821ea..6dc0b865 100644
    const setting = useSearchableSetting();
    const gt = useGT();
    const settings = useScopedSettings();
-@@ -2314,37 +2324,40 @@ export function MaintenanceSettingsPanel() {
+@@ -2316,37 +2326,40 @@ export function MaintenanceSettingsPanel() {
    return (
      <SettingsPageContainer>
        <SettingsSection id="updates" title={gt("Updates")}>
@@ -2549,7 +2482,7 @@ index 96b821ea..6dc0b865 100644
          <SettingsRow
            {...setting("continue-threads-after-server-update")}
            serverScoped
-@@ -2493,7 +2506,7 @@ export function AboutSettingsPanel() {
+@@ -2495,7 +2508,7 @@ export function AboutSettingsPanel() {
            </>
          )}
          <MobileAppSettingsRow />
@@ -2559,7 +2492,7 @@ index 96b821ea..6dc0b865 100644
              {...setting("welcome-page")}
              description={gt("See your agents, import projects, and set up your phone.")}
 diff --git a/apps/web/src/components/settings/SettingsSidebarNav.tsx b/apps/web/src/components/settings/SettingsSidebarNav.tsx
-index 174a80bf..d03c2847 100644
+index 765bfd71..b31d7be5 100644
 --- a/apps/web/src/components/settings/SettingsSidebarNav.tsx
 +++ b/apps/web/src/components/settings/SettingsSidebarNav.tsx
 @@ -1,3 +1,5 @@
@@ -2582,7 +2515,7 @@ index 174a80bf..d03c2847 100644
    const searchableItems = useAvailableSettingsSearchItems();
    const results = searchSettings(query, searchableItems, m);
    const isSearching = query.trim().length > 0;
-@@ -379,7 +388,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
+@@ -380,7 +389,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
                    </SidebarMenu>
                  )}
                  <div onKeyDown={handleSettingsSectionKeyDown} className="flex flex-col gap-4">
@@ -2591,7 +2524,7 @@ index 174a80bf..d03c2847 100644
                      <div
                        key={group.heading}
                        className="flex flex-col gap-1 max-md:border-t max-md:border-sidebar-border max-md:pt-4 max-md:first:border-t-0 max-md:first:pt-0"
-@@ -414,7 +423,11 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
+@@ -415,7 +424,11 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
                                        !compactSearchOpen && "max-md:sr-only",
                                      )}
                                    >
@@ -3697,7 +3630,7 @@ index 8090e3a1..ec1309cb 100644
 +  },
  });
 diff --git a/apps/web/src/routes/_chat.settings.tsx b/apps/web/src/routes/_chat.settings.tsx
-index c9753493..4188c9f0 100644
+index 82b31a5e..54f5ceff 100644
 --- a/apps/web/src/routes/_chat.settings.tsx
 +++ b/apps/web/src/routes/_chat.settings.tsx
 @@ -1,5 +1,7 @@
@@ -3732,42 +3665,6 @@ index c9753493..4188c9f0 100644
    const searchTarget = getSettingsSearchTargetScope(hash);
    const autoSettlementAvailability = searchTarget?.requiresThreadAutoSettlement
      ? getThreadAutoSettlementSearchAvailability(environments, scope)
-diff --git a/apps/web/src/shortcuts/chatRouteCommands.ts b/apps/web/src/shortcuts/chatRouteCommands.ts
-index eb05fb3b..e63b5e19 100644
---- a/apps/web/src/shortcuts/chatRouteCommands.ts
-+++ b/apps/web/src/shortcuts/chatRouteCommands.ts
-@@ -5,6 +5,7 @@ import { msg } from "gt-react";
- import { stackedThreadToast, toastManager } from "~/components/ui/toast";
- import { m } from "~/i18n/messages";
- import { isElectron } from "../env";
-+import { isXtworkDesktop } from "../desktopFeatureVisibility";
- import { isPreviewAvailableFor } from "../browser/previewRuntime";
- import { isCommandPaletteOpen, openCommandPalette } from "../commandPaletteBus";
- import { useComposerDraftStore } from "../composerDraftStore";
-@@ -66,6 +67,7 @@ export function installChatRouteCommands(router: AnyRouter): () => void {
-       : (useComposerDraftStore.getState().getDraftSession(target.draftId)?.environmentId ?? null);
-   };
-   const readPreviewOpen = () => {
-+    if (isXtworkDesktop()) return false;
-     const threadRef = readRouteThreadRef();
-     // Store-only on purpose: the URL-aware arbitration lives in ChatView's
-     // preview toggle, which the action bus reaches.
-@@ -123,6 +125,7 @@ export function installChatRouteCommands(router: AnyRouter): () => void {
-   const previewCommand =
-     (action: PreviewAction): CommandHandler =>
-     (event) => {
-+      if (isXtworkDesktop()) return false;
-       claim(event);
-       const environmentId = readRouteEnvironmentId();
-       if (environmentId && canOperatePreview(environmentId)) dispatchPreviewAction(action);
-@@ -163,6 +166,7 @@ export function installChatRouteCommands(router: AnyRouter): () => void {
-         startNewLocal(event);
-       },
-       "preview.toggle": (event) => {
-+        if (isXtworkDesktop()) return false;
-         claim(event);
-         const threadRef = readRouteThreadRef();
-         if (!threadRef || (!canOperatePreview(threadRef.environmentId) && !readPreviewOpen())) {
 diff --git a/apps/web/src/versionSkew.test.ts b/apps/web/src/versionSkew.test.ts
 index 2b5f6106..2ae9a26f 100644
 --- a/apps/web/src/versionSkew.test.ts
