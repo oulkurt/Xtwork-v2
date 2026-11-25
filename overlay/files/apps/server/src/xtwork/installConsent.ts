@@ -227,34 +227,26 @@ export class InstallConsentStore {
   }
 
   /**
-   * Atomically verifies and consumes a matching single-use approval.
-   * When `approvalToken` is provided, only that exact token may be consumed.
-   * Returns `false` if absent, mismatched, or already consumed.
+   * Atomically verifies and consumes a matching single-use approval token.
+   * Requires a non-empty `approvalToken` bound to the exact normalized key;
+   * omitting or supplying a blank/mismatched token always fails closed (M2).
    */
   consumeApproval(rawKey: InstallConsentKey, approvalToken?: string): boolean {
+    if (typeof approvalToken !== "string") return false;
+    const trimmed = approvalToken.trim();
+    if (!trimmed) return false;
     let key: InstallConsentKey;
     try {
       key = normalizeInstallConsentKey(rawKey);
     } catch {
       return false;
     }
-    if (approvalToken !== undefined) {
-      const trimmed = approvalToken.trim();
-      if (!trimmed) return false;
-      const entry = this.singleUseApprovals.get(trimmed);
-      if (!entry || !installConsentKeysEqual(entry.key, key)) {
-        return false;
-      }
-      this.singleUseApprovals.delete(trimmed);
-      return true;
+    const entry = this.singleUseApprovals.get(trimmed);
+    if (!entry || !installConsentKeysEqual(entry.key, key)) {
+      return false;
     }
-    for (const [token, entry] of this.singleUseApprovals) {
-      if (installConsentKeysEqual(entry.key, key)) {
-        this.singleUseApprovals.delete(token);
-        return true;
-      }
-    }
-    return false;
+    this.singleUseApprovals.delete(trimmed);
+    return true;
   }
 
   revokeApproval(approvalToken: string): boolean {

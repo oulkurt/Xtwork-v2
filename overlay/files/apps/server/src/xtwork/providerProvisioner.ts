@@ -16,6 +16,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { Headers, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
@@ -57,13 +58,15 @@ export type ProvisionerPhase =
 
 export type ProvisionInstallMode = "app-managed" | "vendor-script";
 
-export type ProvisionAgentKind =
+export type KnownProvisionAgentKind =
   | "codex"
   | "claude"
   | "kimi-code"
   | "qoder"
   | "codebuddy-code"
   | "deepseek-harness";
+
+export type ProvisionAgentKind = KnownProvisionAgentKind | (string & {});
 
 export interface ExistingInstallDetection {
   readonly detected: boolean;
@@ -206,7 +209,9 @@ const ANSI_ESCAPE_PATTERN =
   /\u001B(?:\][^\u0007\u001B]*(?:\u0007|\u001B\\)|\[[0-9;?]*[ -/]*[@-~])/g;
 const SECRET_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\b(sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_KEY]"],
+  [/\b((?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g, "[REDACTED_KEY]"],
   [/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]"],
+  [/\b(Authorization\s*:\s*(?:Basic|Token)\s+)\S+/gi, "$1[REDACTED]"],
   [
     /\b((?:ANTHROPIC|OPENAI|DEEPSEEK|KIMI|API)[A-Z0-9_]*(?:KEY|TOKEN|SECRET)\s*=\s*)\S+/gi,
     "$1[REDACTED]",
@@ -217,11 +222,16 @@ const SECRET_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   ],
 ];
 
-export function sanitizeProvisionLogLine(raw: string): string {
-  let clean = raw.replace(ANSI_ESCAPE_PATTERN, "").replace(/\r/g, "").trimEnd();
+export function redactSecrets(raw: string): string {
+  let clean = raw.replace(ANSI_ESCAPE_PATTERN, "").replace(/\r/g, "");
   for (const [pattern, replacement] of SECRET_PATTERNS) {
     clean = clean.replace(pattern, replacement);
   }
+  return clean;
+}
+
+export function sanitizeProvisionLogLine(raw: string): string {
+  let clean = redactSecrets(raw).trimEnd();
   if (clean.length > MAX_LOG_LINE_CHARS) {
     clean = `${clean.slice(0, MAX_LOG_LINE_CHARS - 1)}…`;
   }
@@ -346,6 +356,7 @@ export function findExecutableInPath(
       ? []
       : [
           NodePath.join(home, ".local", "bin"),
+          NodePath.join(home, ".kimi-code", "bin"),
           NodePath.join(home, ".claude", "local", "bin"),
           ...(env.XTWORK_DISABLE_SYSTEM_PATH_PROBE === "1"
             ? []
@@ -587,16 +598,28 @@ const defaultAcpVerifier: ProvisionAcpVerifier = ({ executablePath, args, env, s
       }
     });
 
+    let stderrBuf = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (stderrBuf.length < 4096) {
+        stderrBuf += chunk.toString("utf8");
+      }
+    });
+
     child.on("error", (error) => {
       finish({
         ok: false,
-        error: error instanceof Error ? error.message : "Failed to spawn ACP executable.",
+        error: redactSecrets(
+          error instanceof Error ? error.message : "Failed to spawn ACP executable.",
+        ),
       });
     });
     child.on("close", (code) => {
+      const stderrSummary = sanitizeProvisionLogLine(stderrBuf.trim());
       finish({
         ok: false,
-        error: `ACP executable exited with code ${code ?? 1} before completing initialize.`,
+        error: stderrSummary
+          ? `ACP executable exited with code ${code ?? 1} before completing initialize: ${stderrSummary}`
+          : `ACP executable exited with code ${code ?? 1} before completing initialize.`,
       });
     });
 
@@ -794,11 +817,11 @@ export function resolveProvisionAgentKind(
   if (instance?.driver === ProviderDriverKind.make("acpRegistry")) {
     const source = configString(instance.config, "source");
     const agentId = configString(instance.config, "agentId");
-    if (source !== "local") {
-      if (agentId === "kimi-code") return "kimi-code";
-      if (agentId === "qoder") return "qoder";
-      if (agentId === "codebuddy-code") return "codebuddy-code";
-    } else {
+    if (source !== "local" && agentId.length > 0) {
+      // M3: Support provisioning / re-confirmation / upgrades for ALL ACP Registry agents.
+      return agentId;
+    }
+    if (source === "local") {
       const cmd = NodePath.basename(configString(instance.config, "commandPath"));
       if (cmd === "dsh" || cmd === "dsh.exe" || cmd === "dsh.cmd") {
         return "deepseek-harness";
@@ -818,19 +841,20 @@ interface VendorScriptMeta {
   readonly vendorUninstallGuidanceZh: string;
 }
 
-const ACP_REGISTRY_AGENT_META: Readonly<
-  Record<"kimi-code" | "qoder" | "codebuddy-code", VendorScriptMeta>
-> = {
+type BuiltInVendorAcpAgentId = "kimi-code" | "qoder" | "codebuddy-code";
+
+const ACP_REGISTRY_AGENT_META: Readonly<Record<BuiltInVendorAcpAgentId, VendorScriptMeta>> = {
   "kimi-code": {
     displayName: "Kimi Code",
     cliBinary: "kimi",
     acpArgs: ["acp"],
-    posixScriptUrl: "https://code.kimi.com/install.sh",
-    windowsScriptUrl: "https://code.kimi.com/install.ps1",
+    // M1: Use the modern Kimi Code CLI HTTPS installer (legacy code.kimi.com/install.sh installs deprecated Python kimi-cli without a TTY).
+    posixScriptUrl: "https://code.kimi.com/kimi-code/install.sh",
+    windowsScriptUrl: "https://code.kimi.com/kimi-code/install.ps1",
     vendorUninstallGuidance:
-      "Installed via Kimi Code's official HTTPS script into user global paths. Uninstall using Kimi Code's official instructions or remove the binary from your PATH.",
+      "Installed via Kimi Code's official HTTPS script into user global paths (~/.kimi-code). Uninstall using Kimi Code's official instructions or remove the binary from your PATH.",
     vendorUninstallGuidanceZh:
-      "通过 Kimi Code 官方 HTTPS 脚本安装到用户全局目录，小瞳 Work 不提供应用内自动回滚或卸载；如需卸载请按 Kimi Code 官方说明清理。",
+      "通过 Kimi Code 官方 HTTPS 脚本安装到用户全局目录（~/.kimi-code），小瞳 Work 不提供应用内自动回滚或卸载；如需卸载请按 Kimi Code 官方说明清理。",
   },
   qoder: {
     displayName: "Qoder",
@@ -855,6 +879,10 @@ const ACP_REGISTRY_AGENT_META: Readonly<
       "通过 CodeBuddy 官方 HTTPS 安装脚本写入用户全局目录；小瞳 Work 不会擅自修改或卸载全局环境，如需卸载请按 CodeBuddy 官方说明清理。",
   },
 };
+
+function isBuiltInVendorAcpAgentId(agentKind: string): agentKind is BuiltInVendorAcpAgentId {
+  return Object.prototype.hasOwnProperty.call(ACP_REGISTRY_AGENT_META, agentKind);
+}
 
 export interface ProviderProvisionerDeps {
   readonly baseDir: string;
@@ -936,8 +964,10 @@ interface ActiveOperation {
   readonly mode: ProvisionInstallMode;
   readonly resourceKey: string;
   readonly abortController: AbortController;
+  readonly commitSemaphore: Semaphore.Semaphore;
   cancel: () => void;
   cancelled: boolean;
+  committed: boolean;
 }
 
 interface ResourceLock {
@@ -988,7 +1018,7 @@ export function makeProviderProvisioner(
     if (agentKind === "codex") return `codex:${NodePath.resolve(deps.codexInstallation.managedDirectory)}`;
     if (agentKind === "claude") return `dir:${NodePath.resolve(toolsDir, "claude-code")}`;
     if (agentKind === "deepseek-harness") return `dir:${NodePath.resolve(toolsDir, "deepseek-harness")}`;
-    if (agentKind === "kimi-code" || agentKind === "qoder" || agentKind === "codebuddy-code") {
+    if (agentKind.trim().length > 0) {
       return `acp:${agentKind}`;
     }
     return `dir:${NodePath.resolve(targetInstallDir)}`;
@@ -1001,7 +1031,13 @@ export function makeProviderProvisioner(
     instanceId: string,
     updater: (prev: ProviderProvisionState) => ProviderProvisionState,
   ): ProviderProvisionState => {
-    const next = updater(getOrInitState(instanceId));
+    const rawNext = updater(getOrInitState(instanceId));
+    // S5: Defense-in-depth — always redact secrets from user-facing error and status messages.
+    const next: ProviderProvisionState = {
+      ...rawNext,
+      error: rawNext.error !== null ? redactSecrets(rawNext.error) : null,
+      message: rawNext.message !== null ? redactSecrets(rawNext.message) : null,
+    };
     states.set(instanceId, next);
     return next;
   };
@@ -1075,12 +1111,7 @@ export function makeProviderProvisioner(
             if (cmd && isInsideDirectory(cmd, managedDir)) {
               blocking.push(candidateId);
             }
-          } else if (
-            (agentKind === "kimi-code" ||
-              agentKind === "qoder" ||
-              agentKind === "codebuddy-code") &&
-            instance.driver === ProviderDriverKind.make("acpRegistry")
-          ) {
+          } else if (instance.driver === ProviderDriverKind.make("acpRegistry")) {
             const cmd = configString(config, "commandPath");
             if (
               config.source !== "local" &&
@@ -1505,15 +1536,21 @@ export function makeProviderProvisioner(
         };
       }
 
-      // ---- 4. ACP REGISTRY AGENTS: Kimi Code / Qoder / Codebuddy Code ----
-      const meta = ACP_REGISTRY_AGENT_META[agentKind];
+      // ---- 4. ACP REGISTRY AGENTS (Built-in Kimi/Qoder/Codebuddy + all user-added ACP Registry agents) ----
+      const builtInMeta = isBuiltInVendorAcpAgentId(agentKind)
+        ? ACP_REGISTRY_AGENT_META[agentKind]
+        : undefined;
       const acpAgentId = agentKind;
+      const resolvedDisplayName =
+        instance?.displayName?.trim() || builtInMeta?.displayName || acpAgentId;
       const described = deps.acpCatalog.describeAgent
         ? yield* deps.acpCatalog.describeAgent(acpAgentId, "auto").pipe(Effect.option)
         : Option.none();
       const describedValue = Option.getOrUndefined(described);
 
-      const userCliPath = findExecutableInPath(meta.cliBinary, env, platform, [toolsDir]);
+      const userCliPath = builtInMeta
+        ? findExecutableInPath(builtInMeta.cliBinary, env, platform, [toolsDir])
+        : null;
       const userCliVersion = userCliPath
         ? yield* Effect.promise(() => probeVersion(userCliPath, env))
         : null;
@@ -1546,8 +1583,8 @@ export function makeProviderProvisioner(
         mode: "app-managed",
         label: "App-Managed ACP Install (Recommended)",
         labelZh: "受管隔离安装（ACP Registry，推荐）",
-        summary: `Installs ${meta.displayName} from the official ACP Registry into Xiaotong Work's isolated tools cache using bundled Node & npm.`,
-        summaryZh: `通过官方 ACP Registry 与随包 Node/npm 将 ${meta.displayName} 安装到应用独立目录，支持取消清理与一键卸载。`,
+        summary: `Installs ${resolvedDisplayName} from the official ACP Registry into Xiaotong Work's isolated tools cache using bundled Node & npm.`,
+        summaryZh: `通过官方 ACP Registry 与随包 Node/npm 将 ${resolvedDisplayName} 安装到应用独立目录，支持取消清理与一键卸载。`,
         commandPreview: managedCommandPreview,
         officialSource:
           describedValue?.archiveUrl ??
@@ -1577,48 +1614,50 @@ export function makeProviderProvisioner(
             }),
       };
 
-      const vendorScriptUrl =
-        platform === "win32" ? meta.windowsScriptUrl : meta.posixScriptUrl;
-      const vendorScriptCommand =
-        platform === "win32"
-          ? `irm ${vendorScriptUrl} | iex`
-          : buildHardenedPosixInstallerCommand(vendorScriptUrl);
       const vendorBlocked = userCliPath !== null;
+      const vendorScriptOption: ProvisionPlanOption | null = builtInMeta
+        ? (() => {
+            const vendorScriptUrl =
+              platform === "win32" ? builtInMeta.windowsScriptUrl : builtInMeta.posixScriptUrl;
+            const vendorScriptCommand =
+              platform === "win32"
+                ? `irm ${vendorScriptUrl} | iex`
+                : buildHardenedPosixInstallerCommand(vendorScriptUrl);
+            return {
+              mode: "vendor-script",
+              label: "Official Native Global Install",
+              labelZh: "官方脚本全局安装（可选）",
+              summary: `Runs ${builtInMeta.displayName}'s official HTTPS global installer script into your system/user PATH.`,
+              summaryZh: `通过仅限 HTTPS 的 curl 下载并执行 ${builtInMeta.displayName} 官方全局安装脚本；安装后核验 ACP initialize 并绑定可执行文件路径，不承诺应用内卸载。`,
+              commandPreview: vendorScriptCommand,
+              officialSource: vendorScriptUrl,
+              targetInstallDir: VENDOR_GLOBAL_INSTALL_DIR,
+              uninstallSemantics: "vendor-managed",
+              uninstallGuidance: builtInMeta.vendorUninstallGuidance,
+              uninstallGuidanceZh: builtInMeta.vendorUninstallGuidanceZh,
+              consentKey: normalizeInstallConsentKey({
+                instanceId,
+                source: "vendor-script",
+                version: "official-script",
+                distribution: "vendor-script",
+                installDir: VENDOR_GLOBAL_INSTALL_DIR,
+                artifactSpec: vendorScriptUrl,
+              }),
+              availableVersion: null,
+              distribution: "vendor-script",
+              installable: !vendorBlocked,
+              ...(vendorBlocked
+                ? {
+                    unavailableReason: `${builtInMeta.displayName} is already installed on PATH at ${userCliPath}. Xiaotong Work will not overwrite your existing installation.`,
+                  }
+                : {}),
+            } satisfies ProvisionPlanOption;
+          })()
+        : null;
 
-      const vendorScriptOption: ProvisionPlanOption = {
-        mode: "vendor-script",
-        label: "Official Native Global Install",
-        labelZh: "官方脚本全局安装（可选）",
-        summary: `Runs ${meta.displayName}'s official HTTPS global installer script into your system/user PATH.`,
-        summaryZh: `通过仅限 HTTPS 的 curl 下载并执行 ${meta.displayName} 官方全局安装脚本；安装后核验 ACP initialize 并绑定可执行文件路径，不承诺应用内卸载。`,
-        commandPreview: vendorScriptCommand,
-        officialSource: vendorScriptUrl,
-        targetInstallDir: VENDOR_GLOBAL_INSTALL_DIR,
-        uninstallSemantics: "vendor-managed",
-        uninstallGuidance: meta.vendorUninstallGuidance,
-        uninstallGuidanceZh: meta.vendorUninstallGuidanceZh,
-        consentKey: normalizeInstallConsentKey({
-          instanceId,
-          source: "vendor-script",
-          version: "official-script",
-          distribution: "vendor-script",
-          installDir: VENDOR_GLOBAL_INSTALL_DIR,
-          artifactSpec: vendorScriptUrl,
-        }),
-        availableVersion: null,
-        distribution: "vendor-script",
-        installable: !vendorBlocked,
-        ...(vendorBlocked
-          ? {
-              unavailableReason: `${meta.displayName} is already installed on PATH at ${userCliPath}. Xiaotong Work will not overwrite your existing installation.`,
-            }
-          : {}),
-      };
-
-      const availableModes: ReadonlyArray<ProvisionPlanOption> = [
-        appManagedOption,
-        vendorScriptOption,
-      ];
+      const availableModes: ReadonlyArray<ProvisionPlanOption> = vendorScriptOption
+        ? [appManagedOption, vendorScriptOption]
+        : [appManagedOption];
       const selectedMode: ProvisionInstallMode = requestedMode ?? "app-managed";
       const selectedOption =
         availableModes.find((opt) => opt.mode === selectedMode) ?? appManagedOption;
@@ -1665,7 +1704,7 @@ export function makeProviderProvisioner(
       return {
         instanceId,
         agentKind,
-        displayName: instance?.displayName?.trim() || meta.displayName,
+        displayName: resolvedDisplayName,
         defaultMode: "app-managed",
         selectedMode: selectedOption.mode,
         selectedOption,
@@ -1918,36 +1957,99 @@ export function makeProviderProvisioner(
         return;
       }
 
-      upsertReceipt(deps.baseDir, {
-        instanceId: input.instanceId,
-        agentKind: input.agentKind,
-        mode: "app-managed",
-        source: input.option.consentKey.source,
-        version: installedVersion ?? input.option.consentKey.version,
-        distribution: input.option.consentKey.distribution,
-        installDir: input.installDir,
-        executablePath: managedBin,
-        installedAt: new Date().toISOString(),
+      const commitOp = activeOps.get(input.instanceId);
+      const runCommit = Effect.gen(function* () {
+        if (isOpCancelled(input.instanceId, input.operationId)) {
+          if (!existedBefore) {
+            NodeFs.rmSync(input.installDir, { recursive: true, force: true });
+          }
+          setState(input.instanceId, (prev) => ({
+            ...prev,
+            phase: "cancelled",
+            message: "Installation cancelled.",
+            finishedAt: new Date().toISOString(),
+          }));
+          return;
+        }
+
+        const wireResult = yield* input.wireInstance(managedBin).pipe(
+          Effect.match({
+            onSuccess: () => ({ ok: true as const }),
+            onFailure: (error) => ({ ok: false as const, error }),
+          }),
+        );
+        if (!wireResult.ok) {
+          const detail = redactSecrets(
+            wireResult.error instanceof Error
+              ? wireResult.error.message
+              : `Failed to save provider settings for '${input.instanceId}'.`,
+          );
+          appendLog(input.instanceId, detail);
+          setState(input.instanceId, (prev) => ({
+            ...prev,
+            phase: "failed",
+            installedVersion,
+            executablePath: managedBin,
+            error: detail,
+            message: detail,
+            finishedAt: new Date().toISOString(),
+          }));
+          return;
+        }
+
+        if (isOpCancelled(input.instanceId, input.operationId)) {
+          if (!existedBefore) {
+            NodeFs.rmSync(input.installDir, { recursive: true, force: true });
+          }
+          setState(input.instanceId, (prev) => ({
+            ...prev,
+            phase: "cancelled",
+            message: "Installation cancelled.",
+            finishedAt: new Date().toISOString(),
+          }));
+          return;
+        }
+
+        upsertReceipt(deps.baseDir, {
+          instanceId: input.instanceId,
+          agentKind: input.agentKind,
+          mode: "app-managed",
+          source: input.option.consentKey.source,
+          version: installedVersion ?? input.option.consentKey.version,
+          distribution: input.option.consentKey.distribution,
+          installDir: input.installDir,
+          executablePath: managedBin,
+          installedAt: new Date().toISOString(),
+        });
+
+        if (commitOp && commitOp.operationId === input.operationId) {
+          commitOp.committed = true;
+        }
+
+        yield* deps
+          .refreshProviderInstance(ProviderInstanceId.make(input.instanceId))
+          .pipe(Effect.ignore);
+
+        appendLog(
+          input.instanceId,
+          `Verified ${input.binaryName}${installedVersion ? ` v${installedVersion}` : ""} at ${managedBin}`,
+        );
+        setState(input.instanceId, (prev) => ({
+          ...prev,
+          phase: "succeeded",
+          installedVersion,
+          executablePath: managedBin,
+          error: null,
+          message: `Installed ${input.binaryName}${installedVersion ? ` v${installedVersion}` : ""}.`,
+          finishedAt: new Date().toISOString(),
+        }));
       });
 
-      yield* input.wireInstance(managedBin).pipe(Effect.ignore);
-      yield* deps
-        .refreshProviderInstance(ProviderInstanceId.make(input.instanceId))
-        .pipe(Effect.ignore);
-
-      appendLog(
-        input.instanceId,
-        `Verified ${input.binaryName}${installedVersion ? ` v${installedVersion}` : ""} at ${managedBin}`,
-      );
-      setState(input.instanceId, (prev) => ({
-        ...prev,
-        phase: "succeeded",
-        installedVersion,
-        executablePath: managedBin,
-        error: null,
-        message: `Installed ${input.binaryName}${installedVersion ? ` v${installedVersion}` : ""}.`,
-        finishedAt: new Date().toISOString(),
-      }));
+      if (commitOp && commitOp.operationId === input.operationId) {
+        yield* commitOp.commitSemaphore.withPermits(1)(runCommit);
+      } else {
+        yield* runCommit;
+      }
     });
 
   const runVendorScriptInstall = (input: {
@@ -2108,9 +2210,10 @@ export function makeProviderProvisioner(
           return;
         }
         if (!acpCheck.ok) {
-          const detail =
+          const detail = redactSecrets(
             acpCheck.error ??
-            `Detected '${detectedPath}', but ACP initialize verification failed.`;
+              `Detected '${detectedPath}', but ACP initialize verification failed.`,
+          );
           appendLog(input.instanceId, detail);
           setState(input.instanceId, (prev) => ({
             ...prev,
@@ -2125,32 +2228,83 @@ export function makeProviderProvisioner(
         }
         detectedVersion = detectedVersion ?? acpCheck.version ?? null;
 
-        // M8: Wire detectedPath into `commandPath` while strictly preserving any pre-existing custom `commandPath`.
+        // M8/S4: Read existing config outside commit lock, then serialize commit against cancel
+        // and re-check cancellation atomically BEFORE mutating settings. Propagate write errors!
         const current = yield* getInstanceConfig(input.instanceId);
-        const currentConfig = isObjectRecord(current?.config) ? current.config : {};
-        const existingCommandPath = configString(currentConfig, "commandPath");
-        if (!existingCommandPath) {
-          yield* deps
-            .updateProviderInstance({
-              operation: "upsert",
-              instanceId: ProviderInstanceId.make(input.instanceId),
-              instance: {
-                ...(current ?? {
+        const commitOp = activeOps.get(input.instanceId);
+        const commitVendorWiring = Effect.gen(function* () {
+          if (isOpCancelled(input.instanceId, input.operationId)) {
+            setState(input.instanceId, (prev) => ({
+              ...prev,
+              phase: "cancelled",
+              message: "Installation cancelled.",
+              finishedAt: new Date().toISOString(),
+            }));
+            return "cancelled" as const;
+          }
+          const currentConfig = isObjectRecord(current?.config) ? current.config : {};
+          const existingCommandPath = configString(currentConfig, "commandPath");
+          if (!existingCommandPath) {
+            const displayName = isBuiltInVendorAcpAgentId(input.agentKind)
+              ? ACP_REGISTRY_AGENT_META[input.agentKind].displayName
+              : input.agentKind;
+            const writeResult = yield* deps
+              .updateProviderInstance({
+                operation: "upsert",
+                instanceId: ProviderInstanceId.make(input.instanceId),
+                instance: {
+                  ...(current ?? {
+                    driver: ProviderDriverKind.make("acpRegistry"),
+                    displayName,
+                  }),
                   driver: ProviderDriverKind.make("acpRegistry"),
-                  displayName: ACP_REGISTRY_AGENT_META[input.agentKind].displayName,
-                }),
-                driver: ProviderDriverKind.make("acpRegistry"),
-                enabled: current?.enabled ?? true,
-                config: {
-                  ...currentConfig,
-                  source: "registry",
-                  agentId: input.agentKind,
-                  commandPath: detectedPath,
                   enabled: current?.enabled ?? true,
+                  config: {
+                    ...currentConfig,
+                    source: "registry",
+                    agentId: input.agentKind,
+                    commandPath: detectedPath,
+                    enabled: current?.enabled ?? true,
+                  },
                 },
-              },
-            })
-            .pipe(Effect.ignore);
+              })
+              .pipe(
+                Effect.match({
+                  onSuccess: () => ({ ok: true as const }),
+                  onFailure: (error) => ({ ok: false as const, error }),
+                }),
+              );
+            if (!writeResult.ok) {
+              const detail = redactSecrets(
+                writeResult.error instanceof Error
+                  ? writeResult.error.message
+                  : `Failed to save commandPath for '${input.instanceId}'.`,
+              );
+              appendLog(input.instanceId, detail);
+              setState(input.instanceId, (prev) => ({
+                ...prev,
+                phase: "failed",
+                installedVersion: detectedVersion,
+                executablePath: detectedPath,
+                error: detail,
+                message: detail,
+                finishedAt: new Date().toISOString(),
+              }));
+              return "failed" as const;
+            }
+          }
+          if (commitOp && commitOp.operationId === input.operationId) {
+            commitOp.committed = true;
+          }
+          return "committed" as const;
+        });
+
+        const commitOutcome =
+          commitOp && commitOp.operationId === input.operationId
+            ? yield* commitOp.commitSemaphore.withPermits(1)(commitVendorWiring)
+            : yield* commitVendorWiring;
+        if (commitOutcome !== "committed") {
+          return;
         }
       } else if (detectedVersion === null) {
         const detail = `Detected '${detectedPath}', but '${input.binaryName} --version' verification failed.`;
@@ -2165,16 +2319,30 @@ export function makeProviderProvisioner(
           finishedAt: new Date().toISOString(),
         }));
         return;
-      }
-
-      if (isOpCancelled(input.instanceId, input.operationId)) {
-        setState(input.instanceId, (prev) => ({
-          ...prev,
-          phase: "cancelled",
-          message: "Installation cancelled.",
-          finishedAt: new Date().toISOString(),
-        }));
-        return;
+      } else {
+        const commitOp = activeOps.get(input.instanceId);
+        const markCommitted = Effect.sync(() => {
+          if (isOpCancelled(input.instanceId, input.operationId)) {
+            setState(input.instanceId, (prev) => ({
+              ...prev,
+              phase: "cancelled",
+              message: "Installation cancelled.",
+              finishedAt: new Date().toISOString(),
+            }));
+            return false;
+          }
+          if (commitOp && commitOp.operationId === input.operationId) {
+            commitOp.committed = true;
+          }
+          return true;
+        });
+        const ok =
+          commitOp && commitOp.operationId === input.operationId
+            ? yield* commitOp.commitSemaphore.withPermits(1)(markCommitted)
+            : yield* markCommitted;
+        if (!ok) {
+          return;
+        }
       }
 
       yield* deps
@@ -2353,7 +2521,7 @@ export function makeProviderProvisioner(
   const runAcpRegistryManagedInstall = (input: {
     readonly instanceId: string;
     readonly operationId: string;
-    readonly agentId: "kimi-code" | "qoder" | "codebuddy-code";
+    readonly agentId: string;
     readonly option: ProvisionPlanOption;
     readonly approvalToken: string;
   }): Effect.Effect<void> =>
@@ -2436,30 +2604,43 @@ export function makeProviderProvisioner(
         message: `Verifying ${prepared.agentId} v${prepared.version}…`,
       }));
 
-      if (isOpCancelled(input.instanceId, input.operationId)) {
-        if (!existedBefore) {
-          NodeFs.rmSync(targetDir, { recursive: true, force: true });
+      const commitOp = activeOps.get(input.instanceId);
+      const commitAcp = Effect.sync(() => {
+        if (isOpCancelled(input.instanceId, input.operationId)) {
+          if (!existedBefore) {
+            NodeFs.rmSync(targetDir, { recursive: true, force: true });
+          }
+          setState(input.instanceId, (prev) => ({
+            ...prev,
+            phase: "cancelled",
+            message: "Installation cancelled.",
+            finishedAt: new Date().toISOString(),
+          }));
+          return false;
         }
-        setState(input.instanceId, (prev) => ({
-          ...prev,
-          phase: "cancelled",
-          message: "Installation cancelled.",
-          finishedAt: new Date().toISOString(),
-        }));
+        upsertReceipt(deps.baseDir, {
+          instanceId: input.instanceId,
+          agentKind: input.agentId,
+          mode: "app-managed",
+          source: "acp-registry",
+          version: prepared.version,
+          distribution: prepared.distribution,
+          installDir: targetDir,
+          executablePath: targetDir,
+          installedAt: new Date().toISOString(),
+        });
+        if (commitOp && commitOp.operationId === input.operationId) {
+          commitOp.committed = true;
+        }
+        return true;
+      });
+      const committed =
+        commitOp && commitOp.operationId === input.operationId
+          ? yield* commitOp.commitSemaphore.withPermits(1)(commitAcp)
+          : yield* commitAcp;
+      if (!committed) {
         return;
       }
-
-      upsertReceipt(deps.baseDir, {
-        instanceId: input.instanceId,
-        agentKind: input.agentId,
-        mode: "app-managed",
-        source: "acp-registry",
-        version: prepared.version,
-        distribution: prepared.distribution,
-        installDir: targetDir,
-        executablePath: targetDir,
-        installedAt: new Date().toISOString(),
-      });
 
       yield* deps
         .refreshProviderInstance(ProviderInstanceId.make(input.instanceId))
@@ -2530,8 +2711,10 @@ export function makeProviderProvisioner(
           mode: plan.selectedMode,
           resourceKey,
           abortController: createOperationAbortController(),
+          commitSemaphore: Semaphore.makeUnsafe(1),
           cancel: () => {},
           cancelled: false,
+          committed: false,
         };
         activeOps.set(request.instanceId, op);
         resourceLocks.set(resourceKey, {
@@ -2569,13 +2752,12 @@ export function makeProviderProvisioner(
                 ? "claude"
                 : plan.agentKind === "deepseek-harness"
                   ? "dsh"
-                  : ACP_REGISTRY_AGENT_META[plan.agentKind].cliBinary;
-            const acpArgs =
-              plan.agentKind === "kimi-code" ||
-              plan.agentKind === "qoder" ||
-              plan.agentKind === "codebuddy-code"
-                ? ACP_REGISTRY_AGENT_META[plan.agentKind].acpArgs
-                : undefined;
+                  : isBuiltInVendorAcpAgentId(plan.agentKind)
+                    ? ACP_REGISTRY_AGENT_META[plan.agentKind].cliBinary
+                    : plan.agentKind;
+            const acpArgs = isBuiltInVendorAcpAgentId(plan.agentKind)
+              ? ACP_REGISTRY_AGENT_META[plan.agentKind].acpArgs
+              : undefined;
             return runVendorScriptInstall({
               instanceId: request.instanceId,
               operationId,
@@ -2729,13 +2911,26 @@ export function makeProviderProvisioner(
           ),
         );
       }
+      // S4: Signal abort synchronously (interrupts active child/probes/pending commits immediately),
+      // then serialize with the per-operation commitSemaphore so cancel never races settings/receipt commits.
       op.cancelled = true;
       op.abortController.abort();
       op.cancel();
-      return setState(instanceId, (prev) => ({
-        ...prev,
-        message: "Cancelling installation…",
-      }));
+      return yield* op.commitSemaphore.withPermits(1)(
+        Effect.sync(() => {
+          if (op.committed) {
+            return getOrInitState(instanceId);
+          }
+          const current = getOrInitState(instanceId);
+          if (current.phase === "cancelled" || current.phase === "failed" || current.phase === "succeeded") {
+            return current;
+          }
+          return setState(instanceId, (prev) => ({
+            ...prev,
+            message: "Cancelling installation…",
+          }));
+        }),
+      );
     });
 
   const uninstall = (

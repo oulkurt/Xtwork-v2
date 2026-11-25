@@ -8,6 +8,8 @@ import {
   showAssistantModelPicker,
   sortOrdinaryModeProviderRows,
 } from "./desktopFeatureVisibility";
+import { isProvisionableCodingAgent } from "./components/settings/XtworkProviderProvisioningSection";
+import { ProviderDriverKind } from "@t3tools/contracts";
 
 it("exposes providers in ordinary mode while keeping git/worktree/terminal developer entries gated", () => {
   expect(isDesktopSettingsPathVisible("/settings/providers", false)).toBe(true);
@@ -175,4 +177,19 @@ it("curates ordinary-mode providers to the 1+6 set plus custom and bound provide
     "xtworkDeepseekHarness",
     "customAcpAgent",
   ]);
+});
+
+it("enables the local provisioning card for all non-local ACP Registry instances (M3)", () => {
+  expect(
+    isProvisionableCodingAgent("acpRegistry_gemini", ProviderDriverKind.make("acpRegistry"), {
+      driver: ProviderDriverKind.make("acpRegistry"),
+      config: { source: "registry", agentId: "gemini" },
+    }),
+  ).toBe(true);
+  expect(
+    isProvisionableCodingAgent("acpRegistry_custom", ProviderDriverKind.make("acpRegistry"), {
+      driver: ProviderDriverKind.make("acpRegistry"),
+      config: { source: "local", commandPath: "/usr/local/bin/my-local-acp" },
+    }),
+  ).toBe(false);
 });

@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off globalDate:off globalTimers:off
+// @effect-diagnostics nodeBuiltinImport:off globalDate:off globalTimers:off anyUnknownInErrorContext:off globalErrorInEffectFailure:off
 import * as NodeFs from "node:fs";
 import * as NodeOs from "node:os";
 import * as NodePath from "node:path";
@@ -72,6 +72,12 @@ afterEach(() => {
 
 function createHarness(options?: {
   readonly settings?: ServerSettings;
+  readonly getSettingsOverride?: () => Effect.Effect<ServerSettings, unknown>;
+  readonly updateProviderInstanceOverride?: (input: {
+    readonly operation: "upsert";
+    readonly instanceId: ProviderInstanceId;
+    readonly instance: ProviderInstanceConfig;
+  }) => Effect.Effect<unknown, unknown>;
   readonly env?: NodeJS.ProcessEnv;
   readonly runCommand?: ProvisionCommandRunner;
   readonly probeVersion?: ProvisionVersionProber;
@@ -206,18 +212,21 @@ function createHarness(options?: {
     acpCatalog,
     codexInstallation,
     providerInstallation,
-    getSettings: () => Effect.succeed(settings),
-    updateProviderInstance: ({ instanceId, instance }) =>
-      Effect.sync(() => {
-        upsertedInstances.push({ instanceId, instance });
-        settings = {
-          ...settings,
-          providerInstances: {
-            ...settings.providerInstances,
-            [instanceId]: instance,
-          },
-        };
-      }),
+    getSettings: () =>
+      options?.getSettingsOverride ? options.getSettingsOverride() : Effect.succeed(settings),
+    updateProviderInstance: (input) =>
+      options?.updateProviderInstanceOverride
+        ? options.updateProviderInstanceOverride(input)
+        : Effect.sync(() => {
+            upsertedInstances.push({ instanceId: input.instanceId, instance: input.instance });
+            settings = {
+              ...settings,
+              providerInstances: {
+                ...settings.providerInstances,
+                [input.instanceId]: input.instance,
+              },
+            };
+          }),
     refreshProviderInstance: (instanceId) =>
       Effect.sync(() => {
         refreshedInstances.push(instanceId);
@@ -274,7 +283,7 @@ describe("providerProvisioner", () => {
     const { provisioner } = createHarness();
     for (const [instanceId, expectedHost] of [
       ["claudeAgent", "https://claude.ai/install.sh"],
-      [KIMI_CODE_INSTANCE_ID, "https://code.kimi.com/install.sh"],
+      [KIMI_CODE_INSTANCE_ID, "https://code.kimi.com/kimi-code/install.sh"],
       [QODER_INSTANCE_ID, "https://qoder.com/install"],
       [CODEBUDDY_CODE_INSTANCE_ID, "https://copilot.tencent.com/cli/install.sh"],
     ] as const) {
@@ -690,5 +699,232 @@ describe("providerProvisioner", () => {
     expect(capturedInput?.expectedVersion).toBe("0.166.0");
     expect(capturedInput?.expectedSha256).toBe("a".repeat(64));
     expect(refreshedInstances).toContain("codex");
+  });
+
+  it("supports provisioning plan, cache-loss re-confirm, and version-bump upgrade for user-added non-built-in ACP Registry instances (M3)", async () => {
+    const customId = ProviderInstanceId.make("acpRegistry_gemini");
+    let installed = false;
+    let hasOtherInstalledVersion = false;
+    let version = "1.2.3";
+    const preparedCalls: Array<{
+      readonly agentId: string;
+      readonly instanceId?: string;
+      readonly expectedArtifactSpec?: string;
+    }> = [];
+
+    const { provisioner } = createHarness({
+      settings: {
+        ...DEFAULT_SERVER_SETTINGS,
+        providerInstances: {
+          [customId]: {
+            driver: ProviderDriverKind.make("acpRegistry"),
+            displayName: "Gemini CLI",
+            enabled: true,
+            config: { source: "registry", agentId: "gemini", enabled: true },
+          },
+        },
+      },
+      acpDescribe: (agentId) =>
+        Effect.succeed({
+          agentId,
+          version,
+          distribution: "npx" as const,
+          packageName: `@google/gemini-cli@${version}`,
+          installDir: `/tmp/tools/${agentId}/${version}/npm`,
+          installed,
+          hasOtherInstalledVersion,
+        }),
+      acpPrepare: (input) =>
+        Effect.sync(() => {
+          preparedCalls.push({
+            agentId: input.agentId,
+            ...(input.instanceId ? { instanceId: String(input.instanceId) } : {}),
+            ...(input.expectedArtifactSpec
+              ? { expectedArtifactSpec: input.expectedArtifactSpec }
+              : {}),
+          });
+          installed = true;
+          hasOtherInstalledVersion = false;
+          return {
+            agentId: input.agentId,
+            version,
+            distribution: "npx" as const,
+            prepared: true as const,
+          };
+        }),
+    });
+
+    const initialPlan = await Effect.runPromise(provisioner.getPlan(customId));
+    expect(initialPlan.agentKind).toBe("gemini");
+    expect(initialPlan.displayName).toBe("Gemini CLI");
+    expect(initialPlan.availableModes).toHaveLength(1);
+    expect(initialPlan.selectedMode).toBe("app-managed");
+    expect(initialPlan.consentReason).toBe("install_required");
+    expect(initialPlan.selectedOption.consentKey.artifactSpec).toBe("@google/gemini-cli@1.2.3");
+
+    await Effect.runPromise(
+      provisioner.startInstall({
+        instanceId: customId,
+        mode: "app-managed",
+        consent: { confirmed: true, ...initialPlan.selectedOption.consentKey },
+      }),
+    );
+    const settledInstall = await waitForPhase(
+      () => Effect.runPromise(provisioner.getStatus(customId)),
+      ["succeeded", "failed"],
+    );
+    expect(settledInstall.phase).toBe("succeeded");
+    expect(preparedCalls).toEqual([
+      {
+        agentId: "gemini",
+        instanceId: "acpRegistry_gemini",
+        expectedArtifactSpec: "@google/gemini-cli@1.2.3",
+      },
+    ]);
+
+    // Simulate registry version bump -> plan reports update_required and allows re-confirming upgrade!
+    version = "1.3.0";
+    installed = false;
+    hasOtherInstalledVersion = true;
+    const upgradePlan = await Effect.runPromise(provisioner.getPlan(customId));
+    expect(upgradePlan.updateAvailable).toBe(true);
+    expect(upgradePlan.consentRequired).toBe(true);
+    expect(upgradePlan.consentReason).toBe("update_required");
+    expect(upgradePlan.selectedOption.consentKey.artifactSpec).toBe("@google/gemini-cli@1.3.0");
+  });
+
+  it("propagates settings-write failures instead of succeeding when wiring commandPath after vendor ACP install (M8)", async () => {
+    const installBinDir = makeTempDir("xtwork-vendor-write-fail-");
+    const kimiBin = NodePath.join(installBinDir, "kimi");
+    let capturedArgs: ReadonlyArray<string> = [];
+
+    const { provisioner } = createHarness({
+      env: { PATH: installBinDir },
+      runCommand: ({ args }) => {
+        capturedArgs = args;
+        writeExecutable(kimiBin);
+        return { promise: Promise.resolve({ exitCode: 0, signal: null }), cancel: () => {} };
+      },
+      verifyAcpInitialize: async () => ({ ok: true, version: "2.2.0" }),
+      updateProviderInstanceOverride: () =>
+        Effect.fail(new Error("EACCES writing settings.json with Bearer top-secret-token-999")),
+    });
+
+    const plan = await Effect.runPromise(provisioner.getPlan(KIMI_CODE_INSTANCE_ID, "vendor-script"));
+    await Effect.runPromise(
+      provisioner.startInstall({
+        instanceId: KIMI_CODE_INSTANCE_ID,
+        mode: "vendor-script",
+        consent: { confirmed: true, ...plan.selectedOption.consentKey },
+      }),
+    );
+    const failed = await waitForPhase(
+      () => Effect.runPromise(provisioner.getStatus(KIMI_CODE_INSTANCE_ID)),
+      ["failed", "succeeded"],
+    );
+    // M1: Also assert modern Kimi Code URL was executed!
+    expect(capturedArgs.join(" ")).toContain("https://code.kimi.com/kimi-code/install.sh");
+    // M8 + S5: Failure propagated and secrets redacted from error/message!
+    expect(failed.phase).toBe("failed");
+    expect(failed.error).toContain("EACCES writing settings.json");
+    expect(failed.error).not.toContain("top-secret-token-999");
+    expect(failed.message).not.toContain("top-secret-token-999");
+  });
+
+  it("serializes cancellation against settings commit so cancel arriving during config read blocks commandPath mutation (S4)", async () => {
+    const installBinDir = makeTempDir("xtwork-vendor-cancel-read-");
+    const kimiBin = NodePath.join(installBinDir, "kimi");
+    const baseSettings = seedCodingAgents(DEFAULT_SERVER_SETTINGS).settings;
+
+    let readCallCount = 0;
+    let releaseSecondRead!: () => void;
+    let notifySecondReadStarted!: () => void;
+    const secondReadStarted = new Promise<void>((resolve) => {
+      notifySecondReadStarted = resolve;
+    });
+    const secondReadGate = new Promise<void>((resolve) => {
+      releaseSecondRead = resolve;
+    });
+
+    const { provisioner, upsertedInstances } = createHarness({
+      settings: baseSettings,
+      env: { PATH: installBinDir },
+      runCommand: () => {
+        writeExecutable(kimiBin);
+        return { promise: Promise.resolve({ exitCode: 0, signal: null }), cancel: () => {} };
+      },
+      verifyAcpInitialize: async () => ({ ok: true, version: "2.2.0" }),
+      getSettingsOverride: () =>
+        Effect.promise(async () => {
+          readCallCount += 1;
+          // Calls 1 & 2 are getPlan + startInstall's internal buildPlan; call 3 is post-verify getInstanceConfig!
+          if (readCallCount === 3) {
+            notifySecondReadStarted();
+            await secondReadGate;
+          }
+          return baseSettings;
+        }),
+    });
+
+    const plan = await Effect.runPromise(provisioner.getPlan(KIMI_CODE_INSTANCE_ID, "vendor-script"));
+    const started = await Effect.runPromise(
+      provisioner.startInstall({
+        instanceId: KIMI_CODE_INSTANCE_ID,
+        mode: "vendor-script",
+        consent: { confirmed: true, ...plan.selectedOption.consentKey },
+      }),
+    );
+
+    await secondReadStarted;
+    await Effect.runPromise(
+      provisioner.cancelInstall(KIMI_CODE_INSTANCE_ID, started.operationId ?? undefined),
+    );
+    releaseSecondRead();
+
+    const finalState = await waitForPhase(
+      () => Effect.runPromise(provisioner.getStatus(KIMI_CODE_INSTANCE_ID)),
+      ["cancelled", "succeeded", "failed"],
+    );
+    expect(finalState.phase).toBe("cancelled");
+    expect(upsertedInstances).toHaveLength(0);
+  });
+
+  it("redacts secrets in state.error and state.message when ACP initialize handshake fails (S5)", async () => {
+    const installBinDir = makeTempDir("xtwork-vendor-redact-err-");
+    const kimiBin = NodePath.join(installBinDir, "kimi");
+
+    const { provisioner } = createHarness({
+      env: { PATH: installBinDir },
+      runCommand: () => {
+        writeExecutable(kimiBin);
+        return { promise: Promise.resolve({ exitCode: 0, signal: null }), cancel: () => {} };
+      },
+      verifyAcpInitialize: async () => ({
+        ok: false,
+        error:
+          "ACP initialize failed: Authorization: Basic dXNlcjpwYXNz Bearer my-live-bearer-12345 sk-secretkey9876543210abcd API_KEY=supersecretval",
+      }),
+    });
+
+    const plan = await Effect.runPromise(provisioner.getPlan(KIMI_CODE_INSTANCE_ID, "vendor-script"));
+    await Effect.runPromise(
+      provisioner.startInstall({
+        instanceId: KIMI_CODE_INSTANCE_ID,
+        mode: "vendor-script",
+        consent: { confirmed: true, ...plan.selectedOption.consentKey },
+      }),
+    );
+    const failed = await waitForPhase(
+      () => Effect.runPromise(provisioner.getStatus(KIMI_CODE_INSTANCE_ID)),
+      ["failed", "succeeded"],
+    );
+    expect(failed.phase).toBe("failed");
+    const combined = `${failed.error ?? ""}\n${failed.message ?? ""}\n${failed.logs.join("\n")}`;
+    expect(combined).not.toContain("dXNlcjpwYXNz");
+    expect(combined).not.toContain("my-live-bearer-12345");
+    expect(combined).not.toContain("sk-secretkey9876543210abcd");
+    expect(combined).not.toContain("supersecretval");
+    expect(failed.error).toContain("[REDACTED");
+    expect(failed.message).toContain("[REDACTED");
   });
 });

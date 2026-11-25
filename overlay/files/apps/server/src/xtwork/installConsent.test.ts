@@ -213,4 +213,28 @@ describe("InstallConsentStore", () => {
       }),
     ).toThrow();
   });
+
+  it("refuses missing, blank, or mismatched approvalToken even when an approval is pending (M2)", () => {
+    const dataDir = makeTempDir();
+    const store = new InstallConsentStore(dataDir);
+    const key = {
+      instanceId: "codex",
+      source: "codex-managed",
+      version: "0.156.1",
+      distribution: "codex-release",
+      installDir: "/tmp/tools/codex",
+      artifactSpec: "https://github.com/openai/codex/releases/download/rust-v0.156.1/codex.tar.gz",
+      artifactDigest: "a".repeat(64),
+    };
+
+    const token = store.issueApproval(key);
+    expect(store.consumeApproval(key)).toBe(false);
+    expect(store.consumeApproval(key, undefined)).toBe(false);
+    expect(store.consumeApproval(key, "")).toBe(false);
+    expect(store.consumeApproval(key, "   ")).toBe(false);
+    expect(store.consumeApproval(key, "wrong-token")).toBe(false);
+    // Original pending token remains intact and is consumed exactly once with the exact token.
+    expect(store.consumeApproval(key, token)).toBe(true);
+    expect(store.consumeApproval(key, token)).toBe(false);
+  });
 });

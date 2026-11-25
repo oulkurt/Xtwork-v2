@@ -120,8 +120,6 @@ const PROVISIONABLE_INSTANCE_IDS = new Set([
   "xtworkDeepseekHarness",
 ]);
 
-const PROVISIONABLE_ACP_AGENT_IDS = new Set(["kimi-code", "qoder", "codebuddy-code"]);
-
 export function isProvisionableCodingAgent(
   instanceId: string,
   driver: ProviderDriverKind,
@@ -131,8 +129,13 @@ export function isProvisionableCodingAgent(
   if (driver === "claudeAgent" || driver === "codex") return true;
   if (driver === "acpRegistry" && instance?.config && typeof instance.config === "object") {
     const config = instance.config as Record<string, unknown>;
-    if (config.source !== "local" && typeof config.agentId === "string") {
-      return PROVISIONABLE_ACP_AGENT_IDS.has(config.agentId.trim());
+    if (
+      config.source !== "local" &&
+      typeof config.agentId === "string" &&
+      config.agentId.trim().length > 0
+    ) {
+      // M3: Every non-local ACP Registry instance can re-confirm/reinstall/upgrade from Settings.
+      return true;
     }
     if (config.source === "local" && typeof config.commandPath === "string") {
       const base = config.commandPath.trim().split(/[\\/]/u).pop() ?? "";
