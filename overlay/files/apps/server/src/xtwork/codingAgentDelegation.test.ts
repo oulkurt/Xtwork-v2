@@ -854,7 +854,10 @@ describe("Sol Round 1 regression guards", () => {
     for (const emptyStackedGoal of [
       "Goal: Success Criteria:",
       "Goal: Guardrails:",
+      "Goal: File Paths:",
+      "Goal: Task:",
       "目标：完成标准：",
+      "目标：任务：",
     ]) {
       const res = validateCodingAgentHandoffBrief(
         `${emptyStackedGoal}\n## Scope\nOnly touch auth.\n## Files\napps/server/src/auth.ts`,
@@ -864,6 +867,16 @@ describe("Sol Round 1 regression guards", () => {
         expect(res.missingSections).toEqual(["goal"]);
       }
     }
+
+    // Valid `Non-goals:` constraints heading MUST NOT collide with `goals?`!
+    const validNonGoals = validateCodingAgentHandoffBrief(
+      [
+        "Goal: Fix retry backoff on upload errors.",
+        "Non-goals: Do not change database schema.",
+        "Files: apps/server/src/uploads.ts",
+      ].join("\n"),
+    );
+    expect(validNonGoals).toEqual({ valid: true });
 
     // Normal prose containing a colon, bold text, or Markdown link with keywords like "file" MUST still be accepted!
     const colonInNormalProse = validateCodingAgentHandoffBrief(

@@ -871,8 +871,10 @@ const BRIEF_SECTION_RULES: ReadonlyArray<BriefSectionRule> = (
         "acceptance(?:\\s+criteria)?",
         "success\\s+criteria",
         "expected\\s+result",
+        "tasks?",
+        "requirements?",
       ],
-      zhTokens: ["目标", "验收标准", "验收", "完成标准", "预期结果"],
+      zhTokens: ["目标", "验收标准", "验收", "完成标准", "预期结果", "任务", "需求"],
     },
     {
       key: "constraints",
@@ -885,19 +887,21 @@ const BRIEF_SECTION_RULES: ReadonlyArray<BriefSectionRule> = (
         "guardrails?",
         "rules?",
       ],
-      zhTokens: ["约束", "范围", "边界", "限制", "禁止", "不要修改", "不改"],
+      zhTokens: ["约束", "范围", "边界", "限制", "规则", "禁止", "不要修改", "不改"],
     },
     {
       key: "files",
       label: "File/Attachment Paths (相关文件与路径)",
       enTokens: [
         "file\\/attachment\\s+paths?",
+        "file\\s+paths?",
         "target\\s+files?",
         "relevant\\s+files?",
         "workspace\\s+paths?",
         "files?",
         "paths?",
         "attachments?",
+        "targets?",
       ],
       zhTokens: ["文件路径", "相关文件", "涉及文件", "文件", "路径", "附件", "目录"],
     },
@@ -905,7 +909,7 @@ const BRIEF_SECTION_RULES: ReadonlyArray<BriefSectionRule> = (
 ).map((spec) => ({
   ...spec,
   headingPatterns: [
-    new RegExp(`(?:^|\\b)(?:${spec.enTokens.join("|")})(?:\\b|$)`, "iu"),
+    new RegExp(`(?<![a-z0-9-])(?:${spec.enTokens.join("|")})(?![a-z0-9-])`, "iu"),
     new RegExp(spec.zhTokens.join("|"), "u"),
   ],
 }));
