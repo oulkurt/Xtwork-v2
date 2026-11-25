@@ -4,6 +4,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import { randomUUID } from "node:crypto";
 import {
   DEFAULT_LEADER_ID,
+  LEADER_PAUSED_ERROR,
   imError,
   isImThread,
   normalizeExecutionContext,
@@ -591,8 +592,22 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     if (existing.runId && existing.runId !== runId) {
       return yield* imError("Protected run refused: dispatch command policy is already bound to another run.");
     }
+    const record = rowToPolicy(existing);
+    // S22: Re-check persisted Leader status INSIDE the atomic SQLite transaction that commits
+    // `run.created` so a concurrent pause rolls back `run.created` and never starts an IM turn while paused!
+    if (record.context.source === "im") {
+      const leaderId = record.context.leaderId ?? DEFAULT_LEADER_ID;
+      const [leaderRow] = yield* sql<{ readonly status: string }>`
+        SELECT status FROM xtwork_leaders WHERE id = ${leaderId} LIMIT 1
+      `;
+      if (leaderRow?.status === "paused") {
+        return yield* imError(
+          `${LEADER_PAUSED_ERROR}: Leader is currently paused; new IM tasks are deferred.`,
+        );
+      }
+    }
     yield* sql`UPDATE xtwork_run_policies SET run_id = ${runId} WHERE command_id = ${commandId} AND thread_id = ${threadId}`;
-    return { ...rowToPolicy(existing), runId } satisfies PersistedRunPolicy;
+    return { ...record, runId } satisfies PersistedRunPolicy;
   });
 
   /**

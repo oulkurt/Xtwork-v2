@@ -7,6 +7,25 @@ import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { isRecord } from "./XtworkImBridgeHost.ts";
 
 export const DEFAULT_LEADER_ID = "leader-default";
+export const LEADER_PAUSED_ERROR = "LEADER_PAUSED";
+
+export function containsLeaderPausedError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 10 && current != null; depth++) {
+    if (typeof current === "string") {
+      return current.includes(LEADER_PAUSED_ERROR);
+    }
+    if (typeof current === "object") {
+      const rec = current as { readonly code?: unknown; readonly message?: unknown; readonly cause?: unknown };
+      if (rec.code === LEADER_PAUSED_ERROR) return true;
+      if (typeof rec.message === "string" && rec.message.includes(LEADER_PAUSED_ERROR)) return true;
+      current = rec.cause;
+      continue;
+    }
+    break;
+  }
+  return false;
+}
 
 export type CompanionScope = "private" | `group:${string}`;
 export type MemoryScope = CompanionScope | "role";

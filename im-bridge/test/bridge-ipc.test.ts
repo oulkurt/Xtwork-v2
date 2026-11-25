@@ -954,6 +954,44 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
       assert.equal(store.message(pendingOut.id)?.state, "uncertain");
       assert.equal(store.message(msgCrash.message.id)?.state, "replied");
 
+      // S17: Retrying `messages.liveFinish` after bridge restart (in-memory live handle is gone!)
+      // MUST STILL settle the inbound row via the persisted outbound row's `replyTo`!
+      const msgCrashLive = store.ingestInbound(conn.id, "org", {
+        platformId: "s17-crash-live-restart",
+        chat: { platformId: "dm-owner", kind: "dm" },
+        sender: { id: "owner-1", name: "Owner", isBot: false },
+        text: "crash mid-liveFinish before restart",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_101_750,
+      });
+      assert.equal(msgCrashLive.kind, "dispatch");
+      store.moveInbound([msgCrashLive.message.id], "deliver");
+      const liveCrashOpKey = `${msgCrashLive.message.idempotencyKey}:final`;
+      const pendingLiveOut = store.insertOutbound({
+        connectionId: conn.id,
+        chatId: msgCrashLive.chat.id,
+        body: "Finished before restart",
+        replyTo: msgCrashLive.message.id,
+        operationKey: liveCrashOpKey,
+      });
+      assert.equal(pendingLiveOut.state, "pending");
+      // Call messages.liveFinish with a dead liveId (not in liveReplies map, simulating bridge restart)
+      const retriedLiveFinish = await bridge.handleRequest({
+        id: 602,
+        method: "messages.liveFinish",
+        params: { liveId: "live-gone-after-restart", markdown: "Finished before restart", operationKey: liveCrashOpKey },
+      });
+      assert.equal(retriedLiveFinish.ok, true);
+      assert.equal(mock.sent.length, 1);
+      if (retriedLiveFinish.ok) {
+        const res = retriedLiveFinish.result as { deduplicated?: boolean; result?: { kind?: string } };
+        assert.equal(res.deduplicated, true);
+        assert.equal(res.result?.kind, "uncertain");
+      }
+      assert.equal(store.message(pendingLiveOut.id)?.state, "uncertain");
+      assert.equal(store.message(msgCrashLive.message.id)?.state, "replied");
+
       // S18: Rebind from active Leader A to PAUSED Leader B -> A's queued trigger & paused backlog MUST NOT be blocked by B's pause!
       const msgAQueued = store.ingestInbound(conn.id, "org", {
         platformId: "s18-a-queued",

@@ -14,6 +14,8 @@ import { type BridgePayload, isRecord } from "./XtworkImBridgeHost.ts";
 import {
   DEFAULT_LEADER_ID,
   ImDispatchAuthority,
+  LEADER_PAUSED_ERROR,
+  containsLeaderPausedError,
   hashArgs,
   imError,
   normalizeExecutionContext,
@@ -163,7 +165,7 @@ export const sameAudience = (a: TurnExecutionContext, b: TurnExecutionContext) =
   return (aLegacy && bEpoch === 1) || (bLegacy && aEpoch === 1);
 };
 
-export const LEADER_PAUSED_ERROR = "LEADER_PAUSED";
+export { LEADER_PAUSED_ERROR };
 
 export const makeDispatcher = Effect.fnUntraced(function* (
   dataDir: string,
@@ -336,6 +338,13 @@ export const makeDispatcher = Effect.fnUntraced(function* (
         untrustedEnvelope(content, context),
       ].filter(Boolean).join("\n\n");
       const initialMessage = { messageId, text, attachments: [] };
+      // S22: Re-check Leader status immediately before dispatching (in addition to the atomic
+      // SQLite check inside `EventSink.commitCommand` -> `bindRunPolicySql`) and unwrap any
+      // transactional `LEADER_PAUSED` failure so the inbound message returns to `paused_pending`.
+      const latestLeader = yield* leaders.getLeader(activeLeaderId);
+      if (latestLeader?.status === "paused") {
+        return yield* imError(`${LEADER_PAUSED_ERROR}: Leader is currently paused; new IM tasks are deferred.`);
+      }
       const thread = yield* orchestrator.getThreadShell(threadId);
       const result = yield* (thread === null
         ? Effect.gen(function* () {
@@ -350,7 +359,14 @@ export const makeDispatcher = Effect.fnUntraced(function* (
         : orchestrator.dispatch({
             type: "message.dispatch", createdBy: "user", creationSource: "server", commandId, threadId, ...initialMessage, modelSelection,
             dispatchMode: { type: "queue_after_active" },
-          })).pipe(Effect.provideService(ImDispatchAuthority, true));
+          })).pipe(
+        Effect.provideService(ImDispatchAuthority, true),
+        Effect.mapError((cause) =>
+          containsLeaderPausedError(cause)
+            ? imError(`${LEADER_PAUSED_ERROR}: Leader is currently paused; new IM tasks are deferred.`)
+            : cause,
+        ),
+      );
       const created = result.storedEvents.find(({ event }) => event.type === "run.created")?.event;
       turnId = created?.type === "run.created" ? created.payload.id : undefined;
       if (turnId) {

@@ -5,6 +5,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -14,6 +15,7 @@ import type { AgentAwarenessThread } from "../orchestration-v2/ProjectionStore.t
 import { OrchestratorV2 } from "../orchestration-v2/Orchestrator.ts";
 import { ManagedProjectFolders } from "../project/ManagedProjectFolders.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
+import { PI_DRIVER, PI_INSTANCE_ID } from "../xtwork/bundledPiSettings.ts";
 import { bridgeRpcError } from "./XtworkImBridgeHost.ts";
 import { dispatchIdentity, inboundMessage, makeDispatcher, sameAudience } from "./XtworkImDispatch.ts";
 import { imToolAllowed, runImTool } from "./XtworkImMcp.ts";
@@ -22,6 +24,7 @@ import {
   DEFAULT_LEADER_ID,
   ImApprovals,
   canReuseProviderSession,
+  containsLeaderPausedError,
   desktopContext,
   evaluateThreadAccess,
   hashArgs,
@@ -1017,6 +1020,144 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         if (pausedReplay._tag === "Failure") {
           expect(pausedReplay.failure.message).toContain("LEADER_PAUSED");
         }
+
+        // S22: Transactional `bindRunPolicySql` check inside SQLite transaction MUST reject paused Leader and roll back!
+        const txnPolicy = yield* leaders.persistPolicyBeforeLaunch({
+          commandId: "cmd-s22-txn",
+          threadId: "xtwork-im-dm-s22",
+          context: storedCtx,
+        });
+        expect(txnPolicy.policyDigest).toBeTruthy();
+        const txnRes = yield* sql
+          .withTransaction(leaders.bindRunPolicySql("cmd-s22-txn", "xtwork-im-dm-s22", "run-s22-1"))
+          .pipe(Effect.result);
+        expect(txnRes._tag).toBe("Failure");
+        if (txnRes._tag === "Failure") {
+          expect(containsLeaderPausedError(txnRes.failure)).toBe(true);
+          // Even when wrapped in EventSinkWriteError -> OrchestratorDispatchError style nested `.cause`:
+          const wrapped = { message: "Dispatch failed", cause: { message: "EventSinkWriteError", cause: txnRes.failure } };
+          expect(containsLeaderPausedError(wrapped)).toBe(true);
+        }
+        // Rollback left run_id unbound!
+        const [afterTxn] = yield* sql<{ readonly runId: string | null }>`
+          SELECT run_id AS "runId" FROM xtwork_run_policies WHERE command_id = 'cmd-s22-txn'
+        `;
+        expect(afterTxn?.runId).toBeNull();
+      }).pipe(Effect.provide(fakeDeps)),
+    );
+  });
+
+  it("blocks concurrent pause during role-memory read before dispatching a new run (S22)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xtwork-s22-race-"));
+    const memory = new XtworkImMemory(dir);
+    let dispatchCalls = 0;
+    let enteredRoleRead!: () => void;
+    const roleReadEntered = new Promise<void>((r) => {
+      enteredRoleRead = r;
+    });
+    let releaseRoleRead!: () => void;
+    const roleReadGate = new Promise<void>((r) => {
+      releaseRoleRead = r;
+    });
+    const origRead = memory.read.bind(memory);
+    memory.read = async (scope, note, leaderIdArg) => {
+      if (scope === "role") {
+        enteredRoleRead();
+        await roleReadGate;
+      }
+      return origRead(scope, note, leaderIdArg);
+    };
+
+    const fakeDeps = Layer.mergeAll(
+      NodeFileSystem.layer,
+      NodeSqliteClient.layer({ filename: ":memory:" }),
+      Layer.succeed(OrchestratorV2, {
+        getThreadRecords: () => Effect.succeed({ runs: [], messages: [] }),
+        getThreadShell: () => Effect.succeed(null),
+        dispatch: () =>
+          Effect.sync(() => {
+            dispatchCalls++;
+            return { storedEvents: [] };
+          }),
+      } as never),
+      Layer.succeed(ManagedProjectFolders, {
+        ensureScratchProject: Effect.succeed({ projectId: ProjectId.make("proj-scratch") }),
+      } as never),
+      Layer.succeed(ServerSettingsService, {
+        bundledPi: { instanceId: PI_INSTANCE_ID },
+        getSettings: Effect.succeed({
+          providerInstances: {
+            [PI_INSTANCE_ID]: { driver: PI_DRIVER, enabled: true },
+          },
+        }),
+      } as never),
+    );
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const leaders = yield* makeLeaderStore();
+        yield* leaders.ensureDefaultLeader();
+        const binding = yield* leaders.ensureBinding("conn-feishu", DEFAULT_LEADER_ID);
+        yield* leaders.createLeader({ id: "leader-b", name: "Leader B" });
+        yield* leaders.rebindConnection("conn-feishu", "leader-b");
+        const dispatcher = yield* makeDispatcher(dir, memory, leaders);
+
+        const inbound = inboundMessage({
+          connectionId: "conn-feishu",
+          platformMsgId: "pm-s22-race",
+          chatId: "chat-dm",
+          chatKind: "dm",
+          senderRole: "owner",
+          leaderId: binding.leaderId,
+          bindingId: binding.bindingId,
+          bindingEpoch: binding.epoch,
+        });
+        const storedCtx = normalizeExecutionContext({
+          source: "im",
+          leaderId: binding.leaderId,
+          bindingId: binding.bindingId,
+          bindingEpoch: binding.epoch,
+          connectionId: "conn-feishu",
+          chatId: "chat-dm",
+          chatKind: "dm",
+          senderRole: "owner",
+          replyAudience: "owner_dm",
+          isolatedWorkspaceRoot: dir,
+          companionScope: "private",
+        });
+        yield* sql`INSERT INTO xtwork_im_delivery (key, thread_id, message_id, context_json, payload_json, settled)
+          VALUES (${inbound.key}, 'xtwork-im-dm-s22-race', 'msg-s22', ${JSON.stringify(storedCtx)}, ${JSON.stringify(inbound)}, 0)`;
+
+        // Launch uncommitted replay while Leader A is active; hold at role-memory read
+        const fiber = yield* Effect.forkChild(
+          dispatcher
+            .accept({
+              connectionId: "conn-feishu",
+              platformMsgId: "pm-s22-race",
+              chatId: "chat-dm",
+              chatKind: "dm",
+              senderRole: "owner",
+              leaderId: binding.leaderId,
+              bindingId: binding.bindingId,
+              bindingEpoch: binding.epoch,
+            })
+            .pipe(Effect.result),
+        );
+        yield* Effect.promise(() => roleReadEntered);
+        // Concurrently pause historical Leader A while replay is held in memory.read("role")!
+        yield* leaders.updateLeader(DEFAULT_LEADER_ID, { status: "paused" });
+        releaseRoleRead();
+
+        const outcome = yield* Fiber.await(fiber);
+        expect(outcome._tag).toBe("Success");
+        if (outcome._tag === "Success") {
+          expect(outcome.value._tag).toBe("Failure");
+          if (outcome.value._tag === "Failure") {
+            expect(containsLeaderPausedError(outcome.value.failure)).toBe(true);
+          }
+        }
+        expect(dispatchCalls).toBe(0);
       }).pipe(Effect.provide(fakeDeps)),
     );
   });

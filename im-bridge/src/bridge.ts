@@ -1065,20 +1065,23 @@ export class ImBridge {
   private recordedOutboundResponse(operationKey: string, replyToId?: string | null) {
     const existing = this.store.findOutboundByOperationKey(operationKey);
     if (!existing) return undefined;
+    // S17: Fall back to the persisted outbound row's `replyTo` so retries after bridge restart
+    // (when in-memory `liveReplies` is empty) still settle the inbound message row!
+    const inboundTargetId = replyToId ?? existing.replyTo;
     if (existing.state === "pending") {
       // `runIdempotentSend` serializes live in-process calls via `inflightOperations`, so a
       // persisted `pending` row here means an earlier process died mid-send before persisting the
       // outcome. Treat it as `uncertain` instead of risking a duplicate send!
       this.store.setOutboundResult(existing.id, "uncertain", existing.platformMsgId);
       const promoted = this.store.message(existing.id) ?? { ...existing, state: "uncertain" as const };
-      if (replyToId && this.store.message(replyToId)) {
-        this.store.moveInbound([replyToId], "reply");
+      if (inboundTargetId && this.store.message(inboundTargetId)) {
+        this.store.moveInbound([inboundTargetId], "reply");
       }
       return { message: promoted, result: { kind: "uncertain" as const }, deduplicated: true };
     }
     if (existing.state === "sent" || existing.state === "uncertain") {
-      if (replyToId && this.store.message(replyToId)) {
-        this.store.moveInbound([replyToId], "reply");
+      if (inboundTargetId && this.store.message(inboundTargetId)) {
+        this.store.moveInbound([inboundTargetId], "reply");
       }
       const result: SendResult =
         existing.state === "sent"

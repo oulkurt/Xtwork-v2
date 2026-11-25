@@ -18,10 +18,11 @@ import { forkParked } from "../serverActivation.ts";
 import { PI_INSTANCE_ID } from "../xtwork/bundledPiSettings.ts";
 import { MODEL_PROVIDER, STANDARD_MODEL } from "../xtwork/gateway.ts";
 import { bridgeOptions, type BridgePayload, isRecord, XtworkImBridgeHost } from "./XtworkImBridgeHost.ts";
-import { activeStatuses, decodeInbound, isTerminal, LEADER_PAUSED_ERROR, makeDispatcher, type ImDispatcher } from "./XtworkImDispatch.ts";
+import { activeStatuses, decodeInbound, isTerminal, makeDispatcher, type ImDispatcher } from "./XtworkImDispatch.ts";
 import { XtworkImMemory, memoryScope } from "./XtworkImMemory.ts";
 import {
   DEFAULT_LEADER_ID,
+  containsLeaderPausedError,
   desktopContext,
   hashArgs,
   imError,
@@ -522,7 +523,7 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
         // S4/S14: If a trigger raced with Leader pause, defer ONLY the stamped inbound message!
         // Derive any connection-wide pause flag strictly from the connection's CURRENT active
         // binding so a historical dispatch from paused Leader A NEVER pauses active Leader B.
-        if (accepted.failure.message.includes(LEADER_PAUSED_ERROR)) {
+        if (containsLeaderPausedError(accepted.failure)) {
           const connId = typeof payload.connectionId === "string" ? payload.connectionId : undefined;
           const idempotencyKey = typeof payload.idempotencyKey === "string" ? payload.idempotencyKey : undefined;
           if (idempotencyKey) {
