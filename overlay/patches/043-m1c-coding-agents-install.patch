@@ -1,18 +1,87 @@
+diff --git a/apps/server/src/os-jank.test.ts b/apps/server/src/os-jank.test.ts
+index 857adb2c..469c2c64 100644
+--- a/apps/server/src/os-jank.test.ts
++++ b/apps/server/src/os-jank.test.ts
+@@ -221,3 +221,35 @@ effectIt.effect("adds a directory an installer wrote to the registry after launc
+     assert.deepEqual(env, { PATH: `C:\\Tools;C:\\Windows;${installed}` });
+   }),
+ );
++
++effectIt.effect("keeps XTWORK_BUNDLED_NODE_BIN at the very end behind appended user paths (S3)", () =>
++  Effect.acquireUseRelease(
++    Effect.sync(() =>
++      vi
++        .spyOn(NodeChildProcess, "execFileSync")
++        .mockReturnValue(
++          "__T3CODE_ENV_PATH_START__\n/usr/bin:/app/Resources/node/bin:/opt/homebrew/bin:/Users/me/.local/bin\n__T3CODE_ENV_PATH_END__\n",
++        ),
++    ),
++    () =>
++      Effect.gen(function* () {
++        const env: NodeJS.ProcessEnv = {
++          SHELL: "/bin/zsh",
++          PATH: "/usr/bin:/app/Resources/node/bin",
++          XTWORK_BUNDLED_NODE_BIN: "/app/Resources/node/bin/",
++        };
++
++        yield* fixPath().pipe(
++          Effect.provideService(HostProcess.Platform, "darwin"),
++          Effect.provideService(HostProcess.Environment, env),
++          Effect.provide(NodeServices.layer),
++        );
++
++        assert.equal(
++          env.PATH,
++          "/usr/bin:/opt/homebrew/bin:/Users/me/.local/bin:/app/Resources/node/bin/",
++        );
++      }),
++    (probe) => Effect.sync(() => probe.mockRestore()),
++  ),
++);
 diff --git a/apps/server/src/os-jank.ts b/apps/server/src/os-jank.ts
-index bc6528f9..aacfa8e5 100644
+index bc6528f9..6d864c66 100644
 --- a/apps/server/src/os-jank.ts
 +++ b/apps/server/src/os-jank.ts
-@@ -45,6 +45,18 @@ function readSlowLoginShellEnvironment(shell: string): Partial<Record<string, st
+@@ -22,6 +22,8 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+ // @effect-diagnostics-next-line nodeBuiltinImport:off -- the shared login shell probe runs synchronously through execFileSync.
+ import * as NodeChildProcess from "node:child_process";
+ import * as NodeOS from "node:os";
++// @effect-diagnostics-next-line nodeBuiltinImport:off -- normalizes PATH entries synchronously alongside hydratePosixPath.
++import * as NodePath from "node:path";
+ 
+ function logPathHydrationWarning(message: string, error?: unknown): void {
+   process.stderr.write(
+@@ -45,6 +47,38 @@ function readSlowLoginShellEnvironment(shell: string): Partial<Record<string, st
    );
  }
  
++function normalizePathSegmentForPlatform(segment: string, platform: NodeJS.Platform): string {
++  const trimmed = segment.trim();
++  if (!trimmed) return "";
++  if (platform === "win32") {
++    return NodePath.win32.normalize(trimmed).replace(/[\\\/]+$/u, "").toLowerCase();
++  }
++  const normalized = NodePath.posix.normalize(trimmed);
++  return normalized.length > 1 ? normalized.replace(/\/+$/u, "") : normalized;
++}
++
 +function applyBundledNodeFallbackPath(
 +  env: NodeJS.ProcessEnv,
 +  platform: NodeJS.Platform,
 +): void {
 +  const bundledNodeBin = env.XTWORK_BUNDLED_NODE_BIN?.trim();
 +  if (!bundledNodeBin) return;
-+  const merged = mergePathEntries(env.PATH, bundledNodeBin, platform);
++  const delimiter = platform === "win32" ? ";" : ":";
++  const normalizedBundled = normalizePathSegmentForPlatform(bundledNodeBin, platform);
++  const existingEntries = (env.PATH ?? "")
++    .split(delimiter)
++    .map((entry) => entry.trim())
++    .filter(
++      (entry) =>
++        entry.length > 0 &&
++        normalizePathSegmentForPlatform(entry, platform) !== normalizedBundled,
++    );
++  const merged = mergePathEntries(existingEntries.join(delimiter), bundledNodeBin, platform);
 +  if (merged) {
 +    env.PATH = merged;
 +  }
@@ -21,7 +90,7 @@ index bc6528f9..aacfa8e5 100644
  function applyLoginShellEnvironment(
    env: NodeJS.ProcessEnv,
    platform: NodeJS.Platform,
-@@ -56,6 +68,7 @@ function applyLoginShellEnvironment(
+@@ -56,6 +90,7 @@ function applyLoginShellEnvironment(
    if (mergedPath) {
      env.PATH = mergedPath;
    }
@@ -29,7 +98,7 @@ index bc6528f9..aacfa8e5 100644
    if (shellPath && shellEnvironment.__MISE_DIFF) {
      env.__MISE_DIFF = shellEnvironment.__MISE_DIFF;
    }
-@@ -147,7 +160,10 @@ export const fixPath = Effect.fn("fixPath")(function* (options?: {
+@@ -147,7 +182,10 @@ export const fixPath = Effect.fn("fixPath")(function* (options?: {
        }),
      ),
    );
@@ -41,7 +110,7 @@ index bc6528f9..aacfa8e5 100644
    yield* Effect.sync(() => hydratePosixPath(env, platform)).pipe(
      Effect.catchDefect((defect) =>
        Effect.sync(() => {
-@@ -155,6 +171,7 @@ export const fixPath = Effect.fn("fixPath")(function* (options?: {
+@@ -155,6 +193,7 @@ export const fixPath = Effect.fn("fixPath")(function* (options?: {
        }),
      ),
    );
@@ -49,11 +118,394 @@ index bc6528f9..aacfa8e5 100644
  });
  
  const readLoginShellOutput = Effect.fn("readLoginShellOutput")(
+diff --git a/apps/server/src/provider/CodexInstallation.test.ts b/apps/server/src/provider/CodexInstallation.test.ts
+index a000aacb..2454f3f1 100644
+--- a/apps/server/src/provider/CodexInstallation.test.ts
++++ b/apps/server/src/provider/CodexInstallation.test.ts
+@@ -812,3 +812,104 @@ it.effect.each(["update", "reinstall"] as const)(
+       }
+     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+ );
++
++it.effect("blocks startup auto-upgrade and unapproved start/replay when CodexInstallConsentGate is active (M2)", () =>
++  Effect.gen(function* () {
++    const fs = yield* FileSystem.FileSystem;
++    const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-codex-consent-gate-" });
++    const digest = yield* Digest.Digest;
++    const sha256 = Hex.encode(yield* digest.digest(Digest.sha256, archive).pipe(Effect.orDie));
++    const singleUse = new Map<string, string>();
++    const keyOf = (key: CodexInstallation.CodexInstallConsentKey) =>
++      JSON.stringify([
++        key.instanceId,
++        key.source,
++        key.version,
++        key.distribution,
++        key.installDir,
++        key.artifactSpec,
++        key.artifactDigest,
++      ]);
++    const consentGateLayer = Layer.succeed(CodexInstallation.CodexInstallConsentGate, {
++      consumeInstallApproval: (key, token) =>
++        Effect.sync(() => {
++          const expected = keyOf(key);
++          if (token !== undefined) {
++            if (singleUse.get(token) !== expected) return false;
++            singleUse.delete(token);
++            return true;
++          }
++          for (const [k, v] of singleUse) {
++            if (v === expected) {
++              singleUse.delete(k);
++              return true;
++            }
++          }
++          return false;
++        }),
++    });
++
++    const first = yield* makeHarness({ baseDir }).pipe(Effect.provide(consentGateLayer));
++    const unapproved = yield* Effect.flip(first.installation.start);
++    expect(unapproved.operation).toBe("install_required");
++    expect(first.downloads()).toBe(0);
++
++    const pending = yield* first.installation.describePendingRelease!();
++    expect(pending?.version).toBe("0.156.1");
++    singleUse.set(
++      "codex-tok-1",
++      keyOf({
++        instanceId: "codex",
++        source: "codex-managed",
++        version: pending!.version,
++        distribution: "codex-release",
++        installDir: first.installation.managedDirectory,
++        artifactSpec: pending!.url,
++        artifactDigest: pending!.sha256,
++      }),
++    );
++
++    const badDigest = yield* Effect.flip(
++      first.installation.startForInstance!({
++        instanceId: "codex",
++        approvalToken: "codex-tok-1",
++        expectedVersion: "0.156.1",
++        expectedSha256: "0".repeat(64),
++      }),
++    );
++    expect(badDigest.operation).toBe("install_required");
++    expect(singleUse.has("codex-tok-1")).toBe(true);
++
++    yield* first.installation.startForInstance!({
++      instanceId: "codex",
++      approvalToken: "codex-tok-1",
++      expectedVersion: "0.156.1",
++      expectedSha256: sha256,
++    });
++    expect((yield* terminalState(first.installation)).phase).toBe("succeeded");
++    expect(singleUse.has("codex-tok-1")).toBe(false);
++    expect(first.downloads()).toBe(1);
++
++    const raised = yield* makeHarness({
++      baseDir,
++      options: {
++        releaseAsset: {
++          ...asset,
++          version: "0.160.0",
++          sha256,
++        },
++      },
++    }).pipe(Effect.provide(consentGateLayer));
++    const startupState = yield* raised.installation.state;
++    expect(startupState.installedVersion).toBe("0.156.1");
++    expect(startupState.version).toBe("0.160.0");
++    expect(startupState.phase).toBe("idle");
++    expect(raised.downloads()).toBe(0);
++
++    const unapprovedUpdate = yield* Effect.flip(
++      raised.installation.startForInstance!({ instanceId: "codex" }),
++    );
++    expect(unapprovedUpdate.operation).toBe("update_required");
++    expect(raised.downloads()).toBe(0);
++  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
++);
+diff --git a/apps/server/src/provider/CodexInstallation.ts b/apps/server/src/provider/CodexInstallation.ts
+index 87660f0c..4cdd453d 100644
+--- a/apps/server/src/provider/CodexInstallation.ts
++++ b/apps/server/src/provider/CodexInstallation.ts
+@@ -129,6 +129,33 @@ const installationError = (operation: string, detail: string, cause?: unknown) =
+   new CodexInstallationError({ operation, detail, ...(cause === undefined ? {} : { cause }) });
+ const wrapFailure = (operation: string, detail: string) => (cause: unknown) =>
+   isInstallationError(cause) ? cause : installationError(operation, detail, cause);
++export interface CodexInstallConsentKey {
++  readonly instanceId: string;
++  readonly source: "codex-managed";
++  readonly version: string;
++  readonly distribution: "codex-release";
++  readonly installDir: string;
++  readonly artifactSpec: string;
++  readonly artifactDigest: string;
++}
++
++export class CodexInstallConsentGate extends Context.Service<
++  CodexInstallConsentGate,
++  {
++    readonly consumeInstallApproval: (
++      key: CodexInstallConsentKey,
++      approvalToken?: string,
++    ) => Effect.Effect<boolean>;
++  }
++>()("t3/provider/CodexInstallation/CodexInstallConsentGate") {}
++
++export interface CodexStartOptions {
++  readonly instanceId?: string | undefined;
++  readonly approvalToken?: string | undefined;
++  readonly expectedVersion?: string | undefined;
++  readonly expectedSha256?: string | undefined;
++}
++
+ export interface CodexExecutable {
+   readonly executablePath: string;
+   readonly source: "managed" | "local";
+@@ -137,12 +164,16 @@ export interface CodexExecutable {
+ }
+ interface CodexInstallationService {
+   readonly managedDirectory: string;
++  readonly describePendingRelease?: () => Effect.Effect<CodexReleaseAsset | null>;
+   readonly resolve: () => Effect.Effect<CodexExecutable, CodexInstallationError>;
+   readonly acquire: () => Effect.Effect<CodexExecutable, CodexInstallationError, Scope.Scope>;
+   readonly compatibility: (
+     version: string,
+   ) => Effect.Effect<ServerProviderCompatibilityAdvisory | undefined>;
+   readonly start: Effect.Effect<ProviderInstallState, CodexInstallationError>;
++  readonly startForInstance?: (
++    options?: CodexStartOptions,
++  ) => Effect.Effect<ProviderInstallState, CodexInstallationError>;
+   readonly cancel: (
+     operationId: string,
+   ) => Effect.Effect<ProviderInstallState, CodexInstallationError>;
+@@ -192,6 +223,7 @@ export const makeCodexInstallation = Effect.fn("makeCodexInstallation")(function
+   const platform = yield* HostProcess.Platform;
+   const environment = yield* HostProcess.Environment;
+   const arch = yield* HostProcess.Architecture;
++  const consentGate = yield* Effect.serviceOption(CodexInstallConsentGate);
+   const asset =
+     options.releaseAsset === undefined
+       ? resolveCodexReleaseAsset(platform, arch)
+@@ -817,63 +849,108 @@ export const makeCodexInstallation = Effect.fn("makeCodexInstallation")(function
+       ),
+     ),
+   );
+-  const start = gate
+-    .withPermit(
+-      Effect.gen(function* () {
+-        const current = yield* SubscriptionRef.get(state);
+-        if (isRunning(current)) return current;
+-        if (yield* reuseLocal()) return yield* SubscriptionRef.get(state);
+-        const installedVersion = yield* keptInstall(managedVersion(current));
+-        const release = selectManagedRelease(installedVersion, asset, upstream);
+-        if (!release && installedVersion === null) {
+-          return yield* installationError(
+-            "start",
+-            `OpenAI does not publish a Codex runtime for ${platform}-${arch}. Use a supported remote environment or a custom executable.`,
++  const describePendingRelease = Effect.fn("CodexInstallation.describePendingRelease")(function* () {
++    const current = yield* SubscriptionRef.get(state);
++    const installedVersion = yield* keptInstall(managedVersion(current));
++    return selectManagedRelease(installedVersion, asset, upstream) ?? asset;
++  });
++
++  const startForInstance = (startOptions?: CodexStartOptions) =>
++    gate
++      .withPermit(
++        Effect.gen(function* () {
++          const current = yield* SubscriptionRef.get(state);
++          if (isRunning(current)) return current;
++          if (yield* reuseLocal()) return yield* SubscriptionRef.get(state);
++          const installedVersion = yield* keptInstall(managedVersion(current));
++          const release = selectManagedRelease(installedVersion, asset, upstream);
++          if (!release && installedVersion === null) {
++            return yield* installationError(
++              "start",
++              `OpenAI does not publish a Codex runtime for ${platform}-${arch}. Use a supported remote environment or a custom executable.`,
++            );
++          }
++          if (release) {
++            if (
++              (startOptions?.expectedVersion !== undefined &&
++                startOptions.expectedVersion !== release.version) ||
++              (startOptions?.expectedSha256 !== undefined &&
++                startOptions.expectedSha256.trim().toLowerCase() !== release.sha256.toLowerCase())
++            ) {
++              return yield* installationError(
++                installedVersion !== null ? "update_required" : "install_required",
++                `The selected Codex release changed (${release.version}). Review and confirm the updated release before downloading.`,
++              );
++            }
++            if (Option.isSome(consentGate)) {
++              const approved = yield* consentGate.value.consumeInstallApproval(
++                {
++                  instanceId: startOptions?.instanceId?.trim() || "codex",
++                  source: "codex-managed",
++                  version: release.version,
++                  distribution: "codex-release",
++                  installDir: managedDirectory,
++                  artifactSpec: release.url,
++                  artifactDigest: release.sha256.toLowerCase(),
++                },
++                startOptions?.approvalToken,
++              );
++              if (!approved) {
++                const isUpdate = installedVersion !== null;
++                return yield* installationError(
++                  isUpdate ? "update_required" : "install_required",
++                  isUpdate
++                    ? `Codex v${release.version} update requires explicit user confirmation before downloading.`
++                    : `Codex v${release.version} installation requires explicit user confirmation before downloading.`,
++                );
++              }
++            }
++          }
++          const operationId = yield* random.uuidV4();
++          const next: ProviderInstallState = {
++            ...current,
++            operationId,
++            phase: release ? "downloading" : "verifying",
++            downloadedBytes: 0,
++            ...offer(installedVersion),
++            message: release ? "Downloading Codex." : "Checking Codex.",
++          };
++          yield* SubscriptionRef.set(state, next);
++          const work = (release ? install(release) : reverify()).pipe(
++            Effect.onExit((exit) =>
++              Exit.isFailure(exit)
++                ? SubscriptionRef.update(state, (value) => {
++                    if (value.operationId !== operationId || value.phase === "succeeded")
++                      return value;
++                    const error = Cause.findErrorOption(exit.cause);
++                    const cancelled = Cause.hasInterruptsOnly(exit.cause);
++                    return {
++                      ...value,
++                      phase: cancelled ? "cancelled" : "failed",
++                      message: cancelled
++                        ? "Installation cancelled. The previous runtime is unchanged."
++                        : Option.isSome(error)
++                          ? error.value.detail
++                          : "Could not finish the Codex installation. Check disk space and directory access.",
++                    } satisfies ProviderInstallState;
++                  })
++                : Effect.void,
++            ),
++            Effect.ignoreCause,
++            Effect.ensuring(
++              Effect.sync(() => {
++                if (running?.operationId === operationId) running = undefined;
++              }),
++            ),
+           );
+-        }
+-        const operationId = yield* random.uuidV4();
+-        const next: ProviderInstallState = {
+-          ...current,
+-          operationId,
+-          phase: release ? "downloading" : "verifying",
+-          downloadedBytes: 0,
+-          ...offer(installedVersion),
+-          message: release ? "Downloading Codex." : "Checking Codex.",
+-        };
+-        yield* SubscriptionRef.set(state, next);
+-        const work = (release ? install(release) : reverify()).pipe(
+-          Effect.onExit((exit) =>
+-            Exit.isFailure(exit)
+-              ? SubscriptionRef.update(state, (value) => {
+-                  if (value.operationId !== operationId || value.phase === "succeeded")
+-                    return value;
+-                  const error = Cause.findErrorOption(exit.cause);
+-                  const cancelled = Cause.hasInterruptsOnly(exit.cause);
+-                  return {
+-                    ...value,
+-                    phase: cancelled ? "cancelled" : "failed",
+-                    message: cancelled
+-                      ? "Installation cancelled. The previous runtime is unchanged."
+-                      : Option.isSome(error)
+-                        ? error.value.detail
+-                        : "Could not finish the Codex installation. Check disk space and directory access.",
+-                  } satisfies ProviderInstallState;
+-                })
+-              : Effect.void,
+-          ),
+-          Effect.ignoreCause,
+-          Effect.ensuring(
+-            Effect.sync(() => {
+-              if (running?.operationId === operationId) running = undefined;
+-            }),
+-          ),
+-        );
+-        const fiber = yield* Effect.forkIn(Effect.interruptible(work), serviceScope);
+-        running = { operationId, fiber };
+-        return next;
+-      }).pipe(Effect.uninterruptible),
+-    )
+-    .pipe(Effect.mapError(wrapFailure("start", "Could not start the Codex installation.")));
++          const fiber = yield* Effect.forkIn(Effect.interruptible(work), serviceScope);
++          running = { operationId, fiber };
++          return next;
++        }).pipe(Effect.uninterruptible),
++      )
++      .pipe(Effect.mapError(wrapFailure("start", "Could not start the Codex installation.")));
++
++  const start = startForInstance();
+ 
+   const cancel = Effect.fn("CodexInstallation.cancel")(function* (operationId: string) {
+     return yield* gate.withPermit(
+@@ -986,8 +1063,22 @@ export const makeCodexInstallation = Effect.fn("makeCodexInstallation")(function
+         }) satisfies ProviderInstallState,
+     );
+     // A supported older runtime still resolves, so a raised pin needs its own update.
+-    if (asset && compareSemverVersions(installed.version, asset.version) < 0)
+-      yield* start.pipe(Effect.ignore);
++    // When CodexInstallConsentGate is active (M2), never auto-download at startup.
++    if (asset && compareSemverVersions(installed.version, asset.version) < 0) {
++      if (Option.isSome(consentGate)) {
++        yield* SubscriptionRef.update(
++          state,
++          (current) =>
++            ({
++              ...current,
++              version: asset.version,
++              message: `Codex v${asset.version} update available. Confirm update in provider settings.`,
++            }) satisfies ProviderInstallState,
++        );
++      } else {
++        yield* start.pipe(Effect.ignore);
++      }
++    }
+   }).pipe(
+     Effect.catch(() =>
+       SubscriptionRef.update(
+@@ -1007,10 +1098,12 @@ export const makeCodexInstallation = Effect.fn("makeCodexInstallation")(function
+ 
+   return CodexInstallation.of({
+     managedDirectory,
++    describePendingRelease,
+     resolve,
+     acquire,
+     compatibility,
+     start,
++    startForInstance,
+     cancel,
+     state: SubscriptionRef.get(state),
+     changes: SubscriptionRef.changes(state),
 diff --git a/apps/server/src/provider/ProviderInstanceRegistryHydration.ts b/apps/server/src/provider/ProviderInstanceRegistryHydration.ts
-index f3f49c90..35325419 100644
+index f3f49c90..4b8bab39 100644
 --- a/apps/server/src/provider/ProviderInstanceRegistryHydration.ts
 +++ b/apps/server/src/provider/ProviderInstanceRegistryHydration.ts
-@@ -33,6 +33,7 @@ import type * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
+@@ -15,6 +15,7 @@ import type * as SecureRandom from "effect/crypto/SecureRandom";
+ import * as Effect from "effect/Effect";
+ import * as FileSystem from "effect/FileSystem";
+ import * as Layer from "effect/Layer";
++import * as Option from "effect/Option";
+ import type * as SqlClient from "effect/sql/SqlClient";
+ import * as Path from "effect/Path";
+ import * as Stream from "effect/Stream";
+@@ -33,6 +34,7 @@ import type * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
  import * as ServerConfig from "../config.ts";
  import type * as PortScanner from "../preview/PortScanner.ts";
  import { PI_DRIVER, PI_INSTANCE_ID } from "../xtwork/bundledPiSettings.ts";
@@ -61,25 +513,65 @@ index f3f49c90..35325419 100644
  
  type ProviderInstanceRegistryHydrationEnv =
    | Exclude<
-@@ -213,7 +214,15 @@ export const layer: Layer.Layer<
+@@ -186,6 +188,7 @@ export const layer: Layer.Layer<
+ > = Layer.unwrap(
+   Effect.gen(function* () {
+     const serverSettings = yield* Settings.ServerSettingsService;
++    const xtworkConsent = yield* Effect.serviceOption(XtworkInstallConsent.XtworkInstallConsent);
+     yield* seedDevReplayInstance().pipe(
+       Effect.catchCause((cause) => Effect.logWarning("Dev replay agent unavailable", cause)),
+     );
+@@ -204,6 +207,17 @@ export const layer: Layer.Layer<
+       serverSettings.managedPolicy,
+       yield* HostProcess.Environment,
+     );
++    const acpRegistryLayer = Option.isSome(xtworkConsent)
++      ? AcpRegistrySupport.layerFromHost.pipe(
++          Layer.provide(
++            Layer.succeed(AcpRegistrySupport.AcpInstallConsentGate, {
++              hasConsent: xtworkConsent.value.hasConsent,
++              consumePrepareApproval: xtworkConsent.value.consumeApproval,
++            }),
++          ),
++        )
++      : AcpRegistrySupport.layerFromHost;
++
+     // Instances of drivers the policy leaves out stay listed, as unavailable, so their threads
+     // explain why instead of losing their provider.
+     const layerMutable = ProviderInstanceRegistry.layer({
+@@ -213,7 +227,7 @@ export const layer: Layer.Layer<
          ManagedProviders.disallowedDriverReason(serverSettings.managedPolicy, driver),
      }).pipe(
        Layer.provide(ProviderOrchestrationAdapterInfrastructure.layer),
 -      Layer.provide(AcpRegistrySupport.layerFromHost),
-+      Layer.provide(
-+        AcpRegistrySupport.layerFromHost.pipe(
-+          Layer.provide(
-+            XtworkInstallConsent.acpConsentGateLayer.pipe(
-+              Layer.provide(XtworkInstallConsent.layer),
-+            ),
-+          ),
-+        ),
-+      ),
++      Layer.provide(acpRegistryLayer),
        Layer.provide(ProviderHostLive.layer),
        Layer.provide(Layer.succeed(HostProcess.Environment, hostEnvironment)),
        Layer.provide(SecretResolver.layer),
+diff --git a/apps/server/src/provider/providerInstallation.ts b/apps/server/src/provider/providerInstallation.ts
+index 471c97b8..d88785c5 100644
+--- a/apps/server/src/provider/providerInstallation.ts
++++ b/apps/server/src/provider/providerInstallation.ts
+@@ -155,7 +155,16 @@ const make = Effect.fn("makeProviderInstallation")(function* () {
+ 
+   const start = Effect.fn("ProviderInstallation.start")(function* (input: ProviderSetupInput) {
+     const { installation, driver } = yield* requireInstance(input.instanceId, "install", true);
+-    const started = yield* installation.start.pipe(Effect.mapError(failure(input.instanceId)));
++    const startEffect =
++      driver === ProviderDriverKind.make("codex") && codexInstallation.startForInstance
++        ? codexInstallation.startForInstance({
++            instanceId: input.instanceId,
++            ...(input.approvalToken ? { approvalToken: input.approvalToken } : {}),
++            ...(input.expectedVersion ? { expectedVersion: input.expectedVersion } : {}),
++            ...(input.expectedSha256 ? { expectedSha256: input.expectedSha256 } : {}),
++          })
++        : installation.start;
++    const started = yield* startEffect.pipe(Effect.mapError(failure(input.instanceId)));
+     if (
+       driver === ANTIGRAVITY &&
+       started.operationId !== null &&
 diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
-index afc9518b..963928d1 100644
+index afc9518b..d1a57723 100644
 --- a/apps/server/src/server.ts
 +++ b/apps/server/src/server.ts
 @@ -91,6 +91,8 @@ import * as TerminalManager from "./terminal/Manager.ts";
@@ -91,7 +583,21 @@ index afc9518b..963928d1 100644
  import * as PeerForwarding from "./peer/PeerForwarding.ts";
  import * as RemoteDelegation from "./peer/RemoteDelegation.ts";
  import * as PeerLinkRequests from "./peer/PeerLinkRequests.ts";
-@@ -768,7 +770,15 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
+@@ -761,14 +763,28 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
+       AntigravityInstallation.AntigravityInstallation.layer.pipe(
+         Layer.provide(layerServerSettings),
+       ),
+-      CodexInstallation.CodexInstallation.layer,
++      CodexInstallation.CodexInstallation.layer.pipe(
++        Layer.provide(
++          XtworkInstallConsent.codexConsentGateLayer.pipe(
++            Layer.provide(XtworkInstallConsent.layer),
++          ),
++        ),
++      ),
+     ),
+   ),
+ );
  
  const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
    Layer.provideMerge(layerPtyAdapter),
@@ -108,7 +614,7 @@ index afc9518b..963928d1 100644
    Layer.provideMerge(
      Layer.mergeAll(
        layerProviderEventLoggers,
-@@ -855,6 +865,7 @@ const layerMakeRoutes = Layer.mergeAll(
+@@ -855,6 +871,7 @@ const layerMakeRoutes = Layer.mergeAll(
      ServerHttp.layerAttachmentUploadRoute,
      XtworkPlugins.route,
      XtworkIm.route,
@@ -116,7 +622,7 @@ index afc9518b..963928d1 100644
      GuestHttp.layer,
      DeviceHubProxy.layer,
      ServerBrowserStream.routeLayer,
-@@ -909,6 +920,7 @@ const layerMakeRoutes = Layer.mergeAll(
+@@ -909,6 +926,7 @@ const layerMakeRoutes = Layer.mergeAll(
    Layer.provide(layerCommandReadiness),
    Layer.provide(XtworkPlugins.layer),
    Layer.provide(XtworkIm.layer),
@@ -125,23 +631,31 @@ index afc9518b..963928d1 100644
    Layer.provide(ServerHttp.layerHttpCompression),
  );
 diff --git a/apps/server/src/serverSettings.ts b/apps/server/src/serverSettings.ts
-index e06fc7e0..92526c4a 100644
+index e06fc7e0..735c54d9 100644
 --- a/apps/server/src/serverSettings.ts
 +++ b/apps/server/src/serverSettings.ts
-@@ -58,6 +58,7 @@ import {
+@@ -58,6 +58,11 @@ import {
  import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
  import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
  import { seedBundledPi } from "./xtwork/bundledPiSettings.ts";
-+import { seedCodingAgentsWithMarker, shouldSeedCodingAgents } from "./xtwork/codingAgentSeed.ts";
++import {
++  commitCodingAgentSeedMarker,
++  planCodingAgentSeeds,
++  shouldSeedCodingAgents,
++} from "./xtwork/codingAgentSeed.ts";
  import { startBundledPi } from "./xtwork/gateway.ts";
  import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
  import {
-@@ -940,8 +941,11 @@ const make = Effect.gen(function* () {
+@@ -940,8 +945,15 @@ const make = Effect.gen(function* () {
      const settingsWithRuntime = bundledPi === undefined
        ? sourceControlMigration.settings
        : seedBundledPi(sourceControlMigration.settings, !hasSettings);
-+    const settingsWithCodingAgents = shouldSeedCodingAgents(environment)
-+      ? seedCodingAgentsWithMarker(settingsWithRuntime, baseDir)
++    const codingAgentSeedPlan =
++      settingsFileTrusted && shouldSeedCodingAgents(environment)
++        ? planCodingAgentSeeds(settingsWithRuntime, baseDir)
++        : null;
++    const settingsWithCodingAgents = codingAgentSeedPlan
++      ? codingAgentSeedPlan.settings
 +      : settingsWithRuntime;
      const migrated = settingsFileTrusted
 -      ? yield* moveInlineSettingsSecrets(settingsWithRuntime)
@@ -149,8 +663,400 @@ index e06fc7e0..92526c4a 100644
        : folded;
      if (
        migrated !== loaded ||
+@@ -953,6 +965,9 @@ const make = Effect.gen(function* () {
+         yield* secretStore.remove(move.from).pipe(Effect.ignore);
+       }
+     }
++    if (settingsFileTrusted && codingAgentSeedPlan?.markerNeedsWrite) {
++      commitCodingAgentSeedMarker(baseDir, codingAgentSeedPlan.trackedIds);
++    }
+     return { settings: migrated, parseFailure };
+   });
+ 
+diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
+index 63d45c48..84b798ef 100644
+--- a/apps/server/src/ws.ts
++++ b/apps/server/src/ws.ts
+@@ -124,6 +124,7 @@ import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManag
+ import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
+ import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
+ import * as DocumentText from "./provider/DocumentText.ts";
++import * as XtworkInstallConsent from "./xtwork/installConsent.ts";
+ import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
+ import * as SecretRequests from "./secrets/SecretRequests.ts";
+ import * as GuestShareService from "./guest/GuestShareService.ts";
+@@ -1541,6 +1542,9 @@ export const layerWsRpc = (
+       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
+       const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+       const acpRegistryCatalog = yield* AcpRegistrySupport.AcpRegistryCatalog;
++      const xtworkInstallConsent = yield* Effect.serviceOption(
++        XtworkInstallConsent.XtworkInstallConsent,
++      );
+       const acpRegistryRuntimeCoordinator =
+         yield* AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator;
+       const acpRegistrySessions = yield* AcpRegistrySessions.AcpRegistrySessions;
+@@ -2376,9 +2380,60 @@ export const layerWsRpc = (
+         [WS_METHODS.serverPrepareAcpRegistryAgent]: (input) =>
+           Effect.annotateCurrentSpan({ "acp_registry.agent_id": input.agentId }).pipe(
+             Effect.andThen(
+-              acpRegistryCatalog
+-                .prepare(input)
+-                .pipe(Effect.mapError(AcpRegistrySupport.toAcpRegistryOperationError)),
++              Effect.gen(function* () {
++                if (
++                  input.explicitConsent === true &&
++                  input.expectedVersion !== undefined &&
++                  input.expectedDistribution !== undefined &&
++                  Option.isSome(xtworkInstallConsent) &&
++                  acpRegistryCatalog.describeAgent !== undefined
++                ) {
++                  const described = yield* acpRegistryCatalog.describeAgent(input.agentId, "auto");
++                  if (
++                    described.version !== input.expectedVersion ||
++                    described.distribution !== input.expectedDistribution
++                  ) {
++                    return yield* new AcpRegistrySupport.AcpRegistryError({
++                      reason:
++                        described.version !== input.expectedVersion
++                          ? "update_required"
++                          : "install_required",
++                      detail: `ACP Registry agent '${input.agentId}' changed (${described.version} / ${described.distribution}). Review and confirm the latest version.`,
++                    });
++                  }
++                  const artifactSpec = described.packageName ?? described.archiveUrl;
++                  const consentKey = {
++                    instanceId: input.instanceId ?? `acp:${input.agentId}`,
++                    source: "acp-registry",
++                    version: described.version,
++                    distribution: described.distribution,
++                    installDir: described.installDir,
++                    ...(artifactSpec ? { artifactSpec } : {}),
++                    ...(described.sha256 ? { artifactDigest: described.sha256 } : {}),
++                  };
++                  yield* xtworkInstallConsent.value.grantConsent(consentKey, {
++                    officialSource:
++                      described.archiveUrl ??
++                      (described.packageName
++                        ? `ACP Registry (${described.packageName})`
++                        : "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"),
++                  });
++                  const approvalToken = yield* xtworkInstallConsent.value.issueApproval(consentKey);
++                  return yield* acpRegistryCatalog
++                    .prepare({
++                      ...input,
++                      approvalToken,
++                      ...(artifactSpec ? { expectedArtifactSpec: artifactSpec } : {}),
++                      ...(described.sha256 ? { expectedArchiveSha256: described.sha256 } : {}),
++                    })
++                    .pipe(
++                      Effect.onError(() =>
++                        xtworkInstallConsent.value.revokeApproval(approvalToken).pipe(Effect.ignore),
++                      ),
++                    );
++                }
++                return yield* acpRegistryCatalog.prepare(input);
++              }).pipe(Effect.mapError(AcpRegistrySupport.toAcpRegistryOperationError)),
+             ),
+           ),
+         [WS_METHODS.serverUninstallAcpRegistryManagedBinary]: (input) =>
+diff --git a/apps/web/src/components/chat/ComposerControlsBar.tsx b/apps/web/src/components/chat/ComposerControlsBar.tsx
+index 1f34def9..37ccf286 100644
+--- a/apps/web/src/components/chat/ComposerControlsBar.tsx
++++ b/apps/web/src/components/chat/ComposerControlsBar.tsx
+@@ -1,4 +1,3 @@
+-import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import type { ChatComposerProps } from "./ChatComposer";
+ import type { PromptUltrathink } from "./TraitsPicker";
+ import type { ProviderInstanceEntry } from "../../providerInstances";
+@@ -149,7 +148,6 @@ export function ComposerControlsBar(props: {
+   });
+   const controlSize = composerControlsCollapsed ? "xs" : "sm";
+   const gt = useGT();
+-  const developerFeatures = useDesktopDeveloperFeatures();
+   const m = useMessages();
+   const applyThreadModelPick = useApplyThreadModelPick();
+   const applyRouteThreadModelPick = useStableCallback(() => applyThreadModelPick(routeThreadRef));
+@@ -254,7 +252,7 @@ export function ComposerControlsBar(props: {
+   return showProviderUnavailable ? (
+     <ComposerControl
+       type="button"
+-      disabled={!developerFeatures || !providerSetupInstanceId}
++      disabled={!providerSetupInstanceId}
+       onClick={() => {
+         if (providerSetupInstanceId) {
+           onOpenProviderSetup(providerSetupInstanceId);
+@@ -264,11 +262,7 @@ export function ComposerControlsBar(props: {
+       className="shrink-0"
+     >
+       <CircleAlertIcon className="size-4" />
+-      {!developerFeatures
+-        ? gt("Assistant unavailable")
+-        : providerSetupInstanceId
+-          ? gt("Open provider settings")
+-          : gt("No provider available")}
++      {providerSetupInstanceId ? gt("Open provider settings") : gt("No provider available")}
+     </ComposerControl>
+   ) : (
+     <>
+diff --git a/apps/web/src/components/settings/AcpRegistrySearchStep.browser.test.tsx b/apps/web/src/components/settings/AcpRegistrySearchStep.browser.test.tsx
+index 8835603b..7914c1ac 100644
+--- a/apps/web/src/components/settings/AcpRegistrySearchStep.browser.test.tsx
++++ b/apps/web/src/components/settings/AcpRegistrySearchStep.browser.test.tsx
+@@ -142,3 +142,32 @@ it("leaves out Registry agents that T3 Code supports as their own providers", as
+   expect(page.getByRole("button", { name: "Add Gemini CLI" }).query()).not.toBeNull();
+   expect(page.getByRole("button", { name: "Add Codex" }).query()).toBeNull();
+ });
++
++it("requires explicit confirmation before preparing an ACP registry agent and sends pinned consent metadata", async () => {
++  setup();
++  state.result = { agents: [gemini] };
++  const onPrepared = vi.fn();
++  await using _screen = await render(<Step onPrepared={onPrepared} />);
++
++  await page.getByRole("button", { name: "Add Gemini CLI" }).click();
++  expect(state.prepare).not.toHaveBeenCalled();
++  await expect
++    .element(page.getByRole("region", { name: "Confirm agent installation" }))
++    .toBeVisible();
++
++  await page.getByRole("button", { name: "Confirm & Install" }).click();
++
++  await vi.waitFor(() => {
++    expect(state.prepare).toHaveBeenCalledWith({
++      environmentId,
++      input: {
++        agentId: "gemini",
++        instanceId: "acpRegistry_gemini_cli",
++        explicitConsent: true,
++        expectedVersion: "1.2.3",
++        expectedDistribution: "npx",
++      },
++    });
++  });
++  expect(onPrepared).toHaveBeenCalledTimes(1);
++});
+diff --git a/apps/web/src/components/settings/AcpRegistrySearchStep.tsx b/apps/web/src/components/settings/AcpRegistrySearchStep.tsx
+index b65a0ebf..fb7e6ebc 100644
+--- a/apps/web/src/components/settings/AcpRegistrySearchStep.tsx
++++ b/apps/web/src/components/settings/AcpRegistrySearchStep.tsx
+@@ -3,13 +3,20 @@ import {
+   ACP_REGISTRY_MAX_AGENTS,
+   ACP_REGISTRY_SEARCH_QUERY_MAX_LENGTH,
+   AuthProvidersManageScope,
++  ProviderDriverKind,
++  ProviderInstanceId,
+ } from "@t3tools/contracts";
++import {
++  deriveAvailableInstanceId,
++  deriveInstanceId,
++} from "@t3tools/client-runtime/provider-instance-ids";
+ import { readEnvironmentScope, useEnvironmentScope } from "../../state/session";
+ import {
+   isAtomCommandInterrupted,
+   squashAtomCommandFailure,
+ } from "@t3tools/client-runtime/state/runtime";
+ import type {
++  AcpRegistryPrepareInput,
+   AcpRegistryPrepareResult,
+   AcpRegistrySearchAgent,
+   EnvironmentId,
+@@ -30,7 +37,6 @@ import { InputGroup, InputGroupAddon, InputGroupInput } from "../ui/input-group"
+ import { ScrollArea } from "../ui/scroll-area";
+ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+ import { isConfiguredAcpRegistryAgent } from "./AddProviderInstanceDialog.logic";
+-import { ProviderDriverKind } from "@t3tools/contracts";
+ import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
+ import { providerClients } from "./providerDriverMeta";
+ 
+@@ -112,11 +118,26 @@ export function useAcpRegistrySearch(environmentId: EnvironmentId, enabled: bool
+     prepare: async (
+       agent: AcpRegistrySearchAgent,
+       onPrepared: (agent: AcpRegistrySearchAgent) => void,
++      consentOptions?: {
++        readonly instanceId?: ProviderInstanceId;
++        readonly explicitConsent?: boolean;
++      },
+     ) => {
+       if (!readEnvironmentScope(environmentId, AuthProvidersManageScope)) return;
+       setPrepareError(null);
+       setPreparingId(agent.id);
+-      const result = await prepareAgent({ environmentId, input: { agentId: agent.id } });
++      const input: AcpRegistryPrepareInput = {
++        agentId: agent.id,
++        ...(consentOptions?.instanceId !== undefined ? { instanceId: consentOptions.instanceId } : {}),
++        ...(consentOptions?.explicitConsent === true
++          ? {
++              explicitConsent: true,
++              expectedVersion: agent.version,
++              expectedDistribution: agent.distribution,
++            }
++          : {}),
++      };
++      const result = await prepareAgent({ environmentId, input });
+       setPreparingId(null);
+       if (result._tag === "Success") {
+         onPrepared(applyAcpRegistryPrepareResult(agent, result.value));
+@@ -151,14 +172,42 @@ export function AcpRegistrySearchStep({
+   const gt = useGT();
+   const canManageProviders = useEnvironmentScope(environmentId, AuthProvidersManageScope);
+   const { query, search, preparingId, prepareError } = registry;
++  const [pendingConsentAgent, setPendingConsentAgent] = useState<AcpRegistrySearchAgent | null>(
++    null,
++  );
+ 
+   const handleSearch = (event: FormEvent<HTMLFormElement>) => {
+     event.preventDefault();
++    setPendingConsentAgent(null);
+     registry.submit();
+   };
+ 
+-  const handlePrepare = (agent: AcpRegistrySearchAgent) => {
+-    void registry.prepare(agent, onPrepared);
++  const handleRequestPrepare = (agent: AcpRegistrySearchAgent) => {
++    if (!readEnvironmentScope(environmentId, AuthProvidersManageScope)) return;
++    setPendingConsentAgent(agent);
++  };
++
++  const handleConfirmPrepare = () => {
++    if (!pendingConsentAgent) return;
++    if (!readEnvironmentScope(environmentId, AuthProvidersManageScope)) {
++      setPendingConsentAgent(null);
++      return;
++    }
++    const agent = pendingConsentAgent;
++    setPendingConsentAgent(null);
++    const existingIds = new Set(["codex", "claudeAgent", ...Object.keys(providerInstances)]);
++    const nextInstanceId = ProviderInstanceId.make(
++      deriveAvailableInstanceId(
++        (candidateLabel) =>
++          deriveInstanceId(ProviderDriverKind.make("acpRegistry"), candidateLabel),
++        agent.name,
++        existingIds,
++      ),
++    );
++    void registry.prepare(agent, onPrepared, {
++      instanceId: nextInstanceId,
++      explicitConsent: true,
++    });
+   };
+ 
+   const results =
+@@ -166,6 +215,10 @@ export function AcpRegistrySearchStep({
+   const isInitialSearch = search.isPending && results === null;
+   const isRefreshing = search.isPending && results !== null;
+   const resultCount = results?.length ?? 0;
++  const activePendingConsent =
++    pendingConsentAgent && results?.some((candidate) => candidate.id === pendingConsentAgent.id)
++      ? pendingConsentAgent
++      : null;
+ 
+   return (
+     <section className="grid gap-3" aria-labelledby="acp-registry-search-heading">
+@@ -182,7 +235,10 @@ export function AcpRegistrySearchStep({
+             aria-label={gt("Search ACP Registry")}
+             maxLength={ACP_REGISTRY_SEARCH_QUERY_MAX_LENGTH}
+             disabled={preparingId !== null}
+-            onChange={(event) => registry.type(event.currentTarget.value)}
++            onChange={(event) => {
++              setPendingConsentAgent(null);
++              registry.type(event.currentTarget.value);
++            }}
+             placeholder={gt("Search agents…")}
+             size="sm"
+             type="search"
+@@ -230,6 +286,49 @@ export function AcpRegistrySearchStep({
+         </Alert>
+       ) : null}
+ 
++      {activePendingConsent ? (
++        <div
++          className="rounded-xl border border-border bg-muted/40 p-3 text-xs"
++          role="region"
++          aria-label={gt("Confirm agent installation")}
++        >
++          <div className="font-medium text-foreground">
++            <T>Confirm agent installation</T>
++          </div>
++          <p className="mt-1 text-muted-foreground">
++            <T>
++              Install <Var>{activePendingConsent.name}</Var> (v<Var>{activePendingConsent.version}</Var>,{" "}
++              <Var>{activePendingConsent.distribution}</Var>) from the official ACP Registry.
++            </T>
++          </p>
++          {activePendingConsent.repository || activePendingConsent.website ? (
++            <p className="mt-1 truncate text-[11px] text-muted-foreground">
++              {activePendingConsent.repository || activePendingConsent.website}
++            </p>
++          ) : null}
++          <div className="mt-2.5 flex items-center justify-end gap-2">
++            <Button
++              disabled={preparingId !== null}
++              onClick={() => setPendingConsentAgent(null)}
++              size="xs"
++              type="button"
++              variant="ghost-muted"
++            >
++              <T>Cancel</T>
++            </Button>
++            <Button
++              disabled={!canManageProviders || preparingId !== null}
++              onClick={handleConfirmPrepare}
++              size="xs"
++              type="button"
++              variant="default"
++            >
++              <T>Confirm &amp; Install</T>
++            </Button>
++          </div>
++        </div>
++      ) : null}
++
+       {isInitialSearch ? (
+         <div className="flex min-h-20 items-center justify-center text-sm text-muted-foreground">
+           <T>Searching the registry...</T>
+@@ -256,7 +355,7 @@ export function AcpRegistrySearchStep({
+                   canAdd={canManageProviders && preparingId === null}
+                   isPreparing={preparingId === agent.id}
+                   key={agent.id}
+-                  onAdd={handlePrepare}
++                  onAdd={handleRequestPrepare}
+                 />
+               ))}
+             </div>
+diff --git a/apps/web/src/components/settings/ProviderSettingsPanel.environment.browser.test.tsx b/apps/web/src/components/settings/ProviderSettingsPanel.environment.browser.test.tsx
+index 0b9bcc94..72197166 100644
+--- a/apps/web/src/components/settings/ProviderSettingsPanel.environment.browser.test.tsx
++++ b/apps/web/src/components/settings/ProviderSettingsPanel.environment.browser.test.tsx
+@@ -620,4 +620,27 @@ describe("EnvironmentProviderSettings health check interval", () => {
+     await expect.element(input).toHaveValue("300");
+     expect(state.updateSettings).not.toHaveBeenCalled();
+   });
++
++  it("never mounts the local Xtwork provider provisioner for a remote environment", async () => {
++    await setup();
++    await setProviders([provider()]);
++    const originalFetch = globalThis.fetch;
++    const fetchSpy = vi.fn<typeof fetch>();
++    globalThis.fetch = fetchSpy as unknown as typeof fetch;
++    const originalDesktopBridge = (window as { desktopBridge?: unknown }).desktopBridge;
++    (window as { desktopBridge?: unknown }).desktopBridge = {
++      getLocalEnvironmentBootstraps: () => [],
++    };
++    try {
++      await using _screen = await render(panel({ targetInstanceId: codexId }));
++      await expect.element(page.getByText("Codex").first()).toBeVisible();
++      expect(page.getByText("One-Click Install").query()).toBeNull();
++      expect(
++        fetchSpy.mock.calls.some(([url]) => String(url).includes("/api/xtwork/providers")),
++      ).toBe(false);
++    } finally {
++      globalThis.fetch = originalFetch;
++      (window as { desktopBridge?: unknown }).desktopBridge = originalDesktopBridge;
++    }
++  });
+ });
 diff --git a/apps/web/src/components/settings/ProviderSettingsPanel.tsx b/apps/web/src/components/settings/ProviderSettingsPanel.tsx
-index 892c9cd2..56af46da 100644
+index 892c9cd2..501d05d7 100644
 --- a/apps/web/src/components/settings/ProviderSettingsPanel.tsx
 +++ b/apps/web/src/components/settings/ProviderSettingsPanel.tsx
 @@ -54,6 +54,12 @@ import {
@@ -177,15 +1083,44 @@ index 892c9cd2..56af46da 100644
  import { CodexSetupSection, CodexManagedRuntimeFields } from "./CodexSetupSection";
  import { readCodexSetupMode } from "./CodexSetupSection.logic";
  import { providerClients } from "./providerDriverMeta";
-@@ -577,6 +587,7 @@ export function EnvironmentProviderSettings({
+@@ -549,6 +559,7 @@ function AccessGatedProviderSettings({
+     <EnvironmentProviderSettings
+       environmentId={environment.environmentId}
+       environmentLabel={environment.label}
++      isPrimaryLocalEnvironment={environment.entry.target._tag === "PrimaryConnectionTarget"}
+       readOnly={access.kind === "read-only"}
+       deviceTabs={deviceTabs}
+       targetInstanceId={targetInstanceId}
+@@ -563,6 +574,7 @@ const NO_FAVORITES: UnifiedSettings["favorites"] = [];
+ export function EnvironmentProviderSettings({
+   environmentId,
+   environmentLabel,
++  isPrimaryLocalEnvironment = false,
+   readOnly = false,
+   deviceTabs,
+   targetInstanceId,
+@@ -570,6 +582,7 @@ export function EnvironmentProviderSettings({
+ }: {
+   readonly environmentId: EnvironmentId;
+   readonly environmentLabel: string;
++  readonly isPrimaryLocalEnvironment?: boolean;
+   readonly deviceTabs?: ReactNode;
+   readonly targetInstanceId?: ProviderInstanceId | undefined;
+   readonly projectIds?: readonly ProjectId[];
+@@ -577,6 +590,12 @@ export function EnvironmentProviderSettings({
  }) {
    const searchableSetting = useSearchableSetting();
    const gt = useGT();
 +  const developerFeatures = useDesktopDeveloperFeatures();
++  const primaryEnvironmentId = usePrimaryEnvironmentId();
++  const isLocalProvisioningTarget =
++    isPrimaryLocalEnvironment &&
++    primaryEnvironmentId !== null &&
++    environmentId === primaryEnvironmentId;
    const settings = useEnvironmentSettings(environmentId);
    const managedPolicy = useManagedPolicy(environmentId);
    // A policy that allows no provider leaves nothing to add.
-@@ -809,13 +820,27 @@ export function EnvironmentProviderSettings({
+@@ -809,13 +828,27 @@ export function EnvironmentProviderSettings({
      }
    }
  
@@ -216,7 +1151,7 @@ index 892c9cd2..56af46da 100644
  
    const persistInstance = async (
      instanceId: ProviderInstanceId,
-@@ -961,6 +986,7 @@ export function EnvironmentProviderSettings({
+@@ -961,6 +994,7 @@ export function EnvironmentProviderSettings({
      },
    );
  
@@ -224,7 +1159,7 @@ index 892c9cd2..56af46da 100644
    const stableUpdateModelPreferences = useStableCallback(updateModelPreferences);
    const stableToggleModelFavorite = useStableCallback(toggleModelFavorite);
    const actions: ProviderInstanceRowActions = {
-@@ -974,6 +1000,7 @@ export function EnvironmentProviderSettings({
+@@ -974,6 +1008,7 @@ export function EnvironmentProviderSettings({
      updateModelPreferences: stableUpdateModelPreferences,
      toggleModelFavorite: stableToggleModelFavorite,
      selectInstance: setSelectedInstanceId,
@@ -232,7 +1167,15 @@ index 892c9cd2..56af46da 100644
    };
    // resolveModelPreferences falls back to a fresh `[]`; keep it stable for the rows.
    const favorites = settings.favorites.length > 0 ? settings.favorites : NO_FAVORITES;
-@@ -1111,7 +1138,7 @@ export function EnvironmentProviderSettings({
+@@ -987,6 +1022,7 @@ export function EnvironmentProviderSettings({
+         key={row.instanceId}
+         environmentId={environmentId}
+         environmentLabel={environmentLabel}
++        isPrimaryLocalEnvironment={isLocalProvisioningTarget}
+         instanceId={row.instanceId}
+         driver={row.driver}
+         explicitInstance={row.explicitInstance}
+@@ -1111,7 +1147,7 @@ export function EnvironmentProviderSettings({
                className="@min-[48rem]/providers:min-h-0 @min-[48rem]/providers:flex-1"
              >
                <div className="divide-y divide-border/50">
@@ -241,7 +1184,7 @@ index 892c9cd2..56af46da 100644
                  {canAddProvider ? (
                    <button
                      type="button"
-@@ -1282,6 +1309,7 @@ interface ProviderInstanceRowActions {
+@@ -1282,6 +1318,7 @@ interface ProviderInstanceRowActions {
    readonly updateModelPreferences: ReturnType<typeof useUpdateEnvironmentModelPreferences>;
    readonly toggleModelFavorite: ReturnType<typeof useToggleEnvironmentModelFavorite>;
    readonly selectInstance: (instanceId: ProviderInstanceId) => void;
@@ -249,12 +1192,29 @@ index 892c9cd2..56af46da 100644
  }
  
  const NO_MODELS: ReadonlyArray<string> = [];
-@@ -1360,6 +1388,69 @@ function ProviderInstanceRow({
+@@ -1290,6 +1327,7 @@ const NO_MODELS: ReadonlyArray<string> = [];
+ function ProviderInstanceRow({
+   environmentId,
+   environmentLabel,
++  isPrimaryLocalEnvironment,
+   instanceId,
+   driver,
+   explicitInstance,
+@@ -1310,6 +1348,7 @@ function ProviderInstanceRow({
+ }: {
+   readonly environmentId: EnvironmentId;
+   readonly environmentLabel: string;
++  readonly isPrimaryLocalEnvironment: boolean;
+   readonly instanceId: ProviderInstanceId;
+   readonly driver: ProviderDriverKind;
+   readonly explicitInstance: ProviderInstanceConfig | undefined;
+@@ -1360,6 +1399,70 @@ function ProviderInstanceRow({
        }
      : undefined;
    const codexSetupMode = driver === "codex" ? readCodexSetupMode(instance.config) : null;
 +  const showXtworkProvisioner =
 +    mode === "editor" &&
++    isPrimaryLocalEnvironment &&
 +    isXtworkDesktop() &&
 +    isProvisionableCodingAgent(String(instanceId), driver, instance);
 +  const standardSetupNode =
@@ -319,7 +1279,7 @@ index 892c9cd2..56af46da 100644
    const recommendedVersion = liveProvider?.compatibilityAdvisory?.recommendedVersion;
    const canInstallRecommended =
      !readOnly &&
-@@ -1396,63 +1487,19 @@ function ProviderInstanceRow({
+@@ -1396,63 +1499,19 @@ function ProviderInstanceRow({
        }
        canWriteSettings={canWriteSettings}
        setup={
@@ -397,18 +1357,24 @@ index 892c9cd2..56af46da 100644
        }
        onUpdate={(next) => actions.updateInstance(instanceId, instance, next)}
 diff --git a/packages/contracts/src/acpRegistry.ts b/packages/contracts/src/acpRegistry.ts
-index fffbe8dd..e3d50741 100644
+index fffbe8dd..fa32390b 100644
 --- a/packages/contracts/src/acpRegistry.ts
 +++ b/packages/contracts/src/acpRegistry.ts
-@@ -82,6 +82,7 @@ export type AcpRegistrySearchResult = typeof AcpRegistrySearchResult.Type;
+@@ -82,6 +82,13 @@ export type AcpRegistrySearchResult = typeof AcpRegistrySearchResult.Type;
  
  export const AcpRegistryPrepareInput = Schema.Struct({
    agentId: AcpRegistryAgentId,
 +  instanceId: Schema.optionalKey(ProviderInstanceId),
++  approvalToken: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
++  expectedVersion: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
++  expectedDistribution: Schema.optionalKey(AcpRegistryDistribution),
++  expectedArtifactSpec: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(2_048))),
++  expectedArchiveSha256: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
++  explicitConsent: Schema.optionalKey(Schema.Boolean),
  });
  export type AcpRegistryPrepareInput = typeof AcpRegistryPrepareInput.Type;
  
-@@ -317,6 +318,7 @@ export const AcpRegistryOperationErrorReason = Schema.Literals([
+@@ -317,6 +324,7 @@ export const AcpRegistryOperationErrorReason = Schema.Literals([
    "checksum_mismatch",
    "download_failed",
    "install_failed",
@@ -416,7 +1382,7 @@ index fffbe8dd..e3d50741 100644
    "instance_not_found",
    "logout_unsupported",
    "logout_failed",
-@@ -334,6 +336,7 @@ export const AcpRegistryOperationErrorReason = Schema.Literals([
+@@ -334,6 +342,7 @@ export const AcpRegistryOperationErrorReason = Schema.Literals([
    "provider_configuration_failed",
    "unsupported_distribution",
    "unsupported_platform",
@@ -424,21 +1390,44 @@ index fffbe8dd..e3d50741 100644
  ]);
  export type AcpRegistryOperationErrorReason = typeof AcpRegistryOperationErrorReason.Type;
  
+diff --git a/packages/contracts/src/providerSetup.ts b/packages/contracts/src/providerSetup.ts
+index 2693b8aa..2c334a33 100644
+--- a/packages/contracts/src/providerSetup.ts
++++ b/packages/contracts/src/providerSetup.ts
+@@ -11,6 +11,9 @@ import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+ 
+ export const ProviderSetupInput = Schema.Struct({
+   instanceId: ProviderInstanceId,
++  approvalToken: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
++  expectedVersion: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
++  expectedSha256: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
+ });
+ export type ProviderSetupInput = typeof ProviderSetupInput.Type;
+ 
 diff --git a/packages/provider-acp-registry/src/server/AcpRegistrySupport.test.ts b/packages/provider-acp-registry/src/server/AcpRegistrySupport.test.ts
-index 453855e5..c80c0f36 100644
+index 453855e5..dc1ab65c 100644
 --- a/packages/provider-acp-registry/src/server/AcpRegistrySupport.test.ts
 +++ b/packages/provider-acp-registry/src/server/AcpRegistrySupport.test.ts
-@@ -2105,4 +2105,222 @@ describe("acpRegistryManagedBinaryDirectories", () => {
+@@ -2105,4 +2105,313 @@ describe("acpRegistryManagedBinaryDirectories", () => {
        expect(missing).toEqual([]);
      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
    );
 +
-+  it.effect("blocks unconsented npx inspect/resolve/prepare and registry version bumps via AcpInstallConsentGate", () => {
++  it.effect("blocks unconsented npx inspect/resolve/prepare, same-version cache loss, and registry version bumps via AcpInstallConsentGate (M3/M4)", () => {
 +    let registryVersion = "1.2.3";
 +    let packageVersion = "1.2.3";
-+    const consents = new Set<string>();
++    const persistentConsents = new Set<string>();
++    const singleUseApprovals = new Map<string, string>();
 +    const consentKeyId = (key: AcpRegistrySupport.AcpInstallConsentKey) =>
-+      JSON.stringify([key.instanceId, key.source, key.version, key.distribution, key.installDir]);
++      JSON.stringify([
++        key.instanceId,
++        key.source,
++        key.version,
++        key.distribution,
++        key.installDir,
++        key.artifactSpec ?? "",
++        key.artifactDigest ?? "",
++      ]);
 +
 +    return Effect.gen(function* () {
 +      const fileSystem = yield* FileSystem.FileSystem;
@@ -446,10 +1435,25 @@ index 453855e5..c80c0f36 100644
 +      const rootDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-acp-consent-" });
 +      const toolchain = yield* makeFakeNpmToolchain(rootDir);
 +      const toolsDir = path.join(rootDir, "tools");
-+      // Start with a clean tools directory (makeFakeNpmToolchain pre-creates the version folder).
 +      yield* fileSystem.remove(toolsDir, { recursive: true, force: true });
 +      const consentLayer = Layer.succeed(AcpRegistrySupport.AcpInstallConsentGate, {
-+        hasConsent: (key) => Effect.sync(() => consents.has(consentKeyId(key))),
++        hasConsent: (key) => Effect.sync(() => persistentConsents.has(consentKeyId(key))),
++        consumePrepareApproval: (key, approvalToken) =>
++          Effect.sync(() => {
++            const expected = consentKeyId(key);
++            if (approvalToken !== undefined) {
++              if (singleUseApprovals.get(approvalToken) !== expected) return false;
++              singleUseApprovals.delete(approvalToken);
++              return true;
++            }
++            for (const [token, stored] of singleUseApprovals) {
++              if (stored === expected) {
++                singleUseApprovals.delete(token);
++                return true;
++              }
++            }
++            return false;
++          }),
 +      });
 +      const resolver = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
 +        cacheDir: rootDir,
@@ -460,7 +1464,6 @@ index 453855e5..c80c0f36 100644
 +        Effect.provide(consentLayer),
 +      );
 +
-+      // Uninstalled npx agent must inspect as unprepared (never ready -> never silent install).
 +      const beforeInspect = yield* resolver.inspect(settings(), toolchain.environment, {
 +        instanceId: "xtworkKimiCode",
 +      });
@@ -471,7 +1474,6 @@ index 453855e5..c80c0f36 100644
 +        distribution: "npx",
 +      });
 +
-+      // Unconsented resolve MUST fail with install_required and NOT invoke npm.
 +      const unconsentedResolve = yield* Effect.flip(
 +        resolver.resolve(settings(), rootDir, toolchain.environment, {
 +          instanceId: "xtworkKimiCode",
@@ -480,7 +1482,6 @@ index 453855e5..c80c0f36 100644
 +      expect(unconsentedResolve.reason).toBe("install_required");
 +      expect(yield* fileSystem.readFileString(toolchain.logPath)).toBe("");
 +
-+      // Unconsented prepare MUST also fail with install_required and NOT invoke npm.
 +      const unconsentedPrepare = yield* Effect.flip(
 +        resolver.prepare({
 +          agentId: "example-agent",
@@ -490,42 +1491,69 @@ index 453855e5..c80c0f36 100644
 +      expect(unconsentedPrepare.reason).toBe("install_required");
 +      expect(yield* fileSystem.readFileString(toolchain.logPath)).toBe("");
 +
-+      // Grant exact 5-tuple consent -> prepare and resolve succeed.
 +      const described = yield* resolver.describeAgent!("example-agent", "auto");
 +      expect(described.version).toBe("1.2.3");
 +      expect(described.distribution).toBe("npx");
++      expect(described.packageName).toBe("@example/acp@1.2.3");
 +      expect(described.installed).toBe(false);
-+      consents.add(
-+        consentKeyId({
-+          instanceId: "xtworkKimiCode",
-+          source: "acp-registry",
-+          version: described.version,
-+          distribution: described.distribution,
-+          installDir: described.installDir,
++      const keyStr = consentKeyId({
++        instanceId: "xtworkKimiCode",
++        source: "acp-registry",
++        version: described.version,
++        distribution: described.distribution,
++        installDir: described.installDir,
++        artifactSpec: described.packageName,
++      });
++      persistentConsents.add(keyStr);
++      singleUseApprovals.set("tok-1", keyStr);
++
++      const specDrift = yield* Effect.flip(
++        resolver.prepare({
++          agentId: "example-agent",
++          instanceId: ProviderInstanceId.make("xtworkKimiCode"),
++          approvalToken: "tok-1",
++          expectedVersion: "1.2.3",
++          expectedDistribution: "npx",
++          expectedArtifactSpec: "@example/acp@0.0.1",
 +        }),
 +      );
++      expect(specDrift.reason).toBe("install_required");
++      expect(singleUseApprovals.has("tok-1")).toBe(true);
 +
 +      const prepared = yield* resolver.prepare({
 +        agentId: "example-agent",
 +        instanceId: ProviderInstanceId.make("xtworkKimiCode"),
++        approvalToken: "tok-1",
++        expectedVersion: "1.2.3",
++        expectedDistribution: "npx",
++        expectedArtifactSpec: described.packageName!,
 +      });
 +      expect(prepared.prepared).toBe(true);
++      expect(singleUseApprovals.has("tok-1")).toBe(false);
 +      const readyInspect = yield* resolver.inspect(settings(), toolchain.environment, {
 +        instanceId: "xtworkKimiCode",
 +      });
 +      expect(readyInspect.status).toBe("ready");
 +
-+      // Missing-package recovery after deleting package + revoking consent MUST return install_required.
-+      consents.clear();
++      // M3: Same-version cache deletion WITHOUT clearing persistentConsents MUST STILL refuse silent download.
++      const npmLogBeforeCacheLoss = yield* fileSystem.readFileString(toolchain.logPath);
 +      yield* fileSystem.remove(described.installDir, { recursive: true, force: true });
-+      const missingRecovery = yield* Effect.flip(
++      const missingRecoveryResolve = yield* Effect.flip(
 +        resolver.resolve(settings(), rootDir, toolchain.environment, {
 +          instanceId: "xtworkKimiCode",
 +        }),
 +      );
-+      expect(missingRecovery.reason).toBe("install_required");
++      expect(missingRecoveryResolve.reason).toBe("install_required");
++      const missingRecoveryPrepare = yield* Effect.flip(
++        resolver.prepare({
++          agentId: "example-agent",
++          instanceId: ProviderInstanceId.make("xtworkKimiCode"),
++          approvalToken: "tok-1",
++        }),
++      );
++      expect(missingRecoveryPrepare.reason).toBe("install_required");
++      expect(yield* fileSystem.readFileString(toolchain.logPath)).toBe(npmLogBeforeCacheLoss);
 +
-+      // Re-create v1.2.3 directory to simulate an older installed version, then bump registry to 2.0.0.
 +      yield* fileSystem.makeDirectory(described.installDir, { recursive: true });
 +      registryVersion = "2.0.0";
 +      packageVersion = "2.0.0";
@@ -567,12 +1595,21 @@ index 453855e5..c80c0f36 100644
 +    );
 +  });
 +
-+  it.effect("blocks unconsented binary download and version bump via AcpInstallConsentGate", () => {
++  it.effect("blocks unconsented binary download, same-version cache loss, and version bump via AcpInstallConsentGate (M3)", () => {
 +    let registryVersion = "1.0.0";
 +    let archiveRequests = 0;
-+    const consents = new Set<string>();
++    const persistentConsents = new Set<string>();
++    const singleUseApprovals = new Map<string, string>();
 +    const consentKeyId = (key: AcpRegistrySupport.AcpInstallConsentKey) =>
-+      JSON.stringify([key.instanceId, key.source, key.version, key.distribution, key.installDir]);
++      JSON.stringify([
++        key.instanceId,
++        key.source,
++        key.version,
++        key.distribution,
++        key.installDir,
++        key.artifactSpec ?? "",
++        key.artifactDigest ?? "",
++      ]);
 +
 +    return Effect.gen(function* () {
 +      const fileSystem = yield* FileSystem.FileSystem;
@@ -580,7 +1617,23 @@ index 453855e5..c80c0f36 100644
 +      const rootDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-acp-bin-consent-" });
 +      const toolsDir = path.join(rootDir, "tools");
 +      const consentLayer = Layer.succeed(AcpRegistrySupport.AcpInstallConsentGate, {
-+        hasConsent: (key) => Effect.sync(() => consents.has(consentKeyId(key))),
++        hasConsent: (key) => Effect.sync(() => persistentConsents.has(consentKeyId(key))),
++        consumePrepareApproval: (key, approvalToken) =>
++          Effect.sync(() => {
++            const expected = consentKeyId(key);
++            if (approvalToken !== undefined) {
++              if (singleUseApprovals.get(approvalToken) !== expected) return false;
++              singleUseApprovals.delete(approvalToken);
++              return true;
++            }
++            for (const [token, stored] of singleUseApprovals) {
++              if (stored === expected) {
++                singleUseApprovals.delete(token);
++                return true;
++              }
++            }
++            return false;
++          }),
 +      });
 +      const resolver = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
 +        cacheDir: rootDir,
@@ -595,23 +1648,41 @@ index 453855e5..c80c0f36 100644
 +      expect(archiveRequests).toBe(0);
 +
 +      const described = yield* resolver.describeAgent!("example-agent", "auto");
-+      consents.add(
-+        consentKeyId({
-+          instanceId: "xtworkQoder",
-+          source: "acp-registry",
-+          version: described.version,
-+          distribution: described.distribution,
-+          installDir: described.installDir,
-+        }),
-+      );
++      const keyStr = consentKeyId({
++        instanceId: "xtworkQoder",
++        source: "acp-registry",
++        version: described.version,
++        distribution: described.distribution,
++        installDir: described.installDir,
++        artifactSpec: described.archiveUrl,
++      });
++      persistentConsents.add(keyStr);
++      singleUseApprovals.set("bin-tok-1", keyStr);
++
 +      const prepared = yield* resolver.prepare({
 +        agentId: "example-agent",
 +        instanceId: ProviderInstanceId.make("xtworkQoder"),
++        approvalToken: "bin-tok-1",
 +      });
 +      expect(prepared.prepared).toBe(true);
 +      expect(archiveRequests).toBe(1);
 +
-+      // Registry bumps version -> unconsented prepare/resolve must return update_required without downloading.
++      yield* fileSystem.remove(described.installDir, { recursive: true, force: true });
++      const resolveAfterCacheLoss = yield* Effect.flip(
++        resolver.resolve(settings(), rootDir, undefined, { instanceId: "xtworkQoder" }),
++      );
++      expect(resolveAfterCacheLoss.reason).toBe("install_required");
++      const prepareReplay = yield* Effect.flip(
++        resolver.prepare({
++          agentId: "example-agent",
++          instanceId: ProviderInstanceId.make("xtworkQoder"),
++          approvalToken: "bin-tok-1",
++        }),
++      );
++      expect(prepareReplay.reason).toBe("install_required");
++      expect(archiveRequests).toBe(1);
++
++      yield* fileSystem.makeDirectory(described.installDir, { recursive: true });
 +      registryVersion = "1.1.0";
 +      const bumped = yield* Effect.flip(
 +        resolver.prepare({
@@ -652,10 +1723,10 @@ index 453855e5..c80c0f36 100644
 +  });
  });
 diff --git a/packages/provider-acp-registry/src/server/AcpRegistrySupport.ts b/packages/provider-acp-registry/src/server/AcpRegistrySupport.ts
-index 05133475..6efb49ea 100644
+index 05133475..2ae0b1c4 100644
 --- a/packages/provider-acp-registry/src/server/AcpRegistrySupport.ts
 +++ b/packages/provider-acp-registry/src/server/AcpRegistrySupport.ts
-@@ -469,6 +469,36 @@ export interface ResolvedAcpRegistryAgent {
+@@ -469,6 +469,54 @@ export interface ResolvedAcpRegistryAgent {
    readonly spawn: AcpSessionRuntime.AcpSpawnInput;
  }
  
@@ -665,12 +1736,18 @@ index 05133475..6efb49ea 100644
 +  readonly version: string;
 +  readonly distribution: string;
 +  readonly installDir: string;
++  readonly artifactSpec?: string | undefined;
++  readonly artifactDigest?: string | undefined;
 +}
 +
 +export class AcpInstallConsentGate extends Context.Service<
 +  AcpInstallConsentGate,
 +  {
 +    readonly hasConsent: (key: AcpInstallConsentKey) => Effect.Effect<boolean>;
++    readonly consumePrepareApproval: (
++      key: AcpInstallConsentKey,
++      approvalToken?: string,
++    ) => Effect.Effect<boolean>;
 +  }
 +>()("@t3tools/provider-acp-registry/server/AcpRegistrySupport/AcpInstallConsentGate") {}
 +
@@ -680,9 +1757,21 @@ index 05133475..6efb49ea 100644
 +  readonly distribution: AcpRegistryDistributionKind;
 +  readonly packageName?: string;
 +  readonly archiveUrl?: string;
++  readonly sha256?: string;
 +  readonly installDir: string;
 +  readonly installed: boolean;
 +  readonly hasOtherInstalledVersion: boolean;
++}
++
++export interface AcpRegistryManagedAgentUninstallInput {
++  readonly agentId: string;
++  readonly ignoreInstanceId?: string | undefined;
++}
++
++export interface AcpRegistryManagedAgentUninstallResult {
++  readonly agentId: string;
++  readonly removed: boolean;
++  readonly blockedByInstanceIds: ReadonlyArray<string>;
 +}
 +
 +export interface AcpRegistryInstanceOptions {
@@ -692,7 +1781,7 @@ index 05133475..6efb49ea 100644
  export type AcpRegistryInspection =
    | { readonly status: "unconfigured" }
    | { readonly status: "not_found"; readonly agentId: string }
-@@ -493,7 +523,13 @@ export type AcpRegistryInspection =
+@@ -493,7 +541,13 @@ export type AcpRegistryInspection =
        readonly status: "unprepared";
        readonly agentId: string;
        readonly version: string;
@@ -707,7 +1796,7 @@ index 05133475..6efb49ea 100644
      }
    | {
        readonly status: "ready";
-@@ -512,14 +548,20 @@ export class AcpRegistryCatalog extends Context.Service<
+@@ -512,18 +566,27 @@ export class AcpRegistryCatalog extends Context.Service<
      readonly prepare: (
        input: AcpRegistryPrepareInput,
      ) => Effect.Effect<AcpRegistryPrepareResult, AcpRegistryError>;
@@ -728,7 +1817,14 @@ index 05133475..6efb49ea 100644
      ) => Effect.Effect<ResolvedAcpRegistryAgent, AcpRegistryError>;
      readonly uninstallManagedBinary: (
        input: AcpRegistryManagedBinaryUninstallInput,
-@@ -650,6 +692,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+     ) => Effect.Effect<AcpRegistryManagedBinaryUninstallResult, AcpRegistryError>;
++    readonly uninstallManagedAgent?: (
++      input: AcpRegistryManagedAgentUninstallInput,
++    ) => Effect.Effect<AcpRegistryManagedAgentUninstallResult, AcpRegistryError>;
+   }
+ >()("@t3tools/provider-acp-registry/server/AcpRegistrySupport/AcpRegistryCatalog") {}
+ 
+@@ -650,6 +713,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
    const httpClient = yield* HttpClient.HttpClient;
    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
    const { settings: hostSettings } = yield* ProviderHost.ProviderHost;
@@ -736,7 +1832,7 @@ index 05133475..6efb49ea 100644
    const platform = yield* HostProcess.Platform;
    const architecture = yield* HostProcess.Architecture;
    const hostEnvironment = yield* HostProcess.Environment;
-@@ -1220,11 +1263,61 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+@@ -1220,11 +1284,82 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
      },
    );
  
@@ -763,22 +1859,39 @@ index 05133475..6efb49ea 100644
 +    return false;
 +  });
 +
-+  const requireInstallConsent = Effect.fn("AcpRegistryCatalog.requireInstallConsent")(function* (input: {
++  const requirePrepareApproval = Effect.fn("AcpRegistryCatalog.requirePrepareApproval")(function* (input: {
 +    readonly instanceId?: string;
 +    readonly agentId: string;
 +    readonly version: string;
 +    readonly distribution: AcpRegistryDistributionKind;
 +    readonly installDir: string;
++    readonly artifactSpec?: string;
++    readonly artifactDigest?: string;
++    readonly approvalToken?: string;
++    readonly allowInstall: boolean;
 +    readonly isUpdate: boolean;
 +  }) {
 +    if (Option.isNone(consentGate)) return;
-+    const allowed = yield* consentGate.value.hasConsent({
-+      instanceId: input.instanceId?.trim() || `acp:${input.agentId}`,
-+      source: "acp-registry",
-+      version: input.version,
-+      distribution: input.distribution,
-+      installDir: input.installDir,
-+    });
++    if (!input.allowInstall) {
++      return yield* new AcpRegistryError({
++        reason: input.isUpdate ? "update_required" : "install_required",
++        detail: input.isUpdate
++          ? `ACP Registry agent '${input.agentId}' has a new version (${input.version}). Confirm the update in provider settings before downloading.`
++          : `ACP Registry agent '${input.agentId}' (${input.version}) is not installed. Confirm installation in provider settings before downloading.`,
++      });
++    }
++    const allowed = yield* consentGate.value.consumePrepareApproval(
++      {
++        instanceId: input.instanceId?.trim() || `acp:${input.agentId}`,
++        source: "acp-registry",
++        version: input.version,
++        distribution: input.distribution,
++        installDir: input.installDir,
++        ...(input.artifactSpec ? { artifactSpec: input.artifactSpec } : {}),
++        ...(input.artifactDigest ? { artifactDigest: input.artifactDigest } : {}),
++      },
++      input.approvalToken,
++    );
 +    if (!allowed) {
 +      return yield* new AcpRegistryError({
 +        reason: input.isUpdate ? "update_required" : "install_required",
@@ -794,11 +1907,15 @@ index 05133475..6efb49ea 100644
      distribution: "npx" | "uvx",
      packageSpec: string,
      environment: NodeJS.ProcessEnv,
-+    instanceId?: string,
++    options?: {
++      readonly instanceId?: string;
++      readonly allowInstall: boolean;
++      readonly approvalToken?: string;
++    },
    ) {
      const managerName = packageManagerFor(distribution)!;
      const managerPath = resolveExecutable(managerName, platform, environment);
-@@ -1238,16 +1331,9 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+@@ -1238,16 +1373,9 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
      if (Option.isSome(receipt) && distribution === "npx") return receipt.value;
  
      const packageRoot = packageInstallRoot(agent, distribution);
@@ -818,7 +1935,7 @@ index 05133475..6efb49ea 100644
      const packageEnvironment =
        distribution === "npx"
          ? { ...environment, npm_config_prefix: packageRoot }
-@@ -1256,7 +1342,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+@@ -1256,7 +1384,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
              UV_TOOL_DIR: packageRoot,
              UV_TOOL_BIN_DIR: packageBinDirectory(agent, distribution),
            };
@@ -827,7 +1944,7 @@ index 05133475..6efb49ea 100644
        const installed = yield* discoverUvGlobalPackage(
          agent,
          packageSpec,
-@@ -1266,16 +1352,40 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+@@ -1266,16 +1394,43 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
        if (Option.isSome(installed)) return installed.value;
      }
  
@@ -853,12 +1970,15 @@ index 05133475..6efb49ea 100644
  
 +    // Never silently download or re-install missing/updated packages without explicit consent.
 +    const isUpdate = yield* hasOtherInstalledPackageVersion(agent.id, agent.version);
-+    yield* requireInstallConsent({
-+      ...(instanceId ? { instanceId } : {}),
++    yield* requirePrepareApproval({
++      ...(options?.instanceId ? { instanceId: options.instanceId } : {}),
 +      agentId: agent.id,
 +      version: agent.version,
 +      distribution,
 +      installDir: packageRoot,
++      artifactSpec: packageSpec,
++      ...(options?.approvalToken ? { approvalToken: options.approvalToken } : {}),
++      allowInstall: options?.allowInstall ?? true,
 +      isUpdate,
 +    });
 +
@@ -876,32 +1996,57 @@ index 05133475..6efb49ea 100644
      const managerDirectory = yield* managerBinDirectory(managerPath);
      const installEnvironment = withPreferredPath(packageEnvironment, managerDirectory, platform);
      if (distribution === "npx") {
-@@ -1421,6 +1531,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+@@ -1421,6 +1576,12 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
    const installBinary = Effect.fn("AcpRegistryCatalog.installBinary")(function* (
      agent: AcpRegistryAgent,
      target: typeof AcpRegistryBinaryTarget.Type,
-+    instanceId?: string,
++    options?: {
++      readonly instanceId?: string;
++      readonly allowInstall: boolean;
++      readonly approvalToken?: string;
++      readonly expectedArchiveSha256?: string;
++    },
    ) {
      if (platformTarget === undefined) {
        return yield* new AcpRegistryError({
-@@ -1450,6 +1561,16 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+@@ -1450,6 +1611,22 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
        );
      }
  
 +    const isUpdate = yield* hasInstalledBinaryVersion(agent.id);
-+    yield* requireInstallConsent({
-+      ...(instanceId ? { instanceId } : {}),
++    const pinnedDigest =
++      options?.expectedArchiveSha256?.trim().toLowerCase() ?? target.sha256?.trim().toLowerCase();
++    yield* requirePrepareApproval({
++      ...(options?.instanceId ? { instanceId: options.instanceId } : {}),
 +      agentId: agent.id,
 +      version: agent.version,
 +      distribution: "binary",
 +      installDir: installRoot,
++      artifactSpec: target.archive,
++      ...(pinnedDigest ? { artifactDigest: pinnedDigest } : {}),
++      ...(options?.approvalToken ? { approvalToken: options.approvalToken } : {}),
++      allowInstall: options?.allowInstall ?? true,
 +      isUpdate,
 +    });
 +
      yield* fileSystem.makeDirectory(path.dirname(installRoot), { recursive: true }).pipe(
        Effect.mapError(
          (cause) =>
-@@ -1697,6 +1818,56 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+@@ -1544,9 +1721,11 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+             ),
+         }),
+       );
+-      if (target.sha256 !== undefined) {
++      const expectedSha256 =
++        options?.expectedArchiveSha256?.trim().toLowerCase() ?? target.sha256?.trim().toLowerCase();
++      if (expectedSha256 !== undefined) {
+         const actual = Hex.encode(hash.digest());
+-        if (actual !== target.sha256.toLowerCase()) {
++        if (actual !== expectedSha256) {
+           return yield* new AcpRegistryError({
+             reason: "checksum_mismatch",
+             detail: `ACP Registry agent ${agent.id} download did not match its declared SHA-256.`,
+@@ -1697,21 +1876,116 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
      },
    );
  
@@ -928,6 +2073,9 @@ index 05133475..6efb49ea 100644
 +        version: agent.version,
 +        distribution: "binary",
 +        archiveUrl: distribution.binaryTarget!.archive,
++        ...(distribution.binaryTarget!.sha256
++          ? { sha256: distribution.binaryTarget!.sha256.toLowerCase() }
++          : {}),
 +        installDir: paths.installRoot,
 +        installed,
 +        hasOtherInstalledVersion,
@@ -958,14 +2106,50 @@ index 05133475..6efb49ea 100644
    const prepare: AcpRegistryCatalog["Service"]["prepare"] = Effect.fn("AcpRegistryCatalog.prepare")(
      function* (input) {
        const registry = yield* refreshRegistry();
-@@ -1705,13 +1876,19 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+       const agent = yield* findAgent(registry, input.agentId);
+       const distribution = yield* compatibleDistribution(agent, "auto");
++
++      const resolvedArtifactSpec =
++        distribution.kind === "binary"
++          ? distribution.binaryTarget!.archive
++          : distribution.packageName!;
++      const resolvedArchiveSha256 =
++        distribution.kind === "binary"
++          ? distribution.binaryTarget!.sha256?.trim().toLowerCase()
++          : undefined;
++      const versionDrifted =
++        input.expectedVersion !== undefined && input.expectedVersion !== agent.version;
++      const distributionDrifted =
++        input.expectedDistribution !== undefined &&
++        input.expectedDistribution !== distribution.kind;
++      const artifactDrifted =
++        input.expectedArtifactSpec !== undefined &&
++        input.expectedArtifactSpec !== resolvedArtifactSpec;
++      const sha256Drifted =
++        input.expectedArchiveSha256 !== undefined &&
++        resolvedArchiveSha256 !== undefined &&
++        input.expectedArchiveSha256.trim().toLowerCase() !== resolvedArchiveSha256;
++      if (versionDrifted || distributionDrifted || artifactDrifted || sha256Drifted) {
++        return yield* new AcpRegistryError({
++          reason: versionDrifted ? "update_required" : "install_required",
++          detail: `ACP Registry agent '${agent.id}' changed from the confirmed plan (${agent.version} / ${distribution.kind}). Review and confirm the updated plan before downloading.`,
++        });
++      }
++
        if (distribution.kind === "binary") {
-         // Only explicit command overrides may use PATH copies with different ACP capabilities.
+-        // Only explicit command overrides may use PATH copies with different ACP capabilities.
          yield* withInstallPermit(agent.id)(
 -          installBinary(agent, distribution.binaryTarget!).pipe(
-+          installBinary(agent, distribution.binaryTarget!, input.instanceId).pipe(
-             Effect.tap(() => reservePreparedBinary(agent.id)),
-           ),
+-            Effect.tap(() => reservePreparedBinary(agent.id)),
+-          ),
++          installBinary(agent, distribution.binaryTarget!, {
++            ...(input.instanceId ? { instanceId: input.instanceId } : {}),
++            allowInstall: true,
++            ...(input.approvalToken ? { approvalToken: input.approvalToken } : {}),
++            ...(input.expectedArchiveSha256
++              ? { expectedArchiveSha256: input.expectedArchiveSha256 }
++              : {}),
++          }).pipe(Effect.tap(() => reservePreparedBinary(agent.id))),
          );
        } else {
          yield* withInstallPermit(agent.id)(
@@ -975,12 +2159,16 @@ index 05133475..6efb49ea 100644
 +            distribution.kind,
 +            distribution.packageName!,
 +            hostEnvironment,
-+            input.instanceId,
++            {
++              ...(input.instanceId ? { instanceId: input.instanceId } : {}),
++              allowInstall: true,
++              ...(input.approvalToken ? { approvalToken: input.approvalToken } : {}),
++            },
 +          ),
          );
        }
        return {
-@@ -1797,8 +1974,8 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+@@ -1797,8 +2071,8 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
              const exists = yield* fileSystem
                .exists(paths.executablePath)
                .pipe(Effect.orElseSucceed(() => false));
@@ -991,7 +2179,7 @@ index 05133475..6efb49ea 100644
                return {
                  status: "unprepared",
                  agentId,
-@@ -1806,6 +1983,14 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+@@ -1806,6 +2080,14 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
                  distribution: "binary",
                } as const;
              }
@@ -1006,7 +2194,7 @@ index 05133475..6efb49ea 100644
              if (exists) {
                yield* assertExecutableInRoot(paths.installRoot, paths.executablePath).pipe(
                  Effect.mapError((cause) =>
-@@ -1831,28 +2016,52 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+@@ -1831,28 +2113,52 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
        }
  
        const runner = packageManagerFor(distribution.kind)!;
@@ -1077,24 +2265,131 @@ index 05133475..6efb49ea 100644
        if (settings.source === "local") {
          const executable = settings.commandPath.trim();
          if (!executable) {
-@@ -1908,6 +2117,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+@@ -1908,6 +2214,10 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
              distribution.kind,
              distribution.packageName!,
              effectiveEnvironment,
-+            options?.instanceId,
++            {
++              ...(options?.instanceId ? { instanceId: options.instanceId } : {}),
++              allowInstall: Option.isNone(consentGate),
++            },
            ),
          );
          command = installed.executablePath;
-@@ -1916,7 +2126,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+@@ -1916,9 +2226,10 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
        } else {
          const target = distribution.binaryTarget!;
          command = yield* withInstallPermit(agent.id)(
 -          installBinary(agent, target).pipe(
-+          installBinary(agent, target, options?.instanceId).pipe(
-             Effect.tap(() => consumePreparedBinaryReservation(agent.id)),
-           ),
+-            Effect.tap(() => consumePreparedBinaryReservation(agent.id)),
+-          ),
++          installBinary(agent, target, {
++            ...(options?.instanceId ? { instanceId: options.instanceId } : {}),
++            allowInstall: Option.isNone(consentGate),
++          }).pipe(Effect.tap(() => consumePreparedBinaryReservation(agent.id))),
          );
-@@ -2040,6 +2250,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+         args = distribution.args;
+       }
+@@ -2037,11 +2348,109 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+         }),
+       );
+ 
++  const uninstallManagedAgent: NonNullable<AcpRegistryCatalog["Service"]["uninstallManagedAgent"]> = (
++    input,
++  ) =>
++    hostSettings
++      .withSnapshot((settings) =>
++        withInstallPermit(input.agentId)(
++          Effect.gen(function* () {
++            const safeAgentId = yield* decodeBoundedAgentId(input.agentId).pipe(
++              Effect.mapError(
++                (cause) =>
++                  new AcpRegistryError({
++                    reason: "install_failed",
++                    detail: "ACP Registry managed agent uninstall received an invalid agent ID.",
++                    cause,
++                  }),
++              ),
++            );
++            const blockedByInstanceIds: Array<string> = [];
++            for (const [candidateId, instance] of Object.entries(settings.providerInstances)) {
++              if (input.ignoreInstanceId && candidateId === input.ignoreInstanceId) continue;
++              if (
++                instance.driver !== "acpRegistry" ||
++                instance.enabled === false ||
++                instance.config === null ||
++                typeof instance.config !== "object"
++              ) {
++                continue;
++              }
++              const config = instance.config as Record<string, unknown>;
++              if (config.enabled === false) continue;
++              if (
++                config.source !== "local" &&
++                typeof config.agentId === "string" &&
++                config.agentId.trim() === safeAgentId &&
++                !(typeof config.commandPath === "string" && config.commandPath.trim().length > 0)
++              ) {
++                blockedByInstanceIds.push(candidateId);
++              }
++            }
++            if (blockedByInstanceIds.length > 0) {
++              return {
++                agentId: safeAgentId,
++                removed: false,
++                blockedByInstanceIds,
++              } satisfies AcpRegistryManagedAgentUninstallResult;
++            }
++            yield* consumePreparedBinaryReservation(safeAgentId);
++            const agentRoot = path.join(installsDirectory, safeAgentId);
++            let removed = false;
++            if (yield* fileSystem.exists(agentRoot).pipe(Effect.orElseSucceed(() => false))) {
++              yield* fileSystem.remove(agentRoot, { recursive: true, force: true }).pipe(
++                Effect.mapError(
++                  (cause) =>
++                    new AcpRegistryError({
++                      reason: "install_failed",
++                      detail: `Could not remove managed cache for ACP Registry agent ${safeAgentId}.`,
++                      cause,
++                    }),
++                ),
++              );
++              removed = true;
++            }
++            const receiptsDir = packageReceiptsDirectory;
++            if (yield* fileSystem.exists(receiptsDir).pipe(Effect.orElseSucceed(() => false))) {
++              const entries = yield* fileSystem
++                .readDirectory(receiptsDir)
++                .pipe(Effect.orElseSucceed((): Array<string> => []));
++              for (const entry of entries) {
++                if (entry.startsWith(`${safeAgentId}-`) && entry.endsWith(".json")) {
++                  yield* fileSystem
++                    .remove(path.join(receiptsDir, entry), { force: true })
++                    .pipe(Effect.ignore);
++                  removed = true;
++                }
++              }
++            }
++            return {
++              agentId: safeAgentId,
++              removed,
++              blockedByInstanceIds: [],
++            } satisfies AcpRegistryManagedAgentUninstallResult;
++          }),
++        ),
++      )
++      .pipe(
++        Effect.catchTags({
++          ServerSettingsError: (cause) =>
++            new AcpRegistryError({
++              reason: "install_failed",
++              detail:
++                "Could not read provider settings while checking managed ACP agent references.",
++              cause,
++            }),
++        }),
++      );
++
    return AcpRegistryCatalog.of({
      search,
      prepare,
@@ -1102,6 +2397,9 @@ index 05133475..6efb49ea 100644
      inspect,
      resolve,
      uninstallManagedBinary,
++    uninstallManagedAgent,
+   });
+ });
 diff --git a/packages/provider-acp-registry/src/server/adapter.ts b/packages/provider-acp-registry/src/server/adapter.ts
 index d730cbd5..e3ec48d1 100644
 --- a/packages/provider-acp-registry/src/server/adapter.ts
@@ -1203,42 +2501,3 @@ index c012f38d..1a6550d9 100644
        .pipe(Effect.mapError(AcpRegistrySupport.toAcpRegistryOperationError));
      const runtimeContext = yield* Layer.build(
        AcpSessionRuntime.layer({
-diff --git a/apps/web/src/components/chat/ComposerControlsBar.tsx b/apps/web/src/components/chat/ComposerControlsBar.tsx
-index 1f34def9..37ccf286 100644
---- a/apps/web/src/components/chat/ComposerControlsBar.tsx
-+++ b/apps/web/src/components/chat/ComposerControlsBar.tsx
-@@ -1,4 +1,3 @@
--import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
- import type { ChatComposerProps } from "./ChatComposer";
- import type { PromptUltrathink } from "./TraitsPicker";
- import type { ProviderInstanceEntry } from "../../providerInstances";
-@@ -149,7 +148,6 @@ export function ComposerControlsBar(props: {
-   });
-   const controlSize = composerControlsCollapsed ? "xs" : "sm";
-   const gt = useGT();
--  const developerFeatures = useDesktopDeveloperFeatures();
-   const m = useMessages();
-   const applyThreadModelPick = useApplyThreadModelPick();
-   const applyRouteThreadModelPick = useStableCallback(() => applyThreadModelPick(routeThreadRef));
-@@ -254,7 +252,7 @@ export function ComposerControlsBar(props: {
-   return showProviderUnavailable ? (
-     <ComposerControl
-       type="button"
--      disabled={!developerFeatures || !providerSetupInstanceId}
-+      disabled={!providerSetupInstanceId}
-       onClick={() => {
-         if (providerSetupInstanceId) {
-           onOpenProviderSetup(providerSetupInstanceId);
-@@ -264,11 +262,7 @@ export function ComposerControlsBar(props: {
-       className="shrink-0"
-     >
-       <CircleAlertIcon className="size-4" />
--      {!developerFeatures
--        ? gt("Assistant unavailable")
--        : providerSetupInstanceId
--          ? gt("Open provider settings")
--          : gt("No provider available")}
-+      {providerSetupInstanceId ? gt("Open provider settings") : gt("No provider available")}
-     </ComposerControl>
-   ) : (
-     <>

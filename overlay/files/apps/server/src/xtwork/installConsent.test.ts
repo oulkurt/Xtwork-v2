@@ -89,6 +89,79 @@ describe("InstallConsentStore", () => {
     expect(store.listConsents()).toEqual([]);
   });
 
+  it("fails closed on wrong schema version or any malformed row in the consent file (S2)", () => {
+    const dataDir = makeTempDir();
+    const filePath = installConsentsFilePath(dataDir);
+    const validKey: InstallConsentKey = {
+      instanceId: "xtworkKimiCode",
+      source: "acp-registry",
+      version: "1.0.0",
+      distribution: "npx",
+      installDir: NodePath.join(dataDir, "tools", "kimi-code", "1.0.0", "npm"),
+    };
+    NodeFs.mkdirSync(NodePath.dirname(filePath), { recursive: true });
+
+    // Wrong schema version MUST reject valid rows inside.
+    NodeFs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        version: 2,
+        consents: [{ key: validKey, grantedAt: "2026-01-01T00:00:00.000Z" }],
+      }),
+      "utf8",
+    );
+    const store = new InstallConsentStore(dataDir);
+    expect(store.hasConsent(validKey)).toBe(false);
+    expect(store.listConsents()).toEqual([]);
+
+    // Any malformed row alongside a valid row MUST fail closed for the whole document.
+    NodeFs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        consents: [
+          { key: validKey, grantedAt: "2026-01-01T00:00:00.000Z" },
+          { key: { instanceId: "" }, grantedAt: "2026-01-01T00:00:00.000Z" },
+        ],
+      }),
+      "utf8",
+    );
+    expect(store.hasConsent(validKey)).toBe(false);
+    expect(store.listConsents()).toEqual([]);
+  });
+
+  it("enforces single-use approval tokens bound to exact pinned artifactSpec & digest (M3/M4)", () => {
+    const dataDir = makeTempDir();
+    const store = new InstallConsentStore(dataDir);
+    const key: InstallConsentKey = {
+      instanceId: "xtworkDeepseekHarness",
+      source: "npm-managed",
+      version: "0.4.2",
+      distribution: "npm",
+      installDir: NodePath.join(dataDir, "tools", "deepseek-harness"),
+      artifactSpec: "@deepseek-ai/dsh@0.4.2",
+      artifactDigest: "a".repeat(64),
+    };
+
+    // Persisted consent alone does NOT satisfy single-use consumeApproval.
+    store.grantConsent(key);
+    expect(store.hasConsent(key)).toBe(true);
+    expect(store.consumeApproval(key)).toBe(false);
+
+    // Mismatched artifactSpec or digest fails consent & approval.
+    expect(store.hasConsent({ ...key, artifactSpec: "@deepseek-ai/dsh@0.4.3" })).toBe(false);
+    expect(store.hasConsent({ ...key, artifactDigest: "b".repeat(64) })).toBe(false);
+
+    const token = store.issueApproval(key);
+    expect(store.consumeApproval({ ...key, artifactSpec: "@deepseek-ai/dsh@0.4.3" }, token)).toBe(
+      false,
+    );
+    // Exact key + token succeeds ONCE, then cannot be reused.
+    expect(store.consumeApproval(key, token)).toBe(true);
+    expect(store.consumeApproval(key, token)).toBe(false);
+    expect(store.consumeApproval(key)).toBe(false);
+  });
+
   it("revokes individual keys and all consents for an instance", () => {
     const dataDir = makeTempDir();
     const store = new InstallConsentStore(dataDir);

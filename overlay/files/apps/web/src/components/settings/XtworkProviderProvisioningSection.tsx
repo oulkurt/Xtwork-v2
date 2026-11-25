@@ -47,6 +47,8 @@ interface InstallConsentKey {
   readonly version: string;
   readonly distribution: string;
   readonly installDir: string;
+  readonly artifactSpec?: string;
+  readonly artifactDigest?: string;
 }
 
 interface ProvisionPlanOption {
@@ -64,6 +66,8 @@ interface ProvisionPlanOption {
   readonly consentKey: InstallConsentKey;
   readonly availableVersion: string | null;
   readonly distribution: string;
+  readonly installable: boolean;
+  readonly unavailableReason?: string;
 }
 
 interface ProviderProvisionState {
@@ -103,6 +107,7 @@ interface ProviderInstallPlan {
   readonly uninstallSemantics: "app-managed" | "vendor-managed";
   readonly uninstallGuidance: string;
   readonly uninstallGuidanceZh: string;
+  readonly vendorInstallBlockedByExistingPath?: boolean;
   readonly state: ProviderProvisionState;
 }
 
@@ -293,6 +298,12 @@ export function XtworkProviderProvisioningSection({
           version: plan.selectedOption.consentKey.version,
           distribution: plan.selectedOption.consentKey.distribution,
           installDir: plan.selectedOption.consentKey.installDir,
+          ...(plan.selectedOption.consentKey.artifactSpec
+            ? { artifactSpec: plan.selectedOption.consentKey.artifactSpec }
+            : {}),
+          ...(plan.selectedOption.consentKey.artifactDigest
+            ? { artifactDigest: plan.selectedOption.consentKey.artifactDigest }
+            : {}),
         },
       });
       setConfirmOpen(false);
@@ -413,7 +424,14 @@ export function XtworkProviderProvisioningSection({
                   type="button"
                   size="sm"
                   variant={installed && !plan?.updateAvailable ? "outline" : "default"}
-                  disabled={readOnly || loading || busy || !plan}
+                  disabled={
+                    readOnly ||
+                    loading ||
+                    busy ||
+                    !plan ||
+                    Boolean(plan.vendorInstallBlockedByExistingPath) ||
+                    plan.selectedOption.installable === false
+                  }
                   onClick={() => setConfirmOpen(true)}
                 >
                   {plan?.updateAvailable ? (
@@ -461,6 +479,12 @@ export function XtworkProviderProvisioningSection({
                 {plan.existingDetection.executablePath}
               </code>
             </div>
+          ) : null}
+
+          {plan?.selectedOption.unavailableReason ? (
+            <p className="text-muted-foreground leading-relaxed">
+              {plan.selectedOption.unavailableReason}
+            </p>
           ) : null}
 
           {plan && !plan.canUninstall && plan.existingDetection.source !== "none" ? (

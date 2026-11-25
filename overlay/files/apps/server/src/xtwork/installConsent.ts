@@ -3,9 +3,11 @@ import * as AcpRegistrySupport from "@t3tools/provider-acp-registry/server/AcpRe
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFs from "node:fs";
 import * as NodePath from "node:path";
 import * as ServerConfig from "../config.ts";
+import * as CodexInstallation from "../provider/CodexInstallation.ts";
 
 export interface InstallConsentKey {
   readonly instanceId: string;
@@ -13,6 +15,10 @@ export interface InstallConsentKey {
   readonly version: string;
   readonly distribution: string;
   readonly installDir: string;
+  /** Exact pinned artifact identifier (e.g. `@scope/pkg@1.2.3` or release/archive URL). */
+  readonly artifactSpec?: string | undefined;
+  /** Optional cryptographic digest (e.g. lowercase SHA-256 hex) pinned at confirmation time. */
+  readonly artifactDigest?: string | undefined;
 }
 
 export interface InstallConsentRecord {
@@ -27,6 +33,12 @@ interface PersistedConsentFile {
   readonly consents: ReadonlyArray<InstallConsentRecord>;
 }
 
+interface SingleUseApproval {
+  readonly token: string;
+  readonly key: InstallConsentKey;
+  readonly issuedAt: number;
+}
+
 function normalizeInstallDir(installDir: string): string {
   const trimmed = installDir.trim();
   if (trimmed.length === 0) return "";
@@ -35,12 +47,16 @@ function normalizeInstallDir(installDir: string): string {
 }
 
 export function normalizeInstallConsentKey(key: InstallConsentKey): InstallConsentKey {
+  const artifactSpec = key.artifactSpec?.trim();
+  const artifactDigest = key.artifactDigest?.trim().toLowerCase();
   const normalized: InstallConsentKey = {
     instanceId: key.instanceId.trim(),
     source: key.source.trim(),
     version: key.version.trim(),
     distribution: key.distribution.trim(),
     installDir: normalizeInstallDir(key.installDir),
+    ...(artifactSpec ? { artifactSpec } : {}),
+    ...(artifactDigest ? { artifactDigest } : {}),
   };
   if (
     !normalized.instanceId ||
@@ -65,7 +81,9 @@ export function installConsentKeysEqual(
     left.source === right.source &&
     left.version === right.version &&
     left.distribution === right.distribution &&
-    left.installDir === right.installDir
+    left.installDir === right.installDir &&
+    (left.artifactSpec ?? "") === (right.artifactSpec ?? "") &&
+    (left.artifactDigest ?? "") === (right.artifactDigest ?? "")
   );
 }
 
@@ -73,28 +91,49 @@ export function installConsentsFilePath(dataDir: string): string {
   return NodePath.join(dataDir, "tools", "install-consents.json");
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function isValidConsentRecord(value: unknown): value is InstallConsentRecord {
-  if (value === null || typeof value !== "object") return false;
-  const candidate = value as Record<string, unknown>;
-  if (typeof candidate.grantedAt !== "string") return false;
-  if (candidate.key === null || typeof candidate.key !== "object") return false;
-  const key = candidate.key as Record<string, unknown>;
-  return (
-    typeof key.instanceId === "string" &&
-    key.instanceId.trim().length > 0 &&
-    typeof key.source === "string" &&
-    key.source.trim().length > 0 &&
-    typeof key.version === "string" &&
-    key.version.trim().length > 0 &&
-    typeof key.distribution === "string" &&
-    key.distribution.trim().length > 0 &&
-    typeof key.installDir === "string" &&
-    key.installDir.trim().length > 0
-  );
+  if (!isPlainObject(value)) return false;
+  if (typeof value.grantedAt !== "string" || value.grantedAt.trim().length === 0) return false;
+  if (value.commandPreview !== undefined && typeof value.commandPreview !== "string") return false;
+  if (value.officialSource !== undefined && typeof value.officialSource !== "string") return false;
+  if (!isPlainObject(value.key)) return false;
+  const key = value.key;
+  if (
+    typeof key.instanceId !== "string" ||
+    key.instanceId.trim().length === 0 ||
+    typeof key.source !== "string" ||
+    key.source.trim().length === 0 ||
+    typeof key.version !== "string" ||
+    key.version.trim().length === 0 ||
+    typeof key.distribution !== "string" ||
+    key.distribution.trim().length === 0 ||
+    typeof key.installDir !== "string" ||
+    key.installDir.trim().length === 0
+  ) {
+    return false;
+  }
+  if (
+    key.artifactSpec !== undefined &&
+    (typeof key.artifactSpec !== "string" || key.artifactSpec.trim().length === 0)
+  ) {
+    return false;
+  }
+  if (
+    key.artifactDigest !== undefined &&
+    (typeof key.artifactDigest !== "string" || key.artifactDigest.trim().length === 0)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export class InstallConsentStore {
   readonly filePath: string;
+  private readonly singleUseApprovals = new Map<string, SingleUseApproval>();
 
   constructor(dataDir: string) {
     this.filePath = installConsentsFilePath(dataDir);
@@ -104,12 +143,22 @@ export class InstallConsentStore {
     if (!NodeFs.existsSync(this.filePath)) return [];
     try {
       const raw = NodeFs.readFileSync(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<PersistedConsentFile> | null;
-      if (!parsed || !Array.isArray(parsed.consents)) return [];
-      return parsed.consents.filter(isValidConsentRecord).map((record) => ({
-        ...record,
-        key: normalizeInstallConsentKey(record.key),
-      }));
+      const parsed: unknown = JSON.parse(raw);
+      // Fail closed on any schema violation across the entire document (S2).
+      if (!isPlainObject(parsed)) return [];
+      if (parsed.version !== 1) return [];
+      if (!Array.isArray(parsed.consents)) return [];
+      const validated: Array<InstallConsentRecord> = [];
+      for (const entry of parsed.consents) {
+        if (!isValidConsentRecord(entry)) {
+          return [];
+        }
+        validated.push({
+          ...entry,
+          key: normalizeInstallConsentKey(entry.key),
+        });
+      }
+      return validated;
     } catch {
       // Fail closed: corrupted or unreadable consent file grants nothing.
       return [];
@@ -164,12 +213,65 @@ export class InstallConsentStore {
     return record;
   }
 
+  /**
+   * Issues an in-memory single-use approval token bound to the exact normalized
+   * install key. Must be consumed once by the downloader/installer (`prepare` or
+   * `CodexInstallation.start`) so prior consents can never authorize a silent
+   * re-download after cancellation or cache loss (M2, M3).
+   */
+  issueApproval(rawKey: InstallConsentKey): string {
+    const key = normalizeInstallConsentKey(rawKey);
+    const token = NodeCrypto.randomUUID();
+    this.singleUseApprovals.set(token, { token, key, issuedAt: Date.now() });
+    return token;
+  }
+
+  /**
+   * Atomically verifies and consumes a matching single-use approval.
+   * When `approvalToken` is provided, only that exact token may be consumed.
+   * Returns `false` if absent, mismatched, or already consumed.
+   */
+  consumeApproval(rawKey: InstallConsentKey, approvalToken?: string): boolean {
+    let key: InstallConsentKey;
+    try {
+      key = normalizeInstallConsentKey(rawKey);
+    } catch {
+      return false;
+    }
+    if (approvalToken !== undefined) {
+      const trimmed = approvalToken.trim();
+      if (!trimmed) return false;
+      const entry = this.singleUseApprovals.get(trimmed);
+      if (!entry || !installConsentKeysEqual(entry.key, key)) {
+        return false;
+      }
+      this.singleUseApprovals.delete(trimmed);
+      return true;
+    }
+    for (const [token, entry] of this.singleUseApprovals) {
+      if (installConsentKeysEqual(entry.key, key)) {
+        this.singleUseApprovals.delete(token);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  revokeApproval(approvalToken: string): boolean {
+    return this.singleUseApprovals.delete(approvalToken);
+  }
+
   revokeConsent(rawKey: InstallConsentKey): boolean {
     let key: InstallConsentKey;
     try {
       key = normalizeInstallConsentKey(rawKey);
     } catch {
       return false;
+    }
+    for (const [token, entry] of this.singleUseApprovals) {
+      if (installConsentKeysEqual(entry.key, key)) {
+        this.singleUseApprovals.delete(token);
+      }
     }
     const current = this.readAll();
     const next = current.filter((item) => !installConsentKeysEqual(item.key, key));
@@ -181,6 +283,11 @@ export class InstallConsentStore {
   revokeConsentForInstance(instanceId: string): number {
     const normalized = instanceId.trim();
     if (!normalized) return 0;
+    for (const [token, entry] of this.singleUseApprovals) {
+      if (entry.key.instanceId === normalized) {
+        this.singleUseApprovals.delete(token);
+      }
+    }
     const current = this.readAll();
     const next = current.filter((item) => item.key.instanceId !== normalized);
     const removed = current.length - next.length;
@@ -197,6 +304,12 @@ export interface XtworkInstallConsentService {
     key: InstallConsentKey,
     metadata?: { readonly commandPreview?: string; readonly officialSource?: string },
   ) => Effect.Effect<InstallConsentRecord>;
+  readonly issueApproval: (key: InstallConsentKey) => Effect.Effect<string>;
+  readonly consumeApproval: (
+    key: InstallConsentKey,
+    approvalToken?: string,
+  ) => Effect.Effect<boolean>;
+  readonly revokeApproval: (approvalToken: string) => Effect.Effect<boolean>;
   readonly revokeConsent: (key: InstallConsentKey) => Effect.Effect<boolean>;
   readonly revokeConsentForInstance: (instanceId: string) => Effect.Effect<number>;
 }
@@ -213,6 +326,10 @@ export function makeXtworkInstallConsentService(dataDir: string): XtworkInstallC
     listConsents: () => Effect.sync(() => store.listConsents()),
     hasConsent: (key) => Effect.sync(() => store.hasConsent(key)),
     grantConsent: (key, metadata) => Effect.sync(() => store.grantConsent(key, metadata)),
+    issueApproval: (key) => Effect.sync(() => store.issueApproval(key)),
+    consumeApproval: (key, approvalToken) =>
+      Effect.sync(() => store.consumeApproval(key, approvalToken)),
+    revokeApproval: (approvalToken) => Effect.sync(() => store.revokeApproval(approvalToken)),
     revokeConsent: (key) => Effect.sync(() => store.revokeConsent(key)),
     revokeConsentForInstance: (instanceId) =>
       Effect.sync(() => store.revokeConsentForInstance(instanceId)),
@@ -232,6 +349,18 @@ export const acpConsentGateLayer = Layer.effect(
   Effect.map(XtworkInstallConsent, (consent) =>
     AcpRegistrySupport.AcpInstallConsentGate.of({
       hasConsent: (key) => consent.hasConsent(key),
+      consumePrepareApproval: (key, approvalToken) =>
+        consent.consumeApproval(key, approvalToken),
+    }),
+  ),
+);
+
+export const codexConsentGateLayer = Layer.effect(
+  CodexInstallation.CodexInstallConsentGate,
+  Effect.map(XtworkInstallConsent, (consent) =>
+    CodexInstallation.CodexInstallConsentGate.of({
+      consumeInstallApproval: (key, approvalToken) =>
+        consent.consumeApproval(key, approvalToken),
     }),
   ),
 );

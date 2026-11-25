@@ -22,6 +22,7 @@ import { Headers, HttpRouter, HttpServerRequest, HttpServerResponse } from "effe
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFs from "node:fs";
+import * as NodeHttps from "node:https";
 import * as NodeOs from "node:os";
 import * as NodePath from "node:path";
 import { EnvironmentAuth, parseBearerToken } from "../auth/EnvironmentAuth.ts";
@@ -86,6 +87,9 @@ export interface ProvisionPlanOption {
   readonly consentKey: InstallConsentKey;
   readonly availableVersion: string | null;
   readonly distribution: string;
+  /** True when exact version/artifact resolution succeeded and the option can be installed. */
+  readonly installable: boolean;
+  readonly unavailableReason?: string | undefined;
 }
 
 export interface ProviderProvisionState {
@@ -120,6 +124,7 @@ export interface ProviderInstallPlan {
   readonly uninstallSemantics: "app-managed" | "vendor-managed";
   readonly uninstallGuidance: string;
   readonly uninstallGuidanceZh: string;
+  readonly vendorInstallBlockedByExistingPath: boolean;
   readonly state: ProviderProvisionState;
 }
 
@@ -129,6 +134,8 @@ export interface ProvisionInstallConsentPayload {
   readonly version: string;
   readonly distribution: string;
   readonly installDir: string;
+  readonly artifactSpec?: string | undefined;
+  readonly artifactDigest?: string | undefined;
 }
 
 export interface ProvisionInstallRequest {
@@ -165,16 +172,34 @@ export type ProvisionCommandRunner = (input: {
   readonly env: NodeJS.ProcessEnv;
   readonly cwd?: string;
   readonly onOutput: (chunk: string) => void;
+  readonly onStdout?: (chunk: string) => void;
+  readonly onStderr?: (chunk: string) => void;
 }) => SpawnedCommandHandle;
 
 export type ProvisionVersionProber = (
   executablePath: string,
   env: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
 ) => Promise<string | null>;
+
+export type ProvisionNpmVersionResolver = (
+  packageName: string,
+  env: NodeJS.ProcessEnv,
+) => Promise<string | null>;
+
+export type ProvisionAcpVerifier = (input: {
+  readonly executablePath: string;
+  readonly args: ReadonlyArray<string>;
+  readonly env: NodeJS.ProcessEnv;
+  readonly signal?: AbortSignal;
+}) => Promise<{ readonly ok: boolean; readonly version?: string | null; readonly error?: string }>;
 
 const MAX_LOG_LINES = 300;
 const MAX_LOG_LINE_CHARS = 400;
+const MAX_LINE_BUFFER_CHARS = 16 * 1024;
+const NPM_VERSION_CACHE_TTL_MS = 60_000;
 const VENDOR_GLOBAL_INSTALL_DIR = "vendor-global";
+const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
 
 const ANSI_ESCAPE_PATTERN =
   // eslint-disable-next-line no-control-regex
@@ -182,8 +207,14 @@ const ANSI_ESCAPE_PATTERN =
 const SECRET_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\b(sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_KEY]"],
   [/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]"],
-  [/\b((?:ANTHROPIC|OPENAI|DEEPSEEK|KIMI|API)[A-Z0-9_]*(?:KEY|TOKEN|SECRET)\s*=\s*)\S+/gi, "$1[REDACTED]"],
-  [/\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)\s*[=:]\s*)\S+/gi, "$1[REDACTED]"],
+  [
+    /\b((?:ANTHROPIC|OPENAI|DEEPSEEK|KIMI|API)[A-Z0-9_]*(?:KEY|TOKEN|SECRET)\s*=\s*)\S+/gi,
+    "$1[REDACTED]",
+  ],
+  [
+    /\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)\s*[=:]\s*)\S+/gi,
+    "$1[REDACTED]",
+  ],
 ];
 
 export function sanitizeProvisionLogLine(raw: string): string {
@@ -197,9 +228,79 @@ export function sanitizeProvisionLogLine(raw: string): string {
   return clean;
 }
 
+/**
+ * Bounded per-stream line buffer that defers secret redaction until complete lines
+ * arrive (or the stream flushes), preventing credentials split across chunk
+ * boundaries from leaking into status logs (S5).
+ */
+export interface RedactingLineBuffer {
+  readonly push: (chunk: string) => void;
+  readonly flush: () => void;
+}
+
+export function createRedactingLineBuffer(
+  onCleanLine: (line: string) => void,
+  maxBufferChars = MAX_LINE_BUFFER_CHARS,
+): RedactingLineBuffer {
+  let pending = "";
+
+  const emitLine = (rawLine: string) => {
+    const clean = sanitizeProvisionLogLine(rawLine);
+    if (clean.length > 0) {
+      onCleanLine(clean);
+    }
+  };
+
+  return {
+    push: (chunk: string) => {
+      if (!chunk) return;
+      pending += chunk;
+      let newlineIdx = pending.indexOf("\n");
+      while (newlineIdx !== -1) {
+        const line = pending.slice(0, newlineIdx);
+        pending = pending.slice(newlineIdx + 1);
+        emitLine(line);
+        newlineIdx = pending.indexOf("\n");
+      }
+      if (pending.length > maxBufferChars) {
+        emitLine(pending);
+        pending = "";
+      }
+    },
+    flush: () => {
+      if (pending.length > 0) {
+        emitLine(pending);
+        pending = "";
+      }
+    },
+  };
+}
+
 export function extractVersionString(output: string): string | null {
   const match = /\bv?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/.exec(output);
   return match?.[1] ?? null;
+}
+
+/**
+ * Builds a hardened POSIX installer command using HTTPS-only curl (`--proto '=https'`
+ * and `--proto-redir '=https'`) downloading to a temp file before executing with bash,
+ * so partial downloads or HTTP downgrades are never executed (M1).
+ */
+export function buildHardenedPosixInstallerCommand(httpsUrl: string): string {
+  const trimmed = httpsUrl.trim();
+  if (!trimmed.startsWith("https://")) {
+    throw new Error(`Vendor installer URL must use https:// (got '${trimmed}')`);
+  }
+  if (/[\s'"`$;|&<>\\\n\r]/u.test(trimmed)) {
+    throw new Error(`Vendor installer URL contains unsafe characters: '${trimmed}'`);
+  }
+  return [
+    "set -euo pipefail",
+    'tmp="$(mktemp -t xtwork-install.XXXXXX.sh)"',
+    `trap 'rm -f "$tmp"' EXIT`,
+    `curl --proto '=https' --proto-redir '=https' -fsSL '${trimmed}' -o "$tmp"`,
+    'bash "$tmp"',
+  ].join("\n");
 }
 
 function isExecutableFile(filePath: string): boolean {
@@ -238,9 +339,7 @@ export function findExecutableInPath(
   excludedDirs: ReadonlyArray<string>,
 ): string | null {
   const rawPath =
-    platform === "win32"
-      ? (env.PATH ?? env.Path ?? env.path ?? "")
-      : (env.PATH ?? "");
+    platform === "win32" ? (env.PATH ?? env.Path ?? env.path ?? "") : (env.PATH ?? "");
   const home = env.HOME?.trim() || NodeOs.homedir();
   const extraDirs =
     platform === "win32"
@@ -252,13 +351,9 @@ export function findExecutableInPath(
             ? []
             : ["/opt/homebrew/bin", "/usr/local/bin"]),
         ];
-  const dirs = [
-    ...rawPath.split(NodePath.delimiter).filter(Boolean),
-    ...extraDirs,
-  ];
+  const dirs = [...rawPath.split(NodePath.delimiter).filter(Boolean), ...extraDirs];
   const seen = new Set<string>();
-  const extensions =
-    platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
+  const extensions = platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
 
   for (const rawDir of dirs) {
     const dir = NodePath.resolve(rawDir);
@@ -281,12 +376,16 @@ export function findExecutableInPath(
   return null;
 }
 
-const defaultVersionProber: ProvisionVersionProber = (executablePath, env) =>
+const defaultVersionProber: ProvisionVersionProber = (executablePath, env, signal) =>
   new Promise((resolve) => {
-    NodeChildProcess.execFile(
+    if (signal?.aborted) {
+      resolve(null);
+      return;
+    }
+    const child = NodeChildProcess.execFile(
       executablePath,
       ["--version"],
-      { env, timeout: 5_000, maxBuffer: 64 * 1024 },
+      { env, timeout: 5_000, maxBuffer: 64 * 1024, ...(signal ? { signal } : {}) },
       (error, stdout, stderr) => {
         if (error) {
           resolve(null);
@@ -295,9 +394,239 @@ const defaultVersionProber: ProvisionVersionProber = (executablePath, env) =>
         resolve(extractVersionString(`${stdout}\n${stderr}`));
       },
     );
+    if (signal) {
+      const onAbort = () => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // ignore
+        }
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      child.once("close", () => signal.removeEventListener("abort", onAbort));
+    }
   });
 
-const defaultCommandRunner: ProvisionCommandRunner = ({ command, args, env, cwd, onOutput }) => {
+const defaultNpmVersionResolver: ProvisionNpmVersionResolver = async (packageName, env) => {
+  const npmPath = resolveBundledNpm(env, process.platform);
+  if (npmPath) {
+    const fromCli = await new Promise<string | null>((resolve) => {
+      NodeChildProcess.execFile(
+        npmPath,
+        ["view", packageName, "version", "--json"],
+        { env, timeout: 8_000, maxBuffer: 64 * 1024 },
+        (error, stdout) => {
+          if (error) {
+            resolve(null);
+            return;
+          }
+          const raw = stdout.trim();
+          try {
+            const parsed = JSON.parse(raw) as unknown;
+            if (typeof parsed === "string" && SEMVER_PATTERN.test(parsed.trim())) {
+              resolve(parsed.trim());
+              return;
+            }
+          } catch {
+            if (SEMVER_PATTERN.test(raw)) {
+              resolve(raw);
+              return;
+            }
+          }
+          resolve(null);
+        },
+      );
+    });
+    if (fromCli) return fromCli;
+  }
+  const fromRegistry = await new Promise<string | null>((resolve) => {
+    const encoded = packageName.startsWith("@")
+      ? `@${encodeURIComponent(packageName.slice(1))}`
+      : encodeURIComponent(packageName);
+    let settled = false;
+    const finish = (value: string | null) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const req = NodeHttps.get(
+      `https://registry.npmjs.org/${encoded}/latest`,
+      {
+        headers: { accept: "application/json" },
+        timeout: 8_000,
+      },
+      (res) => {
+        if ((res.statusCode ?? 0) < 200 || (res.statusCode ?? 0) >= 300) {
+          res.resume();
+          finish(null);
+          return;
+        }
+        const chunks: Array<Buffer> = [];
+        let totalBytes = 0;
+        res.on("data", (chunk: Buffer) => {
+          totalBytes += chunk.length;
+          if (totalBytes <= 256 * 1024) {
+            chunks.push(chunk);
+          }
+        });
+        res.on("end", () => {
+          try {
+            const data = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+              version?: unknown;
+            };
+            if (typeof data.version === "string" && SEMVER_PATTERN.test(data.version.trim())) {
+              finish(data.version.trim());
+              return;
+            }
+          } catch {
+            // malformed JSON
+          }
+          finish(null);
+        });
+        res.on("error", () => finish(null));
+      },
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      finish(null);
+    });
+    req.on("error", () => finish(null));
+  });
+  return fromRegistry;
+};
+
+function createOperationAbortController(): AbortController {
+  return new AbortController();
+}
+
+const defaultAcpVerifier: ProvisionAcpVerifier = ({ executablePath, args, env, signal }) =>
+  new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve({ ok: false, error: "Verification cancelled." });
+      return;
+    }
+    const detached = process.platform !== "win32";
+    let settled = false;
+    const child = NodeChildProcess.spawn(executablePath, [...args], {
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+      detached,
+    });
+
+    const killChild = () => {
+      try {
+        if (detached && child.pid) {
+          process.kill(-child.pid, "SIGKILL");
+        } else {
+          child.kill("SIGKILL");
+        }
+      } catch {
+        // already exited
+      }
+    };
+
+    const finish = (outcome: { readonly ok: boolean; readonly version?: string | null; readonly error?: string }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      killChild();
+      resolve(outcome);
+    };
+
+    const onAbort = () => finish({ ok: false, error: "Verification cancelled." });
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    const timer = setTimeout(() => {
+      finish({ ok: false, error: `ACP initialize verification timed out for '${executablePath}'.` });
+    }, 8_000);
+    timer.unref?.();
+
+    let stdoutBuf = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdoutBuf += chunk.toString("utf8");
+      if (stdoutBuf.length > 128 * 1024) {
+        stdoutBuf = stdoutBuf.slice(-64 * 1024);
+      }
+      let nl = stdoutBuf.indexOf("\n");
+      while (nl !== -1) {
+        const line = stdoutBuf.slice(0, nl).trim();
+        stdoutBuf = stdoutBuf.slice(nl + 1);
+        if (line.startsWith("{")) {
+          try {
+            const msg = JSON.parse(line) as {
+              id?: unknown;
+              result?: { agentInfo?: { version?: unknown } };
+              error?: { message?: unknown };
+            };
+            if (msg.id === 1) {
+              if (msg.result && typeof msg.result === "object") {
+                const agentVersion =
+                  typeof msg.result.agentInfo?.version === "string"
+                    ? msg.result.agentInfo.version
+                    : null;
+                finish({ ok: true, version: agentVersion });
+                return;
+              }
+              if (msg.error) {
+                finish({
+                  ok: false,
+                  error:
+                    typeof msg.error.message === "string"
+                      ? msg.error.message
+                      : "ACP initialize returned an error.",
+                });
+                return;
+              }
+            }
+          } catch {
+            // ignore non-JSON banner lines
+          }
+        }
+        nl = stdoutBuf.indexOf("\n");
+      }
+    });
+
+    child.on("error", (error) => {
+      finish({
+        ok: false,
+        error: error instanceof Error ? error.message : "Failed to spawn ACP executable.",
+      });
+    });
+    child.on("close", (code) => {
+      finish({
+        ok: false,
+        error: `ACP executable exited with code ${code ?? 1} before completing initialize.`,
+      });
+    });
+
+    try {
+      child.stdin?.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: 1,
+            clientCapabilities: {},
+            clientInfo: { name: "xtwork-provisioner", version: "1.0.0" },
+          },
+        })}\n`,
+      );
+    } catch {
+      finish({ ok: false, error: "Could not write ACP initialize request." });
+    }
+  });
+
+const defaultCommandRunner: ProvisionCommandRunner = ({
+  command,
+  args,
+  env,
+  cwd,
+  onOutput,
+  onStdout,
+  onStderr,
+}) => {
   const detached = process.platform !== "win32";
   const child = NodeChildProcess.spawn(command, [...args], {
     env,
@@ -306,11 +635,16 @@ const defaultCommandRunner: ProvisionCommandRunner = ({ command, args, env, cwd,
     detached,
   });
 
-  const handleChunk = (chunk: Buffer) => {
-    onOutput(chunk.toString("utf8"));
-  };
-  child.stdout?.on("data", handleChunk);
-  child.stderr?.on("data", handleChunk);
+  child.stdout?.on("data", (chunk: Buffer) => {
+    const text = chunk.toString("utf8");
+    if (onStdout) onStdout(text);
+    else onOutput(text);
+  });
+  child.stderr?.on("data", (chunk: Buffer) => {
+    const text = chunk.toString("utf8");
+    if (onStderr) onStderr(text);
+    else onOutput(text);
+  });
 
   let cancelled = false;
   let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
@@ -341,18 +675,19 @@ const defaultCommandRunner: ProvisionCommandRunner = ({ command, args, env, cwd,
     forceKillTimer.unref?.();
   };
 
-  const promise = new Promise<{ readonly exitCode: number; readonly signal: NodeJS.Signals | null }>(
-    (resolve, reject) => {
-      child.on("error", (error) => {
-        if (forceKillTimer) clearTimeout(forceKillTimer);
-        reject(error);
-      });
-      child.on("close", (code, signal) => {
-        if (forceKillTimer) clearTimeout(forceKillTimer);
-        resolve({ exitCode: code ?? (signal ? 1 : 0), signal });
-      });
-    },
-  );
+  const promise = new Promise<{
+    readonly exitCode: number;
+    readonly signal: NodeJS.Signals | null;
+  }>((resolve, reject) => {
+    child.on("error", (error) => {
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      reject(error);
+    });
+    child.on("close", (code, signal) => {
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      resolve({ exitCode: code ?? (signal ? 1 : 0), signal });
+    });
+  });
 
   return { promise, cancel };
 };
@@ -366,7 +701,7 @@ function readReceipts(baseDir: string): Array<ProvisionerReceipt> {
   if (!NodeFs.existsSync(file)) return [];
   try {
     const parsed = JSON.parse(NodeFs.readFileSync(file, "utf8")) as Partial<PersistedReceiptsFile>;
-    if (!parsed || !Array.isArray(parsed.receipts)) return [];
+    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.receipts)) return [];
     return parsed.receipts.filter(
       (item): item is ProvisionerReceipt =>
         item !== null &&
@@ -436,6 +771,12 @@ function configString(config: unknown, key: string): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function isInstanceEnabled(instance: ProviderInstanceConfig): boolean {
+  if (instance.enabled === false) return false;
+  if (isObjectRecord(instance.config) && instance.config.enabled === false) return false;
+  return true;
+}
+
 export function resolveProvisionAgentKind(
   instanceId: string,
   instance: ProviderInstanceConfig | undefined,
@@ -467,48 +808,51 @@ export function resolveProvisionAgentKind(
   return null;
 }
 
+interface VendorScriptMeta {
+  readonly displayName: string;
+  readonly cliBinary: string;
+  readonly acpArgs: ReadonlyArray<string>;
+  readonly posixScriptUrl: string;
+  readonly windowsScriptUrl: string;
+  readonly vendorUninstallGuidance: string;
+  readonly vendorUninstallGuidanceZh: string;
+}
+
 const ACP_REGISTRY_AGENT_META: Readonly<
-  Record<
-    "kimi-code" | "qoder" | "codebuddy-code",
-    {
-      readonly displayName: string;
-      readonly cliBinary: string;
-      readonly officialScriptCommand: string;
-      readonly officialScriptUrl: string;
-      readonly vendorUninstallGuidance: string;
-      readonly vendorUninstallGuidanceZh: string;
-    }
-  >
+  Record<"kimi-code" | "qoder" | "codebuddy-code", VendorScriptMeta>
 > = {
   "kimi-code": {
     displayName: "Kimi Code",
     cliBinary: "kimi",
-    officialScriptCommand: "curl -L code.kimi.com/install.sh | bash",
-    officialScriptUrl: "https://code.kimi.com/install.sh",
+    acpArgs: ["acp"],
+    posixScriptUrl: "https://code.kimi.com/install.sh",
+    windowsScriptUrl: "https://code.kimi.com/install.ps1",
     vendorUninstallGuidance:
-      "Installed via Kimi Code's official script into user global paths. Uninstall using Kimi Code's official instructions or remove the binary from your PATH.",
+      "Installed via Kimi Code's official HTTPS script into user global paths. Uninstall using Kimi Code's official instructions or remove the binary from your PATH.",
     vendorUninstallGuidanceZh:
-      "通过 Kimi Code 官方脚本安装到用户全局目录，小瞳 Work 不提供应用内自动回滚或卸载；如需卸载请按 Kimi Code 官方说明清理。",
+      "通过 Kimi Code 官方 HTTPS 脚本安装到用户全局目录，小瞳 Work 不提供应用内自动回滚或卸载；如需卸载请按 Kimi Code 官方说明清理。",
   },
   qoder: {
     displayName: "Qoder",
     cliBinary: "qoder",
-    officialScriptCommand: "curl -fsSL https://qoder.com/install | bash",
-    officialScriptUrl: "https://qoder.com/install",
+    acpArgs: ["--acp"],
+    posixScriptUrl: "https://qoder.com/install",
+    windowsScriptUrl: "https://qoder.com/install.ps1",
     vendorUninstallGuidance:
-      "Installed via Qoder's official script into user global paths. Uninstall using Qoder's official instructions.",
+      "Installed via Qoder's official HTTPS script into user global paths. Uninstall using Qoder's official instructions.",
     vendorUninstallGuidanceZh:
-      "通过 Qoder 官方脚本安装到用户全局目录，小瞳 Work 不提供应用内自动回滚或卸载；如需卸载请按 Qoder 官方说明清理。",
+      "通过 Qoder 官方 HTTPS 脚本安装到用户全局目录，小瞳 Work 不提供应用内自动回滚或卸载；如需卸载请按 Qoder 官方说明清理。",
   },
   "codebuddy-code": {
     displayName: "Codebuddy Code",
     cliBinary: "codebuddy",
-    officialScriptCommand: "npm install -g @tencent-ai/codebuddy-code",
-    officialScriptUrl: "https://www.npmjs.com/package/@tencent-ai/codebuddy-code",
+    acpArgs: ["--acp"],
+    posixScriptUrl: "https://copilot.tencent.com/cli/install.sh",
+    windowsScriptUrl: "https://copilot.tencent.com/cli/install.ps1",
     vendorUninstallGuidance:
-      "Installed globally via npm. Run `npm uninstall -g @tencent-ai/codebuddy-code` in your terminal to remove it.",
+      "Installed via CodeBuddy's official HTTPS native installer script into user global paths. Xiaotong Work does not modify your global installation; follow CodeBuddy's official uninstall instructions.",
     vendorUninstallGuidanceZh:
-      "通过全局 npm 安装；小瞳 Work 不会擅自修改系统全局包，如需卸载请在终端运行 `npm uninstall -g @tencent-ai/codebuddy-code`。",
+      "通过 CodeBuddy 官方 HTTPS 安装脚本写入用户全局目录；小瞳 Work 不会擅自修改或卸载全局环境，如需卸载请按 CodeBuddy 官方说明清理。",
   },
 };
 
@@ -531,6 +875,8 @@ export interface ProviderProvisionerDeps {
   readonly refreshLoginPath?: (() => Effect.Effect<void, unknown>) | undefined;
   readonly runCommand?: ProvisionCommandRunner | undefined;
   readonly probeVersion?: ProvisionVersionProber | undefined;
+  readonly resolveNpmVersion?: ProvisionNpmVersionResolver | undefined;
+  readonly verifyAcpInitialize?: ProvisionAcpVerifier | undefined;
 }
 
 export class ProvisionerError extends Error {
@@ -588,8 +934,16 @@ function idleState(instanceId: string): ProviderProvisionState {
 interface ActiveOperation {
   readonly operationId: string;
   readonly mode: ProvisionInstallMode;
+  readonly resourceKey: string;
+  readonly abortController: AbortController;
   cancel: () => void;
   cancelled: boolean;
+}
+
+interface ResourceLock {
+  readonly operationId: string;
+  readonly instanceId: string;
+  readonly kind: "install" | "uninstall";
 }
 
 export function makeProviderProvisioner(
@@ -597,9 +951,48 @@ export function makeProviderProvisioner(
 ): XtworkProviderProvisionerService {
   const runCommand = deps.runCommand ?? defaultCommandRunner;
   const probeVersion = deps.probeVersion ?? defaultVersionProber;
+  const resolveNpmVersionRaw = deps.resolveNpmVersion ?? defaultNpmVersionResolver;
+  const verifyAcpInitialize = deps.verifyAcpInitialize ?? defaultAcpVerifier;
   const toolsDir = NodePath.join(deps.baseDir, "tools");
   const states = new Map<string, ProviderProvisionState>();
   const activeOps = new Map<string, ActiveOperation>();
+  // M6: synchronous instance reservation + shared managed-runtime / target-dir locks.
+  const pendingInstances = new Set<string>();
+  const resourceLocks = new Map<string, ResourceLock>();
+  const npmVersionCache = new Map<string, { readonly version: string; readonly resolvedAt: number }>();
+
+  const resolvePinnedNpmVersion = (
+    packageName: string,
+    env: NodeJS.ProcessEnv,
+  ): Effect.Effect<string | null> =>
+    Effect.gen(function* () {
+      const cached = npmVersionCache.get(packageName);
+      if (cached && Date.now() - cached.resolvedAt < NPM_VERSION_CACHE_TTL_MS) {
+        return cached.version;
+      }
+      const version = yield* Effect.promise(() => resolveNpmVersionRaw(packageName, env));
+      if (version && SEMVER_PATTERN.test(version.trim())) {
+        const clean = version.trim();
+        npmVersionCache.set(packageName, { version: clean, resolvedAt: Date.now() });
+        return clean;
+      }
+      return null;
+    });
+
+  const resourceLockKeyFor = (
+    agentKind: ProvisionAgentKind,
+    mode: ProvisionInstallMode,
+    targetInstallDir: string,
+  ): string => {
+    if (mode === "vendor-script") return `vendor:${agentKind}`;
+    if (agentKind === "codex") return `codex:${NodePath.resolve(deps.codexInstallation.managedDirectory)}`;
+    if (agentKind === "claude") return `dir:${NodePath.resolve(toolsDir, "claude-code")}`;
+    if (agentKind === "deepseek-harness") return `dir:${NodePath.resolve(toolsDir, "deepseek-harness")}`;
+    if (agentKind === "kimi-code" || agentKind === "qoder" || agentKind === "codebuddy-code") {
+      return `acp:${agentKind}`;
+    }
+    return `dir:${NodePath.resolve(targetInstallDir)}`;
+  };
 
   const getOrInitState = (instanceId: string): ProviderProvisionState =>
     states.get(instanceId) ?? idleState(instanceId);
@@ -613,8 +1006,16 @@ export function makeProviderProvisioner(
     return next;
   };
 
-  const appendLog = (instanceId: string, rawChunk: string): void => {
-    const lines = rawChunk
+  const appendCleanLogLine = (instanceId: string, cleanLine: string): void => {
+    if (!cleanLine) return;
+    setState(instanceId, (prev) => ({
+      ...prev,
+      logs: [...prev.logs, cleanLine].slice(-MAX_LOG_LINES),
+    }));
+  };
+
+  const appendLog = (instanceId: string, rawText: string): void => {
+    const lines = rawText
       .split(/\n/u)
       .map(sanitizeProvisionLogLine)
       .filter((line) => line.length > 0);
@@ -625,12 +1026,74 @@ export function makeProviderProvisioner(
     }));
   };
 
+  const isOpCancelled = (instanceId: string, operationId: string): boolean => {
+    const op = activeOps.get(instanceId);
+    return (
+      op !== undefined &&
+      op.operationId === operationId &&
+      (op.cancelled || op.abortController.signal.aborted)
+    );
+  };
+
   const getInstanceConfig = (
     instanceId: string,
   ): Effect.Effect<ProviderInstanceConfig | undefined> =>
     deps.getSettings().pipe(
       Effect.map((settings) => settings.providerInstances[instanceId as ProviderInstanceId]),
       Effect.orElseSucceed(() => undefined),
+    );
+
+  const findOtherReferencingInstances = (
+    instanceId: string,
+    agentKind: ProvisionAgentKind,
+    managedDir: string,
+  ): Effect.Effect<ReadonlyArray<string>> =>
+    deps.getSettings().pipe(
+      Effect.map((settings) => {
+        const blocking: Array<string> = [];
+        for (const [candidateId, instance] of Object.entries(settings.providerInstances)) {
+          if (candidateId === instanceId || !isInstanceEnabled(instance)) continue;
+          const config = isObjectRecord(instance.config) ? instance.config : {};
+          if (agentKind === "codex" && instance.driver === ProviderDriverKind.make("codex")) {
+            const binaryPath = configString(config, "binaryPath");
+            if (config.setupMode === "managed" || (binaryPath && isInsideDirectory(binaryPath, managedDir))) {
+              blocking.push(candidateId);
+            }
+          } else if (
+            agentKind === "claude" &&
+            instance.driver === ProviderDriverKind.make("claudeAgent")
+          ) {
+            const binaryPath = configString(config, "binaryPath");
+            if (binaryPath && isInsideDirectory(binaryPath, managedDir)) {
+              blocking.push(candidateId);
+            }
+          } else if (
+            agentKind === "deepseek-harness" &&
+            instance.driver === ProviderDriverKind.make("acpRegistry")
+          ) {
+            const cmd = configString(config, "commandPath");
+            if (cmd && isInsideDirectory(cmd, managedDir)) {
+              blocking.push(candidateId);
+            }
+          } else if (
+            (agentKind === "kimi-code" ||
+              agentKind === "qoder" ||
+              agentKind === "codebuddy-code") &&
+            instance.driver === ProviderDriverKind.make("acpRegistry")
+          ) {
+            const cmd = configString(config, "commandPath");
+            if (
+              config.source !== "local" &&
+              configString(config, "agentId") === agentKind &&
+              !cmd
+            ) {
+              blocking.push(candidateId);
+            }
+          }
+        }
+        return blocking;
+      }),
+      Effect.orElseSucceed((): ReadonlyArray<string> => []),
     );
 
   const buildPlan = (
@@ -658,6 +1121,9 @@ export function makeProviderProvisioner(
       // ---- 1. CODEX (App-Managed via T3 CodexInstallation) ----
       if (agentKind === "codex") {
         const codexState = yield* deps.codexInstallation.state;
+        const pendingRelease = deps.codexInstallation.describePendingRelease
+          ? yield* deps.codexInstallation.describePendingRelease()
+          : null;
         const userCodexPath = findExecutableInPath("codex", env, platform, [toolsDir]);
         const userCodexVersion = userCodexPath
           ? yield* Effect.promise(() => probeVersion(userCodexPath, env))
@@ -665,29 +1131,44 @@ export function makeProviderProvisioner(
         const managedInstallDir = deps.codexInstallation.managedDirectory;
         const managedInstalled =
           codexState.source === "managed" && codexState.installedVersion !== null;
-        const targetVersion = codexState.version ?? codexState.installedVersion ?? "latest";
+        const targetVersion =
+          pendingRelease?.version ?? codexState.version ?? codexState.installedVersion ?? null;
+        const pinnedUrl =
+          pendingRelease?.url ?? "https://github.com/openai/codex/releases";
+        const pinnedSha256 = pendingRelease?.sha256?.toLowerCase();
+        const installable = targetVersion !== null;
         const consentKey = normalizeInstallConsentKey({
           instanceId,
           source: "codex-managed",
-          version: targetVersion,
+          version: targetVersion ?? "unavailable",
           distribution: "codex-release",
           installDir: managedInstallDir,
+          ...(pendingRelease ? { artifactSpec: pendingRelease.url } : {}),
+          ...(pinnedSha256 ? { artifactDigest: pinnedSha256 } : {}),
         });
         const option: ProvisionPlanOption = {
           mode: "app-managed",
           label: "App-Managed Isolated Install",
           labelZh: "受管隔离安装（推荐）",
-          summary: "Downloads OpenAI's official Codex release into Xiaotong Work's private tools directory with SHA-256 verification.",
-          summaryZh: "从官方发布源下载并经 SHA-256 校验安装到应用独立目录，支持取消与一键卸载，不修改系统全局环境。",
-          commandPreview: `Download official Codex ${targetVersion} release -> ${managedInstallDir}`,
-          officialSource: "https://github.com/openai/codex/releases",
+          summary:
+            "Downloads OpenAI's official Codex release into Xiaotong Work's private tools directory with SHA-256 verification.",
+          summaryZh:
+            "从官方发布源下载并经 SHA-256 校验安装到应用独立目录，支持取消与一键卸载，不修改系统全局环境。",
+          commandPreview: pendingRelease
+            ? `Download verified Codex v${pendingRelease.version} (${pendingRelease.url}, sha256=${pendingRelease.sha256.slice(0, 16)}…) -> ${managedInstallDir}`
+            : `Download official Codex ${targetVersion ?? "(unavailable)"} release -> ${managedInstallDir}`,
+          officialSource: pinnedUrl,
           targetInstallDir: managedInstallDir,
           uninstallSemantics: "app-managed",
           uninstallGuidance: `Removes the managed Codex directory (${managedInstallDir}) without affecting system-installed Codex or sign-in history.`,
           uninstallGuidanceZh: `可直接在应用内移除受管目录（${managedInstallDir}），不影响您本机全局安装的 Codex。`,
           consentKey,
-          availableVersion: codexState.version,
+          availableVersion: targetVersion,
           distribution: "codex-release",
+          installable,
+          ...(installable
+            ? {}
+            : { unavailableReason: "No supported Codex release is published for this platform." }),
         };
         const existingDetection: ExistingInstallDetection = userCodexPath
           ? {
@@ -709,9 +1190,9 @@ export function makeProviderProvisioner(
           : userCodexVersion;
         const updateAvailable =
           managedInstalled &&
-          codexState.version !== null &&
-          codexState.version !== codexState.installedVersion;
-        const hasConsent = yield* deps.consent.hasConsent(consentKey);
+          targetVersion !== null &&
+          targetVersion !== codexState.installedVersion;
+        const hasConsent = installable ? yield* deps.consent.hasConsent(consentKey) : false;
         const consentReason =
           updateAvailable && !hasConsent
             ? "update_required"
@@ -729,7 +1210,7 @@ export function makeProviderProvisioner(
           availableModes: [option],
           existingDetection,
           installedVersion,
-          availableVersion: codexState.version,
+          availableVersion: targetVersion,
           updateAvailable,
           consentRequired: consentReason !== null,
           consentReason,
@@ -737,11 +1218,12 @@ export function makeProviderProvisioner(
           uninstallSemantics: "app-managed",
           uninstallGuidance: option.uninstallGuidance,
           uninstallGuidanceZh: option.uninstallGuidanceZh,
+          vendorInstallBlockedByExistingPath: false,
           state: currentState,
         };
       }
 
-      // ---- 2. CLAUDE CODE (Default: Vendor Script; Optional: App-Managed npm) ----
+      // ---- 2. CLAUDE CODE (Default: Vendor Script; Optional: App-Managed pinned npm) ----
       if (agentKind === "claude") {
         const managedDir = NodePath.join(toolsDir, "claude-code");
         const managedBin = NodePath.join(
@@ -760,20 +1242,24 @@ export function makeProviderProvisioner(
           ? yield* Effect.promise(() => probeVersion(userClaudePath, env))
           : null;
         const npmPath = resolveBundledNpm(env, platform) ?? "npm";
+        const vendorScriptUrl =
+          platform === "win32" ? "https://claude.ai/install.ps1" : "https://claude.ai/install.sh";
         const vendorScriptCmd =
           platform === "win32"
-            ? "irm https://claude.ai/install.ps1 | iex"
-            : "curl -fsSL https://claude.ai/install.sh | bash";
+            ? `irm ${vendorScriptUrl} | iex`
+            : buildHardenedPosixInstallerCommand(vendorScriptUrl);
 
+        const vendorBlocked = userClaudePath !== null;
         const vendorOption: ProvisionPlanOption = {
           mode: "vendor-script",
           label: "Official Install Script (Recommended)",
           labelZh: "官方脚本安装（默认）",
-          summary: "Runs Anthropic's official installer script into your user directory (~/.local/bin/claude).",
-          summaryZh: "执行 Anthropic 官方安装脚本安装到本机用户目录（~/.local/bin/claude），安装后自动探测并刷新状态。",
+          summary:
+            "Runs Anthropic's official HTTPS installer script into your user directory (~/.local/bin/claude).",
+          summaryZh:
+            "通过仅限 HTTPS 的 curl 下载并执行 Anthropic 官方安装脚本到本机用户目录（~/.local/bin/claude），安装后自动探测并刷新状态。",
           commandPreview: vendorScriptCmd,
-          officialSource:
-            platform === "win32" ? "https://claude.ai/install.ps1" : "https://claude.ai/install.sh",
+          officialSource: vendorScriptUrl,
           targetInstallDir: VENDOR_GLOBAL_INSTALL_DIR,
           uninstallSemantics: "vendor-managed",
           uninstallGuidance:
@@ -783,20 +1269,43 @@ export function makeProviderProvisioner(
           consentKey: normalizeInstallConsentKey({
             instanceId,
             source: "vendor-script",
-            version: "latest",
+            version: "official-script",
             distribution: "vendor-script",
             installDir: VENDOR_GLOBAL_INSTALL_DIR,
+            artifactSpec: vendorScriptUrl,
           }),
-          availableVersion: "latest",
+          availableVersion: null,
           distribution: "vendor-script",
+          installable: !vendorBlocked,
+          ...(vendorBlocked
+            ? {
+                unavailableReason: `Claude Code is already installed on PATH at ${userClaudePath}. Xiaotong Work will not overwrite your existing installation.`,
+              }
+            : {}),
         };
+
+        // M4: Resolve exact pinned npm version before confirmation when app-managed mode is selected or inspected.
+        const selectedMode: ProvisionInstallMode =
+          requestedMode ?? (managedExists && !userClaudePath ? "app-managed" : "vendor-script");
+        const resolvedClaudeNpmVersion =
+          selectedMode === "app-managed" || requestedMode === "app-managed"
+            ? yield* resolvePinnedNpmVersion("@anthropic-ai/claude-code", env)
+            : (npmVersionCache.get("@anthropic-ai/claude-code")?.version ?? null);
+        const pinnedClaudeSpec = resolvedClaudeNpmVersion
+          ? `@anthropic-ai/claude-code@${resolvedClaudeNpmVersion}`
+          : null;
+
         const managedOption: ProvisionPlanOption = {
           mode: "app-managed",
           label: "App-Managed Isolated npm",
           labelZh: "受管隔离安装（随包 npm）",
-          summary: "Installs @anthropic-ai/claude-code into Xiaotong Work's isolated tools directory using bundled npm.",
-          summaryZh: "使用随包 npm 安装 @anthropic-ai/claude-code 至应用独立目录，支持取消清理与一键卸载，不污染系统全局。",
-          commandPreview: `${npmPath} install --prefix ${managedDir} @anthropic-ai/claude-code`,
+          summary:
+            "Installs a pinned version of @anthropic-ai/claude-code into Xiaotong Work's isolated tools directory using bundled npm.",
+          summaryZh:
+            "使用随包 npm 将锁定版本的 @anthropic-ai/claude-code 安装至应用独立目录，支持取消清理与一键卸载，不污染系统全局。",
+          commandPreview: pinnedClaudeSpec
+            ? `${npmPath} install --prefix ${managedDir} ${pinnedClaudeSpec}`
+            : `${npmPath} install --prefix ${managedDir} @anthropic-ai/claude-code@<version-unresolved>`,
           officialSource: "https://www.npmjs.com/package/@anthropic-ai/claude-code",
           targetInstallDir: managedDir,
           uninstallSemantics: "app-managed",
@@ -805,17 +1314,23 @@ export function makeProviderProvisioner(
           consentKey: normalizeInstallConsentKey({
             instanceId,
             source: "npm-managed",
-            version: "latest",
+            version: resolvedClaudeNpmVersion ?? "unresolved",
             distribution: "npm",
             installDir: managedDir,
+            ...(pinnedClaudeSpec ? { artifactSpec: pinnedClaudeSpec } : {}),
           }),
-          availableVersion: "latest",
+          availableVersion: resolvedClaudeNpmVersion,
           distribution: "npm",
+          installable: pinnedClaudeSpec !== null,
+          ...(pinnedClaudeSpec === null
+            ? {
+                unavailableReason:
+                  "Could not resolve an exact version of @anthropic-ai/claude-code from npm. Check network connectivity and retry.",
+              }
+            : {}),
         };
 
         const availableModes: ReadonlyArray<ProvisionPlanOption> = [vendorOption, managedOption];
-        const selectedMode: ProvisionInstallMode =
-          requestedMode ?? (managedExists && !userClaudePath ? "app-managed" : "vendor-script");
         const selectedOption =
           availableModes.find((opt) => opt.mode === selectedMode) ?? vendorOption;
 
@@ -835,9 +1350,21 @@ export function makeProviderProvisioner(
               }
             : { detected: false, source: "none", executablePath: null, version: null };
 
-        const hasConsent = yield* deps.consent.hasConsent(selectedOption.consentKey);
-        const installed = existingDetection.detected;
-        const consentReason = !installed && !hasConsent ? "install_required" : null;
+        const updateAvailable =
+          selectedOption.mode === "app-managed" &&
+          managedExists &&
+          managedVersion !== null &&
+          resolvedClaudeNpmVersion !== null &&
+          managedVersion !== resolvedClaudeNpmVersion;
+        const hasConsent = selectedOption.installable
+          ? yield* deps.consent.hasConsent(selectedOption.consentKey)
+          : false;
+        const consentReason =
+          updateAvailable && !hasConsent
+            ? "update_required"
+            : !existingDetection.detected && !hasConsent
+              ? "install_required"
+              : null;
 
         return {
           instanceId,
@@ -850,7 +1377,7 @@ export function makeProviderProvisioner(
           existingDetection,
           installedVersion: existingDetection.version,
           availableVersion: selectedOption.availableVersion,
-          updateAvailable: false,
+          updateAvailable,
           consentRequired: consentReason !== null,
           consentReason,
           canUninstall: managedExists,
@@ -861,11 +1388,12 @@ export function makeProviderProvisioner(
           uninstallGuidanceZh: managedExists
             ? managedOption.uninstallGuidanceZh
             : selectedOption.uninstallGuidanceZh,
+          vendorInstallBlockedByExistingPath: selectedOption.mode === "vendor-script" && vendorBlocked,
           state: currentState,
         };
       }
 
-      // ---- 3. DEEPSEEK HARNESS (App-Managed Isolated npm) ----
+      // ---- 3. DEEPSEEK HARNESS (App-Managed Isolated pinned npm) ----
       if (agentKind === "deepseek-harness") {
         const managedDir = NodePath.join(toolsDir, "deepseek-harness");
         const managedBin = NodePath.join(
@@ -884,14 +1412,21 @@ export function makeProviderProvisioner(
           ? yield* Effect.promise(() => probeVersion(userDshPath, env))
           : null;
         const npmPath = resolveBundledNpm(env, platform) ?? "npm";
+        // M4: Resolve and pin exact npm version BEFORE confirmation.
+        const resolvedDshVersion = yield* resolvePinnedNpmVersion("@deepseek-ai/dsh", env);
+        const pinnedDshSpec = resolvedDshVersion ? `@deepseek-ai/dsh@${resolvedDshVersion}` : null;
 
         const option: ProvisionPlanOption = {
           mode: "app-managed",
           label: "App-Managed Isolated npm",
           labelZh: "受管隔离安装（随包 npm）",
-          summary: "Installs @deepseek-ai/dsh into Xiaotong Work's isolated tools directory using bundled Node & npm.",
-          summaryZh: "使用随包 Node 与 npm 将 @deepseek-ai/dsh 安装至应用独立目录，支持取消清理与一键卸载，不覆盖您已安装的 dsh。",
-          commandPreview: `${npmPath} install --prefix ${managedDir} @deepseek-ai/dsh`,
+          summary:
+            "Installs a pinned version of @deepseek-ai/dsh into Xiaotong Work's isolated tools directory using bundled Node & npm.",
+          summaryZh:
+            "使用随包 Node 与 npm 将锁定版本的 @deepseek-ai/dsh 安装至应用独立目录，支持取消清理与一键卸载，不覆盖您已安装的 dsh。",
+          commandPreview: pinnedDshSpec
+            ? `${npmPath} install --prefix ${managedDir} ${pinnedDshSpec}`
+            : `${npmPath} install --prefix ${managedDir} @deepseek-ai/dsh@<version-unresolved>`,
           officialSource: "https://www.npmjs.com/package/@deepseek-ai/dsh",
           targetInstallDir: managedDir,
           uninstallSemantics: "app-managed",
@@ -900,12 +1435,20 @@ export function makeProviderProvisioner(
           consentKey: normalizeInstallConsentKey({
             instanceId,
             source: "npm-managed",
-            version: "latest",
+            version: resolvedDshVersion ?? "unresolved",
             distribution: "npm",
             installDir: managedDir,
+            ...(pinnedDshSpec ? { artifactSpec: pinnedDshSpec } : {}),
           }),
-          availableVersion: "latest",
+          availableVersion: resolvedDshVersion,
           distribution: "npm",
+          installable: pinnedDshSpec !== null,
+          ...(pinnedDshSpec === null
+            ? {
+                unavailableReason:
+                  "Could not resolve an exact version of @deepseek-ai/dsh from npm. Check network connectivity and retry.",
+              }
+            : {}),
         };
 
         const existingDetection: ExistingInstallDetection = userDshPath
@@ -924,8 +1467,20 @@ export function makeProviderProvisioner(
               }
             : { detected: false, source: "none", executablePath: null, version: null };
 
-        const hasConsent = yield* deps.consent.hasConsent(option.consentKey);
-        const consentReason = !existingDetection.detected && !hasConsent ? "install_required" : null;
+        const updateAvailable =
+          managedExists &&
+          managedVersion !== null &&
+          resolvedDshVersion !== null &&
+          managedVersion !== resolvedDshVersion;
+        const hasConsent = option.installable
+          ? yield* deps.consent.hasConsent(option.consentKey)
+          : false;
+        const consentReason =
+          updateAvailable && !hasConsent
+            ? "update_required"
+            : !existingDetection.detected && !hasConsent
+              ? "install_required"
+              : null;
 
         return {
           instanceId,
@@ -937,14 +1492,15 @@ export function makeProviderProvisioner(
           availableModes: [option],
           existingDetection,
           installedVersion: existingDetection.version,
-          availableVersion: "latest",
-          updateAvailable: false,
+          availableVersion: resolvedDshVersion,
+          updateAvailable,
           consentRequired: consentReason !== null,
           consentReason,
           canUninstall: managedExists,
           uninstallSemantics: "app-managed",
           uninstallGuidance: option.uninstallGuidance,
           uninstallGuidanceZh: option.uninstallGuidanceZh,
+          vendorInstallBlockedByExistingPath: false,
           state: currentState,
         };
       }
@@ -962,20 +1518,29 @@ export function makeProviderProvisioner(
         ? yield* Effect.promise(() => probeVersion(userCliPath, env))
         : null;
 
-      const resolvedVersion = describedValue?.version ?? receipt?.version ?? "latest";
+      const resolvedVersion = describedValue?.version ?? null;
       const resolvedDistribution = describedValue?.distribution ?? receipt?.distribution ?? "npx";
       const resolvedInstallDir =
         describedValue?.installDir ??
         receipt?.installDir ??
-        NodePath.join(toolsDir, acpAgentId, encodeURIComponent(resolvedVersion), "npm");
+        NodePath.join(toolsDir, acpAgentId, encodeURIComponent(resolvedVersion ?? "unresolved"), "npm");
+      const resolvedArtifactSpec = describedValue
+        ? describedValue.distribution === "binary"
+          ? describedValue.archiveUrl
+          : describedValue.packageName
+        : undefined;
+      const resolvedDigest = describedValue?.sha256?.toLowerCase();
       const npmPath = resolveBundledNpm(env, platform) ?? "npm";
       const managedCommandPreview = describedValue
         ? describedValue.distribution === "binary"
-          ? `Download verified ACP Registry binary ${acpAgentId}@${describedValue.version} (${describedValue.archiveUrl ?? "official ACP Registry"}) -> ${describedValue.installDir}`
+          ? `Download verified ACP Registry binary ${acpAgentId}@${describedValue.version} (${describedValue.archiveUrl ?? "official ACP Registry"}${resolvedDigest ? `, sha256=${resolvedDigest.slice(0, 16)}…` : ""}) -> ${describedValue.installDir}`
           : describedValue.distribution === "npx"
             ? `${npmPath} install --global ${describedValue.packageName ?? acpAgentId} (npm_config_prefix=${describedValue.installDir})`
             : `uv tool install --force ${describedValue.packageName ?? acpAgentId} (UV_TOOL_DIR=${describedValue.installDir})`
-        : `Prepare official ACP Registry agent '${acpAgentId}' -> ${resolvedInstallDir}`;
+        : `Prepare official ACP Registry agent '${acpAgentId}' (metadata unavailable)`;
+
+      const appManagedInstallable =
+        describedValue !== undefined && resolvedVersion !== null && resolvedArtifactSpec !== undefined;
 
       const appManagedOption: ProvisionPlanOption = {
         mode: "app-managed",
@@ -996,22 +1561,38 @@ export function makeProviderProvisioner(
         consentKey: normalizeInstallConsentKey({
           instanceId,
           source: "acp-registry",
-          version: resolvedVersion,
+          version: resolvedVersion ?? "unresolved",
           distribution: resolvedDistribution,
           installDir: resolvedInstallDir,
+          ...(resolvedArtifactSpec ? { artifactSpec: resolvedArtifactSpec } : {}),
+          ...(resolvedDigest ? { artifactDigest: resolvedDigest } : {}),
         }),
-        availableVersion: describedValue?.version ?? null,
+        availableVersion: resolvedVersion,
         distribution: resolvedDistribution,
+        installable: appManagedInstallable,
+        ...(appManagedInstallable
+          ? {}
+          : {
+              unavailableReason: `Could not resolve pinned ACP Registry metadata for '${acpAgentId}'. Check network access and retry.`,
+            }),
       };
+
+      const vendorScriptUrl =
+        platform === "win32" ? meta.windowsScriptUrl : meta.posixScriptUrl;
+      const vendorScriptCommand =
+        platform === "win32"
+          ? `irm ${vendorScriptUrl} | iex`
+          : buildHardenedPosixInstallerCommand(vendorScriptUrl);
+      const vendorBlocked = userCliPath !== null;
 
       const vendorScriptOption: ProvisionPlanOption = {
         mode: "vendor-script",
         label: "Official Native Global Install",
         labelZh: "官方脚本全局安装（可选）",
-        summary: `Runs ${meta.displayName}'s official global installer command into your system/user PATH.`,
-        summaryZh: `执行 ${meta.displayName} 官方全局安装命令到本机用户目录；安装后自动探测并刷新，不承诺应用内卸载。`,
-        commandPreview: meta.officialScriptCommand,
-        officialSource: meta.officialScriptUrl,
+        summary: `Runs ${meta.displayName}'s official HTTPS global installer script into your system/user PATH.`,
+        summaryZh: `通过仅限 HTTPS 的 curl 下载并执行 ${meta.displayName} 官方全局安装脚本；安装后核验 ACP initialize 并绑定可执行文件路径，不承诺应用内卸载。`,
+        commandPreview: vendorScriptCommand,
+        officialSource: vendorScriptUrl,
         targetInstallDir: VENDOR_GLOBAL_INSTALL_DIR,
         uninstallSemantics: "vendor-managed",
         uninstallGuidance: meta.vendorUninstallGuidance,
@@ -1019,12 +1600,19 @@ export function makeProviderProvisioner(
         consentKey: normalizeInstallConsentKey({
           instanceId,
           source: "vendor-script",
-          version: "latest",
+          version: "official-script",
           distribution: "vendor-script",
           installDir: VENDOR_GLOBAL_INSTALL_DIR,
+          artifactSpec: vendorScriptUrl,
         }),
-        availableVersion: "latest",
+        availableVersion: null,
         distribution: "vendor-script",
+        installable: !vendorBlocked,
+        ...(vendorBlocked
+          ? {
+              unavailableReason: `${meta.displayName} is already installed on PATH at ${userCliPath}. Xiaotong Work will not overwrite your existing installation.`,
+            }
+          : {}),
       };
 
       const availableModes: ReadonlyArray<ProvisionPlanOption> = [
@@ -1044,24 +1632,25 @@ export function makeProviderProvisioner(
       const updateAvailable = Boolean(
         describedValue && !describedValue.installed && describedValue.hasOtherInstalledVersion,
       );
-      const existingDetection: ExistingInstallDetection =
-        managedInstalled
+      const existingDetection: ExistingInstallDetection = managedInstalled
+        ? {
+            detected: true,
+            source: "app-managed",
+            executablePath: receipt?.executablePath ?? resolvedInstallDir,
+            version: describedValue?.installed ? describedValue.version : (receipt?.version ?? null),
+          }
+        : userCliPath
           ? {
               detected: true,
-              source: "app-managed",
-              executablePath: receipt?.executablePath ?? resolvedInstallDir,
-              version: describedValue?.installed ? describedValue.version : (receipt?.version ?? null),
+              source: "user-path",
+              executablePath: userCliPath,
+              version: userCliVersion,
             }
-          : userCliPath
-            ? {
-                detected: true,
-                source: "user-path",
-                executablePath: userCliPath,
-                version: userCliVersion,
-              }
-            : { detected: false, source: "none", executablePath: null, version: null };
+          : { detected: false, source: "none", executablePath: null, version: null };
 
-      const hasConsent = yield* deps.consent.hasConsent(selectedOption.consentKey);
+      const hasConsent = selectedOption.installable
+        ? yield* deps.consent.hasConsent(selectedOption.consentKey)
+        : false;
       const consentReason =
         selectedOption.mode === "app-managed"
           ? updateAvailable && !hasConsent
@@ -1095,6 +1684,8 @@ export function makeProviderProvisioner(
         uninstallGuidanceZh: managedInstalled
           ? appManagedOption.uninstallGuidanceZh
           : selectedOption.uninstallGuidanceZh,
+        vendorInstallBlockedByExistingPath:
+          selectedOption.mode === "vendor-script" && vendorBlocked,
         state: currentState,
       };
     });
@@ -1112,6 +1703,28 @@ export function makeProviderProvisioner(
         ),
       );
     }
+    // M7: Never run global vendor script over an existing user PATH installation.
+    if (plan.selectedMode === "vendor-script" && plan.vendorInstallBlockedByExistingPath) {
+      return Effect.fail(
+        new ProvisionerError(
+          "existing_install_detected",
+          plan.selectedOption.unavailableReason ??
+            `${plan.displayName} is already installed on your PATH and will not be overwritten.`,
+          409,
+        ),
+      );
+    }
+    // M4: Refuse unpinned / unresolved install options.
+    if (!plan.selectedOption.installable) {
+      return Effect.fail(
+        new ProvisionerError(
+          "version_resolution_failed",
+          plan.selectedOption.unavailableReason ??
+            `Could not resolve a pinned version/artifact for ${plan.displayName}.`,
+          503,
+        ),
+      );
+    }
     let submitted: InstallConsentKey;
     try {
       submitted = normalizeInstallConsentKey({
@@ -1120,6 +1733,8 @@ export function makeProviderProvisioner(
         version: consent.version,
         distribution: consent.distribution,
         installDir: consent.installDir,
+        ...(consent.artifactSpec ? { artifactSpec: consent.artifactSpec } : {}),
+        ...(consent.artifactDigest ? { artifactDigest: consent.artifactDigest } : {}),
       });
     } catch (error) {
       return Effect.fail(
@@ -1147,6 +1762,7 @@ export function makeProviderProvisioner(
     readonly operationId: string;
     readonly agentKind: "deepseek-harness" | "claude";
     readonly packageName: string;
+    readonly pinnedPackageSpec: string;
     readonly binaryName: string;
     readonly installDir: string;
     readonly option: ProvisionPlanOption;
@@ -1174,20 +1790,35 @@ export function makeProviderProvisioner(
         input.installDir,
         "--no-audit",
         "--no-fund",
-        input.packageName,
+        input.pinnedPackageSpec,
       ];
       appendLog(input.instanceId, `$ ${npmPath} ${args.join(" ")}`);
 
+      // S5: separate bounded line buffers per stream so split secrets are redacted across chunk boundaries.
+      const stdoutBuf = createRedactingLineBuffer((line) =>
+        appendCleanLogLine(input.instanceId, line),
+      );
+      const stderrBuf = createRedactingLineBuffer((line) =>
+        appendCleanLogLine(input.instanceId, line),
+      );
       const handle = runCommand({
         command: npmPath,
         args,
         env,
-        onOutput: (chunk) => appendLog(input.instanceId, chunk),
+        onOutput: (chunk) => stdoutBuf.push(chunk),
+        onStdout: (chunk) => stdoutBuf.push(chunk),
+        onStderr: (chunk) => stderrBuf.push(chunk),
       });
       const op = activeOps.get(input.instanceId);
       if (op && op.operationId === input.operationId) {
-        op.cancel = () => handle.cancel();
-        if (op.cancelled) handle.cancel();
+        op.cancel = () => {
+          op.abortController.abort();
+          handle.cancel();
+        };
+        if (op.cancelled) {
+          op.abortController.abort();
+          handle.cancel();
+        }
       }
 
       const result = yield* Effect.tryPromise(() => handle.promise).pipe(
@@ -1196,9 +1827,10 @@ export function makeProviderProvisioner(
           onFailure: (error) => ({ ok: false as const, error }),
         }),
       );
+      stdoutBuf.flush();
+      stderrBuf.flush();
 
-      const currentOp = activeOps.get(input.instanceId);
-      if (currentOp?.operationId === input.operationId && currentOp.cancelled) {
+      if (isOpCancelled(input.instanceId, input.operationId)) {
         if (!existedBefore) {
           NodeFs.rmSync(input.installDir, { recursive: true, force: true });
         }
@@ -1236,24 +1868,46 @@ export function makeProviderProvisioner(
         message: `Verifying ${input.binaryName} executable…`,
       }));
 
-      const binName =
-        deps.platform === "win32" ? `${input.binaryName}.cmd` : input.binaryName;
+      const binName = deps.platform === "win32" ? `${input.binaryName}.cmd` : input.binaryName;
       const managedBin = NodePath.join(input.installDir, "node_modules", ".bin", binName);
       if (!isExecutableFile(managedBin)) {
+        if (!existedBefore) {
+          NodeFs.rmSync(input.installDir, { recursive: true, force: true });
+        }
         setState(input.instanceId, (prev) => ({
           ...prev,
           phase: "failed",
-          error: `Installed ${input.packageName}, but '${binName}' was not found at ${managedBin}.`,
+          error: `Installed ${input.pinnedPackageSpec}, but '${binName}' was not found at ${managedBin}.`,
           message: "Verification failed.",
           finishedAt: new Date().toISOString(),
         }));
         return;
       }
 
-      const probedVersion = yield* Effect.promise(() => probeVersion(managedBin, env));
+      // S4: Pass AbortSignal into verification so cancellation interrupts probing immediately.
+      const signal = activeOps.get(input.instanceId)?.abortController.signal;
+      const probedVersion = yield* Effect.promise(() => probeVersion(managedBin, env, signal));
+
+      // S4: Check cancellation BEFORE committing receipts, wiring settings, or reporting succeeded.
+      if (isOpCancelled(input.instanceId, input.operationId)) {
+        if (!existedBefore) {
+          NodeFs.rmSync(input.installDir, { recursive: true, force: true });
+        }
+        setState(input.instanceId, (prev) => ({
+          ...prev,
+          phase: "cancelled",
+          message: "Installation cancelled.",
+          finishedAt: new Date().toISOString(),
+        }));
+        return;
+      }
+
       const installedVersion =
         probedVersion ?? readInstalledNpmPackageVersion(input.installDir, input.packageName);
       if (probedVersion === null && installedVersion === null) {
+        if (!existedBefore) {
+          NodeFs.rmSync(input.installDir, { recursive: true, force: true });
+        }
         setState(input.instanceId, (prev) => ({
           ...prev,
           phase: "failed",
@@ -1269,7 +1923,7 @@ export function makeProviderProvisioner(
         agentKind: input.agentKind,
         mode: "app-managed",
         source: input.option.consentKey.source,
-        version: installedVersion ?? "installed",
+        version: installedVersion ?? input.option.consentKey.version,
         distribution: input.option.consentKey.distribution,
         installDir: input.installDir,
         executablePath: managedBin,
@@ -1299,8 +1953,10 @@ export function makeProviderProvisioner(
   const runVendorScriptInstall = (input: {
     readonly instanceId: string;
     readonly operationId: string;
+    readonly agentKind: ProvisionAgentKind;
     readonly commandPreview: string;
     readonly binaryName: string;
+    readonly acpArgs?: ReadonlyArray<string> | undefined;
   }): Effect.Effect<void> =>
     Effect.gen(function* () {
       const env = deps.getHostEnvironment();
@@ -1308,18 +1964,32 @@ export function makeProviderProvisioner(
       const shellCmd =
         deps.platform === "win32"
           ? { command: "powershell.exe", args: ["-NoProfile", "-Command", input.commandPreview] }
-          : { command: "/bin/bash", args: ["-lc", input.commandPreview] };
+          : { command: "/bin/bash", args: ["-c", input.commandPreview] };
 
+      const stdoutBuf = createRedactingLineBuffer((line) =>
+        appendCleanLogLine(input.instanceId, line),
+      );
+      const stderrBuf = createRedactingLineBuffer((line) =>
+        appendCleanLogLine(input.instanceId, line),
+      );
       const handle = runCommand({
         command: shellCmd.command,
         args: shellCmd.args,
         env,
-        onOutput: (chunk) => appendLog(input.instanceId, chunk),
+        onOutput: (chunk) => stdoutBuf.push(chunk),
+        onStdout: (chunk) => stdoutBuf.push(chunk),
+        onStderr: (chunk) => stderrBuf.push(chunk),
       });
       const op = activeOps.get(input.instanceId);
       if (op && op.operationId === input.operationId) {
-        op.cancel = () => handle.cancel();
-        if (op.cancelled) handle.cancel();
+        op.cancel = () => {
+          op.abortController.abort();
+          handle.cancel();
+        };
+        if (op.cancelled) {
+          op.abortController.abort();
+          handle.cancel();
+        }
       }
 
       const result = yield* Effect.tryPromise(() => handle.promise).pipe(
@@ -1328,9 +1998,10 @@ export function makeProviderProvisioner(
           onFailure: (error) => ({ ok: false as const, error }),
         }),
       );
+      stdoutBuf.flush();
+      stderrBuf.flush();
 
-      const currentOp = activeOps.get(input.instanceId);
-      if (currentOp?.operationId === input.operationId && currentOp.cancelled) {
+      if (isOpCancelled(input.instanceId, input.operationId)) {
         setState(input.instanceId, (prev) => ({
           ...prev,
           phase: "cancelled",
@@ -1366,34 +2037,153 @@ export function makeProviderProvisioner(
         yield* deps.refreshLoginPath().pipe(Effect.ignore);
       }
 
-      const refreshedEnv = deps.getHostEnvironment();
-      const detectedPath = findExecutableInPath(input.binaryName, refreshedEnv, deps.platform, [
-        toolsDir,
-      ]);
-      const detectedVersion = detectedPath
-        ? yield* Effect.promise(() => probeVersion(detectedPath, refreshedEnv))
-        : null;
-
-      yield* deps
-        .refreshProviderInstance(ProviderInstanceId.make(input.instanceId))
-        .pipe(Effect.ignore);
-
-      if (!detectedPath) {
+      if (isOpCancelled(input.instanceId, input.operationId)) {
         setState(input.instanceId, (prev) => ({
           ...prev,
-          phase: "succeeded",
-          installedVersion: null,
-          executablePath: null,
-          error: null,
-          message: `Installer finished. If '${input.binaryName}' is not detected yet, refresh providers or check your shell PATH.`,
+          phase: "cancelled",
+          message: "Installation cancelled.",
           finishedAt: new Date().toISOString(),
         }));
         return;
       }
 
+      const refreshedEnv = deps.getHostEnvironment();
+      const detectedPath = findExecutableInPath(input.binaryName, refreshedEnv, deps.platform, [
+        toolsDir,
+      ]);
+
+      // M8: Fail cleanly when the vendor installer finishes but no executable is detected!
+      if (!detectedPath) {
+        const detail = `Installer finished, but '${input.binaryName}' was not detected on PATH. Verify installation in a terminal and refresh providers.`;
+        appendLog(input.instanceId, detail);
+        setState(input.instanceId, (prev) => ({
+          ...prev,
+          phase: "failed",
+          installedVersion: null,
+          executablePath: null,
+          error: detail,
+          message: detail,
+          finishedAt: new Date().toISOString(),
+        }));
+        return;
+      }
+
+      const signal = activeOps.get(input.instanceId)?.abortController.signal;
+      let detectedVersion = yield* Effect.promise(() =>
+        probeVersion(detectedPath, refreshedEnv, signal),
+      );
+
+      if (isOpCancelled(input.instanceId, input.operationId)) {
+        setState(input.instanceId, (prev) => ({
+          ...prev,
+          phase: "cancelled",
+          message: "Installation cancelled.",
+          finishedAt: new Date().toISOString(),
+        }));
+        return;
+      }
+
+      const isAcpVendorAgent =
+        input.agentKind === "kimi-code" ||
+        input.agentKind === "qoder" ||
+        input.agentKind === "codebuddy-code";
+
+      if (isAcpVendorAgent) {
+        // M8: Verify ACP `initialize` handshake before wiring `commandPath` or reporting success!
+        const acpCheck = yield* Effect.promise(() =>
+          verifyAcpInitialize({
+            executablePath: detectedPath,
+            args: input.acpArgs ?? ["--acp"],
+            env: refreshedEnv,
+            ...(signal ? { signal } : {}),
+          }),
+        );
+        if (isOpCancelled(input.instanceId, input.operationId)) {
+          setState(input.instanceId, (prev) => ({
+            ...prev,
+            phase: "cancelled",
+            message: "Installation cancelled.",
+            finishedAt: new Date().toISOString(),
+          }));
+          return;
+        }
+        if (!acpCheck.ok) {
+          const detail =
+            acpCheck.error ??
+            `Detected '${detectedPath}', but ACP initialize verification failed.`;
+          appendLog(input.instanceId, detail);
+          setState(input.instanceId, (prev) => ({
+            ...prev,
+            phase: "failed",
+            installedVersion: detectedVersion,
+            executablePath: detectedPath,
+            error: detail,
+            message: detail,
+            finishedAt: new Date().toISOString(),
+          }));
+          return;
+        }
+        detectedVersion = detectedVersion ?? acpCheck.version ?? null;
+
+        // M8: Wire detectedPath into `commandPath` while strictly preserving any pre-existing custom `commandPath`.
+        const current = yield* getInstanceConfig(input.instanceId);
+        const currentConfig = isObjectRecord(current?.config) ? current.config : {};
+        const existingCommandPath = configString(currentConfig, "commandPath");
+        if (!existingCommandPath) {
+          yield* deps
+            .updateProviderInstance({
+              operation: "upsert",
+              instanceId: ProviderInstanceId.make(input.instanceId),
+              instance: {
+                ...(current ?? {
+                  driver: ProviderDriverKind.make("acpRegistry"),
+                  displayName: ACP_REGISTRY_AGENT_META[input.agentKind].displayName,
+                }),
+                driver: ProviderDriverKind.make("acpRegistry"),
+                enabled: current?.enabled ?? true,
+                config: {
+                  ...currentConfig,
+                  source: "registry",
+                  agentId: input.agentKind,
+                  commandPath: detectedPath,
+                  enabled: current?.enabled ?? true,
+                },
+              },
+            })
+            .pipe(Effect.ignore);
+        }
+      } else if (detectedVersion === null) {
+        const detail = `Detected '${detectedPath}', but '${input.binaryName} --version' verification failed.`;
+        appendLog(input.instanceId, detail);
+        setState(input.instanceId, (prev) => ({
+          ...prev,
+          phase: "failed",
+          installedVersion: null,
+          executablePath: detectedPath,
+          error: detail,
+          message: detail,
+          finishedAt: new Date().toISOString(),
+        }));
+        return;
+      }
+
+      if (isOpCancelled(input.instanceId, input.operationId)) {
+        setState(input.instanceId, (prev) => ({
+          ...prev,
+          phase: "cancelled",
+          message: "Installation cancelled.",
+          finishedAt: new Date().toISOString(),
+        }));
+        return;
+      }
+
+      yield* deps
+        .refreshProviderInstance(ProviderInstanceId.make(input.instanceId))
+        .pipe(Effect.ignore);
+
       appendLog(
         input.instanceId,
-        `Detected ${input.binaryName}${detectedVersion ? ` v${detectedVersion}` : ""} at ${detectedPath}`,
+        `Verified ${input.binaryName}${detectedVersion ? ` v${detectedVersion}` : ""} at ${detectedPath}`,
       );
       setState(input.instanceId, (prev) => ({
         ...prev,
@@ -1409,6 +2199,8 @@ export function makeProviderProvisioner(
   const runCodexManagedInstall = (input: {
     readonly instanceId: string;
     readonly operationId: string;
+    readonly option: ProvisionPlanOption;
+    readonly approvalToken: string;
   }): Effect.Effect<void> =>
     Effect.gen(function* () {
       const instanceIdTyped = ProviderInstanceId.make(input.instanceId);
@@ -1438,7 +2230,14 @@ export function makeProviderProvisioner(
 
       appendLog(input.instanceId, "Starting managed Codex installation…");
       const startedResult = yield* deps.providerInstallation
-        .start({ instanceId: instanceIdTyped })
+        .start({
+          instanceId: instanceIdTyped,
+          approvalToken: input.approvalToken,
+          ...(input.option.availableVersion ? { expectedVersion: input.option.availableVersion } : {}),
+          ...(input.option.consentKey.artifactDigest
+            ? { expectedSha256: input.option.consentKey.artifactDigest }
+            : {}),
+        })
         .pipe(
           Effect.match({
             onSuccess: (value) => ({ ok: true as const, value }),
@@ -1447,6 +2246,7 @@ export function makeProviderProvisioner(
         );
 
       if (!startedResult.ok) {
+        yield* deps.consent.revokeApproval(input.approvalToken).pipe(Effect.ignore);
         const msg = startedResult.error.message || "Could not start Codex installation.";
         setState(input.instanceId, (prev) => ({
           ...prev,
@@ -1462,12 +2262,16 @@ export function makeProviderProvisioner(
       const op = activeOps.get(input.instanceId);
       if (op && op.operationId === input.operationId && codexOpId) {
         op.cancel = () => {
+          op.abortController.abort();
           void Effect.runPromise(
             deps.providerInstallation
               .cancel({ instanceId: instanceIdTyped, operationId: codexOpId })
               .pipe(Effect.ignore),
           );
         };
+        if (op.cancelled) {
+          op.cancel();
+        }
       }
 
       const applyCodexState = (st: ProviderInstallState) => {
@@ -1510,6 +2314,7 @@ export function makeProviderProvisioner(
               Effect.map((opt) => Option.getOrElse(opt, () => startedResult.value)),
             );
 
+      yield* deps.consent.revokeApproval(input.approvalToken).pipe(Effect.ignore);
       yield* deps.refreshProviderInstance(instanceIdTyped).pipe(Effect.ignore);
 
       if (finalCodexState.phase === "succeeded") {
@@ -1550,31 +2355,50 @@ export function makeProviderProvisioner(
     readonly operationId: string;
     readonly agentId: "kimi-code" | "qoder" | "codebuddy-code";
     readonly option: ProvisionPlanOption;
+    readonly approvalToken: string;
   }): Effect.Effect<void> =>
     Effect.gen(function* () {
       const targetDir = input.option.targetInstallDir;
       const existedBefore = NodeFs.existsSync(targetDir);
       appendLog(input.instanceId, `$ ${input.option.commandPreview}`);
 
+      const expectedDistribution =
+        input.option.distribution === "binary" ||
+        input.option.distribution === "npx" ||
+        input.option.distribution === "uvx"
+          ? input.option.distribution
+          : undefined;
       const prepareEffect = deps.acpCatalog.prepare({
         agentId: input.agentId,
         instanceId: ProviderInstanceId.make(input.instanceId),
+        approvalToken: input.approvalToken,
+        ...(input.option.availableVersion ? { expectedVersion: input.option.availableVersion } : {}),
+        ...(expectedDistribution ? { expectedDistribution } : {}),
+        ...(input.option.consentKey.artifactSpec
+          ? { expectedArtifactSpec: input.option.consentKey.artifactSpec }
+          : {}),
+        ...(input.option.consentKey.artifactDigest
+          ? { expectedArchiveSha256: input.option.consentKey.artifactDigest }
+          : {}),
       });
 
       const fiber = yield* Effect.forkDetach(prepareEffect);
       const op = activeOps.get(input.instanceId);
       if (op && op.operationId === input.operationId) {
         op.cancel = () => {
+          op.abortController.abort();
           void Effect.runPromise(Fiber.interrupt(fiber));
         };
         if (op.cancelled) {
+          op.abortController.abort();
           yield* Fiber.interrupt(fiber);
         }
       }
 
       const exit = yield* Fiber.await(fiber);
-      const currentOp = activeOps.get(input.instanceId);
-      if (currentOp?.operationId === input.operationId && currentOp.cancelled) {
+      yield* deps.consent.revokeApproval(input.approvalToken).pipe(Effect.ignore);
+
+      if (isOpCancelled(input.instanceId, input.operationId)) {
         if (!existedBefore) {
           NodeFs.rmSync(targetDir, { recursive: true, force: true });
         }
@@ -1612,6 +2436,19 @@ export function makeProviderProvisioner(
         message: `Verifying ${prepared.agentId} v${prepared.version}…`,
       }));
 
+      if (isOpCancelled(input.instanceId, input.operationId)) {
+        if (!existedBefore) {
+          NodeFs.rmSync(targetDir, { recursive: true, force: true });
+        }
+        setState(input.instanceId, (prev) => ({
+          ...prev,
+          phase: "cancelled",
+          message: "Installation cancelled.",
+          finishedAt: new Date().toISOString(),
+        }));
+        return;
+      }
+
       upsertReceipt(deps.baseDir, {
         instanceId: input.instanceId,
         agentKind: input.agentId,
@@ -1646,172 +2483,232 @@ export function makeProviderProvisioner(
   const startInstall = (
     request: ProvisionInstallRequest,
   ): Effect.Effect<ProviderProvisionState, ProvisionerError> =>
-    Effect.gen(function* () {
-      const existingOp = activeOps.get(request.instanceId);
-      if (existingOp !== undefined) {
-        return yield* Effect.fail(
+    Effect.suspend(() => {
+      // M6: Acquire synchronous per-instance reservation BEFORE any async plan construction!
+      if (pendingInstances.has(request.instanceId) || activeOps.has(request.instanceId)) {
+        return Effect.fail(
           new ProvisionerError(
             "already_installing",
-            `An installation is already in progress for '${request.instanceId}'.`,
+            `An operation is already in progress for '${request.instanceId}'.`,
             409,
           ),
         );
       }
+      pendingInstances.add(request.instanceId);
 
-      const plan = yield* buildPlan(request.instanceId, request.mode);
-      const verifiedKey = yield* validateConsentMatches(plan, request.consent);
+      return Effect.gen(function* () {
+        const plan = yield* buildPlan(request.instanceId, request.mode);
+        const verifiedKey = yield* validateConsentMatches(plan, request.consent);
 
-      // Persist explicit user consent BEFORE any download or command runs.
-      yield* deps.consent.grantConsent(verifiedKey, {
-        commandPreview: plan.selectedOption.commandPreview,
-        officialSource: plan.selectedOption.officialSource,
-      });
-
-      const operationId = NodeCrypto.randomUUID();
-      const startedAt = new Date().toISOString();
-      const op: ActiveOperation = {
-        operationId,
-        mode: plan.selectedMode,
-        cancel: () => {},
-        cancelled: false,
-      };
-      activeOps.set(request.instanceId, op);
-
-      const initialState = setState(request.instanceId, () => ({
-        instanceId: request.instanceId,
-        phase: "installing",
-        operationId,
-        mode: plan.selectedMode,
-        message: `Installing ${plan.displayName}…`,
-        error: null,
-        logs: [],
-        installedVersion: null,
-        executablePath: null,
-        startedAt,
-        finishedAt: null,
-      }));
-
-      const workflow: Effect.Effect<void> = (() => {
-        if (plan.agentKind === "codex") {
-          return runCodexManagedInstall({ instanceId: request.instanceId, operationId });
+        const resourceKey = resourceLockKeyFor(
+          plan.agentKind,
+          plan.selectedMode,
+          plan.selectedOption.targetInstallDir,
+        );
+        const existingLock = resourceLocks.get(resourceKey);
+        if (existingLock !== undefined) {
+          return yield* Effect.fail(
+            new ProvisionerError(
+              "resource_busy",
+              `Another ${existingLock.kind} is already running for this managed runtime (${existingLock.instanceId}). Wait for it to finish first.`,
+              409,
+            ),
+          );
         }
-        if (plan.selectedMode === "vendor-script") {
-          const binaryName =
-            plan.agentKind === "claude"
-              ? "claude"
-              : plan.agentKind === "deepseek-harness"
-                ? "dsh"
-                : ACP_REGISTRY_AGENT_META[plan.agentKind].cliBinary;
-          return runVendorScriptInstall({
-            instanceId: request.instanceId,
-            operationId,
-            commandPreview: plan.selectedOption.commandPreview,
-            binaryName,
-          });
-        }
-        if (plan.agentKind === "deepseek-harness") {
-          const managedDir = NodePath.join(toolsDir, "deepseek-harness");
-          return runManagedNpmInstall({
-            instanceId: request.instanceId,
-            operationId,
-            agentKind: "deepseek-harness",
-            packageName: "@deepseek-ai/dsh",
-            binaryName: "dsh",
-            installDir: managedDir,
-            option: plan.selectedOption,
-            wireInstance: (managedBin) =>
-              Effect.gen(function* () {
-                const current = yield* getInstanceConfig(request.instanceId);
-                const currentConfig = isObjectRecord(current?.config) ? current.config : {};
-                const currentCmd = configString(currentConfig, "commandPath");
-                const isDefaultOrManaged =
-                  !currentCmd ||
-                  currentCmd === "dsh" ||
-                  isInsideDirectory(currentCmd, managedDir);
-                if (!isDefaultOrManaged) return;
-                const currentArgs = Array.isArray(currentConfig.commandArgs)
-                  ? currentConfig.commandArgs
-                  : ["--profile", "acp"];
-                yield* deps.updateProviderInstance({
-                  operation: "upsert",
-                  instanceId: ProviderInstanceId.make(request.instanceId),
-                  instance: {
-                    ...(current ?? {
-                      driver: ProviderDriverKind.make("acpRegistry"),
-                      displayName: "DeepSeek Harness",
-                    }),
-                    driver: ProviderDriverKind.make("acpRegistry"),
-                    enabled: current?.enabled ?? true,
-                    config: {
-                      ...currentConfig,
-                      source: "local",
-                      commandPath: managedBin,
-                      commandArgs: currentArgs,
-                      enabled: current?.enabled ?? true,
-                    },
-                  },
-                });
-              }),
-          });
-        }
-        if (plan.agentKind === "claude") {
-          const managedDir = NodePath.join(toolsDir, "claude-code");
-          return runManagedNpmInstall({
-            instanceId: request.instanceId,
-            operationId,
-            agentKind: "claude",
-            packageName: "@anthropic-ai/claude-code",
-            binaryName: "claude",
-            installDir: managedDir,
-            option: plan.selectedOption,
-            wireInstance: (managedBin) =>
-              Effect.gen(function* () {
-                const current = yield* getInstanceConfig(request.instanceId);
-                const currentConfig = isObjectRecord(current?.config) ? current.config : {};
-                const currentBinary = configString(currentConfig, "binaryPath");
-                const isDefaultOrManaged =
-                  !currentBinary ||
-                  currentBinary === "claude" ||
-                  isInsideDirectory(currentBinary, managedDir);
-                if (!isDefaultOrManaged) return;
-                yield* deps.updateProviderInstance({
-                  operation: "upsert",
-                  instanceId: ProviderInstanceId.make(request.instanceId),
-                  instance: {
-                    ...(current ?? { driver: ProviderDriverKind.make("claudeAgent") }),
-                    driver: ProviderDriverKind.make("claudeAgent"),
-                    enabled: current?.enabled ?? true,
-                    config: {
-                      ...currentConfig,
-                      enabled: current?.enabled ?? true,
-                      binaryPath: managedBin,
-                    },
-                  },
-                });
-              }),
-          });
-        }
-        return runAcpRegistryManagedInstall({
-          instanceId: request.instanceId,
-          operationId,
-          agentId: plan.agentKind,
-          option: plan.selectedOption,
+
+        // Persist explicit user consent audit log AND issue fresh single-use approval token (M2/M3).
+        yield* deps.consent.grantConsent(verifiedKey, {
+          commandPreview: plan.selectedOption.commandPreview,
+          officialSource: plan.selectedOption.officialSource,
         });
-      })();
+        const approvalToken = yield* deps.consent.issueApproval(verifiedKey);
 
-      yield* Effect.forkDetach(
-        workflow.pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              if (activeOps.get(request.instanceId)?.operationId === operationId) {
-                activeOps.delete(request.instanceId);
-              }
-            }),
+        const operationId = NodeCrypto.randomUUID();
+        const startedAt = new Date().toISOString();
+        const op: ActiveOperation = {
+          operationId,
+          mode: plan.selectedMode,
+          resourceKey,
+          abortController: createOperationAbortController(),
+          cancel: () => {},
+          cancelled: false,
+        };
+        activeOps.set(request.instanceId, op);
+        resourceLocks.set(resourceKey, {
+          operationId,
+          instanceId: request.instanceId,
+          kind: "install",
+        });
+
+        const initialState = setState(request.instanceId, () => ({
+          instanceId: request.instanceId,
+          phase: "installing",
+          operationId,
+          mode: plan.selectedMode,
+          message: `Installing ${plan.displayName}…`,
+          error: null,
+          logs: [],
+          installedVersion: null,
+          executablePath: null,
+          startedAt,
+          finishedAt: null,
+        }));
+
+        const workflow: Effect.Effect<void> = (() => {
+          if (plan.agentKind === "codex") {
+            return runCodexManagedInstall({
+              instanceId: request.instanceId,
+              operationId,
+              option: plan.selectedOption,
+              approvalToken,
+            });
+          }
+          if (plan.selectedMode === "vendor-script") {
+            const binaryName =
+              plan.agentKind === "claude"
+                ? "claude"
+                : plan.agentKind === "deepseek-harness"
+                  ? "dsh"
+                  : ACP_REGISTRY_AGENT_META[plan.agentKind].cliBinary;
+            const acpArgs =
+              plan.agentKind === "kimi-code" ||
+              plan.agentKind === "qoder" ||
+              plan.agentKind === "codebuddy-code"
+                ? ACP_REGISTRY_AGENT_META[plan.agentKind].acpArgs
+                : undefined;
+            return runVendorScriptInstall({
+              instanceId: request.instanceId,
+              operationId,
+              agentKind: plan.agentKind,
+              commandPreview: plan.selectedOption.commandPreview,
+              binaryName,
+              acpArgs,
+            }).pipe(
+              Effect.ensuring(deps.consent.revokeApproval(approvalToken).pipe(Effect.ignore)),
+            );
+          }
+          if (plan.agentKind === "deepseek-harness") {
+            const managedDir = NodePath.join(toolsDir, "deepseek-harness");
+            const pinnedSpec = plan.selectedOption.consentKey.artifactSpec!;
+            return runManagedNpmInstall({
+              instanceId: request.instanceId,
+              operationId,
+              agentKind: "deepseek-harness",
+              packageName: "@deepseek-ai/dsh",
+              pinnedPackageSpec: pinnedSpec,
+              binaryName: "dsh",
+              installDir: managedDir,
+              option: plan.selectedOption,
+              wireInstance: (managedBin) =>
+                Effect.gen(function* () {
+                  const current = yield* getInstanceConfig(request.instanceId);
+                  const currentConfig = isObjectRecord(current?.config) ? current.config : {};
+                  const currentCmd = configString(currentConfig, "commandPath");
+                  const isDefaultOrManaged =
+                    !currentCmd ||
+                    currentCmd === "dsh" ||
+                    isInsideDirectory(currentCmd, managedDir);
+                  if (!isDefaultOrManaged) return;
+                  const currentArgs = Array.isArray(currentConfig.commandArgs)
+                    ? currentConfig.commandArgs
+                    : ["--profile", "acp"];
+                  yield* deps.updateProviderInstance({
+                    operation: "upsert",
+                    instanceId: ProviderInstanceId.make(request.instanceId),
+                    instance: {
+                      ...(current ?? {
+                        driver: ProviderDriverKind.make("acpRegistry"),
+                        displayName: "DeepSeek Harness",
+                      }),
+                      driver: ProviderDriverKind.make("acpRegistry"),
+                      enabled: current?.enabled ?? true,
+                      config: {
+                        ...currentConfig,
+                        source: "local",
+                        commandPath: managedBin,
+                        commandArgs: currentArgs,
+                        enabled: current?.enabled ?? true,
+                      },
+                    },
+                  });
+                }),
+            }).pipe(
+              Effect.ensuring(deps.consent.revokeApproval(approvalToken).pipe(Effect.ignore)),
+            );
+          }
+          if (plan.agentKind === "claude") {
+            const managedDir = NodePath.join(toolsDir, "claude-code");
+            const pinnedSpec = plan.selectedOption.consentKey.artifactSpec!;
+            return runManagedNpmInstall({
+              instanceId: request.instanceId,
+              operationId,
+              agentKind: "claude",
+              packageName: "@anthropic-ai/claude-code",
+              pinnedPackageSpec: pinnedSpec,
+              binaryName: "claude",
+              installDir: managedDir,
+              option: plan.selectedOption,
+              wireInstance: (managedBin) =>
+                Effect.gen(function* () {
+                  const current = yield* getInstanceConfig(request.instanceId);
+                  const currentConfig = isObjectRecord(current?.config) ? current.config : {};
+                  const currentBinary = configString(currentConfig, "binaryPath");
+                  const isDefaultOrManaged =
+                    !currentBinary ||
+                    currentBinary === "claude" ||
+                    isInsideDirectory(currentBinary, managedDir);
+                  if (!isDefaultOrManaged) return;
+                  yield* deps.updateProviderInstance({
+                    operation: "upsert",
+                    instanceId: ProviderInstanceId.make(request.instanceId),
+                    instance: {
+                      ...(current ?? { driver: ProviderDriverKind.make("claudeAgent") }),
+                      driver: ProviderDriverKind.make("claudeAgent"),
+                      enabled: current?.enabled ?? true,
+                      config: {
+                        ...currentConfig,
+                        enabled: current?.enabled ?? true,
+                        binaryPath: managedBin,
+                      },
+                    },
+                  });
+                }),
+            }).pipe(
+              Effect.ensuring(deps.consent.revokeApproval(approvalToken).pipe(Effect.ignore)),
+            );
+          }
+          return runAcpRegistryManagedInstall({
+            instanceId: request.instanceId,
+            operationId,
+            agentId: plan.agentKind,
+            option: plan.selectedOption,
+            approvalToken,
+          });
+        })();
+
+        yield* Effect.forkDetach(
+          workflow.pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                if (activeOps.get(request.instanceId)?.operationId === operationId) {
+                  activeOps.delete(request.instanceId);
+                }
+                if (resourceLocks.get(resourceKey)?.operationId === operationId) {
+                  resourceLocks.delete(resourceKey);
+                }
+              }),
+            ),
           ),
+        );
+
+        return initialState;
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            pendingInstances.delete(request.instanceId);
+          }),
         ),
       );
-
-      return initialState;
     });
 
   const cancelInstall = (
@@ -1825,10 +2722,15 @@ export function makeProviderProvisioner(
       }
       if (operationId !== undefined && op.operationId !== operationId) {
         return yield* Effect.fail(
-          new ProvisionerError("operation_mismatch", "Active installation operation ID does not match.", 409),
+          new ProvisionerError(
+            "operation_mismatch",
+            "Active installation operation ID does not match.",
+            409,
+          ),
         );
       }
       op.cancelled = true;
+      op.abortController.abort();
       op.cancel();
       return setState(instanceId, (prev) => ({
         ...prev,
@@ -1839,9 +2741,10 @@ export function makeProviderProvisioner(
   const uninstall = (
     instanceId: string,
   ): Effect.Effect<ProviderProvisionState, ProvisionerError> =>
-    Effect.gen(function* () {
-      if (activeOps.has(instanceId)) {
-        return yield* Effect.fail(
+    Effect.suspend(() => {
+      // M6: Synchronously guard against concurrent install/uninstall before async plan lookup.
+      if (pendingInstances.has(instanceId) || activeOps.has(instanceId)) {
+        return Effect.fail(
           new ProvisionerError(
             "already_installing",
             "Cancel the active installation before uninstalling.",
@@ -1849,85 +2752,199 @@ export function makeProviderProvisioner(
           ),
         );
       }
+      pendingInstances.add(instanceId);
 
-      const plan = yield* buildPlan(instanceId);
-      if (!plan.canUninstall) {
-        return yield* Effect.fail(
-          new ProvisionerError("uninstall_unsupported", plan.uninstallGuidance, 400),
+      const operationId = NodeCrypto.randomUUID();
+      let acquiredResourceKey: string | null = null;
+
+      return Effect.gen(function* () {
+        const plan = yield* buildPlan(instanceId, "app-managed");
+        if (!plan.canUninstall) {
+          return yield* Effect.fail(
+            new ProvisionerError("uninstall_unsupported", plan.uninstallGuidance, 400),
+          );
+        }
+
+        const resourceKey = resourceLockKeyFor(
+          plan.agentKind,
+          "app-managed",
+          plan.selectedOption.targetInstallDir,
         );
-      }
+        const existingLock = resourceLocks.get(resourceKey);
+        if (existingLock !== undefined) {
+          return yield* Effect.fail(
+            new ProvisionerError(
+              "resource_busy",
+              `Cannot uninstall while another ${existingLock.kind} is active for this managed runtime (${existingLock.instanceId}).`,
+              409,
+            ),
+          );
+        }
+        resourceLocks.set(resourceKey, {
+          operationId,
+          instanceId,
+          kind: "uninstall",
+        });
+        acquiredResourceKey = resourceKey;
 
-      const instanceIdTyped = ProviderInstanceId.make(instanceId);
+        const instanceIdTyped = ProviderInstanceId.make(instanceId);
 
-      if (plan.agentKind === "codex") {
-        yield* deps.providerInstallation.remove({ instanceId: instanceIdTyped }).pipe(
-          Effect.mapError(
-            (error) => new ProvisionerError("uninstall_failed", error.message, 500),
-          ),
-        );
-      } else if (plan.agentKind === "deepseek-harness") {
-        const managedDir = NodePath.join(toolsDir, "deepseek-harness");
-        NodeFs.rmSync(managedDir, { recursive: true, force: true });
-        const current = yield* getInstanceConfig(instanceId);
-        const currentConfig = isObjectRecord(current?.config) ? current.config : {};
-        const currentCmd = configString(currentConfig, "commandPath");
-        if (current && currentCmd && isInsideDirectory(currentCmd, managedDir)) {
-          yield* deps
-            .updateProviderInstance({
-              operation: "upsert",
-              instanceId: instanceIdTyped,
-              instance: {
-                ...current,
-                config: {
-                  ...currentConfig,
-                  commandPath: "dsh",
+        if (plan.agentKind === "codex") {
+          const blockers = yield* findOtherReferencingInstances(
+            instanceId,
+            "codex",
+            deps.codexInstallation.managedDirectory,
+          );
+          if (blockers.length > 0) {
+            return yield* Effect.fail(
+              new ProvisionerError(
+                "shared_runtime_in_use",
+                `Cannot uninstall managed Codex because another enabled provider instance still uses it (${blockers.join(", ")}).`,
+                409,
+              ),
+            );
+          }
+          yield* deps.providerInstallation.remove({ instanceId: instanceIdTyped }).pipe(
+            Effect.mapError(
+              (error) => new ProvisionerError("uninstall_failed", error.message, 500),
+            ),
+          );
+        } else if (plan.agentKind === "deepseek-harness") {
+          const managedDir = NodePath.join(toolsDir, "deepseek-harness");
+          const blockers = yield* findOtherReferencingInstances(
+            instanceId,
+            "deepseek-harness",
+            managedDir,
+          );
+          if (blockers.length > 0) {
+            return yield* Effect.fail(
+              new ProvisionerError(
+                "shared_runtime_in_use",
+                `Cannot uninstall managed DeepSeek Harness because another enabled provider instance still uses it (${blockers.join(", ")}).`,
+                409,
+              ),
+            );
+          }
+          NodeFs.rmSync(managedDir, { recursive: true, force: true });
+          const current = yield* getInstanceConfig(instanceId);
+          const currentConfig = isObjectRecord(current?.config) ? current.config : {};
+          const currentCmd = configString(currentConfig, "commandPath");
+          if (current && currentCmd && isInsideDirectory(currentCmd, managedDir)) {
+            yield* deps
+              .updateProviderInstance({
+                operation: "upsert",
+                instanceId: instanceIdTyped,
+                instance: {
+                  ...current,
+                  config: {
+                    ...currentConfig,
+                    commandPath: "dsh",
+                  },
                 },
-              },
-            })
-            .pipe(Effect.ignore);
-        }
-      } else if (plan.agentKind === "claude") {
-        const managedDir = NodePath.join(toolsDir, "claude-code");
-        NodeFs.rmSync(managedDir, { recursive: true, force: true });
-        const current = yield* getInstanceConfig(instanceId);
-        const currentConfig = isObjectRecord(current?.config) ? current.config : {};
-        const currentBinary = configString(currentConfig, "binaryPath");
-        if (current && currentBinary && isInsideDirectory(currentBinary, managedDir)) {
-          const { binaryPath: _omit, ...restConfig } = currentConfig;
-          yield* deps
-            .updateProviderInstance({
-              operation: "upsert",
-              instanceId: instanceIdTyped,
-              instance: {
-                ...current,
-                config: restConfig,
-              },
-            })
-            .pipe(Effect.ignore);
-        }
-      } else {
-        // Kimi Code / Qoder / Codebuddy Code managed ACP tools dir + package receipts
-        const agentRoot = NodePath.join(toolsDir, plan.agentKind);
-        NodeFs.rmSync(agentRoot, { recursive: true, force: true });
-        const receiptsDir = NodePath.join(deps.cacheDir, "acp-registry", "package-installs");
-        if (NodeFs.existsSync(receiptsDir)) {
-          for (const entry of NodeFs.readdirSync(receiptsDir)) {
-            if (entry.startsWith(`${plan.agentKind}-`) && entry.endsWith(".json")) {
-              NodeFs.rmSync(NodePath.join(receiptsDir, entry), { force: true });
+              })
+              .pipe(Effect.ignore);
+          }
+        } else if (plan.agentKind === "claude") {
+          const managedDir = NodePath.join(toolsDir, "claude-code");
+          const blockers = yield* findOtherReferencingInstances(instanceId, "claude", managedDir);
+          if (blockers.length > 0) {
+            return yield* Effect.fail(
+              new ProvisionerError(
+                "shared_runtime_in_use",
+                `Cannot uninstall managed Claude Code because another enabled provider instance still uses it (${blockers.join(", ")}).`,
+                409,
+              ),
+            );
+          }
+          NodeFs.rmSync(managedDir, { recursive: true, force: true });
+          const current = yield* getInstanceConfig(instanceId);
+          const currentConfig = isObjectRecord(current?.config) ? current.config : {};
+          const currentBinary = configString(currentConfig, "binaryPath");
+          if (current && currentBinary && isInsideDirectory(currentBinary, managedDir)) {
+            const { binaryPath: _omit, ...restConfig } = currentConfig;
+            yield* deps
+              .updateProviderInstance({
+                operation: "upsert",
+                instanceId: instanceIdTyped,
+                instance: {
+                  ...current,
+                  config: restConfig,
+                },
+              })
+              .pipe(Effect.ignore);
+          }
+        } else {
+          // M6: Acquire AcpRegistrySupport install permit & check shared references before removing ACP cache!
+          const blockers = yield* findOtherReferencingInstances(
+            instanceId,
+            plan.agentKind,
+            NodePath.join(toolsDir, plan.agentKind),
+          );
+          if (blockers.length > 0) {
+            return yield* Effect.fail(
+              new ProvisionerError(
+                "shared_runtime_in_use",
+                `Cannot uninstall managed ${plan.displayName} because another enabled provider instance still references '${plan.agentKind}' (${blockers.join(", ")}).`,
+                409,
+              ),
+            );
+          }
+          if (deps.acpCatalog.uninstallManagedAgent) {
+            const acpRemoval = yield* deps.acpCatalog
+              .uninstallManagedAgent({
+                agentId: plan.agentKind,
+                ignoreInstanceId: instanceId,
+              })
+              .pipe(
+                Effect.mapError(
+                  (error) => new ProvisionerError("uninstall_failed", error.detail, 500),
+                ),
+              );
+            if (acpRemoval.blockedByInstanceIds.length > 0) {
+              return yield* Effect.fail(
+                new ProvisionerError(
+                  "shared_runtime_in_use",
+                  `Cannot uninstall managed ${plan.displayName} because another enabled provider instance still references '${plan.agentKind}' (${acpRemoval.blockedByInstanceIds.join(", ")}).`,
+                  409,
+                ),
+              );
+            }
+          } else {
+            const agentRoot = NodePath.join(toolsDir, plan.agentKind);
+            NodeFs.rmSync(agentRoot, { recursive: true, force: true });
+            const receiptsDir = NodePath.join(deps.cacheDir, "acp-registry", "package-installs");
+            if (NodeFs.existsSync(receiptsDir)) {
+              for (const entry of NodeFs.readdirSync(receiptsDir)) {
+                if (entry.startsWith(`${plan.agentKind}-`) && entry.endsWith(".json")) {
+                  NodeFs.rmSync(NodePath.join(receiptsDir, entry), { force: true });
+                }
+              }
             }
           }
         }
-      }
 
-      removeReceipt(deps.baseDir, instanceId);
-      yield* deps.consent.revokeConsentForInstance(instanceId);
-      yield* deps.refreshProviderInstance(instanceIdTyped).pipe(Effect.ignore);
+        removeReceipt(deps.baseDir, instanceId);
+        yield* deps.consent.revokeConsentForInstance(instanceId);
+        yield* deps.refreshProviderInstance(instanceIdTyped).pipe(Effect.ignore);
 
-      return setState(instanceId, () => ({
-        ...idleState(instanceId),
-        message: `Uninstalled managed ${plan.displayName}.`,
-        finishedAt: new Date().toISOString(),
-      }));
+        return setState(instanceId, () => ({
+          ...idleState(instanceId),
+          message: `Uninstalled managed ${plan.displayName}.`,
+          finishedAt: new Date().toISOString(),
+        }));
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            pendingInstances.delete(instanceId);
+            if (
+              acquiredResourceKey !== null &&
+              resourceLocks.get(acquiredResourceKey)?.operationId === operationId
+            ) {
+              resourceLocks.delete(acquiredResourceKey);
+            }
+          }),
+        ),
+      );
     });
 
   return {
@@ -2058,6 +3075,10 @@ const serve = Effect.fnUntraced(function* (service: XtworkProviderProvisionerSer
         "consent_required",
       );
     }
+    const artifactSpec =
+      typeof rawConsent.artifactSpec === "string" ? rawConsent.artifactSpec : undefined;
+    const artifactDigest =
+      typeof rawConsent.artifactDigest === "string" ? rawConsent.artifactDigest : undefined;
     return yield* service
       .startInstall({
         instanceId,
@@ -2068,6 +3089,8 @@ const serve = Effect.fnUntraced(function* (service: XtworkProviderProvisionerSer
           version: rawConsent.version,
           distribution: rawConsent.distribution,
           installDir: rawConsent.installDir,
+          ...(artifactSpec ? { artifactSpec } : {}),
+          ...(artifactDigest ? { artifactDigest } : {}),
         },
       })
       .pipe(

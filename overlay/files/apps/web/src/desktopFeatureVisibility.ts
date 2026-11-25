@@ -100,13 +100,21 @@ export function showAssistantModelPicker(
     readonly instanceId: string;
     readonly enabled: boolean;
     readonly isAvailable: boolean;
+    readonly installed?: boolean;
+    readonly status?: string;
     readonly models: ReadonlyArray<{ readonly slug: string }>;
   }>,
   developerFeatures: boolean,
 ): boolean {
   if (developerFeatures) return true;
   const models = entries
-    .filter((entry) => entry.enabled && entry.isAvailable)
+    .filter(
+      (entry) =>
+        entry.enabled &&
+        entry.isAvailable &&
+        entry.installed !== false &&
+        (entry.status === undefined || entry.status === "ready"),
+    )
     .flatMap((entry) =>
       entry.models.flatMap(({ slug }) =>
         entry.instanceId === BUILT_IN_ASSISTANT_ID && slug === "default"

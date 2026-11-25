@@ -80,7 +80,22 @@ it("omits the picker for the only built-in model and restores it when there is a
     ...assistant,
     models: [...assistant.models, { ...assistant.models[0]!, slug: "xtwork/second" }],
   };
+  const uninstalledClaude = {
+    instanceId: "claudeAgent",
+    enabled: true,
+    isAvailable: true,
+    installed: false,
+    status: "error",
+    models: [{ slug: "claude-sonnet-4-6" }],
+  };
+  const readyClaude = {
+    ...uninstalledClaude,
+    installed: true,
+    status: "ready",
+  };
   expect(showAssistantModelPicker([assistant], false)).toBe(false);
+  expect(showAssistantModelPicker([assistant, uninstalledClaude], false)).toBe(false);
+  expect(showAssistantModelPicker([assistant, readyClaude], false)).toBe(true);
   expect(showAssistantModelPicker([assistant], true)).toBe(true);
   expect(showAssistantModelPicker([otherModel], false)).toBe(true);
 });

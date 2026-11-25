@@ -10,6 +10,8 @@ import {
   KIMI_CODE_INSTANCE_ID,
   QODER_INSTANCE_ID,
   codingAgentSeedMarkerPath,
+  commitCodingAgentSeedMarker,
+  planCodingAgentSeeds,
   seedCodingAgents,
   seedCodingAgentsWithMarker,
   shouldSeedCodingAgents,
@@ -143,6 +145,31 @@ describe("codingAgentSeed", () => {
     expect(afterRestart.providerInstances[KIMI_CODE_INSTANCE_ID]).toBeDefined();
     expect(afterRestart.providerInstances[CODEBUDDY_CODE_INSTANCE_ID]).toBeDefined();
     expect(afterRestart.providerInstances[DEEPSEEK_HARNESS_INSTANCE_ID]).toBeDefined();
+  });
+
+  it("defers writing the seed marker until settings persistence commits (S1)", () => {
+    const baseDir = makeTempDir();
+    const planned = planCodingAgentSeeds(DEFAULT_SERVER_SETTINGS, baseDir);
+    expect(planned.addedIds).toHaveLength(4);
+    expect(planned.markerNeedsWrite).toBe(true);
+    // Marker MUST NOT exist before commit (e.g., if settings write fails or file is untrusted).
+    expect(NodeFs.existsSync(codingAgentSeedMarkerPath(baseDir))).toBe(false);
+
+    // If settings persistence failed, a subsequent retry still plans all 4 seeds.
+    const retried = planCodingAgentSeeds(DEFAULT_SERVER_SETTINGS, baseDir);
+    expect(retried.addedIds).toHaveLength(4);
+    expect(NodeFs.existsSync(codingAgentSeedMarkerPath(baseDir))).toBe(false);
+
+    // Only after trusted persistence succeeds does commit write the marker.
+    commitCodingAgentSeedMarker(baseDir, planned.trackedIds);
+    expect(NodeFs.existsSync(codingAgentSeedMarkerPath(baseDir))).toBe(true);
+
+    const { [QODER_INSTANCE_ID]: _deleted, ...remainingProviders } =
+      planned.settings.providerInstances;
+    const afterDelete = { ...planned.settings, providerInstances: remainingProviders };
+    const afterRestart = planCodingAgentSeeds(afterDelete, baseDir);
+    expect(afterRestart.addedIds).toEqual([]);
+    expect(afterRestart.settings.providerInstances[QODER_INSTANCE_ID]).toBeUndefined();
   });
 
   it("activates only in Xtwork environments unless explicitly toggled", () => {

@@ -198,22 +198,49 @@ export function seedCodingAgents(
   };
 }
 
+export interface PlannedCodingAgentSeed extends SeedCodingAgentsResult {
+  readonly markerNeedsWrite: boolean;
+}
+
+/**
+ * Pure planning step: reads any prior seed marker and computes the migrated
+ * settings WITHOUT mutating disk. Call `commitCodingAgentSeedMarker` ONLY after
+ * trusted settings persistence succeeds.
+ */
+export function planCodingAgentSeeds(
+  settings: ServerSettings,
+  baseDir: string,
+): PlannedCodingAgentSeed {
+  const previouslySeededIds = readSeededCodingAgentIds(baseDir);
+  const result = seedCodingAgents(settings, { previouslySeededIds });
+  const markerNeedsWrite =
+    result.addedIds.length > 0 ||
+    result.trackedIds.size !== previouslySeededIds.size ||
+    !NodeFs.existsSync(codingAgentSeedMarkerPath(baseDir));
+  return {
+    ...result,
+    markerNeedsWrite,
+  };
+}
+
+export function commitCodingAgentSeedMarker(
+  baseDir: string,
+  trackedIds: ReadonlySet<string>,
+): void {
+  try {
+    writeSeededCodingAgentIds(baseDir, trackedIds);
+  } catch {
+    // Do not fail settings hydration if marker persistence fails; next run remains idempotent.
+  }
+}
+
 export function seedCodingAgentsWithMarker(
   settings: ServerSettings,
   baseDir: string,
 ): ServerSettings {
-  const previouslySeededIds = readSeededCodingAgentIds(baseDir);
-  const result = seedCodingAgents(settings, { previouslySeededIds });
-  const markerMissingOrStale =
-    result.addedIds.length > 0 ||
-    result.trackedIds.size !== previouslySeededIds.size ||
-    !NodeFs.existsSync(codingAgentSeedMarkerPath(baseDir));
-  if (markerMissingOrStale) {
-    try {
-      writeSeededCodingAgentIds(baseDir, result.trackedIds);
-    } catch {
-      // Do not fail settings hydration if marker persistence fails; next run remains idempotent.
-    }
+  const planned = planCodingAgentSeeds(settings, baseDir);
+  if (planned.markerNeedsWrite) {
+    commitCodingAgentSeedMarker(baseDir, planned.trackedIds);
   }
-  return result.settings;
+  return planned.settings;
 }
