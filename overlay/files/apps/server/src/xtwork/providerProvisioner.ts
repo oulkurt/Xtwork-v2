@@ -57,6 +57,7 @@ export type ProvisionerPhase =
   | "cancelled";
 
 export type ProvisionInstallMode = "app-managed" | "vendor-script";
+export type ProvisionAcpDistributionPreference = "auto" | "binary" | "npx" | "uvx";
 
 export type KnownProvisionAgentKind =
   | "codex"
@@ -128,6 +129,7 @@ export interface ProviderInstallPlan {
   readonly uninstallGuidance: string;
   readonly uninstallGuidanceZh: string;
   readonly vendorInstallBlockedByExistingPath: boolean;
+  readonly distributionPreference?: ProvisionAcpDistributionPreference | undefined;
   readonly state: ProviderProvisionState;
 }
 
@@ -208,16 +210,26 @@ const ANSI_ESCAPE_PATTERN =
   // eslint-disable-next-line no-control-regex
   /\u001B(?:\][^\u0007\u001B]*(?:\u0007|\u001B\\)|\[[0-9;?]*[ -/]*[@-~])/g;
 const SECRET_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // S5: JSON-quoted key/value secret fields ("api_key": "...", "apiKey": "...", "password": "...", etc.)
+  [
+    /("(?:[^"\\]|\\.)*(?:api[_-]?key|password|passwd|secret|token|authorization|credential)(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)(")/gi,
+    "$1[REDACTED]$3",
+  ],
+  // Single-quoted key/value secret fields ('api_key': '...')
+  [
+    /('(?:[^'\\]|\\.)*(?:api[_-]?key|password|passwd|secret|token|authorization|credential)(?:[^'\\]|\\.)*'\s*:\s*')((?:[^'\\]|\\.)*)(')/gi,
+    "$1[REDACTED]$3",
+  ],
   [/\b(sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_KEY]"],
   [/\b((?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g, "[REDACTED_KEY]"],
   [/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]"],
   [/\b(Authorization\s*:\s*(?:Basic|Token)\s+)\S+/gi, "$1[REDACTED]"],
   [
-    /\b((?:ANTHROPIC|OPENAI|DEEPSEEK|KIMI|API)[A-Z0-9_]*(?:KEY|TOKEN|SECRET)\s*=\s*)\S+/gi,
+    /\b((?:ANTHROPIC|OPENAI|DEEPSEEK|KIMI|API)[A-Z0-9_]*(?:KEY|TOKEN|SECRET)\s*[=:]\s*)\S+/gi,
     "$1[REDACTED]",
   ],
   [
-    /\b((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)\s*[=:]\s*)\S+/gi,
+    /\b((?:api[_-]?key|apiKey|access[_-]?token|accessToken|refresh[_-]?token|refreshToken|client[_-]?secret|clientSecret|passwd|password|secret|token|credential)\s*[=:]\s*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+)/gi,
     "$1[REDACTED]",
   ],
 ];
@@ -313,11 +325,11 @@ export function buildHardenedPosixInstallerCommand(httpsUrl: string): string {
   ].join("\n");
 }
 
-function isExecutableFile(filePath: string): boolean {
+function isExecutableFile(filePath: string, platform: NodeJS.Platform = process.platform): boolean {
   try {
     const stat = NodeFs.statSync(filePath);
     if (!stat.isFile()) return false;
-    if (process.platform === "win32") return true;
+    if (platform === "win32") return true;
     return (stat.mode & 0o111) !== 0;
   } catch {
     return false;
@@ -334,11 +346,11 @@ function resolveBundledNpm(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): s
   const bundledBin = env.XTWORK_BUNDLED_NODE_BIN?.trim();
   if (bundledBin) {
     const candidate = NodePath.join(bundledBin, npmName);
-    if (isExecutableFile(candidate)) return candidate;
+    if (isExecutableFile(candidate, platform)) return candidate;
   }
   const execDir = NodePath.dirname(process.execPath);
   const siblingNpm = NodePath.join(execDir, npmName);
-  if (isExecutableFile(siblingNpm)) return siblingNpm;
+  if (isExecutableFile(siblingNpm, platform)) return siblingNpm;
   return findExecutableInPath(npmName, env, platform, []);
 }
 
@@ -350,10 +362,17 @@ export function findExecutableInPath(
 ): string | null {
   const rawPath =
     platform === "win32" ? (env.PATH ?? env.Path ?? env.path ?? "") : (env.PATH ?? "");
-  const home = env.HOME?.trim() || NodeOs.homedir();
+  const home =
+    platform === "win32"
+      ? env.USERPROFILE?.trim() || env.HOME?.trim() || NodeOs.homedir()
+      : env.HOME?.trim() || NodeOs.homedir();
   const extraDirs =
     platform === "win32"
-      ? []
+      ? [
+          NodePath.join(home, ".kimi-code", "bin"),
+          NodePath.join(home, ".local", "bin"),
+          NodePath.join(home, ".cargo", "bin"),
+        ]
       : [
           NodePath.join(home, ".local", "bin"),
           NodePath.join(home, ".kimi-code", "bin"),
@@ -362,7 +381,8 @@ export function findExecutableInPath(
             ? []
             : ["/opt/homebrew/bin", "/usr/local/bin"]),
         ];
-  const dirs = [...rawPath.split(NodePath.delimiter).filter(Boolean), ...extraDirs];
+  const pathDelimiter = platform === "win32" ? ";" : ":";
+  const dirs = [...rawPath.split(pathDelimiter).filter(Boolean), ...extraDirs];
   const seen = new Set<string>();
   const extensions = platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
 
@@ -373,7 +393,7 @@ export function findExecutableInPath(
     if (excludedDirs.some((excluded) => isInsideDirectory(dir, excluded))) continue;
     for (const ext of extensions) {
       const candidate = NodePath.join(dir, `${binaryName}${ext}`);
-      if (isExecutableFile(candidate)) {
+      if (isExecutableFile(candidate, platform)) {
         try {
           const real = NodeFs.realpathSync(candidate);
           if (excludedDirs.some((excluded) => isInsideDirectory(real, excluded))) continue;
@@ -967,6 +987,7 @@ interface ActiveOperation {
   readonly commitSemaphore: Semaphore.Semaphore;
   cancel: () => void;
   cancelled: boolean;
+  committing: boolean;
   committed: boolean;
 }
 
@@ -1543,8 +1564,16 @@ export function makeProviderProvisioner(
       const acpAgentId = agentKind;
       const resolvedDisplayName =
         instance?.displayName?.trim() || builtInMeta?.displayName || acpAgentId;
+      // M3: Honor the instance's configured ACP distribution preference (e.g. "npx") rather than forcing "auto".
+      const rawDistributionPref = configString(instance?.config, "distribution");
+      const configuredDistribution: ProvisionAcpDistributionPreference =
+        rawDistributionPref === "binary" ||
+        rawDistributionPref === "npx" ||
+        rawDistributionPref === "uvx"
+          ? rawDistributionPref
+          : "auto";
       const described = deps.acpCatalog.describeAgent
-        ? yield* deps.acpCatalog.describeAgent(acpAgentId, "auto").pipe(Effect.option)
+        ? yield* deps.acpCatalog.describeAgent(acpAgentId, configuredDistribution).pipe(Effect.option)
         : Option.none();
       const describedValue = Option.getOrUndefined(described);
 
@@ -1725,6 +1754,7 @@ export function makeProviderProvisioner(
           : selectedOption.uninstallGuidanceZh,
         vendorInstallBlockedByExistingPath:
           selectedOption.mode === "vendor-script" && vendorBlocked,
+        distributionPreference: configuredDistribution,
         state: currentState,
       };
     });
@@ -1909,7 +1939,7 @@ export function makeProviderProvisioner(
 
       const binName = deps.platform === "win32" ? `${input.binaryName}.cmd` : input.binaryName;
       const managedBin = NodePath.join(input.installDir, "node_modules", ".bin", binName);
-      if (!isExecutableFile(managedBin)) {
+      if (!isExecutableFile(managedBin, deps.platform)) {
         if (!existedBefore) {
           NodeFs.rmSync(input.installDir, { recursive: true, force: true });
         }
@@ -1971,6 +2001,11 @@ export function makeProviderProvisioner(
           }));
           return;
         }
+        // S4: Past point-of-no-return under commitSemaphore; cancelInstall waits for this critical section
+        // and observes committed=true rather than deleting the binary that settings now references.
+        if (commitOp && commitOp.operationId === input.operationId) {
+          commitOp.committing = true;
+        }
 
         const wireResult = yield* input.wireInstance(managedBin).pipe(
           Effect.match({
@@ -1979,6 +2014,9 @@ export function makeProviderProvisioner(
           }),
         );
         if (!wireResult.ok) {
+          if (commitOp && commitOp.operationId === input.operationId) {
+            commitOp.committing = false;
+          }
           const detail = redactSecrets(
             wireResult.error instanceof Error
               ? wireResult.error.message
@@ -1992,19 +2030,6 @@ export function makeProviderProvisioner(
             executablePath: managedBin,
             error: detail,
             message: detail,
-            finishedAt: new Date().toISOString(),
-          }));
-          return;
-        }
-
-        if (isOpCancelled(input.instanceId, input.operationId)) {
-          if (!existedBefore) {
-            NodeFs.rmSync(input.installDir, { recursive: true, force: true });
-          }
-          setState(input.instanceId, (prev) => ({
-            ...prev,
-            phase: "cancelled",
-            message: "Installation cancelled.",
             finishedAt: new Date().toISOString(),
           }));
           return;
@@ -2024,11 +2049,8 @@ export function makeProviderProvisioner(
 
         if (commitOp && commitOp.operationId === input.operationId) {
           commitOp.committed = true;
+          commitOp.committing = false;
         }
-
-        yield* deps
-          .refreshProviderInstance(ProviderInstanceId.make(input.instanceId))
-          .pipe(Effect.ignore);
 
         appendLog(
           input.instanceId,
@@ -2049,6 +2071,12 @@ export function makeProviderProvisioner(
         yield* commitOp.commitSemaphore.withPermits(1)(runCommit);
       } else {
         yield* runCommit;
+      }
+
+      if (getOrInitState(input.instanceId).phase === "succeeded") {
+        yield* deps
+          .refreshProviderInstance(ProviderInstanceId.make(input.instanceId))
+          .pipe(Effect.ignore);
       }
     });
 
@@ -2242,6 +2270,9 @@ export function makeProviderProvisioner(
             }));
             return "cancelled" as const;
           }
+          if (commitOp && commitOp.operationId === input.operationId) {
+            commitOp.committing = true;
+          }
           const currentConfig = isObjectRecord(current?.config) ? current.config : {};
           const existingCommandPath = configString(currentConfig, "commandPath");
           if (!existingCommandPath) {
@@ -2275,6 +2306,9 @@ export function makeProviderProvisioner(
                 }),
               );
             if (!writeResult.ok) {
+              if (commitOp && commitOp.operationId === input.operationId) {
+                commitOp.committing = false;
+              }
               const detail = redactSecrets(
                 writeResult.error instanceof Error
                   ? writeResult.error.message
@@ -2295,7 +2329,21 @@ export function makeProviderProvisioner(
           }
           if (commitOp && commitOp.operationId === input.operationId) {
             commitOp.committed = true;
+            commitOp.committing = false;
           }
+          appendLog(
+            input.instanceId,
+            `Verified ${input.binaryName}${detectedVersion ? ` v${detectedVersion}` : ""} at ${detectedPath}`,
+          );
+          setState(input.instanceId, (prev) => ({
+            ...prev,
+            phase: "succeeded",
+            installedVersion: detectedVersion,
+            executablePath: detectedPath,
+            error: null,
+            message: `Installed ${input.binaryName}${detectedVersion ? ` v${detectedVersion}` : ""}.`,
+            finishedAt: new Date().toISOString(),
+          }));
           return "committed" as const;
         });
 
@@ -2333,7 +2381,21 @@ export function makeProviderProvisioner(
           }
           if (commitOp && commitOp.operationId === input.operationId) {
             commitOp.committed = true;
+            commitOp.committing = false;
           }
+          appendLog(
+            input.instanceId,
+            `Verified ${input.binaryName}${detectedVersion ? ` v${detectedVersion}` : ""} at ${detectedPath}`,
+          );
+          setState(input.instanceId, (prev) => ({
+            ...prev,
+            phase: "succeeded",
+            installedVersion: detectedVersion,
+            executablePath: detectedPath,
+            error: null,
+            message: `Installed ${input.binaryName}${detectedVersion ? ` v${detectedVersion}` : ""}.`,
+            finishedAt: new Date().toISOString(),
+          }));
           return true;
         });
         const ok =
@@ -2348,20 +2410,6 @@ export function makeProviderProvisioner(
       yield* deps
         .refreshProviderInstance(ProviderInstanceId.make(input.instanceId))
         .pipe(Effect.ignore);
-
-      appendLog(
-        input.instanceId,
-        `Verified ${input.binaryName}${detectedVersion ? ` v${detectedVersion}` : ""} at ${detectedPath}`,
-      );
-      setState(input.instanceId, (prev) => ({
-        ...prev,
-        phase: "succeeded",
-        installedVersion: detectedVersion,
-        executablePath: detectedPath,
-        error: null,
-        message: `Installed ${input.binaryName}${detectedVersion ? ` v${detectedVersion}` : ""}.`,
-        finishedAt: new Date().toISOString(),
-      }));
     });
 
   const runCodexManagedInstall = (input: {
@@ -2524,6 +2572,7 @@ export function makeProviderProvisioner(
     readonly agentId: string;
     readonly option: ProvisionPlanOption;
     readonly approvalToken: string;
+    readonly distributionPreference?: ProvisionAcpDistributionPreference | undefined;
   }): Effect.Effect<void> =>
     Effect.gen(function* () {
       const targetDir = input.option.targetInstallDir;
@@ -2540,6 +2589,9 @@ export function makeProviderProvisioner(
         agentId: input.agentId,
         instanceId: ProviderInstanceId.make(input.instanceId),
         approvalToken: input.approvalToken,
+        ...(input.distributionPreference && input.distributionPreference !== "auto"
+          ? { distributionPreference: input.distributionPreference }
+          : {}),
         ...(input.option.availableVersion ? { expectedVersion: input.option.availableVersion } : {}),
         ...(expectedDistribution ? { expectedDistribution } : {}),
         ...(input.option.consentKey.artifactSpec
@@ -2618,6 +2670,9 @@ export function makeProviderProvisioner(
           }));
           return false;
         }
+        if (commitOp && commitOp.operationId === input.operationId) {
+          commitOp.committing = true;
+        }
         upsertReceipt(deps.baseDir, {
           instanceId: input.instanceId,
           agentKind: input.agentId,
@@ -2631,7 +2686,21 @@ export function makeProviderProvisioner(
         });
         if (commitOp && commitOp.operationId === input.operationId) {
           commitOp.committed = true;
+          commitOp.committing = false;
         }
+        appendLog(
+          input.instanceId,
+          `Prepared ${prepared.agentId} v${prepared.version} (${prepared.distribution})`,
+        );
+        setState(input.instanceId, (prev) => ({
+          ...prev,
+          phase: "succeeded",
+          installedVersion: prepared.version,
+          executablePath: targetDir,
+          error: null,
+          message: `Installed ${prepared.agentId} v${prepared.version}.`,
+          finishedAt: new Date().toISOString(),
+        }));
         return true;
       });
       const committed =
@@ -2645,20 +2714,6 @@ export function makeProviderProvisioner(
       yield* deps
         .refreshProviderInstance(ProviderInstanceId.make(input.instanceId))
         .pipe(Effect.ignore);
-
-      appendLog(
-        input.instanceId,
-        `Prepared ${prepared.agentId} v${prepared.version} (${prepared.distribution})`,
-      );
-      setState(input.instanceId, (prev) => ({
-        ...prev,
-        phase: "succeeded",
-        installedVersion: prepared.version,
-        executablePath: targetDir,
-        error: null,
-        message: `Installed ${prepared.agentId} v${prepared.version}.`,
-        finishedAt: new Date().toISOString(),
-      }));
     });
 
   const startInstall = (
@@ -2714,6 +2769,7 @@ export function makeProviderProvisioner(
           commitSemaphore: Semaphore.makeUnsafe(1),
           cancel: () => {},
           cancelled: false,
+          committing: false,
           committed: false,
         };
         activeOps.set(request.instanceId, op);
@@ -2865,6 +2921,7 @@ export function makeProviderProvisioner(
             agentId: plan.agentKind,
             option: plan.selectedOption,
             approvalToken,
+            distributionPreference: plan.distributionPreference,
           });
         })();
 
@@ -2911,20 +2968,25 @@ export function makeProviderProvisioner(
           ),
         );
       }
-      // S4: Signal abort synchronously (interrupts active child/probes/pending commits immediately),
-      // then serialize with the per-operation commitSemaphore so cancel never races settings/receipt commits.
-      op.cancelled = true;
-      op.abortController.abort();
-      op.cancel();
+      // S4: Serialize with the per-operation commitSemaphore BEFORE mutating op.cancelled or aborting.
+      // When a commit critical section (settings/receipt write) is already in progress, cancel waits for
+      // commitSemaphore, observes committed=true / phase="succeeded", and returns that state untouched
+      // instead of setting op.cancelled=true mid-write and triggering destructive cleanup.
+      // When no commit is in progress, commitSemaphore is uncontended so abort runs immediately.
       return yield* op.commitSemaphore.withPermits(1)(
         Effect.sync(() => {
-          if (op.committed) {
-            return getOrInitState(instanceId);
-          }
           const current = getOrInitState(instanceId);
-          if (current.phase === "cancelled" || current.phase === "failed" || current.phase === "succeeded") {
+          if (
+            op.committed ||
+            current.phase === "cancelled" ||
+            current.phase === "failed" ||
+            current.phase === "succeeded"
+          ) {
             return current;
           }
+          op.cancelled = true;
+          op.abortController.abort();
+          op.cancel();
           return setState(instanceId, (prev) => ({
             ...prev,
             message: "Cancelling installation…",

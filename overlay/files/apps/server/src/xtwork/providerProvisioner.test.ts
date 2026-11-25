@@ -27,7 +27,9 @@ import { makeXtworkInstallConsentService } from "./installConsent.ts";
 import {
   buildHardenedPosixInstallerCommand,
   createRedactingLineBuffer,
+  findExecutableInPath,
   makeProviderProvisioner,
+  redactSecrets,
   sanitizeProvisionLogLine,
   type ProvisionAcpVerifier,
   type ProvisionCommandRunner,
@@ -926,5 +928,261 @@ describe("providerProvisioner", () => {
     expect(combined).not.toContain("supersecretval");
     expect(failed.error).toContain("[REDACTED");
     expect(failed.message).toContain("[REDACTED");
+  });
+
+  it("resolves Windows Kimi executable under USERPROFILE\\.kimi-code\\bin and semicolon PATH (M1)", () => {
+    const winHome = makeTempDir("xtwork-win-home-");
+    const kimiExe = NodePath.join(winHome, ".kimi-code", "bin", "kimi.exe");
+    NodeFs.mkdirSync(NodePath.dirname(kimiExe), { recursive: true });
+    NodeFs.writeFileSync(kimiExe, "MZ-fake-windows-binary", { mode: 0o644 });
+
+    const detected = findExecutableInPath(
+      "kimi",
+      { USERPROFILE: winHome, PATH: "" },
+      "win32",
+      [],
+    );
+    expect(detected).toBe(kimiExe);
+
+    const pathDirA = makeTempDir("xtwork-win-path-a-");
+    const pathDirB = makeTempDir("xtwork-win-path-b-");
+    const pathQoderExe = NodePath.join(pathDirB, "qoder.exe");
+    NodeFs.writeFileSync(pathQoderExe, "MZ-fake-windows-binary", { mode: 0o644 });
+    const detectedFromPath = findExecutableInPath(
+      "qoder",
+      { USERPROFILE: makeTempDir("xtwork-win-empty-"), PATH: `${pathDirA};${pathDirB}` },
+      "win32",
+      [],
+    );
+    expect(detectedFromPath).toBe(pathQoderExe);
+  });
+
+  it("honors configured ACP distribution preference (e.g. npx) in getPlan and startInstall (M3)", async () => {
+    const describedPrefs: Array<{ agentId: string; preference: string | undefined }> = [];
+    const prepareCalls: Array<Record<string, unknown>> = [];
+    const baseSettings = seedCodingAgents(DEFAULT_SERVER_SETTINGS).settings;
+    const kimiSeed = baseSettings.providerInstances[KIMI_CODE_INSTANCE_ID]!;
+    const pinnedNpxSettings: ServerSettings = {
+      ...baseSettings,
+      providerInstances: {
+        ...baseSettings.providerInstances,
+        [KIMI_CODE_INSTANCE_ID]: {
+          ...kimiSeed,
+          config: {
+            ...(kimiSeed.config as Record<string, unknown>),
+            distribution: "npx",
+          },
+        },
+      },
+    };
+
+    const { baseDir, provisioner } = createHarness({
+      settings: pinnedNpxSettings,
+      acpDescribe: (agentId, preference) => {
+        describedPrefs.push({ agentId, preference });
+        if (preference === "npx") {
+          return Effect.succeed({
+            agentId,
+            version: "2.1.0",
+            distribution: "npx" as const,
+            packageName: `@official/${agentId}@2.1.0`,
+            installDir: NodePath.join(baseDir, "tools", agentId, "2.1.0", "npm"),
+            installed: false,
+            hasOtherInstalledVersion: false,
+          });
+        }
+        return Effect.succeed({
+          agentId,
+          version: "2.1.0",
+          distribution: "binary" as const,
+          archiveUrl: `https://example.test/${agentId}.tar.gz`,
+          sha256: "b".repeat(64),
+          installDir: NodePath.join(baseDir, "tools", agentId, "2.1.0", "darwin-aarch64"),
+          installed: false,
+          hasOtherInstalledVersion: false,
+        });
+      },
+      acpPrepare: (input) => {
+        prepareCalls.push(input as unknown as Record<string, unknown>);
+        return Effect.sync(() => {
+          const dir = NodePath.join(baseDir, "tools", input.agentId, "2.1.0", "npm");
+          NodeFs.mkdirSync(dir, { recursive: true });
+          return {
+            agentId: input.agentId,
+            version: "2.1.0",
+            distribution: "npx" as const,
+            prepared: true as const,
+          };
+        });
+      },
+    });
+
+    const plan = await Effect.runPromise(provisioner.getPlan(KIMI_CODE_INSTANCE_ID));
+    expect(describedPrefs[0]).toEqual({ agentId: "kimi-code", preference: "npx" });
+    expect(plan.distributionPreference).toBe("npx");
+    expect(plan.selectedOption.distribution).toBe("npx");
+    expect(plan.selectedOption.consentKey.distribution).toBe("npx");
+
+    await Effect.runPromise(
+      provisioner.startInstall({
+        instanceId: KIMI_CODE_INSTANCE_ID,
+        mode: "app-managed",
+        consent: { confirmed: true, ...plan.selectedOption.consentKey },
+      }),
+    );
+    const done = await waitForPhase(
+      () => Effect.runPromise(provisioner.getStatus(KIMI_CODE_INSTANCE_ID)),
+      ["succeeded", "failed"],
+    );
+    expect(done.phase).toBe("succeeded");
+    expect(prepareCalls).toHaveLength(1);
+    expect(prepareCalls[0]?.distributionPreference).toBe("npx");
+    expect(prepareCalls[0]?.expectedDistribution).toBe("npx");
+  });
+
+  it("preserves committed binary, receipt, and succeeded state when cancel arrives mid-DeepSeek settings write (S4)", async () => {
+    let settings = seedCodingAgents(DEFAULT_SERVER_SETTINGS).settings;
+    let markWriteStarted!: () => void;
+    const writeStarted = new Promise<void>((resolve) => {
+      markWriteStarted = resolve;
+    });
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+
+    const { baseDir, provisioner } = createHarness({
+      getSettingsOverride: () => Effect.succeed(settings),
+      updateProviderInstanceOverride: (input) =>
+        Effect.promise(async () => {
+          markWriteStarted();
+          await writeGate;
+          settings = {
+            ...settings,
+            providerInstances: {
+              ...settings.providerInstances,
+              [input.instanceId]: input.instance,
+            },
+          };
+        }),
+      runCommand: ({ args }) => {
+        const prefixIdx = args.indexOf("--prefix");
+        const prefixDir = prefixIdx >= 0 ? args[prefixIdx + 1]! : "";
+        writeExecutable(
+          NodePath.join(prefixDir, "node_modules", ".bin", "dsh"),
+          "#!/bin/sh\necho '1.4.2'\n",
+        );
+        return { promise: Promise.resolve({ exitCode: 0, signal: null }), cancel: () => {} };
+      },
+    });
+
+    const plan = await Effect.runPromise(provisioner.getPlan(DEEPSEEK_HARNESS_INSTANCE_ID));
+    const started = await Effect.runPromise(
+      provisioner.startInstall({
+        instanceId: DEEPSEEK_HARNESS_INSTANCE_ID,
+        mode: "app-managed",
+        consent: { confirmed: true, ...plan.selectedOption.consentKey },
+      }),
+    );
+
+    // Wait until DeepSeek settings write is actively in flight inside commitSemaphore.
+    await writeStarted;
+
+    // Issue cancel right in the middle of the settings write; it must wait for commitSemaphore
+    // without setting op.cancelled=true or deleting the newly wired managed binary.
+    const cancelPromise = Effect.runPromise(
+      provisioner.cancelInstall(DEEPSEEK_HARNESS_INSTANCE_ID, started.operationId!),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    releaseWrite();
+
+    const cancelResult = await cancelPromise;
+    expect(cancelResult.phase).toBe("succeeded");
+
+    const finalState = await waitForPhase(
+      () => Effect.runPromise(provisioner.getStatus(DEEPSEEK_HARNESS_INSTANCE_ID)),
+      ["succeeded", "cancelled", "failed"],
+    );
+    expect(finalState.phase).toBe("succeeded");
+
+    const managedBin = NodePath.join(
+      baseDir,
+      "tools",
+      "deepseek-harness",
+      "node_modules",
+      ".bin",
+      "dsh",
+    );
+    expect(NodeFs.existsSync(managedBin)).toBe(true);
+    const savedConfig = settings.providerInstances[DEEPSEEK_HARNESS_INSTANCE_ID]?.config as Record<
+      string,
+      unknown
+    >;
+    expect(savedConfig.commandPath).toBe(managedBin);
+    const receiptsRaw = NodeFs.readFileSync(
+      NodePath.join(baseDir, "tools", "provisioner-receipts.json"),
+      "utf8",
+    );
+    expect(receiptsRaw).toContain(DEEPSEEK_HARNESS_INSTANCE_ID);
+  });
+
+  it("redacts JSON-formatted credentials in redactSecrets and ACP verifier failures (S5)", async () => {
+    const jsonPayload = JSON.stringify({
+      api_key: "json-secret-1",
+      apiKey: "json-secret-2",
+      password: "pw-secret-3",
+      access_token: "tok-secret-4",
+      refresh_token: "ref-secret-5",
+      secret: "sec-secret-6",
+      token: "t-secret-7",
+    });
+    const cleanedJson = redactSecrets(jsonPayload);
+    for (const leaked of [
+      "json-secret-1",
+      "json-secret-2",
+      "pw-secret-3",
+      "tok-secret-4",
+      "ref-secret-5",
+      "sec-secret-6",
+      "t-secret-7",
+    ]) {
+      expect(cleanedJson).not.toContain(leaked);
+    }
+    expect(cleanedJson).toContain("[REDACTED]");
+
+    const binDir = makeTempDir("xtwork-s5-json-");
+    const kimiPath = NodePath.join(binDir, "kimi");
+    const { provisioner } = createHarness({
+      env: { PATH: binDir },
+      runCommand: () => {
+        writeExecutable(kimiPath, "#!/bin/sh\necho '2.1.0'\n");
+        return { promise: Promise.resolve({ exitCode: 0, signal: null }), cancel: () => {} };
+      },
+      verifyAcpInitialize: async () => ({
+        ok: false,
+        error: `ACP stderr: {"api_key":"kimi-json-key-999","apiKey":"kimi-camel-888","password":"kimi-pw-777","access_token":"kimi-tok-666"}`,
+      }),
+    });
+
+    const plan = await Effect.runPromise(provisioner.getPlan(KIMI_CODE_INSTANCE_ID, "vendor-script"));
+    await Effect.runPromise(
+      provisioner.startInstall({
+        instanceId: KIMI_CODE_INSTANCE_ID,
+        mode: "vendor-script",
+        consent: { confirmed: true, ...plan.selectedOption.consentKey },
+      }),
+    );
+    const failed = await waitForPhase(
+      () => Effect.runPromise(provisioner.getStatus(KIMI_CODE_INSTANCE_ID)),
+      ["failed", "succeeded"],
+    );
+    expect(failed.phase).toBe("failed");
+    const combined = `${failed.error ?? ""}\n${failed.message ?? ""}\n${failed.logs.join("\n")}`;
+    expect(combined).not.toContain("kimi-json-key-999");
+    expect(combined).not.toContain("kimi-camel-888");
+    expect(combined).not.toContain("kimi-pw-777");
+    expect(combined).not.toContain("kimi-tok-666");
+    expect(failed.error).toContain("[REDACTED]");
+    expect(failed.message).toContain("[REDACTED]");
   });
 });

@@ -233,6 +233,10 @@ describe("InstallConsentStore", () => {
     expect(store.consumeApproval(key, "")).toBe(false);
     expect(store.consumeApproval(key, "   ")).toBe(false);
     expect(store.consumeApproval(key, "wrong-token")).toBe(false);
+    // Whitespace-padded tokens MUST fail exact equality without consuming the pending approval!
+    expect(store.consumeApproval(key, ` ${token} `)).toBe(false);
+    expect(store.consumeApproval(key, `${token} `)).toBe(false);
+    expect(store.consumeApproval(key, `\t${token}`)).toBe(false);
     // Original pending token remains intact and is consumed exactly once with the exact token.
     expect(store.consumeApproval(key, token)).toBe(true);
     expect(store.consumeApproval(key, token)).toBe(false);

@@ -228,24 +228,28 @@ export class InstallConsentStore {
 
   /**
    * Atomically verifies and consumes a matching single-use approval token.
-   * Requires a non-empty `approvalToken` bound to the exact normalized key;
-   * omitting or supplying a blank/mismatched token always fails closed (M2).
+   * Requires exact string equality with a non-empty `approvalToken` bound to the
+   * exact normalized key (no whitespace trimming before lookup/comparison) (M2).
    */
   consumeApproval(rawKey: InstallConsentKey, approvalToken?: string): boolean {
-    if (typeof approvalToken !== "string") return false;
-    const trimmed = approvalToken.trim();
-    if (!trimmed) return false;
+    if (
+      typeof approvalToken !== "string" ||
+      approvalToken.length === 0 ||
+      approvalToken.trim().length === 0
+    ) {
+      return false;
+    }
     let key: InstallConsentKey;
     try {
       key = normalizeInstallConsentKey(rawKey);
     } catch {
       return false;
     }
-    const entry = this.singleUseApprovals.get(trimmed);
-    if (!entry || !installConsentKeysEqual(entry.key, key)) {
+    const entry = this.singleUseApprovals.get(approvalToken);
+    if (!entry || entry.token !== approvalToken || !installConsentKeysEqual(entry.key, key)) {
       return false;
     }
-    this.singleUseApprovals.delete(trimmed);
+    this.singleUseApprovals.delete(approvalToken);
     return true;
   }
 
