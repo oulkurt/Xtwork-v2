@@ -28,6 +28,7 @@ it("keeps developer settings and commands behind the switch while leaving change
   expect(isDesktopShortcutVisible("usage.open", false)).toBe(true);
   expect(isDesktopSettingsPathVisible("/settings/diffs", false)).toBe(true);
   expect(isDesktopSettingsPathVisible("/settings/browser", false)).toBe(true);
+  expect(isDesktopSettingsPathVisible("/settings/remote-connections", false)).toBe(true);
   expect(isDesktopSettingVisible({ to: "/settings/diffs", id: "proactive-panels" }, false)).toBe(
     false,
   );

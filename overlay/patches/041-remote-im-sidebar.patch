@@ -1,0 +1,215 @@
+diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
+index 2b0ddd8a..6dc0b865 100644
+--- a/apps/web/src/components/settings/SettingsPanels.tsx
++++ b/apps/web/src/components/settings/SettingsPanels.tsx
+@@ -1,7 +1,6 @@
+ import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import { isXtworkDesktop } from "../../desktopFeatureVisibility";
+ import { DeveloperFeaturesSettings } from "./DeveloperFeaturesSettings";
+-import { RemoteImSettings } from "./RemoteImSettings";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { m as resolveMessage } from "~/i18n/messages";
+ import { useAtomValue } from "@effect/atom-react";
+@@ -842,7 +841,6 @@ export function GeneralSettingsPanel() {
+   return (
+     <SettingsPageContainer>
+       <DeveloperFeaturesSettings />
+-      <RemoteImSettings />
+       <SettingsSection id="notifications" title={gt("Notifications")}>
+         <NotificationSettings />
+         <SettingsRow
+diff --git a/apps/web/src/components/settings/SettingsScopeSentence.tsx b/apps/web/src/components/settings/SettingsScopeSentence.tsx
+index 0cf63419..8bae8505 100644
+--- a/apps/web/src/components/settings/SettingsScopeSentence.tsx
++++ b/apps/web/src/components/settings/SettingsScopeSentence.tsx
+@@ -54,6 +54,7 @@ export const SETTINGS_DEVICE_ONLY_PATHS: ReadonlySet<string> = new Set([
+   "/settings/chat",
+   "/settings/diffs",
+   "/settings/snap-shot",
++  "/settings/remote-connections",
+   "/settings/connections",
+   // Access picks its environment on the page itself.
+   "/settings/access",
+diff --git a/apps/web/src/components/settings/SettingsSidebarNav.tsx b/apps/web/src/components/settings/SettingsSidebarNav.tsx
+index b31d7be5..309be445 100644
+--- a/apps/web/src/components/settings/SettingsSidebarNav.tsx
++++ b/apps/web/src/components/settings/SettingsSidebarNav.tsx
+@@ -20,6 +20,7 @@ import {
+   GitBranchIcon,
+   GlobeIcon,
+   InfoIcon,
++  Link2Icon,
+   MessageSquareTextIcon,
+   MessagesSquareIcon,
+   PanelsTopLeftIcon,
+@@ -107,6 +108,7 @@ const SETTINGS_SECTION_ICONS: Readonly<
+   "/settings/scheduled-tasks": CalendarClockIcon,
+   "/settings/source-control": GitBranchIcon,
+   "/settings/worktrees": FolderTreeIcon,
++  "/settings/remote-connections": Link2Icon,
+   "/settings/connections": ServerIcon,
+   "/settings/access": ShieldCheckIcon,
+   "/settings/secrets": KeyRoundIcon,
+diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
+index b02f8d2f..d73152eb 100644
+--- a/apps/web/src/components/settings/settingsSearch.ts
++++ b/apps/web/src/components/settings/settingsSearch.ts
+@@ -34,6 +34,7 @@ export type SettingsPath =
+   | "/settings/scheduled-tasks"
+   | "/settings/source-control"
+   | "/settings/worktrees"
++  | "/settings/remote-connections"
+   | "/settings/connections"
+   | "/settings/access"
+   | "/settings/secrets"
+@@ -109,6 +110,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
+   "/settings/scheduled-tasks": msg("Scheduled tasks"),
+   "/settings/source-control": msg("Source control & issues"),
+   "/settings/worktrees": msg("Worktrees"),
++  "/settings/remote-connections": msg("Remote connections"),
+   "/settings/connections": msg("Environments"),
+   "/settings/access": msg("Sharing & access"),
+   "/settings/secrets": msg("Secrets"),
+@@ -164,6 +166,7 @@ export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
+   {
+     heading: msg("Connections"),
+     paths: [
++      "/settings/remote-connections",
+       "/settings/connections",
+       "/settings/access",
+       ...(isSecretsFeatureEnabled ? (["/settings/secrets"] as const) : []),
+@@ -1448,6 +1451,12 @@ export const SETTINGS_SEARCH_ITEMS = [
+     searchTerms: [msg("new 1password vault op cli account")],
+     secretsFeatureOnly: true,
+   },
++  {
++    id: "remote-im",
++    title: msg("Remote connections"),
++    to: "/settings/remote-connections",
++    searchTerms: ["feishu lark wecom wechat qr im bot chat 飞书 企业微信 微信 扫码 远程连接"],
++  },
+   {
+     id: "archive",
+     title: msg("Archived threads"),
+@@ -1476,6 +1485,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
+   "/settings/devices": null,
+   "/settings/source-control": "environment-defaults",
+   "/settings/worktrees": "project-defaults",
++  "/settings/remote-connections": null,
+   "/settings/connections": "connections",
+   "/settings/access": "connections",
+   "/settings/secrets": null,
+diff --git a/apps/web/src/i18n/translations/zh.json b/apps/web/src/i18n/translations/zh.json
+index 4e2e6bd2..b0415219 100644
+--- a/apps/web/src/i18n/translations/zh.json
++++ b/apps/web/src/i18n/translations/zh.json
+@@ -1,5 +1,6 @@
+ {
+   "ec12ab09b6db5c40": "选择界面显示语言。",
++  "22b5bc4b64f18ca9": "远程连接",
+   "d7e7974a9dfe58e5": "选择文件夹（按住 Shift 点击）",
+   "cf2e3864206551a5": "开发者功能",
+   "029c28229b003dbc": "显示开发者功能",
+diff --git a/apps/web/src/routeTree.gen.ts b/apps/web/src/routeTree.gen.ts
+index 0392f924..41872100 100644
+--- a/apps/web/src/routeTree.gen.ts
++++ b/apps/web/src/routeTree.gen.ts
+@@ -32,6 +32,7 @@ import { Route as ChatSettingsSourceControlRouteImport } from './routes/_chat.se
+ import { Route as ChatSettingsSnapShotRouteImport } from './routes/_chat.settings.snap-shot'
+ import { Route as ChatSettingsSecretsRouteImport } from './routes/_chat.settings.secrets'
+ import { Route as ChatSettingsScheduledTasksRouteImport } from './routes/_chat.settings.scheduled-tasks'
++import { Route as ChatSettingsRemoteConnectionsRouteImport } from './routes/_chat.settings.remote-connections'
+ import { Route as ChatSettingsProvidersRouteImport } from './routes/_chat.settings.providers'
+ import { Route as ChatSettingsProjectsRouteImport } from './routes/_chat.settings.projects'
+ import { Route as ChatSettingsOpenSourceLicensesRouteImport } from './routes/_chat.settings.open-source-licenses'
+@@ -171,6 +172,12 @@ const ChatSettingsScheduledTasksRoute =
+     path: '/scheduled-tasks',
+     getParentRoute: () => ChatSettingsRoute,
+   } as any)
++const ChatSettingsRemoteConnectionsRoute =
++  ChatSettingsRemoteConnectionsRouteImport.update({
++    id: '/remote-connections',
++    path: '/remote-connections',
++    getParentRoute: () => ChatSettingsRoute,
++  } as any)
+ const ChatSettingsProvidersRoute = ChatSettingsProvidersRouteImport.update({
+   id: '/providers',
+   path: '/providers',
+@@ -315,6 +322,7 @@ export interface FileRoutesByFullPath {
+   '/settings/open-source-licenses': typeof ChatSettingsOpenSourceLicensesRoute
+   '/settings/projects': typeof ChatSettingsProjectsRoute
+   '/settings/providers': typeof ChatSettingsProvidersRoute
++  '/settings/remote-connections': typeof ChatSettingsRemoteConnectionsRoute
+   '/settings/scheduled-tasks': typeof ChatSettingsScheduledTasksRoute
+   '/settings/secrets': typeof ChatSettingsSecretsRoute
+   '/settings/snap-shot': typeof ChatSettingsSnapShotRoute
+@@ -360,6 +368,7 @@ export interface FileRoutesByTo {
+   '/settings/open-source-licenses': typeof ChatSettingsOpenSourceLicensesRoute
+   '/settings/projects': typeof ChatSettingsProjectsRoute
+   '/settings/providers': typeof ChatSettingsProvidersRoute
++  '/settings/remote-connections': typeof ChatSettingsRemoteConnectionsRoute
+   '/settings/scheduled-tasks': typeof ChatSettingsScheduledTasksRoute
+   '/settings/secrets': typeof ChatSettingsSecretsRoute
+   '/settings/snap-shot': typeof ChatSettingsSnapShotRoute
+@@ -407,6 +416,7 @@ export interface FileRoutesById {
+   '/_chat/settings/open-source-licenses': typeof ChatSettingsOpenSourceLicensesRoute
+   '/_chat/settings/projects': typeof ChatSettingsProjectsRoute
+   '/_chat/settings/providers': typeof ChatSettingsProvidersRoute
++  '/_chat/settings/remote-connections': typeof ChatSettingsRemoteConnectionsRoute
+   '/_chat/settings/scheduled-tasks': typeof ChatSettingsScheduledTasksRoute
+   '/_chat/settings/secrets': typeof ChatSettingsSecretsRoute
+   '/_chat/settings/snap-shot': typeof ChatSettingsSnapShotRoute
+@@ -454,6 +464,7 @@ export interface FileRouteTypes {
+     | '/settings/open-source-licenses'
+     | '/settings/projects'
+     | '/settings/providers'
++    | '/settings/remote-connections'
+     | '/settings/scheduled-tasks'
+     | '/settings/secrets'
+     | '/settings/snap-shot'
+@@ -499,6 +510,7 @@ export interface FileRouteTypes {
+     | '/settings/open-source-licenses'
+     | '/settings/projects'
+     | '/settings/providers'
++    | '/settings/remote-connections'
+     | '/settings/scheduled-tasks'
+     | '/settings/secrets'
+     | '/settings/snap-shot'
+@@ -545,6 +557,7 @@ export interface FileRouteTypes {
+     | '/_chat/settings/open-source-licenses'
+     | '/_chat/settings/projects'
+     | '/_chat/settings/providers'
++    | '/_chat/settings/remote-connections'
+     | '/_chat/settings/scheduled-tasks'
+     | '/_chat/settings/secrets'
+     | '/_chat/settings/snap-shot'
+@@ -731,6 +744,13 @@ declare module '@tanstack/react-router' {
+       preLoaderRoute: typeof ChatSettingsScheduledTasksRouteImport
+       parentRoute: typeof ChatSettingsRoute
+     }
++    '/_chat/settings/remote-connections': {
++      id: '/_chat/settings/remote-connections'
++      path: '/remote-connections'
++      fullPath: '/settings/remote-connections'
++      preLoaderRoute: typeof ChatSettingsRemoteConnectionsRouteImport
++      parentRoute: typeof ChatSettingsRoute
++    }
+     '/_chat/settings/providers': {
+       id: '/_chat/settings/providers'
+       path: '/providers'
+@@ -901,6 +921,7 @@ interface ChatSettingsRouteChildren {
+   ChatSettingsOpenSourceLicensesRoute: typeof ChatSettingsOpenSourceLicensesRoute
+   ChatSettingsProjectsRoute: typeof ChatSettingsProjectsRoute
+   ChatSettingsProvidersRoute: typeof ChatSettingsProvidersRoute
++  ChatSettingsRemoteConnectionsRoute: typeof ChatSettingsRemoteConnectionsRoute
+   ChatSettingsScheduledTasksRoute: typeof ChatSettingsScheduledTasksRoute
+   ChatSettingsSecretsRoute: typeof ChatSettingsSecretsRoute
+   ChatSettingsSnapShotRoute: typeof ChatSettingsSnapShotRoute
+@@ -931,6 +952,7 @@ const ChatSettingsRouteChildren: ChatSettingsRouteChildren = {
+   ChatSettingsOpenSourceLicensesRoute: ChatSettingsOpenSourceLicensesRoute,
+   ChatSettingsProjectsRoute: ChatSettingsProjectsRoute,
+   ChatSettingsProvidersRoute: ChatSettingsProvidersRoute,
++  ChatSettingsRemoteConnectionsRoute: ChatSettingsRemoteConnectionsRoute,
+   ChatSettingsScheduledTasksRoute: ChatSettingsScheduledTasksRoute,
+   ChatSettingsSecretsRoute: ChatSettingsSecretsRoute,
+   ChatSettingsSnapShotRoute: ChatSettingsSnapShotRoute,

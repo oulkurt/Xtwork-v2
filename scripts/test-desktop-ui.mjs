@@ -222,6 +222,8 @@ try {
     for (const path of unavailableNav) assert.equal(await settingsNav(path).count(), 0, path);
     await settingsNav("diffs").waitFor({ state: "visible" });
     await settingsNav("browser").waitFor({ state: "visible" });
+    await settingsNav("remote-connections").waitFor({ state: "visible" });
+    assert.equal(await page.locator("#remote-im").count(), 0);
     if (enabled) {
       await button("Open pull requests").waitFor({ state: "visible" });
       await button("Open issues").waitFor({ state: "visible" });
@@ -459,6 +461,10 @@ try {
   await page.getByRole("option", { name: /中文/ }).click();
   await page.getByRole("switch", { name: "显示开发者功能" }).waitFor();
   await page.screenshot({ path: join(testOutput, "general-settings-zh.png") });
+  await settingsNav("remote-connections").click();
+  await page.locator('[data-testid="holo-card-feishu"]').waitFor({ state: "visible" });
+  await page.locator('[data-testid="holo-card-wecom"]').waitFor({ state: "visible" });
+  await page.locator('[data-testid="holo-card-wechat"]').waitFor({ state: "visible" });
   await go("/");
   await page.waitForURL(/#\/draft\//);
   await page.locator("[data-chat-composer-form]").waitFor();
