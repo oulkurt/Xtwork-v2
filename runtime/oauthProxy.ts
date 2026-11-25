@@ -526,6 +526,7 @@ export class OAuthTokenManager {
   private readonly active = new Map<string, OAuthBindingRecord>();
   private readonly staged = new Map<string, OAuthBindingRecord>();
   private readonly pendingDeletes = new Map<string, number>();
+  private readonly pendingDeletesBySecretRef = new Map<string, number>();
 
   constructor(options: OAuthTokenManagerOptions) {
     this.secretStore = options.secretStore;
@@ -534,8 +535,15 @@ export class OAuthTokenManager {
     this.now = options.now ?? Date.now;
   }
 
-  private assertNotDeleting(channelId: string): void {
-    if ((this.pendingDeletes.get(channelId) ?? 0) > 0) {
+  private isDeleting(channelId: string, secretRef?: string): boolean {
+    return (
+      (this.pendingDeletes.get(channelId) ?? 0) > 0 ||
+      (secretRef !== undefined && (this.pendingDeletesBySecretRef.get(secretRef) ?? 0) > 0)
+    );
+  }
+
+  private assertNotDeleting(channelId: string, secretRef?: string): void {
+    if (this.isDeleting(channelId, secretRef)) {
       throw new SecretStoreUnavailableError(
         "SECRET_FENCE_STALE",
         `OAuth credentials for channel "${channelId}" are currently being revoked`,
@@ -713,8 +721,10 @@ export class OAuthTokenManager {
           secretRefFenceKey: secretRefFenceKeyFor(nextConfig.secretRef),
           priorFenceKeys: promotedPriorKeys,
           config: nextConfig,
-          ...(stagedRecord?.cache !== undefined
-            ? { cache: stagedRecord.cache }
+          ...(stagedRecord !== undefined
+            ? stagedRecord.cache !== undefined
+              ? { cache: stagedRecord.cache }
+              : {}
             : nextConfig.initialCredentials !== undefined
               ? { cache: nextConfig.initialCredentials }
               : {}),
@@ -838,18 +848,18 @@ export class OAuthTokenManager {
     record: OAuthBindingRecord,
     lease: DualFenceLease,
   ): Promise<OAuthSubscriptionCredentials> {
-    const channelId = record.config.channelId;
-    this.assertNotDeleting(channelId);
+    const { channelId, secretRef } = record.config;
+    this.assertNotDeleting(channelId, secretRef);
     lease.assertCurrent();
     if (record.cache) {
-      this.assertNotDeleting(channelId);
+      this.assertNotDeleting(channelId, secretRef);
       lease.assertCurrent();
       return record.cache;
     }
-    const raw = await this.secretStore.get(record.config.secretRef);
+    const raw = await this.secretStore.get(secretRef);
     // CRITICAL: Re-check fence & pending-delete state IMMEDIATELY after SecretStore read resolves,
     // BEFORE parsing, caching, returning, or starting a refresh!
-    this.assertNotDeleting(channelId);
+    this.assertNotDeleting(channelId, secretRef);
     lease.assertCurrent();
     if (!raw) {
       throw new SecretStoreUnavailableError(
@@ -870,7 +880,7 @@ export class OAuthTokenManager {
         `Malformed OAuth credentials stored for channel "${channelId}"`,
       );
     }
-    this.assertNotDeleting(channelId);
+    this.assertNotDeleting(channelId, secretRef);
     lease.assertCurrent();
     record.cache = parsed;
     return parsed;
@@ -884,8 +894,9 @@ export class OAuthTokenManager {
       signalOrOptions instanceof AbortSignal
         ? { signal: signalOrOptions }
         : (signalOrOptions ?? {});
-    this.assertNotDeleting(channelId);
+    this.assertNotDeleting(channelId, opts.expectedSecretRef);
     const record = this.resolveBinding(channelId, opts);
+    this.assertNotDeleting(channelId, record.config.secretRef);
     // Acquire dual generation lease (binding fence AND secretRef fence) BEFORE touching SecretStore
     // so any concurrent logout/delete, account swap, or post-commit revocation invalidates this read.
     const readLease = this.acquireDualLease(record, opts.signal);
@@ -900,7 +911,7 @@ export class OAuthTokenManager {
         );
       }
       const current = await this.loadCredentials(record, readLease);
-      this.assertNotDeleting(channelId);
+      this.assertNotDeleting(channelId, record.config.secretRef);
       readLease.assertCurrent();
       if (current.expires - this.now() > this.skewMs) {
         return current as T;
@@ -916,8 +927,8 @@ export class OAuthTokenManager {
     fallback: OAuthSubscriptionCredentials,
     readLease: DualFenceLease,
   ): Promise<T> {
-    const channelId = record.config.channelId;
-    this.assertNotDeleting(channelId);
+    const { channelId, secretRef } = record.config;
+    this.assertNotDeleting(channelId, secretRef);
     readLease.assertCurrent();
     const expectedBindingGen = readLease.bindingGeneration;
     const expectedSecretRefGen = readLease.secretRefGeneration;
@@ -929,7 +940,7 @@ export class OAuthTokenManager {
       existing.secretRefGeneration === expectedSecretRefGen
     ) {
       const sharedResult = await existing.promise;
-      this.assertNotDeleting(channelId);
+      this.assertNotDeleting(channelId, secretRef);
       readLease.assertCurrent();
       return sharedResult as T;
     }
@@ -957,26 +968,26 @@ export class OAuthTokenManager {
       | undefined;
     const refreshPromise = (async (): Promise<OAuthSubscriptionCredentials> => {
       try {
-        this.assertNotDeleting(channelId);
+        this.assertNotDeleting(channelId, secretRef);
         refreshLease.assertCurrent();
         const latest = record.cache ?? fallback;
         if (latest.expires - this.now() > this.skewMs) {
           return latest;
         }
         const refreshed = await record.config.refresh(latest, refreshLease.signal);
-        this.assertNotDeleting(channelId);
+        this.assertNotDeleting(channelId, secretRef);
         refreshLease.assertCurrent();
         // Write under the `secretRef`-scoped fence so BOTH pre-commit staged refreshes AND active
         // refreshes serialize strictly against `revokeAndDelete` for the same `secretRef`!
         await this.fence.writeIfCurrent(
           this.secretStore,
           record.secretRefFenceKey,
-          record.config.secretRef,
+          secretRef,
           JSON.stringify(refreshed),
           refreshLease.secretRefGeneration,
         );
-        if (!refreshLease.isCurrent() || (this.pendingDeletes.get(channelId) ?? 0) > 0) {
-          await this.secretStore.delete(record.config.secretRef).catch(() => undefined);
+        if (!refreshLease.isCurrent() || this.isDeleting(channelId, secretRef)) {
+          await this.secretStore.delete(secretRef).catch(() => undefined);
           throw new SecretStoreUnavailableError(
             "SECRET_FENCE_STALE",
             `Channel "${channelId}" was invalidated during OAuth refresh`,
@@ -1004,7 +1015,7 @@ export class OAuthTokenManager {
     };
     record.inflight = inflightEntry;
     const result = await refreshPromise;
-    this.assertNotDeleting(channelId);
+    this.assertNotDeleting(channelId, secretRef);
     readLease.assertCurrent();
     return result as T;
   }
@@ -1012,8 +1023,8 @@ export class OAuthTokenManager {
   /**
    * Logout / delete a channel's OAuth credentials safely under the fencing token:
    * blocks new reads while deletion is pending, aborts ANY in-flight active OR pre-commit staged
-   * refresh for that channel or `secretRef`, clears in-memory caches, and performs serialized
-   * verified deletion from the OS SecretStore.
+   * refresh for that channel or `secretRef`, clears in-memory caches across all channels sharing
+   * the `secretRef`, and performs serialized verified deletion from the OS SecretStore.
    */
   async revokeAndDelete(
     channelId: string,
@@ -1021,13 +1032,35 @@ export class OAuthTokenManager {
     reason = "OAuth channel logout/deleted",
   ): Promise<number> {
     const activeRecord = this.active.get(channelId);
-    const secretRef = secretRefOverride ?? activeRecord?.config.secretRef;
+    let secretRef = secretRefOverride ?? activeRecord?.config.secretRef;
+    if (!secretRef) {
+      for (const stagedRecord of this.staged.values()) {
+        if (stagedRecord.config.channelId === channelId) {
+          secretRef = stagedRecord.config.secretRef;
+          break;
+        }
+      }
+    }
     this.pendingDeletes.set(channelId, (this.pendingDeletes.get(channelId) ?? 0) + 1);
-    if (activeRecord) {
-      delete activeRecord.cache;
-      delete activeRecord.inflight;
-      for (const priorKey of activeRecord.priorFenceKeys) {
-        this.fence.invalidate(priorKey, reason);
+    if (secretRef !== undefined) {
+      this.pendingDeletesBySecretRef.set(
+        secretRef,
+        (this.pendingDeletesBySecretRef.get(secretRef) ?? 0) + 1,
+      );
+    }
+    for (const rec of this.active.values()) {
+      if (
+        rec.config.channelId === channelId ||
+        (secretRef !== undefined && rec.config.secretRef === secretRef)
+      ) {
+        delete rec.cache;
+        delete rec.inflight;
+        if (rec.fenceKey !== channelId) {
+          this.fence.invalidate(rec.fenceKey, reason);
+        }
+        for (const priorKey of rec.priorFenceKeys) {
+          this.fence.invalidate(priorKey, reason);
+        }
       }
     }
     for (const stagedRecord of this.staged.values()) {
@@ -1038,6 +1071,9 @@ export class OAuthTokenManager {
         delete stagedRecord.cache;
         delete stagedRecord.inflight;
         this.fence.invalidate(stagedRecord.fenceKey, reason);
+        for (const priorKey of stagedRecord.priorFenceKeys) {
+          this.fence.invalidate(priorKey, reason);
+        }
       }
     }
     try {
@@ -1057,6 +1093,14 @@ export class OAuthTokenManager {
         this.pendingDeletes.delete(channelId);
       } else {
         this.pendingDeletes.set(channelId, remaining);
+      }
+      if (secretRef !== undefined) {
+        const remainingRef = (this.pendingDeletesBySecretRef.get(secretRef) ?? 1) - 1;
+        if (remainingRef <= 0) {
+          this.pendingDeletesBySecretRef.delete(secretRef);
+        } else {
+          this.pendingDeletesBySecretRef.set(secretRef, remainingRef);
+        }
       }
     }
   }

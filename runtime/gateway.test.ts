@@ -1923,6 +1923,56 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         );
         assert.equal(await raceStore.get("oauth:staged-race"), undefined);
         assert.equal(raceMgr.getCached("staged-logout-ch"), undefined);
+
+        // --- Proof E (sibling active channels sharing a secretRef) ---
+        // Logging out channel A MUST clear/invalidate sibling active channel B's cached credentials
+        // and block reads during deletion so B can never refresh from stale cache and recreate the secret!
+        let siblingRefreshCalls = 0;
+        let currentNow = 1_000_000;
+        const sharedStore = memorySecrets();
+        const sharedFence = new ChannelCredentialFence();
+        const sharedMgr = new OAuthTokenManager({
+          secretStore: sharedStore,
+          fence: sharedFence,
+          now: () => currentNow,
+        });
+        await sharedStore.set(
+          "oauth:shared-acct",
+          JSON.stringify({ access: "shared-tok-1", refresh: "shared-r1", expires: currentNow + 300_000 }),
+        );
+        const sharedRefresh = async () => {
+          siblingRefreshCalls += 1;
+          return { access: "resurrected-by-sibling", refresh: "shared-r2", expires: currentNow + 3_600_000 };
+        };
+        sharedMgr.register({
+          channelId: "shared-ch-a",
+          provider: "xai",
+          secretRef: "oauth:shared-acct",
+          refresh: sharedRefresh,
+        });
+        sharedMgr.register({
+          channelId: "shared-ch-b",
+          provider: "xai",
+          secretRef: "oauth:shared-acct",
+          refresh: sharedRefresh,
+        });
+        assert.equal((await sharedMgr.getValidCredentials("shared-ch-a")).access, "shared-tok-1");
+        assert.equal((await sharedMgr.getValidCredentials("shared-ch-b")).access, "shared-tok-1");
+        assert.equal(sharedMgr.getCached("shared-ch-b")?.access, "shared-tok-1");
+
+        await sharedMgr.revokeAndDelete("shared-ch-a", undefined, "logout shared account via channel A");
+        assert.equal(sharedMgr.getCached("shared-ch-a"), undefined);
+        assert.equal(sharedMgr.getCached("shared-ch-b"), undefined, "Sibling active channel cache must be evicted on shared secretRef logout");
+        assert.equal(await sharedStore.get("oauth:shared-acct"), undefined);
+
+        // Advance time past expiry and verify sibling B cannot refresh from stale cache or recreate secret!
+        currentNow += 400_000;
+        await assert.rejects(
+          () => sharedMgr.getValidCredentials("shared-ch-b"),
+          (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_STORE_UNAVAILABLE",
+        );
+        assert.equal(siblingRefreshCalls, 0);
+        assert.equal(await sharedStore.get("oauth:shared-acct"), undefined);
       } finally {
         await runtime.close();
       }
