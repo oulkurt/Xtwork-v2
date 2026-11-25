@@ -20,7 +20,7 @@ open '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'
 
 桌面界面默认使用简体中文，可在「设置 → 通用 → 显示 → 语言」中切换为 English（当前仅保留简体中文与 English 两种语言）。
 
-「设置 → 通用 → 开发者功能」默认关闭，设置由本机服务端保存。普通模式保留内置浏览器、`/settings/providers` 六大外部编码 Agent 卡片与受控一键安装底座（[PR #26](https://github.com/oulkurt/Xtwork-v2/pull/26)）、本地文件夹、改动对比和检查点、用量、待办、定时任务、技能和外观。输入框只有内置助手的标准模型可用时会收起模型选择器。普通模式新建定时任务使用所选文件夹和内置助手，编辑已有任务会保留它原来的工作区和模型。
+「设置 → 通用 → 开发者功能」默认关闭，设置由本机服务端保存。普通模式保留内置浏览器、「设置 → 模型渠道」（`/settings/channels`，[PR #28](https://github.com/oulkurt/Xtwork-v2/pull/28)）、`/settings/providers` 六大外部编码 Agent 卡片、受控一键安装与 Coding Agent 委派设置（[PR #26](https://github.com/oulkurt/Xtwork-v2/pull/26)、[PR #29](https://github.com/oulkurt/Xtwork-v2/pull/29)）、本地文件夹、改动对比和检查点、用量、待办、定时任务、技能和外观。输入框只有内置助手的标准模型可用时会收起模型选择器。普通模式新建定时任务使用所选文件夹和内置助手，编辑已有任务会保留它原来的工作区和模型。
 
 开启后，终端、分支与工作树、编辑器、克隆和其他上游非核心外部运行时（Cursor / Grok / Fx / OpenCode / Antigravity / Kiro / Muse）恢复显示。Pull requests 和 Issues 可从「设置 → 通用 → 开发者功能」或 `⌘K` 打开。侧栏底部提供待办、设置和用量入口。内置浏览器由本机服务端浏览器提供；mygo 不提供手机配对、SSH、WSL、Tailscale、服务端暴露、CLI 安装和 SnapShot。
 
@@ -28,13 +28,14 @@ open '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'
 
 新对话默认选内置助手「**小瞳**」（实例 `xtworkPi`，[PR #24](https://github.com/oulkurt/Xtwork-v2/pull/24) 已由旧默认名「内置助手」平滑迁为「小瞳」）。T3 通过 `provider-pi` 和 stdio RPC 启动随包 Pi `1.5.2`。
 
-PR #24（M1b-Gate 1）已在 `main` 落地模型平面底座：
-- `runtime/gateway.ts` 升级为保协议多协议 Proxy-Only 本机反向代理；在 M1b-Gate 2 接入渠道配置前，桌面启动（`030-pi-default.patch`）默认不传渠道列表（零渠道空列表态），仅在显式设置 `XTWORK_DEV_FALLBACK=1` 或任意一个 `XTWORK_MODEL_UPSTREAM_*` 环境变量时激活单路由开发兜底（`xtwork/standard` → 默认 `http://127.0.0.1:3425/v1` 的 Magpie `our-free-model/hy4-flash-free`）；
-- `runtime/oauthProxy.ts` 提供 Codex / GitHub Copilot / xAI OAuth 订阅的 Proxy-Only 窄适配；
+M1b（[PR #24](https://github.com/oulkurt/Xtwork-v2/pull/24)、[PR #28](https://github.com/oulkurt/Xtwork-v2/pull/28)）已在 `main` 完整落地小瞳多渠道模型平面：
+- `runtime/gateway.ts` 提供保协议多协议 Proxy-Only 本机反向代理，`runtime/channelManager.ts`、`runtime/companyAuth.ts`、`runtime/providerCatalog.ts` 与 `runtime/oauthLoginFlows.ts` 接入企业微信 OIDC 团队渠道（`xiaotong-work-team`）及 19 类成员供应商（含 Codex / GitHub Copilot / xAI OAuth 订阅代理 `runtime/oauthProxy.ts`）；
+- `overlay/files/apps/server/src/xtwork/modelChannelsRoutes.ts` 与 `/settings/channels`（`XtworkModelChannelsSettings.tsx`）提供渠道配置、连接测试与零渠道引导横幅（`XtworkZeroChannelBanner.tsx`）；
 - `runtime/secretStore.ts` 复用 `im-bridge/src/platform/secrets.ts` 的单一硬化 OS SecretStore（`app.xtwork.model-channels` 命名空间，零明文回退、删除回读验证与并发代际栅栏）；
-- `overlay/patches/042-m1b-live-refresh.patch` 为活跃 Pi `1.5.2` 会话提供模型目录热刷新。
+- `overlay/patches/042-m1b-live-refresh.patch` 为活跃 Pi `1.5.2` 会话提供模型目录热刷新；
+- `overlay/files/apps/server/src/xtwork/codingAgentDelegation.ts` 与 `CodingAgentSettingsSection.tsx`（[PR #29](https://github.com/oulkurt/Xtwork-v2/pull/29)）提供确定性 Coding Agent 委派路由、阻断操作卡与 IM/群聊硬拒绝。
 
-Pi 会话保存在 `runtime/pi/sessions`，桌面服务进程以应用数据目录内的 `workspace` 为工作目录。首次本地预览可运行 `open -n --env XTWORK_DEV_FALLBACK=1 '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'` 连接 Magpie 默认线路；切到 DeepSeek 线路可传 `XTWORK_MODEL_UPSTREAM_MODEL=auto/deepseek-v4.1-flash`（直接运行 `.app/Contents/MacOS/` 下可执行文件或 `open -n --env ...`）。`XTWORK_MODEL_UPSTREAM_URL` 可指定其它 Chat Completions 服务，`XTWORK_MODEL_UPSTREAM_KEY_FILE` 可指向只供服务端读取的密钥文件。凭据和一次性网关令牌保存在进程侧。
+Pi 会话保存在 `runtime/pi/sessions`，桌面服务进程以应用数据目录内的 `workspace` 为工作目录。未配置任何渠道时，可直接在界面内打开「设置 → 模型渠道」登录企业微信或添加个人供应商；若需离线走本地 Magpie 预览兜底线路（`xtwork/standard` → 默认 `http://127.0.0.1:3425/v1` 的 `our-free-model/hy4-flash-free`），运行 `open -n --env XTWORK_DEV_FALLBACK=1 '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'`，或传 `XTWORK_MODEL_UPSTREAM_MODEL=auto/deepseek-v4.1-flash` 切到 DeepSeek 线路。`XTWORK_MODEL_UPSTREAM_URL` 可指定其它 Chat Completions 服务，`XTWORK_MODEL_UPSTREAM_KEY_FILE` 可指向只供服务端读取的密钥文件。凭据和一次性网关令牌保存在进程侧。
 
 ## 远程连接（`im-bridge`）与 Leader 控制面
 

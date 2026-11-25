@@ -119,7 +119,7 @@
 
 ## 发布前检查
 
-- [ ] `doc/dim-acp-flavor.md` 记录最终字段映射、能力矩阵和版本边界。
+- [ ] `docs/dim-acp-flavor.md` 记录最终字段映射、能力矩阵和版本边界。
 - [ ] [里程碑与验收](10-里程碑与验收.md) 加入 flavor 的 P0/P1/P2 验收。
 - [ ] [风险与待定](11-风险与待定.md) 删除已验证项，保留真实未决项。
 - [ ] 生成包确认 marker 只注入 bundled Dim，settings.json 不持久化 marker。

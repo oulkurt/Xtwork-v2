@@ -60,4 +60,4 @@
 - 内置待办清单迁移为 `kind: "functional"`
 - 功能运行时和外观应用器的独立注册结果
 - 基于 `AppRouteModal` 的 `PluginModalHost`
-- `/doc` 中的协议、验证命令和剩余范围记录
+- `/docs` 中的协议、验证命令和剩余范围记录

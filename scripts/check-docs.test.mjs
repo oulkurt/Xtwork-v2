@@ -62,8 +62,8 @@ test("extractLinks handles balanced parentheses, images, nested linked images, r
     { label: "![status](missing.svg)", href: "README.md", isImage: false, kind: "inline" },
     { label: "status", href: "missing.svg", isImage: true, kind: "image" },
   ]);
-  assert.deepEqual(extractLinks("[ref-id]: doc/plan/01.md#top \"Title\""), [
-    { label: "ref-id", refId: "ref-id", href: "doc/plan/01.md#top", isImage: false, kind: "ref-def" },
+  assert.deepEqual(extractLinks("[ref-id]: docs/plan/01.md#top \"Title\""), [
+    { label: "ref-id", refId: "ref-id", href: "docs/plan/01.md#top", isImage: false, kind: "ref-def" },
   ]);
   assert.equal(
     extractLinks("Keep `` `[fake](missing.md)` `` ignored while keeping [real](ok.md)").length,
@@ -75,21 +75,21 @@ test("extractLinks handles balanced parentheses, images, nested linked images, r
 test("checkRepositoryDocs catches broken links/anchors, linked images, repo escapes, ADR mismatches, unused ref-def index, and patch table drift", () => {
   const root = makeFixture({
     "README.md": [
-      "[ok](doc/README.md#总览)",
-      "[space-ok](doc/my%20note.md#api_key)",
+      "[ok](docs/README.md#总览)",
+      "[space-ok](docs/my%20note.md#api_key)",
       "[escape](../../../etc/hosts)",
-      "![missing-img](doc/missing.png)",
-      "[![badge](doc/missing-badge.svg)](README.md)",
-      "[ref-broken]: doc/missing-ref.md",
+      "![missing-img](docs/missing.png)",
+      "[![badge](docs/missing-badge.svg)](README.md)",
+      "[ref-broken]: docs/missing-ref.md",
     ].join("\n"),
     "DECISIONS.md": [
       "See [ADR-003][adr-three] in body.",
       "",
-      "[unused-ref]: doc/decisions/001-alpha.md",
-      "[adr-three]: doc/decisions/003-used-ref.md",
+      "[unused-ref]: docs/decisions/001-alpha.md",
+      "[adr-three]: docs/decisions/003-used-ref.md",
     ].join("\n"),
-    "doc/my note.md": "# API_KEY\n",
-    "doc/README.md": [
+    "docs/my note.md": "# API_KEY\n",
+    "docs/README.md": [
       "# 总览",
       "- [bad link](missing.md)",
       "- [bad anchor](plan/02-上游与改造层.md#不存在的标题)",
@@ -100,18 +100,18 @@ test("checkRepositoryDocs catches broken links/anchors, linked images, repo esca
       "[ignored-in-fence](does-not-exist.md#nope)",
       "```",
     ].join("\n"),
-    "doc/decisions/001-alpha.md": [
+    "docs/decisions/001-alpha.md": [
       "# ADR-001 · Alpha",
       "- **Status** Accepted",
     ].join("\n"),
-    "doc/decisions/002-unindexed.md": [
+    "docs/decisions/002-unindexed.md": [
       "# ADR-099 · Wrong heading",
     ].join("\n"),
-    "doc/decisions/003-used-ref.md": [
+    "docs/decisions/003-used-ref.md": [
       "# ADR-003 · Referenced via used ref-def",
       "- **Status** Accepted",
     ].join("\n"),
-    "doc/plan/02-上游与改造层.md": [
+    "docs/plan/02-上游与改造层.md": [
       "# 02 上游",
       "## 3. 代码仓库布局",
       "Mention `02-only-outside-table.patch` outside section 4 table must NOT satisfy table coverage.",
