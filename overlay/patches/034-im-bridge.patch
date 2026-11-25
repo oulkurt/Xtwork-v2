@@ -1,0 +1,181 @@
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -90,6 +90,7 @@
+ import * as TerminalManager from "./terminal/Manager.ts";
+ import * as McpHttpServer from "./mcp/McpHttpServer.ts";
+ import * as XtworkPlugins from "./mcp/XtworkPluginService.ts";
++import * as XtworkIm from "./im/XtworkImService.ts";
+ import * as PeerForwarding from "./peer/PeerForwarding.ts";
+ import * as RemoteDelegation from "./peer/RemoteDelegation.ts";
+ import * as PeerLinkRequests from "./peer/PeerLinkRequests.ts";
+@@ -853,6 +854,7 @@
+     ServerHttp.layerAssetRoute,
+     ServerHttp.layerAttachmentUploadRoute,
+     XtworkPlugins.route,
++    XtworkIm.route,
+     GuestHttp.layer,
+     DeviceHubProxy.layer,
+     ServerBrowserStream.routeLayer,
+@@ -906,6 +908,7 @@
+   Layer.provide(ServerSelfUpdate.layer.pipe(Layer.provide(layerDesktopAppUpdate))),
+   Layer.provide(layerCommandReadiness),
+   Layer.provide(XtworkPlugins.layer),
++  Layer.provide(XtworkIm.layer),
+   Layer.provide(ServerHttp.layerBrowserApiCors),
+   Layer.provide(ServerHttp.layerHttpCompression),
+ );
+--- a/apps/server/src/mcp/McpInvocationContext.ts
++++ b/apps/server/src/mcp/McpInvocationContext.ts
+@@ -14,6 +14,8 @@
+ import * as Effect from "effect/Effect";
+ import * as Fiber from "effect/Fiber";
+ import { formatThreadLink, hostedThreadLink } from "@t3tools/shared/threadLinks";
++
++import type { ImDispatcher } from "../im/XtworkImDispatch.ts";
+ 
+ const ALL_MCP_CAPABILITIES = [
+   "preview",
+@@ -138,6 +140,7 @@
+   readonly capabilities: ReadonlySet<McpCapability>;
+   readonly issuedAt: number;
+   readonly requestNamespace: string;
++  readonly imExecution?: NonNullable<Effect.Success<ReturnType<ImDispatcher["resolveExecution"]>>>;
+   readonly thread: McpThreadCaller | undefined;
+   readonly client: McpClientCaller | undefined;
+   /** False while the Linked environments beta is off here; `/mcp` reads it per request. */
+--- a/apps/server/src/mcp/McpHttpServer.ts
++++ b/apps/server/src/mcp/McpHttpServer.ts
+@@ -93,6 +93,9 @@
+ import { HtmlPreviewTool, HtmlPreviewToolkit, HtmlRenderToolkit } from "./toolkits/html/tools.ts";
+ import { MCP_HTTP_PATH } from "../httpCors.ts";
+ import { requestUrl } from "../requestUrl.ts";
++import * as XtworkImMcp from "../im/XtworkImMcp.ts";
++import { isImThread } from "../im/XtworkImSecurity.ts";
++import { XtworkIm } from "../im/XtworkImService.ts";
+ import * as XtworkPluginMcp from "./XtworkPluginMcp.ts";
+ import { isPluginToolName } from "./XtworkPluginHost.ts";
+ 
+@@ -273,6 +276,7 @@
+ const makeMcpAuthMiddleware = Effect.gen(function* () {
+   const registry = yield* McpSessionRegistry.McpSessionRegistry;
+   const clients = yield* Effect.serviceOption(McpClientAuthenticator);
++  const im = Option.getOrUndefined(yield* Effect.serviceOption(XtworkIm));
+   const serverSettings = yield* ServerSettings.ServerSettingsService;
+   const runtimeModeCeiling = serverSettings.managedPolicy?.limits?.maxRuntimeMode;
+   const linksEnabled = serverSettings.getSettings.pipe(
+@@ -312,7 +316,11 @@
+     const linkedEnvironments = yield* linksEnabled;
+     if (limited.client?.linked === true && !linkedEnvironments) return linkedEnvironmentsOff;
+     const origin = Option.getOrUndefined(Option.map(requestUrl(request), (url) => url.origin));
+-    return { ...limited, linkedEnvironments, origin };
++    const threadId = limited.thread?.threadId;
++    const execution = threadId !== undefined && isImThread(threadId) && im?.dispatch
++      ? yield* im.dispatch.resolveExecution(threadId).pipe(Effect.orElseSucceed(() => undefined))
++      : undefined;
++    return { ...limited, linkedEnvironments, origin, ...(execution === undefined ? {} : { imExecution: execution }) };
+   });
+   // Untraced: a span here would wrap the tool call; the HTTP server span already covers it.
+   return Effect.fnUntraced(function* (httpEffect) {
+@@ -1393,6 +1401,17 @@
+   layerHtmlToolkit,
+   layerMessageToolkit,
+   XtworkPluginMcp.layer,
++  XtworkImMcp.layer,
++  McpServer.visibility(({ method, target }) =>
++    Effect.serviceOption(McpInvocationContext.McpInvocationContext).pipe(
++      Effect.map((scope) => {
++        const invocation = Option.getOrUndefined(scope);
++        const threadId = invocation?.thread?.threadId;
++        return method.startsWith("tools/") && !XtworkImMcp.imToolAllowed(threadId, target, method === "tools/list")
++          ? false
++          : true;
++      }),
++    ), { global: true }),
+ );
+ 
+ const layerToolExposure = Layer.effect(
+--- a/apps/server/src/orchestration-v2/Orchestrator.ts
++++ b/apps/server/src/orchestration-v2/Orchestrator.ts
+@@ -1,3 +1,4 @@
++import { ImDispatchAuthority, isImThread, localForkThreadId } from "../im/XtworkImSecurity.ts";
+ import type {
+   OrchestrationV2ThreadLinkMetadata,
+   GuestShareId,
+@@ -5741,7 +5742,7 @@
+     // A side chat may open during the parent's first turn; it starts from a digest instead.
+     if (
+       sourceRun === null &&
+-      !(command.sideChat === true && command.sourcePoint.type === "latest_stable")
++      !((command.sideChat === true || isImThread(command.sourceThreadId)) && command.sourcePoint.type === "latest_stable")
+     ) {
+       return yield* new OrchestratorDispatchError({
+         commandId: command.commandId,
+@@ -5795,7 +5796,7 @@
+       threadId: command.targetThreadId,
+       providerInstanceId: targetThread.providerInstanceId,
+       occurredAt: now,
+-      payload: targetThread,
++      payload: isImThread(command.sourceThreadId) ? { ...targetThread, worktreePath: null, branch: null } : targetThread,
+     });
+     yield* emitEvent({
+       type: "context-transfer.created",
+@@ -15837,6 +15838,50 @@
+       : dispatch;
+   });
+ 
++  const dispatchAudienceSafe = Effect.fnUntraced(function* (command: OrchestrationV2ServerCommand) {
++    const threadId = commandThreadId(command);
++    if (command.type === "thread.merge_back" && (isImThread(command.sourceThreadId) || isImThread(threadId))) {
++      return yield* new OrchestratorDispatchError({
++        commandId: command.commandId,
++        commandType: command.type,
++        cause: "IM threads cannot merge conversation histories.",
++      });
++    }
++    if (!isImThread(threadId) || (yield* ImDispatchAuthority)) {
++      return yield* dispatchWithReceipt(command);
++    }
++    if (command.type === "message.dispatch" && command.guestMessageId === undefined &&
++        command.restartContinuationOfRunId === undefined && command.scheduledTaskId === undefined) {
++      const targetThreadId = ThreadId.make(localForkThreadId(command.commandId));
++      yield* dispatchWithReceipt({
++        type: "thread.fork",
++        createdBy: "user",
++        creationSource: "server",
++        commandId: CommandId.make(`im-private-fork:${command.commandId}`),
++        sourceThreadId: threadId,
++        targetThreadId,
++        sourcePoint: { type: "latest_stable" },
++        title: "IM · 本地续聊",
++      });
++      return yield* dispatchWithReceipt({
++        ...command,
++        threadId: targetThreadId,
++        dispatchMode: { type: "start_immediately" },
++      });
++    }
++    if (command.type === "thread.visit" || command.type === "thread.archive" ||
++        command.type === "thread.unarchive" || command.type === "thread.delete" ||
++        command.type === "thread.stop" || command.type === "run.interrupt" ||
++        command.type === "thread.background-work.settle") {
++      return yield* dispatchWithReceipt(command);
++    }
++    return yield* new OrchestratorDispatchError({
++      commandId: command.commandId,
++      commandType: command.type,
++      cause: "This action cannot change an IM thread's audience or execution context.",
++    });
++  });
++
+   const handleRunUpdate = Effect.fn("Orchestrator.handleRunUpdate")(
+     function* (stored: OrchestrationV2StoredEvent) {
+       if (stored.event.type !== "run.updated") return;
+@@ -16324,7 +16369,7 @@
+     awaitRestartContinuation: Effect.fn("OrchestratorV2.awaitRestartContinuation")(function (run) {
+       return effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore);
+     }),
+-    dispatch: dispatchWithReceipt,
++    dispatch: dispatchAudienceSafe,
+     autoArmLimitRecovery: Effect.fn("OrchestratorV2.autoArmLimitRecovery")(function (input) {
+       return threadDispatch.withLock(
+         input.threadId,

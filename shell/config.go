@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/egoist/mygo"
 )
@@ -94,7 +95,16 @@ func environmentPath(key string, fallback ...string) string {
 }
 
 func (cfg config) backendEnvironment() []string {
-	env := append(os.Environ(),
+	env := make([]string, 0, len(os.Environ())+10)
+	for _, pair := range os.Environ() {
+		key, _, _ := strings.Cut(pair, "=")
+		switch key {
+		case "XTWORK_IM_BRIDGE_ENTRY", "XTWORK_IM_DATA_DIR", "XTWORK_COMPANION_DIR":
+		default:
+			env = append(env, pair)
+		}
+	}
+	env = append(env,
 		"T3CODE_TELEMETRY_ENABLED=false",
 		"XTWORK_DATA_DIR="+cfg.dataDir,
 		"XTWORK_BRAND_CONFIG="+cfg.brandFile,
@@ -107,6 +117,16 @@ func (cfg config) backendEnvironment() []string {
 		if os.Getenv(key) == "" {
 			if _, err := os.Stat(path); err == nil {
 				env = append(env, key+"="+path)
+			}
+		}
+	}
+	entry := environmentPath("XTWORK_IM_BRIDGE_ENTRY", cfg.resources, "im-bridge", "dist", "main.js")
+	if absolute, err := filepath.Abs(entry); err == nil {
+		if info, err := os.Stat(absolute); err == nil && info.Mode().IsRegular() {
+			imData, imErr := filepath.Abs(environmentPath("XTWORK_IM_DATA_DIR", cfg.dataDir, "im"))
+			companion, companionErr := filepath.Abs(environmentPath("XTWORK_COMPANION_DIR", cfg.dataDir, "companion"))
+			if imErr == nil && companionErr == nil {
+				env = append(env, "XTWORK_IM_BRIDGE_ENTRY="+absolute, "XTWORK_IM_DATA_DIR="+imData, "XTWORK_COMPANION_DIR="+companion)
 			}
 		}
 	}
