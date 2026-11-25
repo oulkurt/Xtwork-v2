@@ -210,20 +210,31 @@ const ANSI_ESCAPE_PATTERN =
   // eslint-disable-next-line no-control-regex
   /\u001B(?:\][^\u0007\u001B]*(?:\u0007|\u001B\\)|\[[0-9;?]*[ -/]*[@-~])/g;
 const SECRET_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-  // S5: JSON-quoted key/value secret fields ("api_key": "...", "apiKey": "...", "password": "...", etc.)
+  // S5: JSON-quoted key/value secret fields ("api_key": "...", "token": 123456, "password": "...", etc.)
   [
     /("(?:[^"\\]|\\.)*(?:api[_-]?key|password|passwd|secret|token|authorization|credential)(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)(")/gi,
     "$1[REDACTED]$3",
   ],
-  // Single-quoted key/value secret fields ('api_key': '...')
+  [
+    /("(?:[^"\\]|\\.)*(?:api[_-]?key|password|passwd|secret|token|authorization|credential)(?:[^"\\]|\\.)*"\s*:\s*)(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(?=\s*[,}\]]|$)/gi,
+    '$1"[REDACTED]"',
+  ],
+  // Single-quoted key/value secret fields ('api_key': '...', 'token': 123456)
   [
     /('(?:[^'\\]|\\.)*(?:api[_-]?key|password|passwd|secret|token|authorization|credential)(?:[^'\\]|\\.)*'\s*:\s*')((?:[^'\\]|\\.)*)(')/gi,
     "$1[REDACTED]$3",
   ],
+  [
+    /('(?:[^'\\]|\\.)*(?:api[_-]?key|password|passwd|secret|token|authorization|credential)(?:[^'\\]|\\.)*'\s*:\s*)(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(?=\s*[,}\]]|$)/gi,
+    "$1'[REDACTED]'",
+  ],
   [/\b(sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_KEY]"],
   [/\b((?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g, "[REDACTED_KEY]"],
   [/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]"],
-  [/\b(Authorization\s*:\s*(?:Basic|Token)\s+)\S+/gi, "$1[REDACTED]"],
+  [
+    /\b(Authorization\s*[=:]\s*(?:(?:Bearer|Basic|Token)\s+)?)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+)/gi,
+    "$1[REDACTED]",
+  ],
   [
     /\b((?:ANTHROPIC|OPENAI|DEEPSEEK|KIMI|API)[A-Z0-9_]*(?:KEY|TOKEN|SECRET)\s*[=:]\s*)\S+/gi,
     "$1[REDACTED]",

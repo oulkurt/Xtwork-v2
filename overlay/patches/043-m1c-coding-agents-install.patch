@@ -1949,7 +1949,7 @@ index fffbe8dd..540f6dc3 100644
  export const AcpRegistryPrepareInput = Schema.Struct({
    agentId: AcpRegistryAgentId,
 +  instanceId: Schema.optionalKey(ProviderInstanceId),
-+  approvalToken: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
++  approvalToken: Schema.optionalKey(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256), Schema.isPattern(/^\S+$/))),
 +  distributionPreference: Schema.optionalKey(Schema.Literals(["auto", "binary", "npx", "uvx"])),
 +  expectedVersion: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
 +  expectedDistribution: Schema.optionalKey(AcpRegistryDistribution),
@@ -1983,7 +1983,7 @@ index 2693b8aa..e56c8f3e 100644
  
  export const ProviderSetupInput = Schema.Struct({
    instanceId: ProviderInstanceId,
-+  approvalToken: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
++  approvalToken: Schema.optionalKey(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256), Schema.isPattern(/^\S+$/))),
 +  expectedVersion: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
 +  expectedSha256: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
 +  explicitConsent: Schema.optionalKey(Schema.Boolean),

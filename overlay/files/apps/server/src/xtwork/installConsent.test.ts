@@ -2,6 +2,8 @@
 import * as NodeFs from "node:fs";
 import * as NodeOs from "node:os";
 import * as NodePath from "node:path";
+import * as Schema from "effect/Schema";
+import { AcpRegistryPrepareInput, ProviderSetupInput } from "@t3tools/contracts";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import {
   InstallConsentStore,
@@ -240,5 +242,30 @@ describe("InstallConsentStore", () => {
     // Original pending token remains intact and is consumed exactly once with the exact token.
     expect(store.consumeApproval(key, token)).toBe(true);
     expect(store.consumeApproval(key, token)).toBe(false);
+  });
+
+  it("rejects whitespace-padded approvalToken in AcpRegistryPrepareInput and ProviderSetupInput RPC schemas (M2)", () => {
+    const decodeAcp = Schema.decodeUnknownSync(AcpRegistryPrepareInput);
+    const decodeSetup = Schema.decodeUnknownSync(ProviderSetupInput);
+
+    expect(() =>
+      decodeAcp({ agentId: "kimi-code", approvalToken: "  tok-123  " }),
+    ).toThrow();
+    expect(() =>
+      decodeAcp({ agentId: "kimi-code", approvalToken: "tok-123 " }),
+    ).toThrow();
+    expect(() =>
+      decodeAcp({ agentId: "kimi-code", approvalToken: "\ttok-123" }),
+    ).toThrow();
+    expect(
+      decodeAcp({ agentId: "kimi-code", approvalToken: "tok-123" }).approvalToken,
+    ).toBe("tok-123");
+
+    expect(() =>
+      decodeSetup({ instanceId: "codex", approvalToken: "  tok-123  " }),
+    ).toThrow();
+    expect(
+      decodeSetup({ instanceId: "codex", approvalToken: "tok-123" }).approvalToken,
+    ).toBe("tok-123");
   });
 });
