@@ -732,10 +732,10 @@ index e06fc7e0..735c54d9 100644
  import { startBundledPi } from "./xtwork/gateway.ts";
  import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
  import {
-@@ -940,8 +945,15 @@ const make = Effect.gen(function* () {
-     const settingsWithRuntime = bundledPi === undefined
-       ? sourceControlMigration.settings
-       : seedBundledPi(sourceControlMigration.settings, !hasSettings);
+@@ -942,8 +947,15 @@ const make = Effect.gen(function* () {
+       : seedBundledPi(sourceControlMigration.settings, !hasSettings, {
+           defaultModelSlug: bundledPi.getDefaultModelSlug(),
+         });
 +    const codingAgentSeedPlan =
 +      settingsFileTrusted && shouldSeedCodingAgents(environment)
 +        ? planCodingAgentSeeds(settingsWithRuntime, baseDir)
@@ -749,7 +749,7 @@ index e06fc7e0..735c54d9 100644
        : folded;
      if (
        migrated !== loaded ||
-@@ -953,6 +965,9 @@ const make = Effect.gen(function* () {
+@@ -955,6 +967,9 @@ const make = Effect.gen(function* () {
          yield* secretStore.remove(move.from).pipe(Effect.ignore);
        }
      }
