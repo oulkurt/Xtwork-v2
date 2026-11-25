@@ -563,4 +563,74 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
       // store already closed by bridge.shutdown()
     }
   });
+
+  it("refuses to delete connection or report disconnect when verified secret deletion fails (#8)", async () => {
+    const notifications: RpcNotification[] = [];
+    const mock = createMockChannel({ platform: "feishu", trust: "public", onboardOwnerId: "u-owner" });
+    const store = new Store(":memory:");
+    const baseSecrets = memorySecrets();
+    let failDelete = true;
+    const flakySecrets: SecretStore = {
+      get: (ref) => baseSecrets.get(ref),
+      set: (ref, value) => baseSecrets.set(ref, value),
+      async delete(ref) {
+        if (failDelete) {
+          throw new Error("OS keychain delete verification failed");
+        }
+        await baseSecrets.delete(ref);
+      },
+    };
+
+    await baseSecrets.set("sec:fs-del", JSON.stringify({ appId: "a", appSecret: "s" }));
+    const conn = store.createConnection({
+      platform: "feishu",
+      secretRef: "sec:fs-del",
+      lifecycleState: "active",
+      ownerId: "u-owner",
+    });
+
+    const bridge = new ImBridge({
+      store,
+      secrets: flakySecrets,
+      channels: { feishu: mock.channel },
+      notify: (n) => notifications.push(n),
+    });
+    await bridge.start();
+    await new Promise((r) => setTimeout(r, 20));
+    notifications.length = 0;
+
+    // 1. Failing secrets.delete MUST propagate failure, preserve connection in SQLite, and emit NO disconnected state!
+    const failedRes = await bridge.handleRequest({
+      id: 40,
+      method: "connections.disconnect",
+      params: { connectionId: conn.id },
+    });
+    assert.equal(failedRes.ok, false);
+    if (!failedRes.ok) {
+      assert.equal(failedRes.error.code, "SECRET_DELETE_FAILED");
+    }
+    assert.ok(store.connection(conn.id), "Connection record must remain intact when credential deletion fails");
+    assert.equal(await baseSecrets.get("sec:fs-del"), JSON.stringify({ appId: "a", appSecret: "s" }));
+    assert.equal(
+      notifications.some((n) => n.method === "connection.state" && n.params.stateDetail === "disconnected"),
+      false,
+    );
+
+    // 2. Retrying once secrets.delete succeeds removes both credential and connection cleanly.
+    failDelete = false;
+    const okRes = await bridge.handleRequest({
+      id: 41,
+      method: "connections.disconnect",
+      params: { connectionId: conn.id },
+    });
+    assert.equal(okRes.ok, true);
+    assert.equal(store.connection(conn.id), undefined);
+    assert.equal(await baseSecrets.get("sec:fs-del"), undefined);
+    assert.equal(
+      notifications.some((n) => n.method === "connection.state" && n.params.stateDetail === "disconnected"),
+      true,
+    );
+
+    await bridge.shutdown();
+  });
 });

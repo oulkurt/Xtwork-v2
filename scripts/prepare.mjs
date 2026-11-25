@@ -49,7 +49,23 @@ const runtimeDir = join(root, "runtime");
 if (existsSync(join(runtimeDir, "gateway.ts"))) {
   const target = join(t3, "apps/server/src/xtwork");
   mkdirSync(target, { recursive: true });
-  for (const file of ["gateway.ts", "bundledPiSettings.ts", "bundledPiSettings.test.ts"]) {
+  const canonicalSecretsSrc = join(root, "im-bridge/src/platform/secrets.ts");
+  cpSync(canonicalSecretsSrc, join(target, "secretsCore.ts"));
+  const secretFacadeSource = readFileSync(join(runtimeDir, "secretStore.ts"), "utf8");
+  const canonicalImport = '"../im-bridge/src/platform/secrets.ts"';
+  if (!secretFacadeSource.includes(canonicalImport)) {
+    throw new Error(`Expected canonical secrets import anchor in runtime/secretStore.ts`);
+  }
+  writeFileSync(
+    join(target, "secretStore.ts"),
+    secretFacadeSource.replaceAll(canonicalImport, '"./secretsCore.ts"'),
+  );
+  for (const file of [
+    "oauthProxy.ts",
+    "gateway.ts",
+    "bundledPiSettings.ts",
+    "bundledPiSettings.test.ts",
+  ]) {
     cpSync(join(runtimeDir, file), join(target, file));
   }
 }
