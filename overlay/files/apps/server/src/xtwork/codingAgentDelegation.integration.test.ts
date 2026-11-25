@@ -2494,16 +2494,16 @@ describe("M1c-Gate 2 integration: deterministic routing, workspace contract, can
         // 1. ServerSettings read failure MUST fail closed on BOTH local AND remote delegation!
         let settingsFailDispatches = 0;
         let settingsFailRemotes = 0;
+        const failingSettingsErr = new ServerSettingsError({
+          settingsPath: "/tmp/corrupt-settings.json",
+          operation: "read-file",
+          cause: "disk read error",
+        });
         const failingSettingsLayer = Layer.succeed(
           ServerSettings.ServerSettingsService,
           ServerSettings.ServerSettingsService.of({
-            getSettings: Effect.fail(
-              new ServerSettingsError({
-                settingsPath: "/tmp/corrupt-settings.json",
-                operation: "read-file",
-                cause: "disk read error",
-              }),
-            ),
+            getSettings: Effect.fail(failingSettingsErr),
+            getTrustedSettings: Effect.fail(failingSettingsErr),
             updateSettings: () => Effect.die("unused"),
             streamChanges: Stream.empty,
             managedPolicy: undefined,
@@ -2961,7 +2961,7 @@ describe("M1c-Gate 2 integration: deterministic routing, workspace contract, can
           const fallbackDefaults = yield* settingsSvc.getSettings;
           expect(fallbackDefaults.codingAgent.mode).toBe("auto");
           // ...while getTrustedSettings fails closed so delegation cannot silently fall back to `auto`!
-          const trustedErr = yield* settingsSvc.getTrustedSettings!.pipe(Effect.flip);
+          const trustedErr = yield* settingsSvc.getTrustedSettings.pipe(Effect.flip);
           expect(trustedErr.operation).toBe("read-file");
 
           const corruptMcpDeps = Layer.mergeAll(

@@ -659,9 +659,12 @@ export const checkExternalDelegationAncestry = Effect.fn(
     }
   };
 
+  if (input.initialLineage === null) {
+    return failClosedAncestry("ancestry_lookup_failed", currentId);
+  }
   if (input.initialLineage !== undefined) {
-    enqueue(input.initialLineage?.parentThreadId);
-    enqueue(input.initialLineage?.rootThreadId);
+    enqueue(input.initialLineage.parentThreadId);
+    enqueue(input.initialLineage.rootThreadId);
   } else if (currentId) {
     const selfLookup = yield* lookupLineageSafely(currentId);
     if (!selfLookup.ok || selfLookup.lineage === null) {
@@ -958,7 +961,8 @@ function parseSectionHeaderLine(rawLine: string): ParsedSectionHeader | null {
 
 /**
  * Rejects degenerate inline bodies that are themselves another section heading/tag
- * (e.g., `[Goal] [Scope]`, `<goal> <files>`, `Goal: Scope:`, `## Goal: ## Scope`).
+ * (e.g., `[Goal] [Scope]`, `<goal> <files>`, `Goal: Scope:`, `## Goal: ## Scope`)
+ * while preserving normal prose containing colons (e.g., `Goal: Repair file uploads: preserve retry metadata.`).
  */
 function isInlineBodyAnotherHeadingOrTag(inlineBody: string): boolean {
   const trimmed = inlineBody.trim();
@@ -968,8 +972,10 @@ function isInlineBodyAnotherHeadingOrTag(inlineBody: string): boolean {
   const nestedMatches = BRIEF_SECTION_RULES.filter((rule) =>
     rule.headingPatterns.some((pattern) => pattern.test(nested.header)),
   );
-  if (nestedMatches.length > 0) return true;
-  return nested.structuralHeading && !hasMeaningfulSectionBody(nested.inlineBody);
+  if (nested.structuralHeading) {
+    return nestedMatches.length > 0 || !hasMeaningfulSectionBody(nested.inlineBody);
+  }
+  return nestedMatches.length > 0 && !hasMeaningfulSectionBody(nested.inlineBody);
 }
 
 /**

@@ -609,6 +609,19 @@ describe("Sol Round 1 regression guards", () => {
           blockedAncestorThreadId: failingParent,
         });
 
+        // Fail closed when initialLineage is explicitly `null` (missing lineage must not skip checks)!
+        const nullInitialLineageCheck = yield* checkExternalDelegationAncestry({
+          threadId: ThreadId.make("child-with-null-lineage"),
+          initialLineage: null,
+          isProtectedThread: () => false,
+          loadThreadLineage: () => Effect.succeed({ parentThreadId: null }),
+        });
+        expect(nullInitialLineageCheck).toMatchObject({
+          blocked: true,
+          code: IM_DELEGATION_DENIED_CODE,
+          reason: "ancestry_lookup_failed",
+        });
+
         // Fail closed when a referenced parentThreadId is missing (lookup returns null)!
         const missingParent = ThreadId.make("parent-missing-null");
         const missingParentCheck = yield* checkExternalDelegationAncestry({
@@ -821,5 +834,15 @@ describe("Sol Round 1 regression guards", () => {
     if (!stackedColonLabels.valid) {
       expect(stackedColonLabels.missingSections).toEqual(["goal"]);
     }
+
+    // Normal prose containing a colon and keywords like "file" MUST still be accepted!
+    const colonInNormalProse = validateCodingAgentHandoffBrief(
+      [
+        "Goal: Repair file uploads: preserve retry metadata.",
+        "Scope: Keep API response shape backwards-compatible.",
+        "Files: apps/server/src/uploads.ts",
+      ].join("\n"),
+    );
+    expect(colonInNormalProse).toEqual({ valid: true });
   });
 });
