@@ -33,7 +33,9 @@ describe("inbound message state machine", () => {
     assert.equal(nextInbound("failed", "send"), undefined);
     assert.equal(nextInbound("received", "pause"), "paused_pending");
     assert.equal(nextInbound("waiting", "pause"), "paused_pending");
-    assert.equal(nextInbound("delivered", "pause"), undefined);
+    // S28: Unacked `delivered` messages may be paused (store enforces `acked_at IS NULL AND t3_turn_id IS NULL`).
+    assert.equal(nextInbound("delivered", "pause"), "paused_pending");
+    assert.equal(nextInbound("held", "admit_paused"), "paused_pending");
     assert.equal(nextInbound("paused_pending", "replay_paused"), "received");
     assert.equal(nextInbound("paused_pending", "dismiss_paused"), "ignored");
     assert.equal(nextInbound("failed", "ignore"), "ignored");

@@ -394,12 +394,30 @@ describe("SQLite store invariants (ADR-011 S5/S6)", () => {
         }),
       );
       assert.equal(first.kind, "dispatch");
-      store.moveInbound([first.message.id], "deliver");
+      // ACKed in-flight run stays `delivered` on Pause, whereas an unacked `delivered` row moves to `paused_pending` (S28)!
+      store.ackInbound(
+        { idempotencyKey: first.message.idempotencyKey! },
+        { t3ThreadId: "xtwork-im-dm-acked", t3TurnId: "run-acked-1" },
+      );
+      const unackedDelivered = store.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "m_unacked_delivered",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "unacked delivered trigger",
+        }),
+      );
+      assert.equal(unackedDelivered.kind, "dispatch");
+      store.moveInbound([unackedDelivered.message.id], "deliver");
+      assert.equal(store.message(unackedDelivered.message.id)?.state, "delivered");
 
-      // Leader pauses: connection stays active, in-flight stays delivered, new triggers enter paused_pending.
+      // Leader pauses: connection stays active, ACKed in-flight stays delivered, unacked delivered & new triggers enter paused_pending.
       store.updateConnection(conn.id, { leaderPaused: true });
       store.pauseConnectionMessages(conn.id);
       assert.equal(store.message(first.message.id)?.state, "delivered");
+      assert.equal(store.message(unackedDelivered.message.id)?.state, "paused_pending");
 
       const deferred = store.ingestInbound(
         conn.id,
@@ -416,7 +434,7 @@ describe("SQLite store invariants (ADR-011 S5/S6)", () => {
       assert.equal(deferred.message.idempotencyKey, `im:${conn.id}:m_while_paused`);
       assert.equal(store.heldMessages(conn.id).length, 0);
       assert.equal(store.listUnackedTriggers(conn.id).length, 0);
-      assert.equal(store.pausedPendingMessages([conn.id]).length, 1);
+      assert.equal(store.pausedPendingMessages([conn.id]).length, 2);
 
       // Verified Owner /stop still works while Leader is paused!
       const stopOutcome = store.ingestInbound(
@@ -437,7 +455,7 @@ describe("SQLite store invariants (ADR-011 S5/S6)", () => {
       assert.equal(replayed.length, 1);
       assert.equal(replayed[0]!.state, "received");
       assert.equal(replayed[0]!.idempotencyKey, `im:${conn.id}:m_while_paused`);
-      assert.equal(store.pausedPendingMessages([conn.id]).length, 0);
+      assert.equal(store.pausedPendingMessages([conn.id]).length, 1);
     } finally {
       store.close();
     }

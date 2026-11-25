@@ -376,6 +376,8 @@ export const makeBridgeEventHandler = (
           payload.bindingEpoch !== binding.epoch ||
           Boolean(payload.leaderPaused) !== desiredPaused;
         if (needsSync) {
+          const ownerPauseGen = ownerLeader?.pauseGeneration ?? 0;
+          const ownerPauseVer = ownerLeader?.pauseVersion ?? 0;
           yield* callHost(host, "connections.syncBindings", {
             bindings: [
               {
@@ -384,11 +386,20 @@ export const makeBridgeEventHandler = (
                 bindingId: binding.bindingId,
                 bindingEpoch: binding.epoch,
                 leaderPaused: desiredPaused,
-                pauseGeneration: ownerLeader?.pauseGeneration ?? 0,
+                pauseGeneration: ownerPauseGen,
+                pauseVersion: ownerPauseVer,
               },
             ],
-            leaderPauseGenerations: { [binding.leaderId]: ownerLeader?.pauseGeneration ?? 0 },
+            leaderStates: {
+              [binding.leaderId]: {
+                paused: desiredPaused,
+                pauseGeneration: ownerPauseGen,
+                pauseVersion: ownerPauseVer,
+              },
+            },
+            leaderPauseGenerations: { [binding.leaderId]: ownerPauseGen },
             leaderPausedById: { [binding.leaderId]: desiredPaused },
+            leaderPauseVersions: { [binding.leaderId]: ownerPauseVer },
           }).pipe(Effect.ignore);
         }
       }
@@ -419,6 +430,7 @@ export const makeBridgeEventHandler = (
               const currentLeader = yield* leaders.getLeader(currentBinding.leaderId).pipe(Effect.orElseSucceed(() => undefined));
               const currentPaused = currentLeader?.status === "paused";
               const currentPauseGen = currentLeader?.pauseGeneration ?? 0;
+              const currentPauseVer = currentLeader?.pauseVersion ?? 0;
               yield* callHost(host, "connections.syncBindings", {
                 bindings: [
                   {
@@ -428,10 +440,19 @@ export const makeBridgeEventHandler = (
                     bindingEpoch: currentBinding.epoch,
                     leaderPaused: currentPaused,
                     pauseGeneration: currentPauseGen,
+                    pauseVersion: currentPauseVer,
                   },
                 ],
+                leaderStates: {
+                  [currentBinding.leaderId]: {
+                    paused: currentPaused,
+                    pauseGeneration: currentPauseGen,
+                    pauseVersion: currentPauseVer,
+                  },
+                },
                 leaderPauseGenerations: { [currentBinding.leaderId]: currentPauseGen },
                 leaderPausedById: { [currentBinding.leaderId]: currentPaused },
+                leaderPauseVersions: { [currentBinding.leaderId]: currentPauseVer },
               }).pipe(Effect.ignore);
             }
           }
@@ -576,6 +597,13 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
     const leaderById = new Map(allLeaders.map((l) => [l.id, l]));
     const leaderPauseGenerations = Object.fromEntries(allLeaders.map((l) => [l.id, l.pauseGeneration]));
     const leaderPausedById = Object.fromEntries(allLeaders.map((l) => [l.id, l.status === "paused"]));
+    const leaderPauseVersions = Object.fromEntries(allLeaders.map((l) => [l.id, l.pauseVersion]));
+    const leaderStates = Object.fromEntries(
+      allLeaders.map((l) => [
+        l.id,
+        { paused: l.status === "paused", pauseGeneration: l.pauseGeneration, pauseVersion: l.pauseVersion },
+      ]),
+    );
     const listed = yield* tryWork((signal) => callRaw("connections.list", {}, signal)).pipe(
       Effect.map((val) => (isRecord(val) && Array.isArray(val.connections) ? val.connections : [])),
       Effect.orElseSucceed(() => []),
@@ -593,6 +621,7 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
         bindingEpoch: binding.epoch,
         leaderPaused,
         pauseGeneration: leaderRecord?.pauseGeneration ?? 0,
+        pauseVersion: leaderRecord?.pauseVersion ?? 0,
       });
     }
     yield* tryWork((signal) =>
@@ -600,10 +629,13 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
         "connections.syncBindings",
         {
           bindings: bindingsPayload,
+          leaderStates,
           leaderPauseGenerations,
           leaderPausedById,
+          leaderPauseVersions,
           defaultLeaderPaused: defaultLdr.status === "paused",
           defaultLeaderPauseGeneration: defaultLdr.pauseGeneration,
+          defaultLeaderPauseVersion: defaultLdr.pauseVersion,
           ...(triggerReplay ? { triggerReplay: true } : {}),
         },
         signal,
@@ -723,6 +755,13 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
   const leaderById = new Map(allLeaders.map((l) => [l.id, l]));
   const leaderPauseGenerations = Object.fromEntries(allLeaders.map((l) => [l.id, l.pauseGeneration]));
   const leaderPausedById = Object.fromEntries(allLeaders.map((l) => [l.id, l.status === "paused"]));
+  const leaderPauseVersions = Object.fromEntries(allLeaders.map((l) => [l.id, l.pauseVersion]));
+  const leaderStates = Object.fromEntries(
+    allLeaders.map((l) => [
+      l.id,
+      { paused: l.status === "paused", pauseGeneration: l.pauseGeneration, pauseVersion: l.pauseVersion },
+    ]),
+  );
   const toSync: Array<Record<string, unknown>> = [];
   for (const conn of rawConnections) {
     if (isRecord(conn) && typeof conn.id === "string") {
@@ -745,6 +784,7 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
             bindingEpoch: binding.epoch,
             leaderPaused: desiredPaused,
             pauseGeneration: leaderRec?.pauseGeneration ?? 0,
+            pauseVersion: leaderRec?.pauseVersion ?? 0,
           });
         }
       }
@@ -753,8 +793,10 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
   if (service.host?.available && toSync.length > 0) {
     yield* call(service.host, "connections.syncBindings", {
       bindings: toSync,
+      leaderStates,
       leaderPauseGenerations,
       leaderPausedById,
+      leaderPauseVersions,
     }).pipe(Effect.ignore);
   }
   const refreshedBindings = yield* service.leaders.listBindings(leader.id);
@@ -964,7 +1006,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
       const bindings = yield* service.leaders.listBindings(updated.id);
       let pausedPending: unknown[] = [];
       if (service.host?.available) {
-        // S4/S23: Reconcile binding + leaderPaused + pauseGeneration for all bound connections.
+        // S4/S23/S29: Reconcile binding + leaderPaused + pauseGeneration + pauseVersion for all bound connections.
         const bindingsPayload = bindings.map((b) => ({
           connectionId: b.connectionId,
           leaderId: b.leaderId,
@@ -972,15 +1014,25 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
           bindingEpoch: b.epoch,
           leaderPaused: nextPaused,
           pauseGeneration: updated.pauseGeneration,
+          pauseVersion: updated.pauseVersion,
         }));
         yield* call(service.host, "connections.syncBindings", {
           bindings: bindingsPayload,
+          leaderStates: {
+            [updated.id]: {
+              paused: nextPaused,
+              pauseGeneration: updated.pauseGeneration,
+              pauseVersion: updated.pauseVersion,
+            },
+          },
           leaderPauseGenerations: { [updated.id]: updated.pauseGeneration },
           leaderPausedById: { [updated.id]: nextPaused },
+          leaderPauseVersions: { [updated.id]: updated.pauseVersion },
           ...(updated.id === DEFAULT_LEADER_ID
             ? {
                 defaultLeaderPaused: nextPaused,
                 defaultLeaderPauseGeneration: updated.pauseGeneration,
+                defaultLeaderPauseVersion: updated.pauseVersion,
               }
             : {}),
         }).pipe(Effect.ignore);
@@ -1026,6 +1078,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
         ...params,
         leaderId: leader.id,
         pauseGeneration: leader.pauseGeneration,
+        pauseVersion: leader.pauseVersion,
         messageIds: scopedIds,
       }).pipe(
         Effect.match({ onSuccess: (val) => response(val), onFailure: (err) => failure(err.message, 400) }),

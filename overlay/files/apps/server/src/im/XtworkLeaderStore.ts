@@ -22,6 +22,7 @@ export interface LeaderRecord {
   readonly role: string;
   readonly status: LeaderStatus;
   readonly pauseGeneration: number;
+  readonly pauseVersion: number;
   readonly pinnedThreadId: string | null;
   readonly awarenessScope: AwarenessScope;
   readonly ownerDmDesktopGrants: readonly string[];
@@ -64,6 +65,7 @@ type LeaderRow = {
   readonly role: string;
   readonly status: string;
   readonly pauseGeneration: number;
+  readonly pauseVersion: number;
   readonly pinnedThreadId: string | null;
   readonly awarenessScopeJson: string;
   readonly ownerDmGrantsJson: string;
@@ -144,6 +146,7 @@ function rowToLeader(row: LeaderRow): LeaderRecord {
     role: row.role,
     status,
     pauseGeneration: Number(row.pauseGeneration ?? 0),
+    pauseVersion: Number(row.pauseVersion ?? 0),
     pinnedThreadId: row.pinnedThreadId,
     awarenessScope: parseAwarenessScope(row.awarenessScopeJson),
     ownerDmDesktopGrants: parseGrants(row.ownerDmGrantsJson),
@@ -202,6 +205,7 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     role TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'active',
     pause_generation INTEGER NOT NULL DEFAULT 0,
+    pause_version INTEGER NOT NULL DEFAULT 0,
     pinned_thread_id TEXT,
     awareness_scope_json TEXT NOT NULL DEFAULT '{"kind":"all_local","projectIds":[]}',
     owner_dm_grants_json TEXT NOT NULL DEFAULT '[]',
@@ -211,6 +215,15 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   const leaderCols = yield* sql<{ readonly name: string }>`PRAGMA table_info(xtwork_leaders)`;
   if (!leaderCols.some((c) => c.name === "pause_generation")) {
     yield* sql`ALTER TABLE xtwork_leaders ADD COLUMN pause_generation INTEGER NOT NULL DEFAULT 0`;
+  }
+  if (!leaderCols.some((c) => c.name === "pause_version")) {
+    yield* sql`ALTER TABLE xtwork_leaders ADD COLUMN pause_version INTEGER NOT NULL DEFAULT 0`;
+    yield* sql`UPDATE xtwork_leaders
+      SET pause_version = CASE
+        WHEN status = 'paused' THEN pause_generation * 2 + 1
+        ELSE pause_generation * 2
+      END
+      WHERE pause_version = 0 AND (pause_generation > 0 OR status = 'paused')`;
   }
 
   yield* sql`CREATE TABLE IF NOT EXISTS xtwork_leader_bindings (
@@ -317,6 +330,7 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   const getLeader = (id: string) =>
     sql<LeaderRow>`
       SELECT id, name, avatar, role, status, pause_generation AS "pauseGeneration",
+        pause_version AS "pauseVersion",
         pinned_thread_id AS "pinnedThreadId",
         awareness_scope_json AS "awarenessScopeJson", owner_dm_grants_json AS "ownerDmGrantsJson",
         created_at AS "createdAt", updated_at AS "updatedAt"
@@ -348,6 +362,7 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   const listLeaders = () =>
     sql<LeaderRow>`
       SELECT id, name, avatar, role, status, pause_generation AS "pauseGeneration",
+        pause_version AS "pauseVersion",
         pinned_thread_id AS "pinnedThreadId",
         awareness_scope_json AS "awarenessScopeJson", owner_dm_grants_json AS "ownerDmGrantsJson",
         created_at AS "createdAt", updated_at AS "updatedAt"
@@ -401,6 +416,9 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     // S23: Advance pause_generation whenever a Leader pauses so in-flight dispatches started
     // before the pause cannot bypass the paused backlog even if the Leader is resumed later.
     const advancePauseGeneration = patch.status === "paused" ? 1 : 0;
+    // S29: Advance pause_version on EVERY Pause and Resume transition so out-of-order bridge
+    // syncs are strictly totally ordered and stale syncs can never overwrite newer state.
+    const advancePauseVersion = patch.status === "paused" || patch.status === "active" ? 1 : 0;
     const nextPinned = patch.pinnedThreadId !== undefined ? patch.pinnedThreadId : current.pinnedThreadId;
     const nextScope = patch.awarenessScope !== undefined ? patch.awarenessScope : current.awarenessScope;
     const nextGrants =
@@ -412,6 +430,7 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
       role = ${nextRole},
       status = ${nextStatus},
       pause_generation = pause_generation + ${advancePauseGeneration},
+      pause_version = pause_version + ${advancePauseVersion},
       pinned_thread_id = ${nextPinned},
       awareness_scope_json = ${JSON.stringify(nextScope)},
       owner_dm_grants_json = ${JSON.stringify(nextGrants)},

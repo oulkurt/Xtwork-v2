@@ -260,9 +260,9 @@ export class ImBridge {
     }
   }
 
-  /** Replay all gate-approved unacked `received`/`delivered` triggers with their stable idempotency keys. */
+  /** Replay all gate-approved unacked `received`/`delivered` triggers with their stable idempotency keys (S28: sweep paused Leaders' unacked items into `paused_pending`). */
   replayUnackedTriggers(): number {
-    const pending = this.store.listUnackedTriggers();
+    const pending = this.store.listUnackedTriggers({ includePaused: true });
     let dispatched = 0;
     for (const msg of pending) {
       const chat = this.store.chat(msg.chatId);
@@ -717,35 +717,75 @@ export class ImBridge {
   }
 
   private handleSyncBindings(params: Record<string, unknown>) {
-    // S23/S25/S26: Persist synced per-Leader pause generations & pause flags BEFORE processing
-    // bindings, new onboarding connections, or startup replay!
+    // S23/S25/S26/S29: Merge per-Leader pause states (paused + pauseGeneration + pauseVersion) into
+    // one atomic update per Leader so out-of-order syncs are monotonically rejected across BOTH
+    // Leader state and bound connections!
+    type LeaderSyncUpdate = { paused?: boolean; pauseGeneration?: number; pauseVersion?: number };
+    const leaderUpdates = new Map<string, LeaderSyncUpdate>();
+    const ensureEntry = (leaderId: string): LeaderSyncUpdate => {
+      let entry = leaderUpdates.get(leaderId);
+      if (!entry) {
+        entry = {};
+        leaderUpdates.set(leaderId, entry);
+      }
+      return entry;
+    };
+    const validNonNegInt = (v: unknown): number | undefined =>
+      typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : undefined;
+
+    if (params.leaderStates && typeof params.leaderStates === "object" && !Array.isArray(params.leaderStates)) {
+      for (const [leaderId, raw] of Object.entries(params.leaderStates as Record<string, unknown>)) {
+        if (!leaderId || !raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+        const item = raw as Record<string, unknown>;
+        const entry = ensureEntry(leaderId);
+        if (typeof item.paused === "boolean") entry.paused = item.paused;
+        const gen = validNonNegInt(item.pauseGeneration);
+        if (gen !== undefined) entry.pauseGeneration = gen;
+        const ver = validNonNegInt(item.pauseVersion);
+        if (ver !== undefined) entry.pauseVersion = ver;
+      }
+    }
     if (params.leaderPauseGenerations && typeof params.leaderPauseGenerations === "object" && !Array.isArray(params.leaderPauseGenerations)) {
       for (const [leaderId, gen] of Object.entries(params.leaderPauseGenerations as Record<string, unknown>)) {
-        if (typeof gen === "number" && Number.isInteger(gen) && gen >= 0) {
-          this.store.setLeaderPauseState(leaderId, { pauseGeneration: gen });
-        }
+        const parsed = validNonNegInt(gen);
+        if (leaderId && parsed !== undefined) ensureEntry(leaderId).pauseGeneration ??= parsed;
       }
     }
     if (params.leaderPausedById && typeof params.leaderPausedById === "object" && !Array.isArray(params.leaderPausedById)) {
       for (const [leaderId, pausedFlag] of Object.entries(params.leaderPausedById as Record<string, unknown>)) {
-        if (typeof pausedFlag === "boolean") {
-          this.store.setLeaderPauseState(leaderId, { paused: pausedFlag });
-        }
+        if (leaderId && typeof pausedFlag === "boolean") ensureEntry(leaderId).paused ??= pausedFlag;
+      }
+    }
+    if (params.leaderPauseVersions && typeof params.leaderPauseVersions === "object" && !Array.isArray(params.leaderPauseVersions)) {
+      for (const [leaderId, ver] of Object.entries(params.leaderPauseVersions as Record<string, unknown>)) {
+        const parsed = validNonNegInt(ver);
+        if (leaderId && parsed !== undefined) ensureEntry(leaderId).pauseVersion ??= parsed;
       }
     }
     if (
-      typeof params.defaultLeaderPauseGeneration === "number" &&
-      Number.isInteger(params.defaultLeaderPauseGeneration) &&
-      params.defaultLeaderPauseGeneration >= 0
+      typeof params.defaultLeaderPaused === "boolean" ||
+      validNonNegInt(params.defaultLeaderPauseGeneration) !== undefined ||
+      validNonNegInt(params.defaultLeaderPauseVersion) !== undefined
     ) {
-      this.store.setLeaderPauseState("leader-default", { pauseGeneration: params.defaultLeaderPauseGeneration });
+      const entry = ensureEntry("leader-default");
+      if (typeof params.defaultLeaderPaused === "boolean") entry.paused ??= params.defaultLeaderPaused;
+      const gen = validNonNegInt(params.defaultLeaderPauseGeneration);
+      if (gen !== undefined) entry.pauseGeneration ??= gen;
+      const ver = validNonNegInt(params.defaultLeaderPauseVersion);
+      if (ver !== undefined) entry.pauseVersion ??= ver;
     }
-    if (typeof params.defaultLeaderPaused === "boolean") {
-      this.store.setLeaderPauseState("leader-default", { paused: params.defaultLeaderPaused });
+
+    const emittedConnIds = new Set<string>();
+    const updated: Record<string, unknown>[] = [];
+    for (const [leaderId, state] of leaderUpdates.entries()) {
+      const res = this.store.setLeaderPauseState(leaderId, state);
+      for (const connId of res.updatedConnectionIds) {
+        emittedConnIds.add(connId);
+      }
     }
+
     const rawBindings = Array.isArray(params.bindings) ? params.bindings : [];
     const seen = new Set<string>();
-    const updated: Record<string, unknown>[] = [];
     for (const entry of rawBindings) {
       if (!entry || typeof entry !== "object") continue;
       const item = entry as Record<string, unknown>;
@@ -754,10 +794,8 @@ export class ImBridge {
       const bindingId = typeof item.bindingId === "string" && item.bindingId ? item.bindingId : null;
       const bindingEpoch = typeof item.bindingEpoch === "number" && Number.isInteger(item.bindingEpoch) ? item.bindingEpoch : 1;
       const leaderPaused = Boolean(item.leaderPaused);
-      const pauseGeneration =
-        typeof item.pauseGeneration === "number" && Number.isInteger(item.pauseGeneration) && item.pauseGeneration >= 0
-          ? item.pauseGeneration
-          : undefined;
+      const pauseGeneration = validNonNegInt(item.pauseGeneration);
+      const pauseVersion = validNonNegInt(item.pauseVersion);
       if (!connectionId) continue;
       seen.add(connectionId);
       const prev = this.store.connection(connectionId);
@@ -768,6 +806,7 @@ export class ImBridge {
         bindingEpoch,
         leaderPaused,
         ...(pauseGeneration !== undefined ? { pauseGeneration } : {}),
+        ...(pauseVersion !== undefined ? { pauseVersion } : {}),
       });
       if (next) {
         const changed =
@@ -775,12 +814,16 @@ export class ImBridge {
           prev.leaderId !== next.leaderId ||
           prev.bindingId !== next.bindingId ||
           prev.bindingEpoch !== next.bindingEpoch ||
-          prev.leaderPaused !== next.leaderPaused;
+          prev.leaderPaused !== next.leaderPaused ||
+          emittedConnIds.has(next.id);
+        emittedConnIds.delete(next.id);
         if (changed) this.emitConnectionState(next);
         updated.push(sanitizeConnection(next));
       }
     }
     if (typeof params.defaultLeaderPaused === "boolean") {
+      // S29: Always apply the authoritative monotonic state for `leader-default` (never a stale param!).
+      const effectiveDefaultPaused = this.store.getLeaderPaused("leader-default");
       for (const conn of this.store.connections()) {
         if (seen.has(conn.id)) continue;
         // S4: Apply default Leader pause fallback ONLY to unbound connections;
@@ -791,12 +834,21 @@ export class ImBridge {
           leaderId: conn.leaderId,
           bindingId: conn.bindingId,
           bindingEpoch: conn.bindingEpoch,
-          leaderPaused: params.defaultLeaderPaused,
+          leaderPaused: effectiveDefaultPaused,
         });
         if (next) {
-          if (conn.leaderPaused !== next.leaderPaused) this.emitConnectionState(next);
+          const changed = conn.leaderPaused !== next.leaderPaused || emittedConnIds.has(next.id);
+          emittedConnIds.delete(next.id);
+          if (changed) this.emitConnectionState(next);
           updated.push(sanitizeConnection(next));
         }
+      }
+    }
+    for (const connId of emittedConnIds) {
+      const conn = this.store.connection(connId);
+      if (conn) {
+        this.emitConnectionState(conn);
+        if (!seen.has(conn.id)) updated.push(sanitizeConnection(conn));
       }
     }
     if (params.triggerReplay === true && !this.replayedOnHello) {
@@ -848,8 +900,18 @@ export class ImBridge {
       typeof params.pauseGeneration === "number" && Number.isInteger(params.pauseGeneration) && params.pauseGeneration >= 0
         ? params.pauseGeneration
         : undefined;
-    if (leaderId && replayPauseGeneration !== undefined) {
-      this.store.setLeaderPauseGeneration(leaderId, replayPauseGeneration);
+    const replayPauseVersion =
+      typeof params.pauseVersion === "number" && Number.isInteger(params.pauseVersion) && params.pauseVersion >= 0
+        ? params.pauseVersion
+        : undefined;
+    if (leaderId && decision === "replay" && replayPauseVersion !== undefined) {
+      this.store.setLeaderPauseState(leaderId, {
+        paused: false,
+        ...(replayPauseGeneration !== undefined ? { pauseGeneration: replayPauseGeneration } : {}),
+        pauseVersion: replayPauseVersion,
+      });
+    } else if (leaderId && replayPauseGeneration !== undefined) {
+      this.store.setLeaderPauseState(leaderId, { pauseGeneration: replayPauseGeneration });
     }
     const messageIds = Array.isArray(params.messageIds)
       ? params.messageIds.filter((id): id is string => typeof id === "string" && id.length > 0)
@@ -907,15 +969,14 @@ export class ImBridge {
         heldIds.push(msg.id);
         continue;
       }
-      const moved = this.store.decidePausedPending([msg.id], "replay");
+      // S24/S27: Atomically commit `paused_pending -> received` AND refresh `pause_generation` in one UPDATE!
+      const freshGen = replayPauseGeneration ?? this.store.getLeaderPauseGeneration(msgLeaderId);
+      const moved = this.store.decidePausedPending([msg.id], "replay", freshGen);
       const replayed = moved[0];
       if (!replayed) continue;
-      // S24: Explicit Replay refreshes the persisted pause_generation on the message row!
-      const freshGen = replayPauseGeneration ?? this.store.getLeaderPauseGeneration(msgLeaderId);
-      const stamped = this.store.stampMessagePauseGeneration(replayed.id, freshGen) ?? replayed;
-      const contact = stamped.senderId ? this.store.contactByPlatformId(conn.id, stamped.senderId) : undefined;
-      this.emitDispatch(conn, chat, stamped, contact, freshGen);
-      replayedIds.push(stamped.id);
+      const contact = replayed.senderId ? this.store.contactByPlatformId(conn.id, replayed.senderId) : undefined;
+      this.emitDispatch(conn, chat, replayed, contact, freshGen);
+      replayedIds.push(replayed.id);
     }
 
     return {
@@ -1048,40 +1109,35 @@ export class ImBridge {
     if (toRefuse.length > 0) {
       this.store.moveInbound(toRefuse, "refuse");
     }
-    const admittedIds = this.store.moveInbound(toAdmit, "admit");
-    for (const msgId of admittedIds) {
-      const msg = this.store.message(msgId);
-      if (!msg) continue;
-      const conn = this.store.connection(msg.connectionId);
-      const chat = this.store.chat(msg.chatId);
-      if (!conn || !chat) continue;
-      const contact = msg.senderId ? this.store.contactByPlatformId(conn.id, msg.senderId) : undefined;
-      const msgLeaderId = msg.leaderId ?? "leader-default";
-      // S26: Approving a held message while its stamped Leader (or connection) is paused MUST
-      // move it to `paused_pending` rather than emitting an immediate dispatch!
-      if (this.store.isLeaderPausedForConnection(msgLeaderId, conn)) {
-        this.store.moveInbound([msg.id], "pause");
+    const admittedIds: string[] = [];
+    for (const msgId of toAdmit) {
+      // S26/S27: Atomically transition `held -> paused_pending` (when paused) OR `held -> received`
+      // with `pause_generation` committed in ONE single SQL statement (never split across two writes!).
+      const result = this.store.admitHeldMessage(msgId);
+      if (!result) continue;
+      admittedIds.push(result.message.id);
+      const contact = result.message.senderId
+        ? this.store.contactByPlatformId(result.conn.id, result.message.senderId)
+        : undefined;
+      if (result.kind === "paused_pending") {
         this.emit({
           method: "inbound.paused",
           params: {
-            connectionId: conn.id,
-            platform: conn.platform,
-            chatId: chat.id,
-            chatKind: chat.kind,
-            chatName: chat.name,
-            messageId: msg.id,
-            idempotencyKey: msg.idempotencyKey,
-            senderName: contactName(contact) ?? msg.senderName,
-            body: msg.body,
-            createdAt: msg.createdAt,
+            connectionId: result.conn.id,
+            platform: result.conn.platform,
+            chatId: result.chat.id,
+            chatKind: result.chat.kind,
+            chatName: result.chat.name,
+            messageId: result.message.id,
+            idempotencyKey: result.message.idempotencyKey,
+            senderName: contactName(contact) ?? result.message.senderName,
+            body: result.message.body,
+            createdAt: result.message.createdAt,
           },
         });
         continue;
       }
-      // S24: Stamp the Leader's current pause_generation when the message first becomes dispatchable.
-      const freshGen = this.store.getLeaderPauseGeneration(msgLeaderId);
-      const stamped = this.store.stampMessagePauseGeneration(msg.id, freshGen) ?? msg;
-      this.emitDispatch(conn, chat, stamped, contact, freshGen);
+      this.emitDispatch(result.conn, result.chat, result.message, contact, result.pauseGeneration);
     }
 
     return { targetKind, targetId, decision, affectedMessages: admittedIds };
@@ -1775,18 +1831,10 @@ export class ImBridge {
     const dispatchLeaderId = msg.leaderId ?? "leader-default";
     const dispatchBindingId = msg.bindingId;
     const dispatchBindingEpoch = msg.bindingEpoch ?? 1;
-    // S23/S24: Reuse the message's persisted dispatchable pause_generation on automatic redelivery
-    // (never upgrade it to a newer generation across bridge downtime!); only explicit Replay
-    // overrides and refreshes the generation.
-    let dispatchPauseGeneration: number;
-    if (overridePauseGeneration !== undefined) {
-      dispatchPauseGeneration = overridePauseGeneration;
-    } else if (msg.pauseGeneration !== null) {
-      dispatchPauseGeneration = msg.pauseGeneration;
-    } else {
-      dispatchPauseGeneration = this.store.getLeaderPauseGeneration(dispatchLeaderId);
-      this.store.stampMessagePauseGeneration(msg.id, dispatchPauseGeneration);
-    }
+    // S23/S24/S27: Every dispatchable message commits `pause_generation` atomically when it enters
+    // `received` (on ingest, admission, or explicit Replay). Never fill a missing `pause_generation`
+    // from the Leader's newer synced generation on automatic redelivery — fail closed to 0!
+    const dispatchPauseGeneration = overridePauseGeneration ?? msg.pauseGeneration ?? 0;
 
     this.emit({
       method: "inbound.dispatch",

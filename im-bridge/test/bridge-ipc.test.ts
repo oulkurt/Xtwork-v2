@@ -1432,6 +1432,238 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
 
         await bridge3.shutdown();
       }
+
+      // S27, S28, S29: Atomic state+generation commit (fail-closed on null), paused startup
+      // sweeping unacked `delivered` while keeping ACKed runs, and monotonic `pauseVersion`
+      // rejecting late out-of-order `Active(0)` after `Pause(1)` and `Pause(1)` after `Resume(2)`.
+      {
+        const dbPath2 = join(dir, "s27-28-29.sqlite");
+
+        // Part A (S27 + S28): Seed unacked `delivered` + ACKed `delivered` + NULL-gen `received`, then restart paused & active.
+        const storeA = new Store(dbPath2);
+        const connA = storeA.createConnection({
+          platform: "feishu",
+          secretRef: null,
+          lifecycleState: "active",
+          ownerId: "owner-1",
+          askAll: false,
+        });
+        const unackedDel = storeA.ingestInbound(connA.id, "org", {
+          platformId: "s28-unacked-delivered",
+          chat: { platformId: "dm-owner", kind: "dm" },
+          sender: { id: "owner-1", name: "Owner", isBot: false },
+          text: "unacked delivered before paused restart",
+          attachments: [],
+          addressedToBot: true,
+          sentAt: 1_700_000_300_000,
+        });
+        assert.equal(unackedDel.kind, "dispatch");
+        storeA.moveInbound([unackedDel.message.id], "deliver");
+        assert.equal(storeA.message(unackedDel.message.id)?.state, "delivered");
+
+        const ackedDel = storeA.ingestInbound(connA.id, "org", {
+          platformId: "s28-acked-delivered",
+          chat: { platformId: "dm-owner", kind: "dm" },
+          sender: { id: "owner-1", name: "Owner", isBot: false },
+          text: "committed in-flight run before paused restart",
+          attachments: [],
+          addressedToBot: true,
+          sentAt: 1_700_000_301_000,
+        });
+        assert.equal(ackedDel.kind, "dispatch");
+        storeA.ackInbound(
+          { idempotencyKey: ackedDel.message.idempotencyKey! },
+          { t3ThreadId: "xtwork-im-dm-acked", t3TurnId: "run-committed-s28" },
+        );
+
+        const nullGenMsg = storeA.ingestInbound(connA.id, "org", {
+          platformId: "s27-null-gen",
+          chat: { platformId: "dm-owner", kind: "dm" },
+          sender: { id: "owner-1", name: "Owner", isBot: false },
+          text: "legacy null pause_generation row",
+          attachments: [],
+          addressedToBot: true,
+          sentAt: 1_700_000_302_000,
+        });
+        assert.equal(nullGenMsg.kind, "dispatch");
+        // Simulate corrupted/legacy row lacking pause_generation
+        storeA.db.prepare("UPDATE messages SET pause_generation = NULL WHERE id = ?").run(nullGenMsg.message.id);
+        storeA.close();
+
+        // Restart bridge in PAUSED mode (Pause gen=1, ver=1) -> S28: unacked `delivered` & `received`
+        // move into `paused_pending` (and appear in `paused.list`), while ACKed run stays `delivered`!
+        const storeB = new Store(dbPath2);
+        const notificationsB: RpcNotification[] = [];
+        const mockB = createMockChannel({ platform: "feishu", trust: "public", onboardOwnerId: "owner-1" });
+        const bridgeB = new ImBridge({
+          store: storeB,
+          secrets: memorySecrets(),
+          channels: { feishu: mockB.channel },
+          notify: (n) => notificationsB.push(n),
+          sleepCheckIntervalMs: 0,
+        });
+        await bridgeB.handleRequest({ id: 1, method: "bridge.hello", params: { protocolVersion: 1, deferReplay: true } });
+        await bridgeB.handleRequest({
+          id: 2,
+          method: "connections.syncBindings",
+          params: {
+            bindings: [
+              {
+                connectionId: connA.id,
+                leaderId: "leader-default",
+                bindingId: "bind-default-1",
+                bindingEpoch: 1,
+                leaderPaused: true,
+                pauseGeneration: 1,
+                pauseVersion: 1,
+              },
+            ],
+            leaderStates: { "leader-default": { paused: true, pauseGeneration: 1, pauseVersion: 1 } },
+            defaultLeaderPaused: true,
+            defaultLeaderPauseGeneration: 1,
+            defaultLeaderPauseVersion: 1,
+            triggerReplay: true,
+          },
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        assert.equal(notificationsB.filter((n) => n.method === "inbound.dispatch").length, 0);
+        assert.equal(storeB.message(unackedDel.message.id)?.state, "paused_pending");
+        assert.equal(storeB.message(nullGenMsg.message.id)?.state, "paused_pending");
+        assert.equal(storeB.message(ackedDel.message.id)?.state, "delivered");
+        const pausedListed = await bridgeB.handleRequest({
+          id: 3,
+          method: "paused.list",
+          params: { leaderId: "leader-default" },
+        });
+        assert.equal(pausedListed.ok, true);
+        if (pausedListed.ok) {
+          const items = (pausedListed.result as { items: Array<{ id: string }> }).items;
+          assert.equal(items.some((i) => i.id === unackedDel.message.id), true);
+          assert.equal(items.some((i) => i.id === ackedDel.message.id), false);
+        }
+
+        // S29 (part 1): Late stale Active(gen=0, ver=0) arriving AFTER Pause(gen=1, ver=1)
+        // MUST NOT clear Leader pause or connection pause! Newly onboarded connection still starts paused!
+        await bridgeB.handleRequest({
+          id: 4,
+          method: "connections.syncBindings",
+          params: {
+            bindings: [
+              {
+                connectionId: connA.id,
+                leaderId: "leader-default",
+                bindingId: "bind-default-1",
+                bindingEpoch: 1,
+                leaderPaused: false,
+                pauseGeneration: 0,
+                pauseVersion: 0,
+              },
+            ],
+            leaderStates: { "leader-default": { paused: false, pauseGeneration: 0, pauseVersion: 0 } },
+            defaultLeaderPaused: false,
+            defaultLeaderPauseGeneration: 0,
+            defaultLeaderPauseVersion: 0,
+          },
+        });
+        assert.equal(storeB.getLeaderPaused("leader-default"), true);
+        assert.equal(storeB.getLeaderPauseState("leader-default").pauseVersion, 1);
+        assert.equal(storeB.connection(connA.id)?.leaderPaused, true);
+        const onboardAfterStale = await bridgeB.handleRequest({
+          id: 5,
+          method: "onboarding.start",
+          params: { platform: "feishu", mode: "qr" },
+        });
+        assert.equal(onboardAfterStale.ok, true);
+        await new Promise((r) => setTimeout(r, 30));
+        const newestConn = storeB.connections().find((c) => c.id !== connA.id)!;
+        assert.equal(newestConn.leaderPaused, true);
+
+        // S29 (part 2): Resume(gen=1, ver=2) followed by late stale Pause(gen=1, ver=1)
+        // MUST keep Leader active (`paused=false, ver=2`) so Replay succeeds immediately!
+        await bridgeB.handleRequest({
+          id: 6,
+          method: "connections.syncBindings",
+          params: {
+            bindings: [
+              {
+                connectionId: connA.id,
+                leaderId: "leader-default",
+                bindingId: "bind-default-1",
+                bindingEpoch: 1,
+                leaderPaused: false,
+                pauseGeneration: 1,
+                pauseVersion: 2,
+              },
+            ],
+            leaderStates: { "leader-default": { paused: false, pauseGeneration: 1, pauseVersion: 2 } },
+            defaultLeaderPaused: false,
+            defaultLeaderPauseGeneration: 1,
+            defaultLeaderPauseVersion: 2,
+          },
+        });
+        assert.equal(storeB.getLeaderPaused("leader-default"), false);
+        assert.equal(storeB.connection(connA.id)?.leaderPaused, false);
+        // Late stale Pause(gen=1, ver=1) arrives AFTER Resume(gen=1, ver=2) -> MUST be rejected!
+        await bridgeB.handleRequest({
+          id: 7,
+          method: "connections.syncBindings",
+          params: {
+            bindings: [
+              {
+                connectionId: connA.id,
+                leaderId: "leader-default",
+                bindingId: "bind-default-1",
+                bindingEpoch: 1,
+                leaderPaused: true,
+                pauseGeneration: 1,
+                pauseVersion: 1,
+              },
+            ],
+            leaderStates: { "leader-default": { paused: true, pauseGeneration: 1, pauseVersion: 1 } },
+            defaultLeaderPaused: true,
+            defaultLeaderPauseGeneration: 1,
+            defaultLeaderPauseVersion: 1,
+          },
+        });
+        assert.equal(storeB.getLeaderPaused("leader-default"), false);
+        assert.equal(storeB.getLeaderPauseState("leader-default").pauseVersion, 2);
+        assert.equal(storeB.connection(connA.id)?.leaderPaused, false);
+
+        // Replay of `unackedDel` succeeds with atomic `pauseGeneration = 1`!
+        notificationsB.length = 0;
+        const replayAfterStalePause = await bridgeB.handleRequest({
+          id: 8,
+          method: "paused.decide",
+          params: {
+            messageIds: [unackedDel.message.id],
+            decision: "replay",
+            leaderId: "leader-default",
+            pauseGeneration: 1,
+            pauseVersion: 2,
+          },
+        });
+        assert.equal(replayAfterStalePause.ok, true);
+        const replayedDispatches = notificationsB.filter((n) => n.method === "inbound.dispatch");
+        assert.equal(replayedDispatches.length, 1);
+        assert.equal(replayedDispatches[0]!.params.messageId, unackedDel.message.id);
+        assert.equal(replayedDispatches[0]!.params.pauseGeneration, 1);
+        assert.equal(storeB.message(unackedDel.message.id)?.pauseGeneration, 1);
+
+        // S27: Verify a corrupted/legacy `received` row with NULL `pause_generation` NEVER gets
+        // upgraded to the Leader's newer generation (1) on automatic startup redelivery — fails closed to 0!
+        storeB.db
+          .prepare("UPDATE messages SET state = 'received', pause_generation = NULL WHERE id = ?")
+          .run(nullGenMsg.message.id);
+        notificationsB.length = 0;
+        bridgeB.replayUnackedTriggers();
+        const nullGenDispatch = notificationsB.find(
+          (n) => n.method === "inbound.dispatch" && n.params.messageId === nullGenMsg.message.id,
+        );
+        assert.ok(nullGenDispatch);
+        assert.equal(nullGenDispatch.params.pauseGeneration, 0);
+
+        await bridgeB.shutdown();
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

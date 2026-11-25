@@ -15,7 +15,8 @@
  *   send:    delivered, unanswered ──▶ replied
  *   retry:   waiting, failed, unanswered ──▶ received
  *   ignore:  waiting, failed, unanswered ──▶ ignored
- *   pause:          received, waiting ──▶ paused_pending
+ *   pause:          received, delivered (unacked), waiting ──▶ paused_pending
+ *   admit_paused:   held ──▶ paused_pending
  *   replay_paused:  paused_pending ──▶ received
  *   dismiss_paused: paused_pending ──▶ ignored
  *   admit:          held ──▶ received
@@ -60,8 +61,10 @@ export type InboundEvent =
   | "retry"
   /** Owner dismisses it. */
   | "ignore"
-  /** Owner paused the Leader/connection: defer queued triggers without aborting delivered runs. */
+  /** Owner paused the Leader/connection: defer unacked triggers without touching ACKed runs. */
   | "pause"
+  /** Owner approved a held sender/group while its Leader is paused: enters paused review backlog directly. */
+  | "admit_paused"
   /** Owner selectively replays a paused backlog item under its original idempotency key. */
   | "replay_paused"
   /** Owner dismisses a paused backlog item. */
@@ -86,7 +89,8 @@ export const INBOUND: Readonly<
   send: { from: ["delivered", "unanswered"], to: "replied" },
   retry: { from: ["waiting", "failed", "unanswered"], to: "received" },
   ignore: { from: ["waiting", "failed", "unanswered"], to: "ignored" },
-  pause: { from: ["received", "waiting"], to: "paused_pending" },
+  pause: { from: ["received", "delivered", "waiting"], to: "paused_pending" },
+  admit_paused: { from: ["held"], to: "paused_pending" },
   replay_paused: { from: ["paused_pending"], to: "received" },
   dismiss_paused: { from: ["paused_pending"], to: "ignored" },
   rehold_paused: { from: ["paused_pending"], to: "held" },

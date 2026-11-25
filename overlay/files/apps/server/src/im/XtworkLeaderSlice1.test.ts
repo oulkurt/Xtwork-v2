@@ -1226,6 +1226,7 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         const leaders = yield* makeLeaderStore();
         const initialLeader = yield* leaders.ensureDefaultLeader();
         expect(initialLeader.pauseGeneration).toBe(0);
+        expect(initialLeader.pauseVersion).toBe(0);
         const binding = yield* leaders.ensureBinding("conn-feishu", DEFAULT_LEADER_ID);
         const dispatcher = yield* makeDispatcher(dir, memory, leaders);
 
@@ -1244,12 +1245,14 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         const fiber = yield* Effect.forkChild(dispatcher.accept(payload, 0).pipe(Effect.result));
         yield* Effect.promise(() => roleReadEntered);
 
-        // 2. Pause Leader (gen 0 -> 1), then RESUME without selecting Replay (status=active, gen=1)
+        // 2. Pause Leader (gen 0 -> 1, ver 0 -> 1), then RESUME without selecting Replay (status=active, gen=1, ver 1 -> 2)
         const paused = yield* leaders.updateLeader(DEFAULT_LEADER_ID, { status: "paused" });
         expect(paused?.pauseGeneration).toBe(1);
+        expect(paused?.pauseVersion).toBe(1);
         const resumed = yield* leaders.updateLeader(DEFAULT_LEADER_ID, { status: "active" });
         expect(resumed?.status).toBe("active");
         expect(resumed?.pauseGeneration).toBe(1);
+        expect(resumed?.pauseVersion).toBe(2);
 
         // 3. Release role-memory read -> MUST reject stale gen=0 attempt with LEADER_PAUSED!
         releaseRoleRead();
@@ -1312,9 +1315,10 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         };
         const handleEvent = makeBridgeEventHandler(fakeServiceHost, dispatcher, leaders);
 
-        // T3 records Pause (gen 1 -> 2) FIRST
+        // T3 records Pause (gen 1 -> 2, ver 2 -> 3) FIRST
         const paused2 = yield* leaders.updateLeader(DEFAULT_LEADER_ID, { status: "paused" });
         expect(paused2?.pauseGeneration).toBe(2);
+        expect(paused2?.pauseVersion).toBe(3);
 
         // Bridge (still at gen 1 before pause sync reaches it) emits `inbound.dispatch` with `pauseGeneration: 1`!
         const queuedPayload = {
@@ -1332,12 +1336,14 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         Queue.offerUnsafe(serviceQueue, { sequence: 1, event: "inbound.dispatch", payload: queuedPayload });
         // Bridge receives pause sync and moves message to `paused_pending`
         simulatedBridgeState = "paused_pending";
-        // T3 resumes Leader WITHOUT selecting Replay (status=active, gen=2)
+        // T3 resumes Leader WITHOUT selecting Replay (status=active, gen=2, ver 3 -> 4)
         const resumed2 = yield* leaders.updateLeader(DEFAULT_LEADER_ID, { status: "active" });
         expect(resumed2?.status).toBe("active");
         expect(resumed2?.pauseGeneration).toBe(2);
+        expect(resumed2?.pauseVersion).toBe(4);
 
-        // Now the held service queue drains -> MUST reject stale gen=1 dispatch, NOT ACK, keep `paused_pending`!
+        // Now the held service queue drains -> MUST reject stale gen=1 dispatch, NOT ACK, keep `paused_pending`,
+        // AND sync authoritative pauseVersion=4 + leaderStates back to the bridge!
         const drained = yield* Queue.take(serviceQueue);
         yield* handleEvent(drained);
         expect(dispatchCalls).toBe(1); // unchanged!
@@ -1348,6 +1354,11 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
             (c) => c.method === "inbound.settle" && c.params?.event === "pause" && c.params?.idempotencyKey === queuedPayload.idempotencyKey,
           ),
         ).toBe(true);
+        const syncCall = bridgeRpcCalls.find((c) => c.method === "connections.syncBindings");
+        expect(syncCall?.params?.leaderPauseVersions).toEqual({ [DEFAULT_LEADER_ID]: 4 });
+        expect(syncCall?.params?.leaderStates).toEqual({
+          [DEFAULT_LEADER_ID]: { paused: false, pauseGeneration: 2, pauseVersion: 4 },
+        });
 
         // Explicit Replay emits fresh `pauseGeneration: 2` with the ORIGINAL idempotencyKey -> commits & ACKs!
         Queue.offerUnsafe(serviceQueue, {

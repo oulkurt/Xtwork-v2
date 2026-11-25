@@ -274,7 +274,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_unacked
 CREATE TABLE IF NOT EXISTS leader_pause_generations (
   leader_id TEXT PRIMARY KEY,
   pause_generation INTEGER NOT NULL DEFAULT 0,
-  paused INTEGER NOT NULL DEFAULT 0
+  paused INTEGER NOT NULL DEFAULT 0,
+  pause_version INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -319,7 +320,7 @@ export class Store {
   private migrate(): void {
     const row = this.db.prepare("PRAGMA user_version").get() as Row;
     const version = Number(row.user_version ?? 0);
-    if (version >= 8) return;
+    if (version >= 9) return;
     this.db.exec("BEGIN");
     try {
       if (version < 1) {
@@ -417,7 +418,8 @@ export class Store {
           `CREATE TABLE IF NOT EXISTS leader_pause_generations (
             leader_id TEXT PRIMARY KEY,
             pause_generation INTEGER NOT NULL DEFAULT 0,
-            paused INTEGER NOT NULL DEFAULT 0
+            paused INTEGER NOT NULL DEFAULT 0,
+            pause_version INTEGER NOT NULL DEFAULT 0
           )`,
         );
         const lpgCols = (this.db.prepare("PRAGMA table_info(leader_pause_generations)").all() as Row[]).map((c) =>
@@ -426,8 +428,11 @@ export class Store {
         if (!lpgCols.includes("paused")) {
           this.db.exec("ALTER TABLE leader_pause_generations ADD COLUMN paused INTEGER NOT NULL DEFAULT 0");
         }
+        if (!lpgCols.includes("pause_version")) {
+          this.db.exec("ALTER TABLE leader_pause_generations ADD COLUMN pause_version INTEGER NOT NULL DEFAULT 0");
+        }
       }
-      this.db.exec("PRAGMA user_version = 8");
+      this.db.exec("PRAGMA user_version = 9");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1367,37 +1372,116 @@ export class Store {
   }
 
   /**
-   * Transition inbound messages strictly through the `inbound.ts` state machine.
-   * When admitting `held -> received`, indexes the admitted message into FTS5.
-   * When refusing `held -> blocked`, scrubs body and ensures removal from FTS5.
+   * Transition inbound messages strictly through the `inbound.ts` state machine inside one atomic
+   * SQLite savepoint.
+   * - `admit` / `replay_paused`: atomically commits `state = 'received'` AND `pause_generation` in
+   *   the SAME UPDATE statement (S27).
+   * - `admit_paused`: transitions `held -> paused_pending` directly + indexes FTS without ever
+   *   committing `state = 'received'` (S26/S27).
+   * - `pause`: accepts unacked `received`/`delivered`/`waiting` ONLY (`acked_at IS NULL AND
+   *   t3_turn_id IS NULL`), preserving committed/ACKed runs (S28).
+   * - `refuse`: scrubs body/attachments and removes from FTS5.
    */
-  moveInbound(ids: readonly string[], event: InboundEvent, retryAt?: number): string[] {
+  moveInbound(ids: readonly string[], event: InboundEvent, retryAt?: number, pauseGeneration?: number): string[] {
+    if (!ids.length) return [];
     const rule = INBOUND[event];
     const placeholders = rule.from.map(() => "?").join(", ");
-    const stmt = this.db.prepare(
-      `UPDATE messages
-       SET state = ?,
-           retry_at = CASE WHEN ? THEN ? ELSE NULL END
-       WHERE id = ? AND direction = 'in' AND state IN (${placeholders})`,
-    );
     const isHold = event === "hold" ? 1 : 0;
+    const unackedGuard = event === "pause" ? " AND acked_at IS NULL AND t3_turn_id IS NULL" : "";
+    const updatesPauseGeneration = event === "admit" || event === "replay_paused";
+    const clearsPauseGeneration = event === "admit_paused" || event === "rehold_paused";
+
+    const sql = updatesPauseGeneration
+      ? `UPDATE messages
+         SET state = ?,
+             retry_at = CASE WHEN ? THEN ? ELSE NULL END,
+             pause_generation = COALESCE(
+               ?,
+               (SELECT pause_generation FROM leader_pause_generations WHERE leader_id = COALESCE(messages.leader_id, 'leader-default')),
+               0
+             )
+         WHERE id = ? AND direction = 'in' AND state IN (${placeholders})${unackedGuard}`
+      : clearsPauseGeneration
+        ? `UPDATE messages
+           SET state = ?,
+               retry_at = CASE WHEN ? THEN ? ELSE NULL END,
+               pause_generation = NULL
+           WHERE id = ? AND direction = 'in' AND state IN (${placeholders})${unackedGuard}`
+        : `UPDATE messages
+           SET state = ?,
+               retry_at = CASE WHEN ? THEN ? ELSE NULL END
+           WHERE id = ? AND direction = 'in' AND state IN (${placeholders})${unackedGuard}`;
+
+    const stmt = this.db.prepare(sql);
     const moved: string[] = [];
-    for (const id of ids) {
-      const res = stmt.run(rule.to, isHold, retryAt ?? null, id, ...rule.from);
-      if (Number(res.changes) > 0) {
-        moved.push(id);
-        if (event === "admit") {
-          const msg = this.message(id);
-          if (msg) this.indexMessageInFts(msg.id, msg.body);
-        } else if (event === "rehold_paused") {
-          this.stmt("DELETE FROM messages_fts WHERE msg_id = ?").run(id);
-        } else if (event === "refuse") {
-          this.stmt("UPDATE messages SET body = '', attachments = NULL WHERE id = ?").run(id);
-          this.stmt("DELETE FROM messages_fts WHERE msg_id = ?").run(id);
+    this.db.exec("SAVEPOINT move_inbound");
+    try {
+      for (const id of ids) {
+        const res = updatesPauseGeneration
+          ? stmt.run(rule.to, isHold, retryAt ?? null, pauseGeneration ?? null, id, ...rule.from)
+          : stmt.run(rule.to, isHold, retryAt ?? null, id, ...rule.from);
+        if (Number(res.changes) > 0) {
+          moved.push(id);
+          if (event === "admit" || event === "admit_paused") {
+            const msg = this.message(id);
+            if (msg) this.indexMessageInFts(msg.id, msg.body);
+          } else if (event === "rehold_paused") {
+            this.stmt("DELETE FROM messages_fts WHERE msg_id = ?").run(id);
+          } else if (event === "refuse") {
+            this.stmt("UPDATE messages SET body = '', attachments = NULL WHERE id = ?").run(id);
+            this.stmt("DELETE FROM messages_fts WHERE msg_id = ?").run(id);
+          }
         }
       }
+      this.db.exec("RELEASE SAVEPOINT move_inbound");
+      return moved;
+    } catch (error) {
+      this.db.exec("ROLLBACK TO SAVEPOINT move_inbound");
+      this.db.exec("RELEASE SAVEPOINT move_inbound");
+      throw error;
     }
-    return moved;
+  }
+
+  /**
+   * Atomically admit a single `held` message (S26/S27):
+   * - If the message's stamped Leader (or connection) is paused, commits `held -> paused_pending`
+   *   directly in one transaction (never transiently entering `received`).
+   * - Otherwise commits `held -> received` AND `pause_generation` in one single SQL UPDATE.
+   */
+  admitHeldMessage(messageId: string):
+    | { readonly kind: "paused_pending"; readonly message: Message; readonly conn: Connection; readonly chat: Chat }
+    | { readonly kind: "received"; readonly message: Message; readonly conn: Connection; readonly chat: Chat; readonly pauseGeneration: number }
+    | undefined {
+    this.db.exec("SAVEPOINT admit_held");
+    try {
+      const msg = this.message(messageId);
+      if (!msg || msg.direction !== "in" || msg.state !== "held") {
+        this.db.exec("RELEASE SAVEPOINT admit_held");
+        return undefined;
+      }
+      const conn = this.connection(msg.connectionId);
+      const chat = this.chat(msg.chatId);
+      if (!conn || !chat) {
+        this.db.exec("RELEASE SAVEPOINT admit_held");
+        return undefined;
+      }
+      const msgLeaderId = msg.leaderId ?? "leader-default";
+      if (this.isLeaderPausedForConnection(msgLeaderId, conn)) {
+        const moved = this.moveInbound([msg.id], "admit_paused");
+        const updated = moved.length > 0 ? this.message(msg.id) : undefined;
+        this.db.exec("RELEASE SAVEPOINT admit_held");
+        return updated ? { kind: "paused_pending", message: updated, conn, chat } : undefined;
+      }
+      const freshGen = this.getLeaderPauseGeneration(msgLeaderId);
+      const moved = this.moveInbound([msg.id], "admit", undefined, freshGen);
+      const updated = moved.length > 0 ? this.message(msg.id) : undefined;
+      this.db.exec("RELEASE SAVEPOINT admit_held");
+      return updated ? { kind: "received", message: updated, conn, chat, pauseGeneration: freshGen } : undefined;
+    } catch (error) {
+      this.db.exec("ROLLBACK TO SAVEPOINT admit_held");
+      this.db.exec("RELEASE SAVEPOINT admit_held");
+      throw error;
+    }
   }
 
   /** Record T3 acknowledgment for an inbound trigger message (idempotency boundary). */
@@ -1447,13 +1531,22 @@ export class Store {
   }
 
   /**
-   * ADR-011 Invariant #7 & ADR-013 S18: Return gate-approved unacked `received` / `delivered`
-   * trigger messages on active, non-paused connections. Apply `n.leader_paused` ONLY to rows
-   * owned by the connection's current Leader (`n.leader_id`) so historical messages for an active
-   * prior Leader are still delivered to T3 (which enforces that Leader's own pause state).
+   * ADR-011 Invariant #7 & ADR-013 S18/S28: Return gate-approved unacked `received` / `delivered`
+   * trigger messages on active connections. By default filters out paused connections/current paused
+   * Leaders; when `includePaused: true` is passed (startup replay), returns ALL unacked triggers on
+   * active connections so paused startup sweeps unacked `received` and `delivered` items into
+   * `paused_pending` without stranding them.
    */
-  listUnackedTriggers(connectionId?: string): Message[] {
+  listUnackedTriggers(
+    filter?: string | { readonly connectionId?: string; readonly includePaused?: boolean },
+  ): Message[] {
+    const connectionId = typeof filter === "string" ? filter : filter?.connectionId;
+    const includePaused = typeof filter === "object" && filter !== null ? Boolean(filter.includePaused) : false;
     const scope = connectionId ? "AND m.connection_id = ?" : "";
+    const pauseFilter = includePaused
+      ? ""
+      : `AND n.paused = 0
+         AND (n.leader_paused = 0 OR COALESCE(m.leader_id, 'leader-default') != n.leader_id)`;
     const sql = `
       SELECT m.*
       FROM messages m
@@ -1462,9 +1555,9 @@ export class Store {
         AND m.triggers = 1
         AND m.state IN ('received', 'delivered')
         AND m.acked_at IS NULL
+        AND m.t3_turn_id IS NULL
         AND n.lifecycle_state = 'active'
-        AND n.paused = 0
-        AND (n.leader_paused = 0 OR COALESCE(m.leader_id, 'leader-default') != n.leader_id)
+        ${pauseFilter}
         ${scope}
       ORDER BY m.created_at ASC, m.rowid ASC
     `;
@@ -1690,22 +1783,24 @@ export class Store {
     );
   }
 
-  /** Defer unacked queued/waiting inbound messages for a paused connection/leader into `paused_pending` without touching committed runs. */
+  /** Defer unacked queued/delivered/waiting inbound triggers for a paused connection/leader into `paused_pending` without touching ACKed runs (S28). */
   pauseConnectionMessages(connectionId: string, leaderId?: string): string[] {
     const rows = (
       leaderId
         ? this.stmt(
             `SELECT id FROM messages
              WHERE connection_id = ? AND direction = 'in'
+               AND triggers = 1
                AND acked_at IS NULL AND t3_turn_id IS NULL
-               AND state IN ('received', 'waiting')
+               AND state IN ('received', 'delivered', 'waiting')
                AND COALESCE(leader_id, 'leader-default') = ?`,
           ).all(connectionId, leaderId)
         : this.stmt(
             `SELECT id FROM messages
              WHERE connection_id = ? AND direction = 'in'
+               AND triggers = 1
                AND acked_at IS NULL AND t3_turn_id IS NULL
-               AND state IN ('received', 'waiting')`,
+               AND state IN ('received', 'delivered', 'waiting')`,
           ).all(connectionId)
     ) as Row[];
     if (!rows.length) return [];
@@ -1715,30 +1810,163 @@ export class Store {
     );
   }
 
-  /** Record the latest pause generation and/or paused flag synced from T3 for a Leader (S23/S25/S26). */
+  /** Defer all unacked queued/delivered/waiting inbound triggers owned by a paused Leader across all connections without touching ACKed runs (S28). */
+  pauseLeaderMessages(leaderId: string): string[] {
+    const rows = this.stmt(
+      `SELECT id FROM messages
+       WHERE direction = 'in'
+         AND triggers = 1
+         AND acked_at IS NULL AND t3_turn_id IS NULL
+         AND state IN ('received', 'delivered', 'waiting')
+         AND COALESCE(leader_id, 'leader-default') = ?`,
+    ).all(leaderId) as Row[];
+    if (!rows.length) return [];
+    return this.moveInbound(
+      rows.map((r) => String(r.id)),
+      "pause",
+    );
+  }
+
+  /** Read the full persisted pause state for a Leader (S23/S25/S29). */
+  getLeaderPauseState(leaderId: string): {
+    readonly exists: boolean;
+    readonly pauseGeneration: number;
+    readonly paused: boolean;
+    readonly pauseVersion: number;
+  } {
+    const row = this.stmt(
+      "SELECT pause_generation, paused, pause_version FROM leader_pause_generations WHERE leader_id = ?",
+    ).get(leaderId) as Row | undefined;
+    if (!row) {
+      return { exists: false, pauseGeneration: 0, paused: false, pauseVersion: 0 };
+    }
+    return {
+      exists: true,
+      pauseGeneration: row.pause_generation == null ? 0 : Number(row.pause_generation),
+      paused: Number(row.paused ?? 0) === 1,
+      pauseVersion: row.pause_version == null ? 0 : Number(row.pause_version),
+    };
+  }
+
+  /**
+   * Monotonically reconcile a Leader's pause state (`pauseVersion`, `pauseGeneration`, `paused`)
+   * and atomically mirror the authoritative `paused` flag onto all connections bound to that Leader (S23/S25/S29).
+   * Stale out-of-order syncs (lower `pauseVersion` or lower `pauseGeneration`) are ignored completely.
+   */
   setLeaderPauseState(
     leaderId: string,
-    state: { readonly pauseGeneration?: number; readonly paused?: boolean },
-  ): void {
-    if (!leaderId) return;
-    const currentGen = this.getLeaderPauseGeneration(leaderId);
-    const currentPaused = this.getLeaderPaused(leaderId);
-    const nextGen =
+    state: { readonly pauseGeneration?: number; readonly paused?: boolean; readonly pauseVersion?: number },
+  ): {
+    readonly applied: boolean;
+    readonly pauseGeneration: number;
+    readonly paused: boolean;
+    readonly pauseVersion: number;
+    readonly updatedConnectionIds: readonly string[];
+  } {
+    if (!leaderId) {
+      return { applied: false, pauseGeneration: 0, paused: false, pauseVersion: 0, updatedConnectionIds: [] };
+    }
+    const incomingGen =
       typeof state.pauseGeneration === "number" && Number.isInteger(state.pauseGeneration) && state.pauseGeneration >= 0
-        ? Math.max(currentGen, state.pauseGeneration)
-        : currentGen;
-    const nextPaused = typeof state.paused === "boolean" ? state.paused : currentPaused;
-    this.stmt(
-      `INSERT INTO leader_pause_generations (leader_id, pause_generation, paused)
-       VALUES (?, ?, ?)
-       ON CONFLICT(leader_id) DO UPDATE SET
-         pause_generation = CASE
-           WHEN excluded.pause_generation > leader_pause_generations.pause_generation
-           THEN excluded.pause_generation
-           ELSE leader_pause_generations.pause_generation
-         END,
-         paused = excluded.paused`,
-    ).run(leaderId, nextGen, nextPaused ? 1 : 0);
+        ? state.pauseGeneration
+        : undefined;
+    const incomingVer =
+      typeof state.pauseVersion === "number" && Number.isInteger(state.pauseVersion) && state.pauseVersion >= 0
+        ? state.pauseVersion
+        : undefined;
+    const incomingPaused = typeof state.paused === "boolean" ? state.paused : undefined;
+
+    this.db.exec("SAVEPOINT set_leader_pause");
+    try {
+      const current = this.getLeaderPauseState(leaderId);
+      let stale = false;
+      if (incomingVer !== undefined) {
+        if (current.exists && incomingVer < current.pauseVersion) {
+          stale = true;
+        } else if (current.exists && incomingVer === current.pauseVersion) {
+          if (incomingGen !== undefined && incomingGen < current.pauseGeneration) {
+            stale = true;
+          } else if (
+            current.pauseVersion > 0 &&
+            (incomingGen === undefined || incomingGen === current.pauseGeneration)
+          ) {
+            // Same positive version cannot carry a conflicting Pause/Resume transition; treat as idempotent.
+            stale = true;
+          }
+        }
+      } else {
+        // Unversioned fallback: never allow a lower pauseGeneration (or a same/lower generation
+        // against an already-versioned Leader) to overwrite newer state!
+        if (incomingGen !== undefined && incomingGen < current.pauseGeneration) {
+          stale = true;
+        } else if (
+          current.exists &&
+          current.pauseVersion > 0 &&
+          incomingPaused !== undefined &&
+          incomingGen !== undefined &&
+          incomingGen <= current.pauseGeneration
+        ) {
+          stale = true;
+        }
+      }
+
+      if (stale) {
+        this.db.exec("RELEASE SAVEPOINT set_leader_pause");
+        return {
+          applied: false,
+          pauseGeneration: current.pauseGeneration,
+          paused: current.paused,
+          pauseVersion: current.pauseVersion,
+          updatedConnectionIds: [],
+        };
+      }
+
+      const nextVersion =
+        incomingVer !== undefined && incomingPaused !== undefined
+          ? Math.max(current.pauseVersion, incomingVer)
+          : current.pauseVersion;
+      const nextGen = incomingGen !== undefined ? Math.max(current.pauseGeneration, incomingGen) : current.pauseGeneration;
+      const nextPaused = incomingPaused !== undefined ? incomingPaused : current.paused;
+
+      this.stmt(
+        `INSERT INTO leader_pause_generations (leader_id, pause_generation, paused, pause_version)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(leader_id) DO UPDATE SET
+           pause_generation = excluded.pause_generation,
+           paused = excluded.paused,
+           pause_version = excluded.pause_version`,
+      ).run(leaderId, nextGen, nextPaused ? 1 : 0, nextVersion);
+
+      const updatedConnectionIds: string[] = [];
+      if (incomingPaused !== undefined) {
+        const affected = this.stmt(
+          "SELECT id FROM connections WHERE leader_id = ? AND leader_paused != ?",
+        ).all(leaderId, nextPaused ? 1 : 0) as Row[];
+        if (affected.length > 0) {
+          this.stmt("UPDATE connections SET leader_paused = ?, updated_at = ? WHERE leader_id = ?").run(
+            nextPaused ? 1 : 0,
+            this.now(),
+            leaderId,
+          );
+          for (const r of affected) updatedConnectionIds.push(String(r.id));
+        }
+      }
+      if (nextPaused) {
+        this.pauseLeaderMessages(leaderId);
+      }
+      this.db.exec("RELEASE SAVEPOINT set_leader_pause");
+      return {
+        applied: true,
+        pauseGeneration: nextGen,
+        paused: nextPaused,
+        pauseVersion: nextVersion,
+        updatedConnectionIds,
+      };
+    } catch (error) {
+      this.db.exec("ROLLBACK TO SAVEPOINT set_leader_pause");
+      this.db.exec("RELEASE SAVEPOINT set_leader_pause");
+      throw error;
+    }
   }
 
   /** Record the latest pause generation synced from T3 for a Leader (S23). */
@@ -1748,18 +1976,12 @@ export class Store {
 
   /** Read the pause generation currently known to the bridge for a Leader (S23). */
   getLeaderPauseGeneration(leaderId: string): number {
-    const row = this.stmt("SELECT pause_generation FROM leader_pause_generations WHERE leader_id = ?").get(
-      leaderId,
-    ) as Row | undefined;
-    return row?.pause_generation == null ? 0 : Number(row.pause_generation);
+    return this.getLeaderPauseState(leaderId).pauseGeneration;
   }
 
   /** Read the persisted paused flag currently known to the bridge for a Leader (S25/S26). */
   getLeaderPaused(leaderId: string): boolean {
-    const row = this.stmt("SELECT paused FROM leader_pause_generations WHERE leader_id = ?").get(
-      leaderId,
-    ) as Row | undefined;
-    return Number(row?.paused ?? 0) === 1;
+    return this.getLeaderPauseState(leaderId).paused;
   }
 
   /** Whether a message's target Leader (or its connection) is currently paused (S26). */
@@ -1769,16 +1991,7 @@ export class Store {
     return leaderId === conn.leaderId && conn.leaderPaused;
   }
 
-  /** Persist a message's dispatchable pause_generation (S24: initial stamp or explicit Replay refresh). */
-  stampMessagePauseGeneration(messageId: string, pauseGeneration: number): Message | undefined {
-    this.stmt("UPDATE messages SET pause_generation = ? WHERE id = ? AND direction = 'in'").run(
-      pauseGeneration,
-      messageId,
-    );
-    return this.message(messageId);
-  }
-
-  /** Reconcile Leader binding identity and pause flag onto a bridge connection. */
+  /** Reconcile Leader binding identity and pause flag onto a bridge connection atomically using monotonic pauseVersion (S4/S6/S29). */
   syncConnectionBinding(input: {
     readonly connectionId: string;
     readonly leaderId: string;
@@ -1786,36 +1999,53 @@ export class Store {
     readonly bindingEpoch: number;
     readonly leaderPaused: boolean;
     readonly pauseGeneration?: number;
+    readonly pauseVersion?: number;
   }): Connection | undefined {
-    this.setLeaderPauseState(input.leaderId, {
-      paused: input.leaderPaused,
-      ...(typeof input.pauseGeneration === "number" ? { pauseGeneration: input.pauseGeneration } : {}),
-    });
-    const prev = this.connection(input.connectionId);
-    const updated = this.updateConnection(input.connectionId, {
-      leaderId: input.leaderId,
-      bindingId: input.bindingId,
-      bindingEpoch: input.bindingEpoch,
-      leaderPaused: input.leaderPaused,
-    });
-    if (updated) {
-      const bindingChanged =
-        !prev ||
-        prev.leaderId !== updated.leaderId ||
-        prev.bindingId !== updated.bindingId ||
-        prev.bindingEpoch !== updated.bindingEpoch;
-      if (bindingChanged) {
-        this.clearStaleChatThreadPointers(updated.id, {
-          leaderId: updated.leaderId,
-          bindingId: updated.bindingId,
-          bindingEpoch: updated.bindingEpoch,
-        });
+    this.db.exec("SAVEPOINT sync_conn_binding");
+    try {
+      const leaderState = this.setLeaderPauseState(input.leaderId, {
+        paused: input.leaderPaused,
+        ...(typeof input.pauseGeneration === "number" ? { pauseGeneration: input.pauseGeneration } : {}),
+        ...(typeof input.pauseVersion === "number" ? { pauseVersion: input.pauseVersion } : {}),
+      });
+      const prev = this.connection(input.connectionId);
+      const bindingStale = prev !== undefined && input.bindingEpoch < prev.bindingEpoch;
+      // S29: Always apply the authoritative monotonic `leaderState.paused` (never a stale input flag!),
+      // and never roll back a connection to an older binding epoch.
+      const updated = bindingStale
+        ? this.updateConnection(input.connectionId, {
+            leaderPaused: this.getLeaderPaused(prev.leaderId),
+          })
+        : this.updateConnection(input.connectionId, {
+            leaderId: input.leaderId,
+            bindingId: input.bindingId,
+            bindingEpoch: input.bindingEpoch,
+            leaderPaused: leaderState.paused,
+          });
+      if (updated) {
+        const bindingChanged =
+          !prev ||
+          prev.leaderId !== updated.leaderId ||
+          prev.bindingId !== updated.bindingId ||
+          prev.bindingEpoch !== updated.bindingEpoch;
+        if (bindingChanged) {
+          this.clearStaleChatThreadPointers(updated.id, {
+            leaderId: updated.leaderId,
+            bindingId: updated.bindingId,
+            bindingEpoch: updated.bindingEpoch,
+          });
+        }
+        if (updated.leaderPaused) {
+          this.pauseConnectionMessages(updated.id, updated.leaderId);
+        }
       }
-      if (input.leaderPaused) {
-        this.pauseConnectionMessages(updated.id, input.leaderId);
-      }
+      this.db.exec("RELEASE SAVEPOINT sync_conn_binding");
+      return updated;
+    } catch (error) {
+      this.db.exec("ROLLBACK TO SAVEPOINT sync_conn_binding");
+      this.db.exec("RELEASE SAVEPOINT sync_conn_binding");
+      throw error;
     }
-    return updated;
   }
 
   /** Re-evaluate current access gate for a stored inbound message before selective replay (S5). */
@@ -1880,10 +2110,19 @@ export class Store {
     return out;
   }
 
-  /** Selectively replay (`paused_pending` -> `received`) or dismiss (`paused_pending` -> `ignored`) paused backlog items. */
-  decidePausedPending(messageIds: readonly string[], decision: "replay" | "dismiss"): Message[] {
+  /** Selectively replay (`paused_pending` -> `received`, atomically committing `pause_generation`) or dismiss (`paused_pending` -> `ignored`) paused backlog items (S27). */
+  decidePausedPending(
+    messageIds: readonly string[],
+    decision: "replay" | "dismiss",
+    pauseGeneration?: number,
+  ): Message[] {
     if (!messageIds.length) return [];
-    const changedIds = this.moveInbound(messageIds, decision === "replay" ? "replay_paused" : "dismiss_paused");
+    const changedIds = this.moveInbound(
+      messageIds,
+      decision === "replay" ? "replay_paused" : "dismiss_paused",
+      undefined,
+      decision === "replay" ? pauseGeneration : undefined,
+    );
     return changedIds.map((id) => this.message(id)).filter((msg): msg is Message => Boolean(msg));
   }
 }
