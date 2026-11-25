@@ -1,0 +1,650 @@
+/* Holographic 3D tilt + flip card styles implementing kubai-holo-card,
+ * harmonized with Xtwork's active theme tokens (--card, --background, --foreground, --accent, --border)
+ * and brand icon palettes for Feishu, WeCom, and WeChat in both light and dark modes. */
+
+.xtwork-holo-scene {
+  perspective: 1600px;
+  position: relative;
+  width: 100%;
+  min-height: 416px;
+  touch-action: pan-y;
+}
+
+.xtwork-holo-shadow {
+  position: absolute;
+  left: 8%;
+  right: 8%;
+  bottom: -22px;
+  height: 54px;
+  border-radius: 9999px;
+  pointer-events: none;
+  filter: blur(22px);
+  transform-origin: center center;
+  will-change: transform, opacity;
+  background: radial-gradient(ellipse at center, var(--holo-shadow-color), transparent 72%);
+  opacity: 0.72;
+}
+
+.xtwork-holo-card {
+  position: relative;
+  width: 100%;
+  min-height: 416px;
+  transform-style: preserve-3d;
+  will-change: transform;
+  border-radius: 26px;
+  corner-shape: squircle;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.xtwork-holo-edge {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  corner-shape: squircle;
+  pointer-events: none;
+  background: var(--holo-edge);
+  opacity: 0;
+  backface-visibility: visible;
+  will-change: opacity;
+}
+
+.xtwork-holo-face {
+  --holo-lx: 34%;
+  --holo-ly: 22%;
+  --holo-on: 0;
+  --holo-seal-angle: 0deg;
+  --holo-glare-x: -16%;
+  --holo-glare-y: -28%;
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  border-radius: inherit;
+  corner-shape: squircle;
+  overflow: hidden;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+  color: var(--holo-ink);
+  background: var(--holo-base);
+  box-shadow: var(--holo-surface-shadow);
+  isolation: isolate;
+}
+
+.xtwork-holo-face-front {
+  transform: translateZ(5px);
+  cursor: pointer;
+}
+
+.xtwork-holo-face-back {
+  transform: rotateY(180deg) translateZ(5px);
+}
+
+.xtwork-holo-card[data-flipped="true"] .xtwork-holo-face-front {
+  pointer-events: none;
+}
+
+.xtwork-holo-card[data-flipped="false"] .xtwork-holo-face-back {
+  pointer-events: none;
+}
+
+/* Foil layer: slides across the surface as the pointer light moves. */
+.xtwork-holo-foil {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  border-radius: inherit;
+  background-image: var(--holo-foil);
+  background-size: 240% 240%;
+  background-position: var(--holo-lx) var(--holo-ly);
+  mix-blend-mode: var(--holo-foil-blend);
+  opacity: calc(var(--holo-foil-base-opacity) + var(--holo-on) * var(--holo-foil-hover-boost));
+  mask-image: var(--holo-foil-mask);
+  -webkit-mask-image: var(--holo-foil-mask);
+  will-change: background-position, opacity;
+}
+
+/* Subtle fine prism grain/sheen rim on the outer border */
+.xtwork-holo-rim {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  padding: 1.5px;
+  border-radius: inherit;
+  corner-shape: squircle;
+  pointer-events: none;
+  background:
+    radial-gradient(
+      circle at var(--holo-lx) var(--holo-ly),
+      var(--holo-rim-light) 0%,
+      transparent 44%
+    ),
+    linear-gradient(155deg, var(--holo-rim-base), var(--holo-rim-base));
+  opacity: calc(0.6 + var(--holo-on) * 0.4);
+  mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  -webkit-mask-composite: xor;
+}
+
+/* Glare layer: 2x-sized radial sheen translated via transform for smooth 60/120fps */
+.xtwork-holo-glare-clip {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  overflow: hidden;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.xtwork-holo-glare {
+  position: absolute;
+  left: -50%;
+  top: -50%;
+  width: 200%;
+  height: 200%;
+  pointer-events: none;
+  background: var(--holo-glare);
+  mix-blend-mode: var(--holo-glare-blend);
+  opacity: calc(var(--holo-glare-base-opacity) + var(--holo-on) * var(--holo-glare-hover-boost));
+  transform: translate3d(var(--holo-glare-x), var(--holo-glare-y), 0);
+  will-change: transform, opacity;
+}
+
+/* Keep back-face controls, inputs, and QR codes completely free from glare washout. */
+.xtwork-holo-face-back .xtwork-holo-glare-clip {
+  z-index: 1;
+}
+
+.xtwork-holo-face-back .xtwork-holo-glare {
+  opacity: calc(0.14 + var(--holo-on) * 0.16);
+}
+
+/* Print layer: stays above foil so typography and controls remain crisp at all angles. */
+.xtwork-holo-print {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  padding: 18px 18px 20px;
+}
+
+/* Artwork window with multi-stop luminous inner glow + 3D parallax depth layers. */
+.xtwork-holo-window {
+  position: relative;
+  flex: 1;
+  min-height: 196px;
+  margin: 12px 0 16px;
+  border-radius: 18px;
+  corner-shape: squircle;
+  overflow: hidden;
+  border: 1px solid var(--holo-window-border);
+  background: var(--holo-window-bg);
+  box-shadow: var(--holo-window-shadow);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.xtwork-holo-window-glow {
+  position: absolute;
+  inset: -84px;
+  pointer-events: none;
+  background: var(--holo-window-glow);
+  will-change: transform;
+}
+
+.xtwork-holo-depth-layer {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.xtwork-holo-ring {
+  border-radius: 9999px;
+  border: 1px solid var(--holo-ring-color);
+}
+
+.xtwork-holo-ring-dashed {
+  border-radius: 9999px;
+  border: 1px dashed var(--holo-ring-dashed-color);
+}
+
+/* Hologram seal disc (kubai-holo-card section 2) */
+.xtwork-holo-seal {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  border-radius: 9999px;
+  background: conic-gradient(
+    from var(--holo-seal-angle),
+    rgb(255 154 200),
+    rgb(255 224 138),
+    rgb(164 255 207),
+    rgb(143 220 255),
+    rgb(183 155 255),
+    rgb(255 154 200),
+    rgb(255 224 138),
+    rgb(164 255 207),
+    rgb(143 220 255),
+    rgb(183 155 255),
+    rgb(255 154 200)
+  );
+  box-shadow:
+    inset 0 0 0 1px rgb(255 255 255 / 0.6),
+    0 2px 6px rgb(0 0 0 / 0.14);
+  opacity: calc(0.76 + var(--holo-on) * 0.24);
+}
+
+.xtwork-holo-seal::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: repeating-radial-gradient(
+    circle at center,
+    rgb(255 255 255 / 0.36) 0 1px,
+    transparent 1px 3.5px
+  );
+}
+
+/* Theme-harmonized Light Mode base defaults */
+.xtwork-holo-scene {
+  --holo-ink: color-mix(in oklab, var(--foreground) 90%, var(--holo-brand-ink-light) 10%);
+  --holo-ink-muted: color-mix(in oklab, var(--foreground) 66%, var(--holo-brand-ink-light) 34%);
+  --holo-chip-bg: color-mix(in oklab, var(--card) 72%, transparent);
+  --holo-chip-border: color-mix(in oklab, var(--foreground) 12%, transparent);
+  --holo-control-bg: color-mix(in oklab, var(--card) 74%, transparent);
+  --holo-control-hover: color-mix(in oklab, var(--card) 92%, var(--accent) 8%);
+  --holo-foil-blend: multiply;
+  --holo-foil-base-opacity: 0.34;
+  --holo-foil-hover-boost: 0.24;
+  --holo-foil-mask: radial-gradient(74% 64% at 50% 44%, rgb(0 0 0 / 0.35) 26%, rgb(0 0 0) 100%);
+  --holo-glare: radial-gradient(
+    circle at center,
+    rgb(255 255 255 / 0.72) 0%,
+    rgb(255 255 255 / 0.18) 26%,
+    transparent 56%
+  );
+  --holo-glare-blend: soft-light;
+  --holo-glare-base-opacity: 0.38;
+  --holo-glare-hover-boost: 0.48;
+  --holo-rim-base: color-mix(in oklab, var(--foreground) 11%, var(--holo-brand-primary) 16%);
+  --holo-rim-light: rgb(255 255 255 / 0.94);
+  --holo-surface-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.72),
+    0 1px 2px rgb(0 0 0 / 0.06);
+  --holo-window-shadow: inset 0 1px 0 rgb(255 255 255 / 0.65);
+  --holo-ring-color: color-mix(in oklab, var(--holo-brand-primary) 24%, transparent);
+  --holo-ring-dashed-color: color-mix(in oklab, var(--holo-brand-secondary) 32%, transparent);
+  --holo-back-panel-bg: color-mix(in oklab, var(--card) 82%, transparent);
+  --holo-back-panel-border: color-mix(in oklab, var(--foreground) 11%, transparent);
+}
+
+/* Feishu — Cyan-Teal (#00D6B9) -> Cobalt Blue (#3370FF) */
+.xtwork-holo-scene[data-channel="feishu"] {
+  --holo-brand-primary: #3370ff;
+  --holo-brand-secondary: #00d6b9;
+  --holo-brand-ink-light: #0f2c59;
+  --holo-edge: color-mix(in oklab, var(--border) 38%, #67a8ff 62%);
+  --holo-shadow-color: color-mix(in srgb, #1d5ee6 22%, rgb(0 0 0 / 0.14));
+  --holo-base:
+    radial-gradient(84% 56% at 14% 0%, rgb(0 214 185 / 0.24), transparent 68%),
+    radial-gradient(76% 58% at 92% 100%, rgb(51 112 255 / 0.2), transparent 70%),
+    linear-gradient(
+      162deg in oklab,
+      color-mix(in oklab, var(--card) 74%, #d7f7f2 26%),
+      color-mix(in oklab, var(--background) 68%, #dbe8ff 32%)
+    );
+  --holo-foil: linear-gradient(
+    118deg,
+    rgb(164 248 234 / 0.78) 0%,
+    rgb(184 214 255 / 0.8) 18%,
+    rgb(218 208 255 / 0.72) 34%,
+    rgb(176 246 238 / 0.78) 50%,
+    rgb(184 214 255 / 0.8) 68%,
+    rgb(218 208 255 / 0.72) 84%,
+    rgb(164 248 234 / 0.78) 100%
+  );
+  --holo-window-bg: linear-gradient(
+    158deg in oklab,
+    color-mix(in oklab, var(--card) 30%, #dff9f5 70%),
+    color-mix(in oklab, var(--card) 22%, #d8e6ff 78%)
+  );
+  --holo-window-border: color-mix(in oklab, var(--border) 42%, rgb(51 112 255 / 0.26) 58%);
+  --holo-window-glow:
+    radial-gradient(
+      46% 50% at var(--holo-lx) var(--holo-ly),
+      rgb(0 214 185 / 0.42) 0%,
+      rgb(0 214 185 / 0.26) 22%,
+      rgb(0 214 185 / 0.1) 50%,
+      transparent 80%
+    ),
+    radial-gradient(
+      54% 56% at calc(100% - var(--holo-lx)) 76%,
+      rgb(51 112 255 / 0.34) 0%,
+      rgb(51 112 255 / 0.18) 26%,
+      rgb(51 112 255 / 0.06) 56%,
+      transparent 82%
+    ),
+    radial-gradient(66% 52% at 24% 100%, color-mix(in oklab, var(--accent) 18%, transparent), transparent 76%);
+}
+
+/* WeCom — Enterprise Azure Blue (#2878FF) with multi-dot sky/amber prism whisper */
+.xtwork-holo-scene[data-channel="wecom"] {
+  --holo-brand-primary: #2878ff;
+  --holo-brand-secondary: #58b4ff;
+  --holo-brand-ink-light: #122a54;
+  --holo-edge: color-mix(in oklab, var(--border) 38%, #70a6ff 62%);
+  --holo-shadow-color: color-mix(in srgb, #236de8 22%, rgb(0 0 0 / 0.14));
+  --holo-base:
+    radial-gradient(82% 54% at 84% 0%, rgb(40 120 255 / 0.22), transparent 68%),
+    radial-gradient(68% 52% at 14% 96%, rgb(255 190 46 / 0.16), transparent 68%),
+    linear-gradient(
+      162deg in oklab,
+      color-mix(in oklab, var(--card) 74%, #e2eeff 26%),
+      color-mix(in oklab, var(--background) 68%, #dce7ff 32%)
+    );
+  --holo-foil: linear-gradient(
+    118deg,
+    rgb(180 218 255 / 0.8) 0%,
+    rgb(255 235 178 / 0.72) 18%,
+    rgb(188 242 224 / 0.72) 34%,
+    rgb(196 214 255 / 0.82) 50%,
+    rgb(255 216 206 / 0.68) 68%,
+    rgb(180 218 255 / 0.8) 84%,
+    rgb(255 235 178 / 0.72) 100%
+  );
+  --holo-window-bg: linear-gradient(
+    158deg in oklab,
+    color-mix(in oklab, var(--card) 30%, #e4f0ff 70%),
+    color-mix(in oklab, var(--card) 22%, #dae6ff 78%)
+  );
+  --holo-window-border: color-mix(in oklab, var(--border) 42%, rgb(40 120 255 / 0.26) 58%);
+  --holo-window-glow:
+    radial-gradient(
+      46% 50% at var(--holo-lx) var(--holo-ly),
+      rgb(54 136 255 / 0.38) 0%,
+      rgb(54 136 255 / 0.22) 24%,
+      rgb(54 136 255 / 0.08) 54%,
+      transparent 82%
+    ),
+    radial-gradient(
+      52% 54% at calc(100% - var(--holo-lx)) 76%,
+      rgb(255 194 64 / 0.28) 0%,
+      rgb(255 194 64 / 0.14) 26%,
+      rgb(255 194 64 / 0.05) 56%,
+      transparent 82%
+    ),
+    radial-gradient(64% 50% at 72% 100%, rgb(42 209 129 / 0.16), transparent 74%);
+}
+
+/* WeChat — Iconic Emerald Green (#07C160) -> Fresh Mint Jade (#2EE082) */
+.xtwork-holo-scene[data-channel="wechat"] {
+  --holo-brand-primary: #07c160;
+  --holo-brand-secondary: #2ee082;
+  --holo-brand-ink-light: #0d3a22;
+  --holo-edge: color-mix(in oklab, var(--border) 38%, #5cd494 62%);
+  --holo-shadow-color: color-mix(in srgb, #07a853 22%, rgb(0 0 0 / 0.14));
+  --holo-base:
+    radial-gradient(84% 56% at 50% 0%, rgb(7 193 96 / 0.22), transparent 68%),
+    radial-gradient(76% 58% at 88% 100%, rgb(46 224 130 / 0.18), transparent 70%),
+    linear-gradient(
+      162deg in oklab,
+      color-mix(in oklab, var(--card) 74%, #ddf8e9 26%),
+      color-mix(in oklab, var(--background) 68%, #d5f2e2 32%)
+    );
+  --holo-foil: linear-gradient(
+    118deg,
+    rgb(174 247 206 / 0.82) 0%,
+    rgb(184 242 238 / 0.76) 18%,
+    rgb(228 248 188 / 0.74) 34%,
+    rgb(174 247 206 / 0.82) 50%,
+    rgb(184 242 238 / 0.76) 68%,
+    rgb(228 248 188 / 0.74) 84%,
+    rgb(174 247 206 / 0.82) 100%
+  );
+  --holo-window-bg: linear-gradient(
+    158deg in oklab,
+    color-mix(in oklab, var(--card) 30%, #e1faec 70%),
+    color-mix(in oklab, var(--card) 22%, #d2f3e1 78%)
+  );
+  --holo-window-border: color-mix(in oklab, var(--border) 42%, rgb(7 193 96 / 0.28) 58%);
+  --holo-window-glow:
+    radial-gradient(
+      46% 50% at var(--holo-lx) var(--holo-ly),
+      rgb(7 193 96 / 0.36) 0%,
+      rgb(7 193 96 / 0.2) 24%,
+      rgb(7 193 96 / 0.08) 54%,
+      transparent 82%
+    ),
+    radial-gradient(
+      54% 56% at calc(100% - var(--holo-lx)) 76%,
+      rgb(88 236 178 / 0.34) 0%,
+      rgb(88 236 178 / 0.18) 26%,
+      rgb(88 236 178 / 0.06) 56%,
+      transparent 82%
+    ),
+    radial-gradient(66% 52% at 24% 100%, color-mix(in oklab, var(--accent) 16%, transparent), transparent 76%);
+}
+
+/* Dark Mode: Deep backlit Prism glass rooted in active theme's --card / --background */
+.dark .xtwork-holo-scene {
+  --holo-ink: color-mix(in oklab, var(--foreground) 94%, white 6%);
+  --holo-ink-muted: color-mix(in oklab, var(--foreground) 72%, transparent);
+  --holo-chip-bg: rgb(255 255 255 / 0.09);
+  --holo-chip-border: rgb(255 255 255 / 0.16);
+  --holo-control-bg: rgb(255 255 255 / 0.1);
+  --holo-control-hover: rgb(255 255 255 / 0.2);
+  --holo-foil-blend: screen;
+  --holo-foil-base-opacity: 0.14;
+  --holo-foil-hover-boost: 0.26;
+  --holo-foil-mask: radial-gradient(
+    farthest-corner at var(--holo-lx) var(--holo-ly),
+    rgb(0 0 0) 8%,
+    rgb(0 0 0 / 0.2) 72%
+  );
+  --holo-glare: radial-gradient(
+    circle at center,
+    rgb(255 255 255 / 0.56) 0%,
+    rgb(255 255 255 / 0.14) 28%,
+    rgb(0 0 0 / 0.28) 95%
+  );
+  --holo-glare-blend: overlay;
+  --holo-glare-base-opacity: 0.25;
+  --holo-glare-hover-boost: 0.45;
+  --holo-rim-base: rgb(255 255 255 / 0.1);
+  --holo-rim-light: rgb(255 255 255 / 0.62);
+  --holo-surface-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.14),
+    0 2px 10px rgb(0 0 0 / 0.35);
+  --holo-window-shadow: inset 0 1px 0 rgb(255 255 255 / 0.14);
+  --holo-ring-color: rgb(255 255 255 / 0.14);
+  --holo-ring-dashed-color: rgb(255 255 255 / 0.2);
+  --holo-back-panel-bg: color-mix(in oklab, var(--background) 62%, transparent);
+  --holo-back-panel-border: rgb(255 255 255 / 0.14);
+}
+
+.dark .xtwork-holo-scene[data-channel="feishu"] {
+  --holo-edge: color-mix(in oklab, var(--card) 26%, #0c7e8f 74%);
+  --holo-shadow-color: rgb(0 0 0 / 0.6);
+  --holo-base:
+    radial-gradient(72% 48% at 18% 0%, rgb(0 224 196 / 0.42), transparent 70%),
+    radial-gradient(72% 52% at 88% 96%, rgb(51 112 255 / 0.34), transparent 72%),
+    linear-gradient(
+      166deg in oklab,
+      color-mix(in oklab, var(--card) 40%, #094c66 60%),
+      color-mix(in oklab, var(--background) 42%, #0a2554 58%)
+    );
+  --holo-foil: linear-gradient(
+    118deg,
+    rgb(0 238 208 / 0.72) 0%,
+    rgb(74 176 255 / 0.72) 22%,
+    rgb(138 148 255 / 0.56) 44%,
+    rgb(0 238 208 / 0.72) 66%,
+    rgb(74 176 255 / 0.72) 88%,
+    rgb(138 148 255 / 0.56) 100%
+  );
+  --holo-window-bg: linear-gradient(
+    166deg in oklab,
+    color-mix(in oklab, var(--card) 20%, #0a607c 80%),
+    color-mix(in oklab, var(--background) 24%, #0d3269 76%)
+  );
+  --holo-window-border: rgb(118 232 230 / 0.28);
+  --holo-window-glow:
+    radial-gradient(
+      46% 50% at var(--holo-lx) var(--holo-ly),
+      rgb(72 245 224 / 0.52) 0%,
+      rgb(72 245 224 / 0.34) 18%,
+      rgb(72 245 224 / 0.16) 40%,
+      rgb(72 245 224 / 0.05) 66%,
+      transparent 84%
+    ),
+    radial-gradient(
+      54% 56% at calc(100% - var(--holo-lx)) 74%,
+      rgb(112 168 255 / 0.45) 0%,
+      rgb(112 168 255 / 0.28) 20%,
+      rgb(112 168 255 / 0.12) 44%,
+      transparent 82%
+    ),
+    radial-gradient(70% 55% at 30% 100%, rgb(134 255 218 / 0.24), transparent 76%);
+}
+
+.dark .xtwork-holo-scene[data-channel="wecom"] {
+  --holo-edge: color-mix(in oklab, var(--card) 26%, #245cc2 74%);
+  --holo-shadow-color: rgb(0 0 0 / 0.6);
+  --holo-base:
+    radial-gradient(66% 44% at 80% 0%, rgb(62 142 255 / 0.38), transparent 70%),
+    radial-gradient(62% 48% at 16% 96%, rgb(255 190 46 / 0.18), transparent 70%),
+    linear-gradient(
+      166deg in oklab,
+      color-mix(in oklab, var(--card) 42%, #143b7a 58%),
+      color-mix(in oklab, var(--background) 44%, #0d2152 56%)
+    );
+  --holo-foil: linear-gradient(
+    118deg,
+    rgb(92 170 255 / 0.72) 0%,
+    rgb(255 204 92 / 0.52) 22%,
+    rgb(96 230 176 / 0.54) 44%,
+    rgb(112 166 255 / 0.72) 66%,
+    rgb(255 154 128 / 0.48) 88%,
+    rgb(92 170 255 / 0.72) 100%
+  );
+  --holo-window-bg: linear-gradient(
+    166deg in oklab,
+    color-mix(in oklab, var(--card) 22%, #1a4b9c 78%),
+    color-mix(in oklab, var(--background) 26%, #102b68 74%)
+  );
+  --holo-window-border: rgb(148 198 255 / 0.24);
+  --holo-window-glow:
+    radial-gradient(
+      46% 50% at var(--holo-lx) var(--holo-ly),
+      rgb(114 188 255 / 0.52) 0%,
+      rgb(114 188 255 / 0.34) 18%,
+      rgb(114 188 255 / 0.16) 40%,
+      rgb(114 188 255 / 0.05) 66%,
+      transparent 84%
+    ),
+    radial-gradient(
+      54% 56% at calc(100% - var(--holo-lx)) 74%,
+      rgb(255 206 106 / 0.34) 0%,
+      rgb(255 206 106 / 0.2) 20%,
+      rgb(255 206 106 / 0.08) 44%,
+      transparent 82%
+    ),
+    radial-gradient(70% 55% at 72% 100%, rgb(84 226 164 / 0.22), transparent 76%);
+}
+
+.dark .xtwork-holo-scene[data-channel="wechat"] {
+  --holo-edge: color-mix(in oklab, var(--card) 26%, #137846 74%);
+  --holo-shadow-color: rgb(0 0 0 / 0.6);
+  --holo-base:
+    radial-gradient(66% 44% at 50% 0%, rgb(7 193 96 / 0.36), transparent 70%),
+    radial-gradient(70% 52% at 86% 96%, rgb(46 224 130 / 0.24), transparent 72%),
+    linear-gradient(
+      166deg in oklab,
+      color-mix(in oklab, var(--card) 42%, #0d4f2e 58%),
+      color-mix(in oklab, var(--background) 44%, #072d1b 56%)
+    );
+  --holo-foil: linear-gradient(
+    118deg,
+    rgb(62 232 142 / 0.68) 0%,
+    rgb(104 242 222 / 0.62) 22%,
+    rgb(196 248 134 / 0.5) 44%,
+    rgb(62 232 142 / 0.68) 66%,
+    rgb(104 242 222 / 0.62) 88%,
+    rgb(196 248 134 / 0.5) 100%
+  );
+  --holo-window-bg: linear-gradient(
+    166deg in oklab,
+    color-mix(in oklab, var(--card) 22%, #0f663b 78%),
+    color-mix(in oklab, var(--background) 26%, #083b22 74%)
+  );
+  --holo-window-border: rgb(124 240 176 / 0.24);
+  --holo-window-glow:
+    radial-gradient(
+      46% 50% at var(--holo-lx) var(--holo-ly),
+      rgb(78 245 156 / 0.5) 0%,
+      rgb(78 245 156 / 0.32) 18%,
+      rgb(78 245 156 / 0.15) 40%,
+      rgb(78 245 156 / 0.05) 66%,
+      transparent 84%
+    ),
+    radial-gradient(
+      54% 56% at calc(100% - var(--holo-lx)) 74%,
+      rgb(122 246 218 / 0.38) 0%,
+      rgb(122 246 218 / 0.22) 20%,
+      rgb(122 246 218 / 0.09) 44%,
+      transparent 82%
+    ),
+    radial-gradient(70% 55% at 28% 100%, rgb(168 255 174 / 0.22), transparent 76%);
+}
+
+/* Reduced motion: disable 3D flip spring and replace with clean cross-fade */
+@media (prefers-reduced-motion: reduce) {
+  .xtwork-holo-card {
+    transform: none !important;
+  }
+
+  .xtwork-holo-edge {
+    display: none;
+  }
+
+  .xtwork-holo-face {
+    transition: opacity 200ms ease;
+    transform: none !important;
+    backface-visibility: visible;
+  }
+
+  .xtwork-holo-card[data-flipped="false"] .xtwork-holo-face-front {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .xtwork-holo-card[data-flipped="false"] .xtwork-holo-face-back {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .xtwork-holo-card[data-flipped="true"] .xtwork-holo-face-front {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .xtwork-holo-card[data-flipped="true"] .xtwork-holo-face-back {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
