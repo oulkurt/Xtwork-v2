@@ -1,0 +1,3858 @@
+diff --git a/apps/server/src/cli/doctor.test.ts b/apps/server/src/cli/doctor.test.ts
+index 6315378d..c1c79829 100644
+--- a/apps/server/src/cli/doctor.test.ts
++++ b/apps/server/src/cli/doctor.test.ts
+@@ -112,7 +112,7 @@ it.effect(
+       ).pipe(Effect.flip);
+       assert.equal(
+         refused.message,
+-        `Stop T3 Code server process ${state.pid}, which the background service did not start, before repairing the database.`,
++        `Stop 小瞳 Work server process ${state.pid}, which the background service did not start, before repairing the database.`,
+       );
+       assert.deepEqual(calls, ["pause", "resume"]);
+     }).pipe(Effect.provide(layerHost)),
+diff --git a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
+index fd5f89b8..bbeb39ae 100644
+--- a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
+@@ -1292,7 +1292,7 @@ describe("CodexAdapterV2 session initialize", () => {
+       assert.instanceOf(failure.cause, ProviderSetupError);
+       assert.equal(
+         failure.cause.message,
+-        "Codex 0.144.3 does not work with this T3 Code release. Update Codex to >=0.159.0, then retry.",
++        "Codex 0.144.3 does not work with this 小瞳 Work release. Update Codex to >=0.159.0, then retry.",
+       );
+     }).pipe(
+       Effect.scoped,
+diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.test.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.test.ts
+index 53114878..9df84e79 100644
+--- a/apps/server/src/orchestration-v2/ProviderTurnStartService.test.ts
++++ b/apps/server/src/orchestration-v2/ProviderTurnStartService.test.ts
+@@ -1524,7 +1524,7 @@ effectIt.effect(
+           failure: {
+             class: "unknown",
+             message:
+-              "T3 Code could not start this turn. Send the message again; if it keeps failing, check the server logs.",
++              "小瞳 Work could not start this turn. Send the message again; if it keeps failing, check the server logs.",
+           },
+         },
+       ]);
+diff --git a/apps/server/src/orchestration-v2/runtimeLayer.test.ts b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
+index 82fd3381..cc28b022 100644
+--- a/apps/server/src/orchestration-v2/runtimeLayer.test.ts
++++ b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
+@@ -6870,7 +6870,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
+           notification: {
+             source: { kind: "system" as const },
+             outcome: "updated" as const,
+-            summary: "T3 Code restarted and resumed this turn",
++            summary: "小瞳 Work restarted and resumed this turn",
+             detail: "Continue where you left off.",
+           },
+           attachments: [],
+@@ -6891,7 +6891,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
+           continuationItems.flatMap((item) =>
+             item.type === "notification" ? [[item.summary, item.detail]] : [],
+           ),
+-          ["T3 Code restarted and resumed this turn", "Continue where you left off."],
++          ["小瞳 Work restarted and resumed this turn", "Continue where you left off."],
+         );
+         yield* orchestrator.dispatch({
+           ...command,
+diff --git a/apps/server/src/provider/providerMaintenanceRunner.test.ts b/apps/server/src/provider/providerMaintenanceRunner.test.ts
+index 985347a6..d99d0ea9 100644
+--- a/apps/server/src/provider/providerMaintenanceRunner.test.ts
++++ b/apps/server/src/provider/providerMaintenanceRunner.test.ts
+@@ -597,7 +597,7 @@ describe("providerMaintenanceRunner", () => {
+         // The registry reports no new version, so a command that exits 0 ends as "unchanged".
+         assert.strictEqual(
+           result.providers[0]?.updateState?.message,
+-          "Update command completed, but T3 Code still detects an outdated provider version.",
++          "Update command completed, but 小瞳 Work still detects an outdated provider version.",
+         );
+       }).pipe(
+         Effect.provide(
+diff --git a/apps/web/src/appInit.tsx b/apps/web/src/appInit.tsx
+index ae8e685c..02c12c28 100644
+--- a/apps/web/src/appInit.tsx
++++ b/apps/web/src/appInit.tsx
+@@ -1,3 +1,4 @@
++import { isXtworkDesktop } from "./desktopFeatureVisibility";
+ import {
+   scopedThreadKey,
+   scopeProjectRef,
+@@ -277,9 +278,9 @@ export function startAppServices(): AppRouter {
+   startBrowserChromeThemeSync(router);
+   startDefaultThemeAdoption();
+   startModelPreferencesMigration();
+-  startAgentOpenedPreviews();
++  if (!isXtworkDesktop()) startAgentOpenedPreviews();
+   if (isElectron) startElectronBrowserHost();
+-  startPreviewTitleRecording();
++  if (!isXtworkDesktop()) startPreviewTitleRecording();
+   startBrowserProfileReporting();
+   installChatRouteCommands(router);
+   installCommandPaletteCommands(router);
+diff --git a/apps/web/src/browser/previewRuntime.ts b/apps/web/src/browser/previewRuntime.ts
+index 7ca4a8a8..6ed7c742 100644
+--- a/apps/web/src/browser/previewRuntime.ts
++++ b/apps/web/src/browser/previewRuntime.ts
+@@ -1,6 +1,7 @@
+ import { useAtomValue } from "@effect/atom-react";
+ import type { EnvironmentId, PreviewRuntime, PreviewSessionSnapshot } from "@t3tools/contracts";
+ 
++import { isXtworkDesktop } from "~/desktopFeatureVisibility";
+ import { isElectron } from "~/env";
+ import { isPreviewSupportedInRuntime } from "~/previewStateStore";
+ import { appAtomRegistry } from "~/rpc/atomRegistry";
+@@ -11,7 +12,7 @@ import {
+ } from "~/state/entities";
+ 
+ export function previewRuntimeFor(environmentId: EnvironmentId): PreviewRuntime | undefined {
+-  if (!readEnvironmentSupportsServerBrowser(environmentId)) return undefined;
++  if (isXtworkDesktop() || !readEnvironmentSupportsServerBrowser(environmentId)) return undefined;
+   if (
+     isPreviewSupportedInRuntime() &&
+     environmentId !== appAtomRegistry.get(primaryEnvironmentIdAtom)
+@@ -33,12 +34,15 @@ export function alternatePreviewRuntime(
+ }
+ 
+ export function isPreviewAvailableFor(environmentId: EnvironmentId): boolean {
+-  return isPreviewSupportedInRuntime() || readEnvironmentSupportsServerBrowser(environmentId);
++  return (
++    !isXtworkDesktop() &&
++    (isPreviewSupportedInRuntime() || readEnvironmentSupportsServerBrowser(environmentId))
++  );
+ }
+ 
+ export function usePreviewAvailable(environmentId: EnvironmentId | null): boolean {
+   const serverBrowser = useEnvironmentSupportsServerBrowser(environmentId);
+-  return isPreviewSupportedInRuntime() || serverBrowser;
++  return !isXtworkDesktop() && (isPreviewSupportedInRuntime() || serverBrowser);
+ }
+ 
+ export function rendersServerTabNatively(
+diff --git a/apps/web/src/cloud/publicConfig.ts b/apps/web/src/cloud/publicConfig.ts
+index ec9cf15b..7dacf751 100644
+--- a/apps/web/src/cloud/publicConfig.ts
++++ b/apps/web/src/cloud/publicConfig.ts
+@@ -1,3 +1,4 @@
++import { isXtworkDesktop } from "../desktopFeatureVisibility";
+ import {
+   clerkFrontendApiHostnameFromPublishableKey,
+   relayClerkTokenOptions,
+@@ -86,6 +87,7 @@ export function resolveRelayTracingConfig() {
+ }
+ 
+ export function hasCloudPublicConfig(): boolean {
++  if (isXtworkDesktop()) return false;
+   const config = resolveCloudPublicConfig();
+   if (!config.clerkPublishableKey || !config.clerkJwtTemplate || !config.relayUrl) {
+     return false;
+diff --git a/apps/web/src/components/ChatMarkdown.tsx b/apps/web/src/components/ChatMarkdown.tsx
+index c4129edc..852237c9 100644
+--- a/apps/web/src/components/ChatMarkdown.tsx
++++ b/apps/web/src/components/ChatMarkdown.tsx
+@@ -137,6 +137,7 @@ import {
+   useOpenInPreferredEditor,
+   usePreferredEditor,
+ } from "../editorPreferences";
++import { useDesktopDeveloperFeatures } from "../hooks/useDeveloperFeatures";
+ import { openInEditorMenuLabel } from "../editorLabels";
+ import { resolveDiffThemeName } from "../lib/diffRendering";
+ import { RenderErrorBoundary } from "./RenderErrorBoundary";
+@@ -666,8 +667,11 @@ function useChatMarkdownState({
+       },
+     );
+   };
+-  const { pullRequestsEnabled, issuesEnabled, availableEditors, revealInFileManager, isMacOS } =
+-    useAtomValue(markdownServerConfigFieldsAtom(environmentId));
++  const developerFeatures = useDesktopDeveloperFeatures();
++  const config = useAtomValue(markdownServerConfigFieldsAtom(environmentId));
++  const { availableEditors, revealInFileManager, isMacOS } = config;
++  const pullRequestsEnabled = developerFeatures && config.pullRequestsEnabled;
++  const issuesEnabled = developerFeatures && config.issuesEnabled;
+   const revealInFileManagerLabel =
+     revealInFileManager === undefined
+       ? undefined
+@@ -959,7 +963,7 @@ function useChatMarkdownState({
+                   environmentId,
+                   input: { cwd: (await resolveHostPath()).absolutePath, editor: "file-manager" },
+                 })
+-            : canUseShellActions
++            : developerFeatures && canUseShellActions
+               ? async () =>
+                   openInPreferredEditor(
+                     markdownFileEditorTarget(fileLinkMeta, await resolveHostPath()),
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index a731a579..48aa99cd 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -1,3 +1,7 @@
++import { registerMenuAction } from "../shortcuts/dispatcher";
++import { useOpenInPreferredEditor } from "../editorPreferences";
++import { useDesktopDeveloperFeatures } from "../hooks/useDeveloperFeatures";
++import { isXtworkDesktop, resolveVisibleProviderStatuses } from "../desktopFeatureVisibility";
+ import { m } from "../i18n/messages";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { useGT, useMessages } from "gt-react";
+@@ -444,6 +448,7 @@ const DismissedFallbackWindowSchema = Schema.NullOr(Schema.String);
+ const ignoreComposerFocus = () => {};
+ 
+ export default function ChatView(props: ChatViewProps) {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const gt = useGT();
+   const messages = useMessages();
+   const {
+@@ -457,7 +462,8 @@ export default function ChatView(props: ChatViewProps) {
+   } = props;
+   const embedded = parentPanel !== undefined;
+   const canOperateThread = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
+-  const canOperateTerminal = useEnvironmentScope(environmentId, AuthTerminalOperateScope);
++  const hasTerminalScope = useEnvironmentScope(environmentId, AuthTerminalOperateScope);
++  const canOperateTerminal = developerFeatures && hasTerminalScope;
+   const draftId = routeKind === "draft" ? props.draftId : null;
+   const handleNewThread = useNewThreadHandler();
+   const routeThreadRef = scopeThreadRef(environmentId, threadId);
+@@ -997,7 +1003,8 @@ export default function ChatView(props: ChatViewProps) {
+     (isServerThread ? activeThread?.runtimeMode : undefined) ??
+     defaultRuntimeMode;
+   const isLocalDraftThread = !isServerThread && localDraftThread !== undefined;
+-  const canCheckoutPullRequestIntoThread = canWriteSourceControl && isLocalDraftThread;
++  const canCheckoutPullRequestIntoThread =
++    developerFeatures && canWriteSourceControl && isLocalDraftThread;
+   const activeThreadId = activeThread?.id ?? null;
+   // Turn items can lag projection hydration; keep the environment locked through that gap.
+   const activeMessageCount = isServerThread
+@@ -1037,7 +1044,8 @@ export default function ChatView(props: ChatViewProps) {
+   const activeEnvironmentServerBrowser = useEnvironmentSupportsServerBrowser(
+     activeThreadRef?.environmentId ?? null,
+   );
+-  const browserAvailable = isPreviewSupportedInRuntime() || activeEnvironmentServerBrowser;
++  const browserAvailable =
++    !isXtworkDesktop() && (isPreviewSupportedInRuntime() || activeEnvironmentServerBrowser);
+   const activeThreadShell = serverThread;
+   const limitRecoveryRun =
+     serverRuntime?.status === "failed" && serverRuntime.lastErrorClass === "usage_limit"
+@@ -1107,12 +1115,24 @@ export default function ChatView(props: ChatViewProps) {
+   );
+   const canReuseTerminal = activeThreadKnownSessionsRaw !== null;
+   const previewPanelOpen = activeRightPanelKind === "preview" && browserAvailable;
++  const visibleRightPanelSurfaces = rightPanelState.surfaces.filter(
++    ({ kind }) =>
++      !isXtworkDesktop() ||
++      (kind !== "preview" &&
++        kind !== "device" &&
++        (developerFeatures ||
++          !["terminal", "pull-request", "pull-requests", "issue"].includes(kind))),
++  );
++  const activeVisibleSurface =
++    visibleRightPanelSurfaces.find((surface) => surface.id === activeRightPanelSurface?.id) ??
++    visibleRightPanelSurfaces.at(-1) ??
++    null;
+   const rightPanelOpen = rightPanelState.isOpen;
+   const { active: panelAnimationsActive, durationMs: panelAnimationDurationMs } =
+     usePanelAnimationSettings();
+   const rightPanelPresenceValue = {
+-    activeSurface: activeRightPanelSurface,
+-    surfaces: rightPanelState.surfaces,
++    activeSurface: activeVisibleSurface,
++    surfaces: visibleRightPanelSurfaces,
+   };
+   const rightPanelPresence = usePanelPresence(
+     rightPanelOpen && activeThreadRef !== null,
+@@ -1234,6 +1254,7 @@ export default function ChatView(props: ChatViewProps) {
+       activeProject,
+       environmentById.get(activeProject.environmentId)?.serverConfig?.scratchWorkspaceRoot ?? null,
+     );
++  const showThreadDetails = developerFeatures || !activeProjectIsScratch || isServerThread;
+   const logicalProjectEnvironments = useLogicalProjectEnvironments(
+     activeProject,
+     activeProjectIsScratch && draftId !== null,
+@@ -1278,12 +1299,20 @@ export default function ChatView(props: ChatViewProps) {
+         worktreePath: activeThread?.worktreePath ?? null,
+       })
+     : null;
+-  const providerStatuses = resolveProvidersForCwd(
++  const allProviderStatuses = resolveProvidersForCwd(
+     (providerEnvironmentId === undefined
+       ? undefined
+       : providersByEnvironment.get(providerEnvironmentId)) ?? EMPTY_PROVIDERS,
+     gitCwd,
+   );
++  const boundThreadInstanceId = threadHasStarted(activeThread)
++    ? (activeRuntime?.providerInstanceId ?? activeThread?.modelSelection.instanceId ?? null)
++    : null;
++  const providerStatuses = resolveVisibleProviderStatuses({
++    allProviders: allProviderStatuses,
++    developerFeatures,
++    boundInstanceId: boundThreadInstanceId,
++  });
+   const composerModelSelectionApplies = draftModelSelectionApplies(
+     { modelSelectionExplicit: composerModelSelectionExplicit },
+     threadHasStarted(activeThread),
+@@ -1301,7 +1330,7 @@ export default function ChatView(props: ChatViewProps) {
+   });
+   const modelPickerLockedProvider = supportsProviderSwitchingViaHandoff ? null : lockedProvider;
+   const pullRequestsCapabilityKnown = serverConfig !== null;
+-  const supportsPullRequests = serverConfig !== null;
++  const supportsPullRequests = developerFeatures && serverConfig !== null;
+   const attachmentEnvironmentConfig = environmentById.get(environmentId)?.serverConfig ?? null;
+   const attachmentUploadsCapabilityKnown = attachmentEnvironmentConfig !== null;
+   const supportsQuestionAttachments = attachmentEnvironmentConfig !== null;
+@@ -1699,13 +1728,16 @@ export default function ChatView(props: ChatViewProps) {
+     useAtomValue(serverEnvironment.configValueAtom(openInEnvironmentId))?.availableEditors ?? [];
+   const hostEnvironmentId = useAtomValue(hostEnvironmentIdAtom);
+   const remoteOpenState = useRemoteOpenState(openInEnvironmentId);
+-  const showOpenInPicker = shouldShowOpenInPicker({
+-    activeProjectName: activeProject?.title,
+-    activeThreadEnvironmentId: openInEnvironmentId,
+-    primaryEnvironmentId: primaryEnvironment?.environmentId ?? null,
+-    hostEnvironmentId,
+-    remoteOpenMode: remoteOpenState.mode,
+-  });
++  const openInPreferredEditor = useOpenInPreferredEditor(openInEnvironmentId, availableEditors);
++  const showOpenInPicker =
++    developerFeatures &&
++    shouldShowOpenInPicker({
++      activeProjectName: activeProject?.title,
++      activeThreadEnvironmentId: openInEnvironmentId,
++      primaryEnvironmentId: primaryEnvironment?.environmentId ?? null,
++      hostEnvironmentId,
++      remoteOpenMode: remoteOpenState.mode,
++    });
+   useOpenFavoriteEditorShortcut({
+     enabled: showOpenInPicker && !backgroundThread,
+     environmentId: openInEnvironmentId,
+@@ -1755,12 +1787,11 @@ export default function ChatView(props: ChatViewProps) {
+     activeProviderStatus,
+   );
+   const providerStatusDismissed = useProviderStatusBannerDismissed(providerStatusDismissalKey);
+-  const visibleProviderStatus = shouldShowProviderStatusBanner(
+-    activeProviderStatus,
+-    providerStatusDismissed,
+-  )
+-    ? activeProviderStatus
+-    : null;
++  const visibleProviderStatus =
++    developerFeatures &&
++    shouldShowProviderStatusBanner(activeProviderStatus, providerStatusDismissed)
++      ? activeProviderStatus
++      : null;
+   const hasTimelineTopBanner = Boolean(timelineThreadError) || visibleProviderStatus !== null;
+   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
+   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
+@@ -1802,6 +1833,7 @@ export default function ChatView(props: ChatViewProps) {
+           reportedModelSelection,
+         );
+   const showComposerContextStrip =
++    developerFeatures &&
+     !embedded &&
+     shouldShowComposerContextStrip({
+       isDraftHeroState,
+@@ -1972,11 +2004,13 @@ export default function ChatView(props: ChatViewProps) {
+     scripts: activeProjectScripts,
+     settings,
+   });
+-  const canOperatePreview = useEnvironmentScope(
++  const hasPreviewScope = useEnvironmentScope(
+     activeThreadRef?.environmentId ?? null,
+     AuthPreviewOperateScope,
+   );
++  const canOperatePreview = !isXtworkDesktop() && hasPreviewScope;
+   const shownPreviewMiniPlayer =
++    !isXtworkDesktop() &&
+     activeThreadRef &&
+     activePreviewMiniPlayer &&
+     previewMiniPlayerVisible &&
+@@ -2007,7 +2041,7 @@ export default function ChatView(props: ChatViewProps) {
+       threadPanelPresentation,
+     ),
+   );
+-  const supportsThreadPullRequests = serverConfig !== null;
++  const supportsThreadPullRequests = developerFeatures && serverConfig !== null;
+   const visiblePullRequests = visibleThreadPullRequests(
+     (activeThreadShell ?? activeThread)?.pullRequests ?? [],
+   );
+@@ -2016,7 +2050,7 @@ export default function ChatView(props: ChatViewProps) {
+     isServerThread && supportsThreadPullRequests && visiblePullRequestCount > 0;
+   const linkedItemsSurfaceAvailable =
+     pullRequestsSurfaceAvailable ||
+-    (isServerThread && (activeThreadShell?.issues?.length ?? 0) > 0);
++    (developerFeatures && isServerThread && (activeThreadShell?.issues?.length ?? 0) > 0);
+   const { state: deviceState, loaded: deviceStateLoaded } = useDeviceState(
+     activeThreadRef?.environmentId ?? null,
+   );
+@@ -2585,7 +2619,7 @@ export default function ChatView(props: ChatViewProps) {
+   const toggleKeepFullHistoryStable = useStableCallback(toggleKeepFullHistory);
+   const armFreshSessionStable = useStableCallback(() => armFreshSession(routeThreadKey));
+   const handleRestoreThreadBranch = () => {
+-    if (!canWriteSourceControl) return;
++    if (!developerFeatures || !canWriteSourceControl) return;
+     if (gitStatusQuery.data?.hasWorkingTreeChanges) {
+       if (activeThreadKey !== null) openBranchRestoreConfirm(activeThreadKey);
+       return;
+@@ -2693,7 +2727,12 @@ export default function ChatView(props: ChatViewProps) {
+       freshSessionAvailable && freshSessionArmed && activePendingApproval === null
+         ? [freshSessionBannerItem(() => disarmFreshSession(routeThreadKey), messages)]
+         : [];
+-    if (!localCheckoutBranchMismatch || !showBranchMismatchBanner || !activeBranchMismatchKey) {
++    if (
++      !developerFeatures ||
++      !localCheckoutBranchMismatch ||
++      !showBranchMismatchBanner ||
++      !activeBranchMismatchKey
++    ) {
+       return [
+         ...feedbackBannerItems,
+         ...fallbackItems,
+@@ -2774,6 +2813,36 @@ export default function ChatView(props: ChatViewProps) {
+     }
+   });
+ 
++  useEffect(() => {
++    if (!developerFeatures || !isXtworkDesktop() || embedded || backgroundThread) return;
++    const dispose = [
++      registerMenuAction("terminal.toggle", () => {
++        if (canOperateTerminal) toggleTerminalVisibilityStable();
++      }),
++      registerMenuAction("editor.openFavorite", () => {
++        if (showOpenInPicker && gitCwd) void openInPreferredEditor(gitCwd);
++      }),
++      registerMenuAction("composer.branch", () => {
++        if (showComposerContextStrip) branchToolbarRef.current?.openBranchPicker();
++      }),
++      registerMenuAction("composer.workspace", () => {
++        if (showComposerContextStrip) composerRef.current?.openControl("composer.workspace");
++      }),
++    ];
++    return () => dispose.forEach((unregister) => unregister());
++  }, [
++    developerFeatures,
++    embedded,
++    backgroundThread,
++    canOperateTerminal,
++    toggleTerminalVisibilityStable,
++    showOpenInPicker,
++    gitCwd,
++    openInPreferredEditor,
++    showComposerContextStrip,
++    composerRef,
++  ]);
++
+   useChatShortcuts({
+     enabled: activeThreadId !== null && !backgroundThread,
+     embedded,
+@@ -2789,7 +2858,7 @@ export default function ChatView(props: ChatViewProps) {
+       focusComposerStable();
+     },
+     commands: {
+-      ...terminalShortcuts,
++      ...(developerFeatures ? terminalShortcuts : {}),
+       ...rightPanelShortcuts,
+       ...threadLifecycleShortcuts,
+       "thread.copyReference": ({ event }) => {
+@@ -3311,7 +3380,7 @@ export default function ChatView(props: ChatViewProps) {
+             ? addPullRequestsSurfaceStable
+             : undefined,
+       }}
+-      issuesSupported={serverConfig?.environment.capabilities.issues === true}
++      issuesSupported={developerFeatures && serverConfig?.environment.capabilities.issues === true}
+       files={{
+         projectId: activeProject?.id,
+         projectName: activeProject?.title ?? null,
+@@ -3324,6 +3393,7 @@ export default function ChatView(props: ChatViewProps) {
+     />
+   ) : null;
+   const panelToggleControlProps = {
++    showTerminalControl: developerFeatures,
+     terminalAvailable: activeProject !== null,
+     terminalOpen: terminalUiState.terminalOpen,
+     terminalShortcutLabel: shortcutLabelForCommand(keybindings, "terminal.toggle"),
+@@ -3341,7 +3411,7 @@ export default function ChatView(props: ChatViewProps) {
+   const panelToggleControls = (
+     <PanelLayoutControls
+       {...panelToggleControlProps}
+-      showThreadPanelControl={!inlineRightPanelOwnsTitleBar}
++      showThreadPanelControl={showThreadDetails && !inlineRightPanelOwnsTitleBar}
+     />
+   );
+   const threadPanelHeaderControl = <ThreadPanelHeaderControl {...panelToggleControlProps} />;
+@@ -3367,7 +3437,7 @@ export default function ChatView(props: ChatViewProps) {
+       ref={setWorkspaceLayoutElement}
+       className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background"
+     >
+-      {embedded ? null : (
++      {embedded || isXtworkDesktop() ? null : (
+         <DeviceSetupDialogHost
+           threadKey={activeThreadKey}
+           threadRef={activeThreadRef}
+@@ -3409,7 +3479,7 @@ export default function ChatView(props: ChatViewProps) {
+               />
+             ) : null}
+             {!rightPanelControlsAtRoot && !rightPanelControlsInPanel ? panelLayoutControls : null}
+-            {inlineRightPanelOwnsTitleBar ? threadPanelHeaderControl : null}
++            {showThreadDetails && inlineRightPanelOwnsTitleBar ? threadPanelHeaderControl : null}
+             <ChatHeader
+               activeThreadEnvironmentId={activeThread.environmentId}
+               activeThreadId={activeThread.id}
+@@ -3488,7 +3558,7 @@ export default function ChatView(props: ChatViewProps) {
+                   citationHistory={citationHistory}
+                   onCiteAssistantText={citeAssistantTextStable}
+                   onReplyToResponse={replyToResponseStable}
+-                  {...(activeProject
++                  {...(activeProject && canOperateTerminal
+                     ? { onRunShellCommand: parentPanel?.runShellCommand ?? runShellCommandStable }
+                     : {})}
+                   isWorking={isWorking}
+@@ -3924,84 +3994,90 @@ export default function ChatView(props: ChatViewProps) {
+ 
+             {embedded ? null : (
+               <>
+-                <BranchRestoreConfirmHost
+-                  threadKey={activeThreadKey}
+-                  threadBranch={localCheckoutBranchMismatch?.threadBranch ?? ""}
+-                  canWriteSourceControl={canWriteSourceControl}
+-                  onConfirm={handleSwitchCheckoutToThreadStable}
+-                />
++                {developerFeatures ? (
++                  <BranchRestoreConfirmHost
++                    threadKey={activeThreadKey}
++                    threadBranch={localCheckoutBranchMismatch?.threadBranch ?? ""}
++                    canWriteSourceControl={canWriteSourceControl}
++                    onConfirm={handleSwitchCheckoutToThreadStable}
++                  />
++                ) : null}
+ 
+-                <ThreadDetailsPanel
+-                  anchor={threadPanelPopoverAnchorRef}
+-                  handle={threadPanelPopoverHandle}
+-                  forceNewWorktree={multipleModelSelections !== null}
+-                  environmentId={activeThread.environmentId}
+-                  threadId={activeThread.id}
+-                  projectId={activeThread.projectId}
+-                  worktreePath={activeThread.worktreePath}
+-                  isServerThread={isServerThread}
+-                  {...(draftId ? { draftId } : {})}
+-                  composerDraftTarget={composerDraftTarget}
+-                  activeProjectName={activeProject?.title}
+-                  activeProjectScripts={activeProject ? activeProjectScripts : undefined}
+-                  preferredScriptId={
+-                    activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
+-                  }
+-                  keybindings={keybindings}
+-                  availableEditors={availableEditors}
+-                  showOpenInPicker={showOpenInPicker}
+-                  openInShortcutEnabled={
+-                    !(
+-                      rightPanelOpen &&
+-                      renderedRightPanelSurface?.kind === "file" &&
+-                      renderedRightPanelSurface.attachment === undefined
+-                    )
+-                  }
+-                  gitCwd={gitCwd}
+-                  workspaceMutationId={workspaceMutationId}
+-                  isGitRepo={isGitRepo}
+-                  envLocked={envLocked}
+-                  availableEnvironments={logicalProjectEnvironments}
+-                  autoEnvironmentLabel={autoEnvironmentLabel}
+-                  onAutoEnvironment={
+-                    draftId &&
+-                    !envLocked &&
+-                    canAutoBalanceEnvironments &&
+-                    loadBalancingSettings.loadBalancingEnabled
+-                      ? onAutoEnvironmentStable
+-                      : undefined
+-                  }
+-                  {...(canChangeEnvironment
+-                    ? { onEnvironmentChange: onEnvironmentChangeStable }
+-                    : {})}
+-                  onEnvModeChange={onEnvModeChangeStable}
+-                  envMode={envMode}
+-                  {...(canOverrideServerThreadEnvMode
+-                    ? {
+-                        activeThreadBranchOverride: activeThreadBranch,
+-                        onActiveThreadBranchOverrideChange: setPendingServerThreadBranch,
+-                      }
+-                    : {})}
+-                  startFromOrigin={startFromOrigin}
+-                  onStartFromOriginChange={onStartFromOriginChange}
+-                  {...(canCheckoutPullRequestIntoThread
+-                    ? { onCheckoutPullRequestRequest: openPullRequestDialogStable }
+-                    : {})}
+-                  onComposerFocusRequest={scheduleComposerFocusStable}
+-                  {...(isServerThread && isGitRepo
+-                    ? { onOpenChanges: openChangesFromThreadPanelStable }
+-                    : {})}
+-                  onRunProjectScript={runProjectScriptStable}
+-                  onAddProjectScript={saveProjectScriptStable}
+-                  onUpdateProjectScript={updateProjectScriptStable}
+-                  onDeleteProjectScript={deleteProjectScriptStable}
+-                  usage={{
+-                    providerInstanceId: activeProviderInstanceId,
+-                    providers: providerStatuses,
+-                    sources: serverConfig?.usageLimitSources ?? EMPTY_USAGE_LIMIT_SOURCES,
+-                    contextWindow: activeContextWindow,
+-                  }}
+-                />
++                {showThreadDetails ? (
++                  <ThreadDetailsPanel
++                    anchor={threadPanelPopoverAnchorRef}
++                    handle={threadPanelPopoverHandle}
++                    forceNewWorktree={multipleModelSelections !== null}
++                    environmentId={activeThread.environmentId}
++                    threadId={activeThread.id}
++                    projectId={activeThread.projectId}
++                    worktreePath={activeThread.worktreePath}
++                    isServerThread={isServerThread}
++                    {...(draftId ? { draftId } : {})}
++                    composerDraftTarget={composerDraftTarget}
++                    activeProjectName={activeProject?.title}
++                    activeProjectScripts={activeProject ? activeProjectScripts : undefined}
++                    preferredScriptId={
++                      activeProject
++                        ? (lastInvokedScriptByProjectId[activeProject.id] ?? null)
++                        : null
++                    }
++                    keybindings={keybindings}
++                    availableEditors={developerFeatures ? availableEditors : []}
++                    showOpenInPicker={showOpenInPicker}
++                    openInShortcutEnabled={
++                      !(
++                        rightPanelOpen &&
++                        renderedRightPanelSurface?.kind === "file" &&
++                        renderedRightPanelSurface.attachment === undefined
++                      )
++                    }
++                    gitCwd={gitCwd}
++                    workspaceMutationId={workspaceMutationId}
++                    isGitRepo={isGitRepo}
++                    envLocked={envLocked}
++                    availableEnvironments={logicalProjectEnvironments}
++                    autoEnvironmentLabel={autoEnvironmentLabel}
++                    onAutoEnvironment={
++                      draftId &&
++                      !envLocked &&
++                      canAutoBalanceEnvironments &&
++                      loadBalancingSettings.loadBalancingEnabled
++                        ? onAutoEnvironmentStable
++                        : undefined
++                    }
++                    {...(canChangeEnvironment
++                      ? { onEnvironmentChange: onEnvironmentChangeStable }
++                      : {})}
++                    onEnvModeChange={onEnvModeChangeStable}
++                    envMode={envMode}
++                    {...(canOverrideServerThreadEnvMode
++                      ? {
++                          activeThreadBranchOverride: activeThreadBranch,
++                          onActiveThreadBranchOverrideChange: setPendingServerThreadBranch,
++                        }
++                      : {})}
++                    startFromOrigin={startFromOrigin}
++                    onStartFromOriginChange={onStartFromOriginChange}
++                    {...(canCheckoutPullRequestIntoThread
++                      ? { onCheckoutPullRequestRequest: openPullRequestDialogStable }
++                      : {})}
++                    onComposerFocusRequest={scheduleComposerFocusStable}
++                    {...(isServerThread && isGitRepo
++                      ? { onOpenChanges: openChangesFromThreadPanelStable }
++                      : {})}
++                    onRunProjectScript={runProjectScriptStable}
++                    onAddProjectScript={saveProjectScriptStable}
++                    onUpdateProjectScript={updateProjectScriptStable}
++                    onDeleteProjectScript={deleteProjectScriptStable}
++                    usage={{
++                      providerInstanceId: activeProviderInstanceId,
++                      providers: providerStatuses,
++                      sources: serverConfig?.usageLimitSources ?? EMPTY_USAGE_LIMIT_SOURCES,
++                      contextWindow: activeContextWindow,
++                    }}
++                  />
++                ) : null}
+ 
+                 <PullRequestThreadDialogHost
+                   threadKey={activeThreadKey}
+@@ -4015,7 +4091,7 @@ export default function ChatView(props: ChatViewProps) {
+           </ThreadFindCanvas>
+         </div>
+ 
+-        {embedded ? null : (
++        {embedded || !developerFeatures ? null : (
+           <ChatTerminalDrawers
+             activeThreadKey={activeThreadKey}
+             activeTerminalOpen={Boolean(terminalUiState.terminalOpen)}
+@@ -4087,7 +4163,7 @@ export default function ChatView(props: ChatViewProps) {
+           filesAvailable={activeProject !== null}
+           pullRequestAvailable={pullRequestSurfaceAvailable}
+           pullRequestsAvailable={linkedItemsSurfaceAvailable}
+-          deviceAvailable={activeThreadRef !== null}
++          deviceAvailable={!isXtworkDesktop() && activeThreadRef !== null}
+           sideChatAvailable={sideChat.available}
+           sideChatDisabledReason={sideChatDisabledReason}
+         >
+@@ -4101,7 +4177,7 @@ export default function ChatView(props: ChatViewProps) {
+         worktreePath={activeThread?.worktreePath ?? null}
+         onConfirm={onConfirmRevertStable}
+       />
+-      {embedded ? null : <LinkPullRequestDialogHost />}
++      {embedded || !developerFeatures ? null : <LinkPullRequestDialogHost />}
+       <ThreadVisitWatermark threadRef={routeThreadRef} />
+       <ExpandedImageDialogHost threadKey={routeThreadKey} />
+     </div>
+diff --git a/apps/web/src/components/CommandPalette.tsx b/apps/web/src/components/CommandPalette.tsx
+index 0ab99ce8..d442ccf9 100644
+--- a/apps/web/src/components/CommandPalette.tsx
++++ b/apps/web/src/components/CommandPalette.tsx
+@@ -1,3 +1,6 @@
++import { dispatchMenuAction } from "../shortcuts/dispatcher";
++import { useDesktopDeveloperFeatures } from "../hooks/useDeveloperFeatures";
++import { isXtworkDesktop } from "../desktopFeatureVisibility";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { decodeMsg, msg, T, useGT, useMessages, Var } from "gt-react";
+ import { m, type MessageResolver } from "../i18n/messages";
+@@ -489,6 +492,7 @@ function OpenCommandPaletteDialog(props: {
+   const refreshProviders = useAtomCommand(serverEnvironment.refreshProviders, {
+     reportFailure: false,
+   });
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const { environments } = useEnvironments();
+   const desktopLocalBootstraps = useDesktopLocalBootstraps();
+   const primaryEnvironmentId = usePrimaryEnvironmentId();
+@@ -1094,6 +1098,9 @@ function OpenCommandPaletteDialog(props: {
+       },
+     ];
+ 
++    if (!developerFeatures)
++      return [{ value: `sources:${environmentId}`, label: gt("Sources"), items: sourceItems }];
++
+     if (newProjectsRootFor(environmentId) !== null) {
+       sourceItems.unshift({
+         kind: "action",
+@@ -1264,7 +1271,7 @@ function OpenCommandPaletteDialog(props: {
+   const openAddProjectFlow = () => {
+     switch (addProjectEntry.kind) {
+       case "connect-environment":
+-        openConnectionSettings();
++        if (!isXtworkDesktop()) openConnectionSettings();
+         return;
+       case "choose-environment":
+         pushPaletteView({
+@@ -1283,6 +1290,7 @@ function OpenCommandPaletteDialog(props: {
+   const addProjectEntryGroups = (): ReadonlyArray<CommandPaletteGroup> => {
+     switch (addProjectEntry.kind) {
+       case "connect-environment":
++        if (isXtworkDesktop()) return [];
+         return [
+           {
+             value: ADD_PROJECT_ENTRY_GROUP,
+@@ -1381,7 +1389,7 @@ function OpenCommandPaletteDialog(props: {
+     });
+   }
+ 
+-  if (triageEnvironmentId !== null && canTriage) {
++  if (!isXtworkDesktop() && triageEnvironmentId !== null && canTriage) {
+     actionItems.push({
+       kind: "action",
+       value: "action:triage",
+@@ -1407,7 +1415,7 @@ function OpenCommandPaletteDialog(props: {
+     });
+   }
+ 
+-  if (activeThreadPreviewOpen && previewBridge) {
++  if (!isXtworkDesktop() && activeThreadPreviewOpen && previewBridge) {
+     actionItems.push({
+       kind: "action",
+       value: "find-in-browser-page",
+@@ -1491,6 +1499,7 @@ function OpenCommandPaletteDialog(props: {
+   }
+ 
+   if (
++    developerFeatures &&
+     activeThread !== null &&
+     threadPullRequestLinkMode(activeThreadServerConfig?.environment.capabilities) !== "unsupported"
+   ) {
+@@ -1597,7 +1606,7 @@ function OpenCommandPaletteDialog(props: {
+     },
+   });
+ 
+-  if (newProjectEnvironmentOptions.length > 0) {
++  if (developerFeatures && newProjectEnvironmentOptions.length > 0) {
+     actionItems.push({
+       kind: "action",
+       value: "action:new-project",
+@@ -1614,23 +1623,28 @@ function OpenCommandPaletteDialog(props: {
+   const addProjectAction: CommandPaletteActionItem = {
+     kind: "action",
+     value: "action:add-project",
++    disabled: isXtworkDesktop() && addProjectEntry.kind === "connect-environment",
+     searchTerms: [
+       "add project",
+       "folder",
+       "directory",
+       "browse",
+-      "clone",
+-      "remote",
+-      "repository",
+-      "repo",
+-      "git",
+-      ...sourceControlClients.definitions.flatMap((definition) =>
+-        definition.pickerLabel
+-          .toLowerCase()
+-          .split(/[^a-z0-9]+/u)
+-          .filter(Boolean),
+-      ),
+-      "url",
++      ...(developerFeatures
++        ? [
++            "clone",
++            "remote",
++            "repository",
++            "repo",
++            "git",
++            ...sourceControlClients.definitions.flatMap((definition) =>
++              definition.pickerLabel
++                .toLowerCase()
++                .split(/[^a-z0-9]+/u)
++                .filter(Boolean),
++            ),
++            "url",
++          ]
++        : []),
+       "environment",
+     ],
+     title: gt("Add project"),
+@@ -1642,7 +1656,7 @@ function OpenCommandPaletteDialog(props: {
+   };
+   actionItems.push(addProjectAction);
+ 
+-  if (wslAddProjectEnvironmentOption) {
++  if (!isXtworkDesktop() && wslAddProjectEnvironmentOption) {
+     actionItems.push({
+       kind: "action",
+       value: "action:add-project:wsl-folder",
+@@ -1657,12 +1671,31 @@ function OpenCommandPaletteDialog(props: {
+     });
+   }
+ 
++  if (isXtworkDesktop() && developerFeatures && paletteRouteTarget !== null) {
++    for (const [command, title] of [
++      ["terminal.toggle", gt("Toggle terminal")],
++      ["editor.openFavorite", gt("Open in editor")],
++      ["composer.branch", gt("Choose a Git branch")],
++      ["composer.workspace", gt("Choose local folder or worktree")],
++    ] as const) {
++      actionItems.push({
++        kind: "action",
++        value: `action:${command}`,
++        title,
++        searchTerms: [command],
++        shortcutCommand: command,
++        icon: <SettingsIcon className={ITEM_ICON_CLASS} />,
++        run: async () => dispatchMenuAction(command),
++      });
++    }
++  }
++
+   actionItems.push(changeThemeItem);
+   actionItems.push(changeAppearanceItem);
+ 
+   actionItems.push(themeEditorItem);
+ 
+-  if (environments.some((environment) => environment.serverConfig !== null)) {
++  if (developerFeatures && environments.some((environment) => environment.serverConfig !== null)) {
+     actionItems.push({
+       kind: "action",
+       value: "action:pull-requests",
+@@ -1691,6 +1724,7 @@ function OpenCommandPaletteDialog(props: {
+   }
+ 
+   if (
++    developerFeatures &&
+     environments.some(
+       (environment) => environment.serverConfig?.environment.capabilities.issues === true,
+     )
+@@ -1707,33 +1741,34 @@ function OpenCommandPaletteDialog(props: {
+     });
+   }
+ 
+-  actionItems.push({
+-    kind: "action",
+-    value: "action:use-in-another-app",
+-    searchTerms: [
+-      "mcp",
+-      "connector",
+-      "another app",
+-      "poke",
+-      "claude",
+-      "chatgpt",
+-      "grok",
+-      "muse",
+-      "instinct",
+-      "openclaw",
+-      "hermes",
+-    ],
+-    title: gt("Use T3 Code in another app (MCP)"),
+-    icon: <PlugIcon className={ITEM_ICON_CLASS} />,
+-    run: async () => {
+-      openUseInAnotherApp(
+-        currentProjectEnvironmentId ??
+-          (paletteRouteTarget?.kind === "server"
+-            ? paletteRouteTarget.threadRef.environmentId
+-            : null),
+-      );
+-    },
+-  });
++  if (developerFeatures)
++    actionItems.push({
++      kind: "action",
++      value: "action:use-in-another-app",
++      searchTerms: [
++        "mcp",
++        "connector",
++        "another app",
++        "poke",
++        "claude",
++        "chatgpt",
++        "grok",
++        "muse",
++        "instinct",
++        "openclaw",
++        "hermes",
++      ],
++      title: gt("Use T3 Code in another app (MCP)"),
++      icon: <PlugIcon className={ITEM_ICON_CLASS} />,
++      run: async () => {
++        openUseInAnotherApp(
++          currentProjectEnvironmentId ??
++            (paletteRouteTarget?.kind === "server"
++              ? paletteRouteTarget.threadRef.environmentId
++              : null),
++        );
++      },
++    });
+ 
+   actionItems.push({
+     kind: "action",
+diff --git a/apps/web/src/components/DiffPanel.tsx b/apps/web/src/components/DiffPanel.tsx
+index 77200799..e6f98b4a 100644
+--- a/apps/web/src/components/DiffPanel.tsx
++++ b/apps/web/src/components/DiffPanel.tsx
+@@ -32,6 +32,7 @@ import { type MouseEvent, useEffect, useRef, useState } from "react";
+ import { useCodeViewFileReveal } from "./diffs/useCodeViewFileReveal";
+ import { useCodeViewScrollRestore } from "./diffs/useCodeViewScrollRestore";
+ import { useFilesystemReadAccess } from "~/state/filesystem";
++import { useDesktopDeveloperFeatures } from "../hooks/useDeveloperFeatures";
+ import { useOpenInPreferredEditor } from "../editorPreferences";
+ import { useFileContextMenuHandler } from "../fileContextMenu";
+ import { type DraftId } from "../composerDraftStore";
+@@ -265,6 +266,7 @@ export default function DiffPanel({
+     serverEnvironment.configValueAtom(activeThread?.environmentId ?? null),
+   );
+   const onFileContextMenu = useFileContextMenuHandler(activeThread?.environmentId ?? null);
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const openInPreferredEditor = useOpenInPreferredEditor(
+     activeThread?.environmentId ?? null,
+     serverConfig?.availableEditors ?? [],
+@@ -763,6 +765,7 @@ export default function DiffPanel({
+       activeCwd,
+       repositoryRoot: diffPathRepositoryRoot,
+       openInEditor: (targetPath) => {
++        if (!developerFeatures) return;
+         void (async () => {
+           const result = await openInPreferredEditor(targetPath);
+           if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+diff --git a/apps/web/src/components/RightPanelTabs.tsx b/apps/web/src/components/RightPanelTabs.tsx
+index 2ce8f22f..5cf543ca 100644
+--- a/apps/web/src/components/RightPanelTabs.tsx
++++ b/apps/web/src/components/RightPanelTabs.tsx
+@@ -1,3 +1,5 @@
++import { useDesktopDeveloperFeatures } from "../hooks/useDeveloperFeatures";
++import { isXtworkDesktop } from "../desktopFeatureVisibility";
+ import { msg, T, useGT, useMessages } from "gt-react";
+ import { m, type MessageResolver } from "../i18n/messages";
+ import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
+@@ -323,6 +325,15 @@ function SurfaceMenuItem(props: {
+   return <DisabledReasonTooltip reason={props.disabledReason} trigger={item} />;
+ }
+ 
++function showSurfaceAction(action: { readonly label: string }, developerFeatures: boolean) {
++  return (
++    !isXtworkDesktop() ||
++    (action.label !== "Browser" &&
++      action.label !== "Device" &&
++      (developerFeatures || !["Terminal", "Pull request", "Linked items"].includes(action.label)))
++  );
++}
++
+ function RightPanelEmptyState(props: {
+   onAddBrowser: () => void;
+   onAddBrowserInProfile: (profileId: string) => void;
+@@ -349,6 +360,7 @@ function RightPanelEmptyState(props: {
+   const messages = useMessages();
+   const [highlight, setHighlight] = useState(-1);
+ 
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const actions = [
+     {
+       label: msg("Browser"),
+@@ -425,7 +437,8 @@ function RightPanelEmptyState(props: {
+ 
+   type SurfaceAction = (typeof actions)[number];
+ 
+-  const availableActions = actions.filter((action) => action.available);
++  const visibleActions = actions.filter((action) => showSurfaceAction(action, developerFeatures));
++  const availableActions = visibleActions.filter((action) => action.available);
+   const highlightIndex =
+     availableActions.length === 0 ? -1 : Math.min(highlight, availableActions.length - 1);
+ 
+@@ -501,7 +514,7 @@ function RightPanelEmptyState(props: {
+           <T>Open a surface</T>
+         </h3>
+         <div className="flex flex-col gap-0.5">
+-          {actions.map((action) =>
++          {visibleActions.map((action) =>
+             action.available ? (
+               <div
+                 key={action.label}
+@@ -1168,7 +1181,8 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
+     });
+   };
+ 
+-  const addSurfaceActions = [
++  const developerFeatures = useDesktopDeveloperFeatures();
++  const allAddSurfaceActions = [
+     {
+       label: msg("Browser"),
+       icon: Globe2,
+@@ -1240,6 +1254,10 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
+       : []),
+   ] as const;
+ 
++  const addSurfaceActions = allAddSurfaceActions.filter((action) =>
++    showSurfaceAction(action, developerFeatures),
++  );
++
+   const handleAddSurfaceMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+     const action = surfaceShortcutActionForKey(addSurfaceActions, event.nativeEvent);
+     if (!action) return;
+diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
+index 31b33d1a..51462f2b 100644
+--- a/apps/web/src/components/chat/ChatComposer.tsx
++++ b/apps/web/src/components/chat/ChatComposer.tsx
+@@ -1,3 +1,5 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
++import { showAssistantModelPicker } from "../../desktopFeatureVisibility";
+ import { copySnapshot } from "./copySnapshot";
+ import { VoiceInputSetup } from "./VoiceInputSetup";
+ import { useComposerTypingGuard } from "./useComposerTypingGuard";
+@@ -495,6 +497,7 @@ const NO_PROVIDER_SKILLS: ServerProvider["skills"] = [];
+ const NO_PROVIDER_SLASH_COMMANDS: ServerProvider["slashCommands"] = [];
+ 
+ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps) {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const gt = useGT();
+   const m = useMessages();
+   const {
+@@ -916,6 +919,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+     lockedInstanceId:
+       activeThread?.runtime?.providerInstanceId ?? activeThreadModelSelection?.instanceId,
+   });
++  const showModelPicker = showAssistantModelPicker(providerInstanceEntries, developerFeatures);
+   const noProviderAvailable =
+     selectedProviderEntry === undefined && multipleModelSelections === null;
+   const providerCatalogPending = noProviderAvailable && !providerCatalogKnown;
+@@ -1029,6 +1033,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+   const [isComposerFooterCompact, setIsComposerFooterCompact] = useState(false);
+   const [isComposerPrimaryActionsCompact, setIsComposerPrimaryActionsCompact] = useState(false);
+   const [isComposerModelPickerOpen, setIsComposerModelPickerOpen] = useState(false);
++  const effectiveModelPickerOpen = showModelPicker && isComposerModelPickerOpen;
+   const isMobileViewport = useMediaQuery("max-sm");
+   const isSoftwareKeyboardOpen = useSoftwareKeyboardOpen();
+   const [isComposerFocused, setIsComposerFocused] = useState(false);
+@@ -1164,6 +1169,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+     selectedProviderSlashCommands,
+     showSkillsInSlashMenu: settings.showSkillsInSlashMenu,
+     workspaceSkillsScanning,
++    showModelPicker,
+     questionAttachmentTarget,
+     modelMentions: { instanceEntries: providerInstanceEntries, modelOptionsByInstance },
+   });
+@@ -1937,7 +1943,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+     speech: speechInput,
+     disabled: dictationDisabled,
+     terminalOpen,
+-    modelPickerOpen: isComposerModelPickerOpen,
++    modelPickerOpen: effectiveModelPickerOpen,
+     ...(backgroundThread ? { targetRef: composerFormRef } : {}),
+   });
+ 
+@@ -2003,6 +2009,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+     }
+     if (item.type === "slash-command") {
+       if (item.command === "model") {
++        if (!showModelPicker) return;
+         const applied = applyPromptReplacement(trigger.rangeStart, trigger.rangeEnd, "", {
+           expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd),
+           focusEditorAfterReplace: false,
+@@ -2493,7 +2500,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+   // The collapsed mobile web composer keeps a second controls row inside the card.
+   const showInlineRestingControls = isComposerCollapsedMobile;
+   const composerControlsHidden = showInlineRestingControls && !restingControlsVisible;
+-  if (composerControlsHidden && isComposerModelPickerOpen) {
++  if ((!showModelPicker || composerControlsHidden) && isComposerModelPickerOpen) {
+     setIsComposerModelPickerOpen(false);
+   }
+   const collapsedComposerImagePreviews =
+@@ -2569,7 +2576,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+       keybindings={keybindings}
+       modelOptionsByInstance={modelOptionsByInstance}
+       terminalOpen={terminalOpen}
+-      modelPickerOpen={isComposerModelPickerOpen}
++      showModelPicker={showModelPicker}
++      modelPickerOpen={effectiveModelPickerOpen}
+       onModelPickerOpenChange={setIsComposerModelPickerOpen}
+       modelPickerIconClassName={composerProviderState.modelPickerIconClassName}
+       getModelDisabledReason={getModelDisabledReason}
+@@ -3109,6 +3117,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+   }, []);
+ 
+   const openModelPicker = () => {
++    if (!showModelPicker) return;
+     if (composerControlsHidden) {
+       if (composerBlurFrameRef.current !== null) {
+         window.cancelAnimationFrame(composerBlurFrameRef.current);
+@@ -3199,7 +3208,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+         }
+       },
+       toggleModelPicker: () => {
+-        if (isComposerModelPickerOpen) {
++        if (effectiveModelPickerOpen) {
+           setIsComposerModelPickerOpen(false);
+         } else {
+           openModelPickerStable();
+@@ -3227,7 +3236,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+         trigger.click();
+       },
+       compactContext: compactThreadContextStable,
+-      isModelPickerOpen: () => isComposerModelPickerOpen,
++      isModelPickerOpen: () => effectiveModelPickerOpen,
+       isCaretAtStart: () => {
+         const range = composerEditorRef.current?.readSelectionRange();
+         return range !== undefined && range.start === 0 && range.end === 0;
+@@ -3376,7 +3385,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+       pendingUserInputs.length,
+       projectSelectionRequired,
+       applyPromptReplacementStable,
+-      isComposerModelPickerOpen,
++      effectiveModelPickerOpen,
+       openModelPickerStable,
+       readComposerSnapshotStable,
+       resetComposerTrigger,
+@@ -3574,7 +3583,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+                       theme={resolvedTheme}
+                     />
+                   ) : showProviderUnavailable ? (
+-                    gt("Enable a provider in Settings")
++                    developerFeatures ? (
++                      gt("Enable a provider in Settings")
++                    ) : (
++                      gt("Assistant unavailable")
++                    )
+                   ) : (
+                     gt("Ask anything...")
+                   )}
+@@ -3765,7 +3778,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
+                           : projectSelectionRequired
+                             ? gt("Choose a project above to start a thread")
+                             : showProviderUnavailable
+-                              ? gt("Enable a provider in Settings to send a message")
++                              ? developerFeatures
++                                ? gt("Enable a provider in Settings to send a message")
++                                : gt("Assistant unavailable")
+                               : (offeredPromptSuggestion ?? m(DEFAULT_COMPOSER_PLACEHOLDER))
+                     }
+                     placeholderSuffix={
+diff --git a/apps/web/src/components/chat/ComposerControlsBar.tsx b/apps/web/src/components/chat/ComposerControlsBar.tsx
+index 0688cdfe..1f34def9 100644
+--- a/apps/web/src/components/chat/ComposerControlsBar.tsx
++++ b/apps/web/src/components/chat/ComposerControlsBar.tsx
+@@ -1,3 +1,4 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import type { ChatComposerProps } from "./ChatComposer";
+ import type { PromptUltrathink } from "./TraitsPicker";
+ import type { ProviderInstanceEntry } from "../../providerInstances";
+@@ -83,6 +84,7 @@ export function ComposerControlsBar(props: {
+   keybindings: ChatComposerProps["keybindings"];
+   modelOptionsByInstance: ReadonlyMap<ProviderInstanceId, ReadonlyArray<AppModelOption>>;
+   terminalOpen: boolean;
++  showModelPicker?: boolean;
+   modelPickerOpen: boolean;
+   onModelPickerOpenChange: (open: boolean) => void;
+   modelPickerIconClassName: string | undefined;
+@@ -147,6 +149,7 @@ export function ComposerControlsBar(props: {
+   });
+   const controlSize = composerControlsCollapsed ? "xs" : "sm";
+   const gt = useGT();
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const m = useMessages();
+   const applyThreadModelPick = useApplyThreadModelPick();
+   const applyRouteThreadModelPick = useStableCallback(() => applyThreadModelPick(routeThreadRef));
+@@ -251,7 +254,7 @@ export function ComposerControlsBar(props: {
+   return showProviderUnavailable ? (
+     <ComposerControl
+       type="button"
+-      disabled={!providerSetupInstanceId}
++      disabled={!developerFeatures || !providerSetupInstanceId}
+       onClick={() => {
+         if (providerSetupInstanceId) {
+           onOpenProviderSetup(providerSetupInstanceId);
+@@ -261,11 +264,15 @@ export function ComposerControlsBar(props: {
+       className="shrink-0"
+     >
+       <CircleAlertIcon className="size-4" />
+-      {providerSetupInstanceId ? gt("Open provider settings") : gt("No provider available")}
++      {!developerFeatures
++        ? gt("Assistant unavailable")
++        : providerSetupInstanceId
++          ? gt("Open provider settings")
++          : gt("No provider available")}
+     </ComposerControl>
+   ) : (
+     <>
+-      {composerModelPicker}
++      {props.showModelPicker === false ? null : composerModelPicker}
+ 
+       <>
+         {restingBlockDefs.map((def, index) => {
+diff --git a/apps/web/src/components/chat/OpenInPickerShortcut.ts b/apps/web/src/components/chat/OpenInPickerShortcut.ts
+index 3ba5b460..cb78406a 100644
+--- a/apps/web/src/components/chat/OpenInPickerShortcut.ts
++++ b/apps/web/src/components/chat/OpenInPickerShortcut.ts
+@@ -1,3 +1,5 @@
++import { readDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
++import { isXtworkDesktop } from "../../desktopFeatureVisibility";
+ import {
+   buildRemoteOpenUrl,
+   type EditorId,
+@@ -29,7 +31,7 @@ export function registerOpenFavoriteEditorCommand(): () => void {
+   return registerCommands(
+     {
+       "editor.openFavorite": (event) => {
+-        if (event.repeat) return false;
++        if (event.repeat || (isXtworkDesktop() && !readDeveloperFeatures())) return false;
+         const button = [
+           ...document.querySelectorAll<HTMLButtonElement>(`[${OPEN_FAVORITE_EDITOR_ATTRIBUTE}]`),
+         ].at(-1);
+diff --git a/apps/web/src/components/chat/QueuedRunsControl.browser.test.tsx b/apps/web/src/components/chat/QueuedRunsControl.browser.test.tsx
+index 4f4daf7c..24da310b 100644
+--- a/apps/web/src/components/chat/QueuedRunsControl.browser.test.tsx
++++ b/apps/web/src/components/chat/QueuedRunsControl.browser.test.tsx
+@@ -317,7 +317,7 @@ it("shows who sent a queued message and folds automation and agent prompts", asy
+   await page.getByRole("button", { name: "Open thread" }).nth(1).click({ force: true });
+   expect(onOpenThread).toHaveBeenLastCalledWith("thread:linked-lead", "environment:linked");
+ 
+-  await expect.element(page.getByText("Sent by T3 Code")).toBeVisible();
++  await expect.element(page.getByText("Sent by 小瞳 Work")).toBeVisible();
+   await expect.element(page.getByText("Continue where you left off.")).toBeVisible();
+ });
+ 
+diff --git a/apps/web/src/components/chat/ThreadActivityAnnouncer.browser.test.tsx b/apps/web/src/components/chat/ThreadActivityAnnouncer.browser.test.tsx
+index b9efe2dc..4d1afea4 100644
+--- a/apps/web/src/components/chat/ThreadActivityAnnouncer.browser.test.tsx
++++ b/apps/web/src/components/chat/ThreadActivityAnnouncer.browser.test.tsx
+@@ -129,9 +129,9 @@ describe("ThreadActivityAnnouncer", () => {
+ 
+     expect(heard).toEqual([
+       ["Working", ""],
+-      ["Working", "T3 Code: Checking the repo"],
+-      ["Needs approval", "T3 Code: Checking the repo"],
+-      ["Needs approval", "T3 Code: Checking the repo"],
++      ["Working", "小瞳 Work: Checking the repo"],
++      ["Needs approval", "小瞳 Work: Checking the repo"],
++      ["Needs approval", "小瞳 Work: Checking the repo"],
+       ["Needs approval", "Running rg"],
+     ]);
+   });
+@@ -151,7 +151,7 @@ describe("ThreadActivityAnnouncer", () => {
+       }),
+     );
+ 
+-    await expect.element(detail).toHaveTextContent("T3 Code: Checking the repo. Needs approval");
++    await expect.element(detail).toHaveTextContent("小瞳 Work: Checking the repo. Needs approval");
+     await expect.element(status).toHaveTextContent("Working");
+   });
+ });
+diff --git a/apps/web/src/components/chat/ThreadDetailsItemsMenu.tsx b/apps/web/src/components/chat/ThreadDetailsItemsMenu.tsx
+index 691e15fd..3db6e0af 100644
+--- a/apps/web/src/components/chat/ThreadDetailsItemsMenu.tsx
++++ b/apps/web/src/components/chat/ThreadDetailsItemsMenu.tsx
+@@ -1,3 +1,4 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import { T, useMessages } from "gt-react";
+ import {
+   getClientSettings,
+@@ -15,6 +16,7 @@ import {
+ 
+ /** Menu body that shows and hides thread details items. The card's context menu and Settings share it. */
+ export function ThreadDetailsItemsMenuItems() {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const visibility = useClientSettings(resolveThreadDetailsVisibility);
+   const m = useMessages();
+   return (
+@@ -23,7 +25,11 @@ export function ThreadDetailsItemsMenuItems() {
+         <MenuGroupLabel>
+           <T>Show in thread details</T>
+         </MenuGroupLabel>
+-        {THREAD_DETAILS_ITEMS.map((item) => (
++        {THREAD_DETAILS_ITEMS.filter(
++          ({ id }) =>
++            developerFeatures ||
++            !["environment", "openIn", "scripts", "branch", "gitActions", "servers"].includes(id),
++        ).map((item) => (
+           <MenuCheckboxItem
+             key={item.id}
+             checked={visibility[item.id]}
+diff --git a/apps/web/src/components/chat/ThreadDetailsPanel.tsx b/apps/web/src/components/chat/ThreadDetailsPanel.tsx
+index d7c30907..89e52a2c 100644
+--- a/apps/web/src/components/chat/ThreadDetailsPanel.tsx
++++ b/apps/web/src/components/chat/ThreadDetailsPanel.tsx
+@@ -1,3 +1,4 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import type {
+   EditorId,
+   EnvironmentId,
+@@ -95,7 +96,14 @@ interface ThreadDetailsPanelProps extends Pick<
+ }
+ 
+ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const visible = useClientSettings(resolveThreadDetailsVisibility);
++  const items = developerFeatures
++    ? THREAD_DETAILS_ITEMS
++    : THREAD_DETAILS_ITEMS.filter(
++        ({ id }) =>
++          !["environment", "openIn", "scripts", "branch", "gitActions", "servers"].includes(id),
++      );
+   const gt = useGT();
+   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null);
+   const fileScripts = useT3ProjectFileScripts(
+@@ -143,7 +151,8 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
+       threadRef={{ environmentId: props.environmentId, threadId: props.threadId }}
+       anchor={props.anchor}
+       handle={props.handle}
+-      contentKey={THREAD_DETAILS_ITEMS.filter((item) => visible[item.id])
++      contentKey={items
++        .filter((item) => visible[item.id])
+         .map((item) => item.id)
+         .join(",")}
+       onContextMenu={(event) => {
+@@ -168,16 +177,16 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
+       {(density) => {
+         // Section flags follow the rows that will render, so no empty section steals the divider rule.
+         const show = {
+-          environment: density === "full" && visible.environment,
++          environment: developerFeatures && density === "full" && visible.environment,
+           openIn: density !== "essential" && visible.openIn && props.showOpenInPicker,
+-          scripts: visible.scripts && props.activeProjectScripts !== undefined,
+-          branch: offersGit && props.isGitRepo && visible.branch,
++          scripts: developerFeatures && visible.scripts && props.activeProjectScripts !== undefined,
++          branch: developerFeatures && offersGit && props.isGitRepo && visible.branch,
+           // Without a branch selector, linked pull requests still need somewhere to show.
+-          pullRequests: !(offersGit && props.isGitRepo) && visible.branch,
++          pullRequests: developerFeatures && !(offersGit && props.isGitRepo) && visible.branch,
+           git:
+             offersGit &&
+             props.activeProjectName !== undefined &&
+-            (visible.gitActions || (visible.changes && props.isGitRepo)),
++            ((developerFeatures && visible.gitActions) || (visible.changes && props.isGitRepo)),
+         };
+         return (
+           <>
+@@ -253,7 +262,7 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
+                     {show.git && props.gitCwd ? (
+                       <GitActionsControl
+                         compact={density !== "full"}
+-                        showActions={visible.gitActions}
++                        showActions={developerFeatures && visible.gitActions}
+                         showChanges={visible.changes}
+                         gitCwd={props.gitCwd}
+                         workspaceMutationId={props.workspaceMutationId}
+@@ -266,7 +275,7 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
+                 </ThreadDetailsSection>
+               ) : null}
+ 
+-              {density === "full" && !props.draftId && visible.servers ? (
++              {developerFeatures && density === "full" && !props.draftId && visible.servers ? (
+                 <ThreadServersPanel environmentId={props.environmentId} threadId={props.threadId} />
+               ) : null}
+ 
+diff --git a/apps/web/src/components/chat/turnDetailAnnouncement.test.ts b/apps/web/src/components/chat/turnDetailAnnouncement.test.ts
+index 42737043..6d5eed16 100644
+--- a/apps/web/src/components/chat/turnDetailAnnouncement.test.ts
++++ b/apps/web/src/components/chat/turnDetailAnnouncement.test.ts
+@@ -279,10 +279,10 @@ describe("nextTurnDetailAnnouncement", () => {
+ 
+   it.each<{ level: ScreenReaderAnnouncements; spoken: ReadonlyArray<string> }>([
+     { level: "status", spoken: [] },
+-    { level: "messages", spoken: ["T3 Code: first", "T3 Code: second"] },
++    { level: "messages", spoken: ["小瞳 Work: first", "小瞳 Work: second"] },
+     {
+       level: "everything",
+-      spoken: ["Running git", "T3 Code: first", "Reading a.ts", "T3 Code: second"],
++      spoken: ["Running git", "小瞳 Work: first", "Reading a.ts", "小瞳 Work: second"],
+     },
+   ])("says each message and step once at the $level level", ({ level, spoken }) => {
+     expect(speak(level, turn)).toEqual(spoken);
+@@ -295,7 +295,7 @@ describe("nextTurnDetailAnnouncement", () => {
+         frame("Running git", [said("first")]),
+         frame("Reading a.ts", [said("first"), said("second", true, true)]),
+       ]),
+-    ).toEqual(["T3 Code: second", "Reading a.ts"]);
++    ).toEqual(["小瞳 Work: second", "Reading a.ts"]);
+   });
+ 
+   it("stays silent about history loaded above the messages it knows", () => {
+@@ -318,7 +318,7 @@ describe("nextTurnDetailAnnouncement", () => {
+         frame(null),
+         frame(null, [first, { ...said("empty", true, true), text: "<!-- note -->" }]),
+       ]),
+-    ).toEqual(["T3 Code: Tests pass in web. See the docs"]);
++    ).toEqual(["小瞳 Work: Tests pass in web. See the docs"]);
+   });
+ 
+   it("cuts a long message without splitting an emoji", () => {
+diff --git a/apps/web/src/components/chat/useChatShortcuts.ts b/apps/web/src/components/chat/useChatShortcuts.ts
+index 6400aa13..2d16b9bc 100644
+--- a/apps/web/src/components/chat/useChatShortcuts.ts
++++ b/apps/web/src/components/chat/useChatShortcuts.ts
+@@ -1,3 +1,5 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
++import { isXtworkDesktop, isDesktopShortcutVisible } from "../../desktopFeatureVisibility";
+ import type { KeybindingCommand, ResolvedKeybindingsConfig } from "@t3tools/contracts";
+ import { useEffect, useEffectEvent } from "react";
+ import { isCommandPaletteOpen } from "../../commandPaletteBus";
+@@ -58,6 +60,9 @@ interface ChatShortcutsInput {
+  * act on the current render without re-registering on every change.
+  */
+ export function useChatShortcuts(input: ChatShortcutsInput) {
++  const developerFeatures = useDesktopDeveloperFeatures();
++  const commandVisible = (command: KeybindingCommand) =>
++    !isXtworkDesktop() || isDesktopShortcutVisible(command, developerFeatures);
+   const embedded = input.embedded === true;
+   const composerElement = embedded ? (input.composerElement ?? null) : null;
+   const handleShortcut = useEffectEvent((event: KeyboardEvent) => {
+@@ -92,7 +97,12 @@ export function useChatShortcuts(input: ChatShortcutsInput) {
+     const command = resolveChatShortcutCommand(event, keybindings, input.scriptKeybindings, {
+       context: shortcutContext,
+     });
+-    if (!command || (inSideChatPane && !SIDE_CHAT_PANE_COMMANDS.has(command))) return;
++    if (
++      !command ||
++      !commandVisible(command) ||
++      (inSideChatPane && !SIDE_CHAT_PANE_COMMANDS.has(command))
++    )
++      return;
+     const run =
+       input.commands[command] ??
+       composerShortcutCommands(input.composerRef, input.branchToolbarRef)[command] ??
+@@ -122,9 +132,10 @@ export function useChatShortcuts(input: ChatShortcutsInput) {
+     const command = resolveChatShortcutCommand(event, input.keybindings, input.scriptKeybindings, {
+       context: input.getShortcutContext(event.target),
+     });
+-    const run = command
+-      ? composerShortcutCommands(input.composerRef, input.branchToolbarRef)[command]
+-      : undefined;
++    const run =
++      command && commandVisible(command)
++        ? composerShortcutCommands(input.composerRef, input.branchToolbarRef)[command]
++        : undefined;
+     if (!run || run({ event, terminalFocusOwner: null }) === false) return;
+     event.preventDefault();
+     event.stopPropagation();
+diff --git a/apps/web/src/components/chat/useComposerMenuItems.ts b/apps/web/src/components/chat/useComposerMenuItems.ts
+index ae15e94a..75e28089 100644
+--- a/apps/web/src/components/chat/useComposerMenuItems.ts
++++ b/apps/web/src/components/chat/useComposerMenuItems.ts
+@@ -82,6 +82,7 @@ export function useComposerMenuItems({
+   selectedProviderSlashCommands,
+   showSkillsInSlashMenu,
+   workspaceSkillsScanning,
++  showModelPicker,
+   questionAttachmentTarget,
+   modelMentions,
+ }: {
+@@ -102,6 +103,7 @@ export function useComposerMenuItems({
+   readonly selectedProviderSlashCommands: ServerProvider["slashCommands"];
+   readonly showSkillsInSlashMenu: boolean;
+   readonly workspaceSkillsScanning: boolean;
++  readonly showModelPicker: boolean;
+   readonly questionAttachmentTarget: DraftId | null;
+   readonly modelMentions: {
+     readonly instanceEntries: ReadonlyArray<ProviderInstanceEntry>;
+@@ -258,13 +260,17 @@ export function useComposerMenuItems({
+     }
+     if (composerTrigger.kind === "slash-command") {
+       const builtInSlashCommandItems = [
+-        {
+-          id: "slash:model",
+-          type: "slash-command",
+-          command: "model",
+-          label: "/model",
+-          description: gt("Switch response model for this thread"),
+-        },
++        ...(showModelPicker
++          ? ([
++              {
++                id: "slash:model",
++                type: "slash-command",
++                command: "model",
++                label: "/model",
++                description: gt("Switch response model for this thread"),
++              },
++            ] as const)
++          : []),
+         ...(sideChatAvailable
+           ? ([
+               {
+diff --git a/apps/web/src/components/diffs/AnnotatableCodeView.tsx b/apps/web/src/components/diffs/AnnotatableCodeView.tsx
+index 1fb8b99f..b5376c9e 100644
+--- a/apps/web/src/components/diffs/AnnotatableCodeView.tsx
++++ b/apps/web/src/components/diffs/AnnotatableCodeView.tsx
+@@ -19,6 +19,7 @@ import {
+ } from "~/reviewCommentContext";
+ 
+ import { nextFileCommentId } from "../files/fileCommentAnnotations";
++import { useDesktopDeveloperFeatures } from "~/hooks/useDeveloperFeatures";
+ import { DiffCommentAnnotation } from "./DiffCommentAnnotation";
+ import { StyledDiffCodeView, type StyledDiffCodeViewOptions } from "./StyledDiffCodeView";
+ 
+@@ -126,6 +127,7 @@ export function AnnotatableCodeView({
+   renderHeaderPrefix,
+   onFileCollapsedChange,
+ }: AnnotatableCodeViewProps) {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const addReviewComment = useComposerDraftStore((store) => store.addReviewComment);
+   const removeReviewComment = useComposerDraftStore((store) => store.removeReviewComment);
+   const reviewComments = useComposerDraftStore(
+@@ -228,7 +230,7 @@ export function AnnotatableCodeView({
+   };
+ 
+   const beginComment = (range: SelectedLineRange | null, context: DiffSelectionContext) => {
+-    if (!range) return;
++    if (!developerFeatures || !range) return;
+     const item = context.item;
+     if (item.type !== "diff") return;
+     const id = nextFileCommentId();
+@@ -277,9 +279,9 @@ export function AnnotatableCodeView({
+       onSelectedLinesChange={setSelectedLines}
+       options={{
+         ...options,
+-        enableGutterUtility: draft === null,
+-        enableLineSelection: draft === null,
+-        onGutterUtilityClick: beginComment,
++        enableGutterUtility: developerFeatures && draft === null,
++        enableLineSelection: developerFeatures && draft === null,
++        ...(developerFeatures ? { onGutterUtilityClick: beginComment } : {}),
+         onItemCollapsedChange: (_item, nextItem) =>
+           onFileCollapsedChange(nextItem.id, nextItem.collapsed === true),
+       }}
+diff --git a/apps/web/src/components/files/FilePreviewPanel.tsx b/apps/web/src/components/files/FilePreviewPanel.tsx
+index 04ca07bd..eef8b2dc 100644
+--- a/apps/web/src/components/files/FilePreviewPanel.tsx
++++ b/apps/web/src/components/files/FilePreviewPanel.tsx
+@@ -1,3 +1,4 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { DownloadIcon, CopyIcon, CheckIcon, Code2Icon, EyeIcon, Table2Icon } from "lucide-react";
+ import { msg, T, useGT, useMessages, Var } from "gt-react";
+@@ -858,6 +859,7 @@ function EditableFileSurface({
+   onPendingChange,
+   onEditorChange,
+ }: EditableFileSurfaceProps) {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const messages = useMessages();
+   const addReviewComment = useComposerDraftStore((store) => store.addReviewComment);
+   const removeReviewComment = useComposerDraftStore((store) => store.removeReviewComment);
+@@ -975,6 +977,7 @@ function EditableFileSurface({
+   };
+ 
+   const beginComment = (range: SelectedLineRange) => {
++    if (!developerFeatures) return;
+     editorRef.current?.setSelections([]);
+     editorRef.current?.blur();
+     const { startLine, endLine } = normalizeFileCommentRange(range);
+@@ -1067,11 +1070,15 @@ function EditableFileSurface({
+             onEditChange={handleEditChange}
+             options={{
+               disableFileHeader: true,
+-              enableGutterUtility: !hasOpenCommentForm,
+-              enableLineSelection: !hasOpenCommentForm,
+-              onGutterUtilityClick: setSelectedRange,
+-              onLineSelectionChange: setSelectedRange,
+-              onLineSelectionEnd: handleLineSelectionEnd,
++              enableGutterUtility: developerFeatures && !hasOpenCommentForm,
++              enableLineSelection: developerFeatures && !hasOpenCommentForm,
++              ...(developerFeatures
++                ? {
++                    onGutterUtilityClick: setSelectedRange,
++                    onLineSelectionChange: setSelectedRange,
++                    onLineSelectionEnd: handleLineSelectionEnd,
++                  }
++                : {}),
+               overflow: wordWrap ? "wrap" : "scroll",
+               theme: resolveDiffThemeName(resolvedTheme),
+               preferredHighlighter: PREFERRED_HIGHLIGHTER,
+@@ -1237,6 +1244,7 @@ export default function FilePreviewPanel({
+   const relativePath =
+     attachment === undefined ? resolveFilePreviewPath(requestedPath, cwd) : requestedPath;
+   const draft = typeof composerDraftTarget === "string";
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const gt = useGT();
+   const m = useMessages();
+   const { resolvedTheme } = useTheme();
+@@ -1552,7 +1560,8 @@ export default function FilePreviewPanel({
+               />
+             </div>
+           </ScrollArea>
+-          {absolutePath &&
++          {developerFeatures &&
++          absolutePath &&
+           (environmentId === primaryEnvironmentId ||
+             environmentId === hostEnvironmentId ||
+             remoteOpenState.mode !== "local-exec") ? (
+diff --git a/apps/web/src/components/settings/AppearanceSettingsPanel.tsx b/apps/web/src/components/settings/AppearanceSettingsPanel.tsx
+index 72fda915..d3fa5daa 100644
+--- a/apps/web/src/components/settings/AppearanceSettingsPanel.tsx
++++ b/apps/web/src/components/settings/AppearanceSettingsPanel.tsx
+@@ -1,3 +1,4 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import type { CSSProperties } from "react";
+ import { useState } from "react";
+ import { msg, useGT, useMessages } from "gt-react";
+@@ -86,6 +87,7 @@ const EFFORT_DISPLAY_LABELS: Record<EffortDisplay, string> = {
+ };
+ 
+ export function AppearanceSettingsPanel() {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const searchableSetting = useSearchableSetting();
+   const {
+     appearanceMode,
+@@ -463,35 +465,37 @@ export function AppearanceSettingsPanel() {
+               </Select>
+             }
+           />
+-          <SettingsRow
+-            {...searchableSetting("composer-context")}
+-            description={gt(
+-              "Keep branch and worktree controls below the composer after a thread starts.",
+-            )}
+-            resetAction={
+-              settings.persistComposerContextStrip !==
+-              DEFAULT_UNIFIED_SETTINGS.persistComposerContextStrip ? (
+-                <SettingResetButton
+-                  ariaLabel={gt("Reset composer context to default")}
+-                  onClick={() =>
+-                    updateSettings({
+-                      persistComposerContextStrip:
+-                        DEFAULT_UNIFIED_SETTINGS.persistComposerContextStrip,
+-                    })
++          {developerFeatures ? (
++            <SettingsRow
++              {...searchableSetting("composer-context")}
++              description={gt(
++                "Keep branch and worktree controls below the composer after a thread starts.",
++              )}
++              resetAction={
++                settings.persistComposerContextStrip !==
++                DEFAULT_UNIFIED_SETTINGS.persistComposerContextStrip ? (
++                  <SettingResetButton
++                    ariaLabel={gt("Reset composer context to default")}
++                    onClick={() =>
++                      updateSettings({
++                        persistComposerContextStrip:
++                          DEFAULT_UNIFIED_SETTINGS.persistComposerContextStrip,
++                      })
++                    }
++                  />
++                ) : null
++              }
++              control={
++                <Switch
++                  checked={settings.persistComposerContextStrip}
++                  onCheckedChange={(checked) =>
++                    updateSettings({ persistComposerContextStrip: Boolean(checked) })
+                   }
++                  aria-label={gt("Keep composer context visible in active threads")}
+                 />
+-              ) : null
+-            }
+-            control={
+-              <Switch
+-                checked={settings.persistComposerContextStrip}
+-                onCheckedChange={(checked) =>
+-                  updateSettings({ persistComposerContextStrip: Boolean(checked) })
+-                }
+-                aria-label={gt("Keep composer context visible in active threads")}
+-              />
+-            }
+-          />
++              }
++            />
++          ) : null}
+         </AdvancedSettings>
+       </SettingsSection>
+ 
+diff --git a/apps/web/src/components/settings/BackgroundActivitySettings.tsx b/apps/web/src/components/settings/BackgroundActivitySettings.tsx
+index 69987a39..7f272187 100644
+--- a/apps/web/src/components/settings/BackgroundActivitySettings.tsx
++++ b/apps/web/src/components/settings/BackgroundActivitySettings.tsx
+@@ -1,3 +1,4 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import { useScopedSettingsWriteAllowed } from "./useScopedSettings";
+ import { SettingsIcon } from "lucide-react";
+ import { msg, T, useGT, useMessages } from "gt-react";
+@@ -95,6 +96,7 @@ function BackgroundActivityAdvancedDialog({
+   readonly open: boolean;
+   readonly onOpenChange: (open: boolean) => void;
+ }) {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const searchableSetting = useSearchableSetting();
+   const gt = useGT();
+   const m = useMessages();
+@@ -176,81 +178,84 @@ function BackgroundActivityAdvancedDialog({
+               </Select>
+             </div>
+ 
+-            <div className="flex flex-col gap-3 border-b px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+-              <div className="min-w-0 space-y-1">
+-                <div className="text-sm font-medium">
+-                  {searchableSetting("git-fetch-interval").title}
++            {developerFeatures ? (
++              <>
++                <div className="flex flex-col gap-3 border-b px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
++                  <div className="min-w-0 space-y-1">
++                    <div className="text-sm font-medium">
++                      {searchableSetting("git-fetch-interval").title}
++                    </div>
++                    <p className="text-xs leading-relaxed text-muted-foreground">
++                      <T>Refresh remote branch status in the background.</T>
++                    </p>
++                  </div>
++                  <div className="flex shrink-0 items-center gap-2">
++                    <IntervalSecondsField
++                      labels={{
++                        decrease: gt("Decrease Git fetch interval"),
++                        input: gt("Git fetch interval in seconds"),
++                        increase: gt("Increase Git fetch interval"),
++                      }}
++                      value={automaticGitFetchIntervalSeconds}
++                      min={0}
++                      step={5}
++                      onCommit={(seconds, options) =>
++                        updateSettings(
++                          backgroundActivityOverrideSettings(
++                            settings.backgroundActivity,
++                            resolvedBackgroundActivity,
++                            { automaticGitFetchInterval: Duration.seconds(seconds) },
++                          ),
++                          options,
++                        )
++                      }
++                    />
++                    <span className="text-xs text-muted-foreground">
++                      <T>seconds</T>
++                    </span>
++                  </div>
+                 </div>
+-                <p className="text-xs leading-relaxed text-muted-foreground">
+-                  <T>Refresh remote branch status in the background.</T>
+-                </p>
+-              </div>
+-              <div className="flex shrink-0 items-center gap-2">
+-                <IntervalSecondsField
+-                  labels={{
+-                    decrease: gt("Decrease Git fetch interval"),
+-                    input: gt("Git fetch interval in seconds"),
+-                    increase: gt("Increase Git fetch interval"),
+-                  }}
+-                  value={automaticGitFetchIntervalSeconds}
+-                  min={0}
+-                  step={5}
+-                  onCommit={(seconds, options) =>
+-                    updateSettings(
+-                      backgroundActivityOverrideSettings(
+-                        settings.backgroundActivity,
+-                        resolvedBackgroundActivity,
+-                        { automaticGitFetchInterval: Duration.seconds(seconds) },
+-                      ),
+-                      options,
+-                    )
+-                  }
+-                />
+-                <span className="text-xs text-muted-foreground">
+-                  <T>seconds</T>
+-                </span>
+-              </div>
+-            </div>
+ 
+-            <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+-              <div className="min-w-0 space-y-1">
+-                <div className="text-sm font-medium">
+-                  <T>Provider health interval</T>
++                <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
++                  <div className="min-w-0 space-y-1">
++                    <div className="text-sm font-medium">
++                      <T>Provider health interval</T>
++                    </div>
++                    <p className="text-xs leading-relaxed text-muted-foreground">
++                      <T>
++                        Refresh provider availability, versions, and auth state. Model catalog
++                        updates follow Provider update checks.
++                      </T>
++                    </p>
++                  </div>
++                  <div className="flex shrink-0 items-center gap-2">
++                    <IntervalSecondsField
++                      labels={{
++                        decrease: gt("Decrease provider health interval"),
++                        input: gt("Provider health interval in seconds"),
++                        increase: gt("Increase provider health interval"),
++                      }}
++                      value={providerHealthRefreshIntervalSeconds}
++                      min={0}
++                      step={PROVIDER_HEALTH_INTERVAL_STEP_SECONDS}
++                      onCommit={(seconds, options) =>
++                        updateSettings(
++                          backgroundActivityOverrideSettings(
++                            settings.backgroundActivity,
++                            resolvedBackgroundActivity,
++                            { providerHealthRefreshInterval: Duration.seconds(seconds) },
++                          ),
++                          options,
++                        )
++                      }
++                    />
++                    <span className="text-xs text-muted-foreground">
++                      <T>seconds</T>
++                    </span>
++                  </div>
+                 </div>
+-                <p className="text-xs leading-relaxed text-muted-foreground">
+-                  <T>
+-                    Refresh provider availability, versions, and auth state. Model catalog updates
+-                    follow Provider update checks.
+-                  </T>
+-                </p>
+-              </div>
+-              <div className="flex shrink-0 items-center gap-2">
+-                <IntervalSecondsField
+-                  labels={{
+-                    decrease: gt("Decrease provider health interval"),
+-                    input: gt("Provider health interval in seconds"),
+-                    increase: gt("Increase provider health interval"),
+-                  }}
+-                  value={providerHealthRefreshIntervalSeconds}
+-                  min={0}
+-                  step={PROVIDER_HEALTH_INTERVAL_STEP_SECONDS}
+-                  onCommit={(seconds, options) =>
+-                    updateSettings(
+-                      backgroundActivityOverrideSettings(
+-                        settings.backgroundActivity,
+-                        resolvedBackgroundActivity,
+-                        { providerHealthRefreshInterval: Duration.seconds(seconds) },
+-                      ),
+-                      options,
+-                    )
+-                  }
+-                />
+-                <span className="text-xs text-muted-foreground">
+-                  <T>seconds</T>
+-                </span>
+-              </div>
+-            </div>
+-
++              </>
++            ) : null}
+             <div className="flex flex-col gap-3 border-t px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+               <div className="min-w-0 space-y-1">
+                 <div className="text-sm font-medium">
+@@ -368,6 +373,7 @@ function BackgroundActivityAdvancedDialog({
+ }
+ 
+ export function BackgroundActivitySettingsRow() {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const searchableSetting = useSearchableSetting();
+   const gt = useGT();
+   const m = useMessages();
+@@ -401,9 +407,11 @@ export function BackgroundActivitySettingsRow() {
+         <span className="inline-flex items-center gap-1.5">
+           {searchableSetting("background-activity").title}
+           <PolicyTooltip>
+-            {gt(
+-              "This shared policy gates background work such as Git refreshes and provider health probes after their individual intervals elapse.",
+-            )}
++            {developerFeatures
++              ? gt(
++                  "This shared policy gates background work such as Git refreshes and provider health probes after their individual intervals elapse.",
++                )
++              : gt("This policy controls when background tasks run.")}
+           </PolicyTooltip>
+         </span>
+       }
+diff --git a/apps/web/src/components/settings/KeybindingsSettings.tsx b/apps/web/src/components/settings/KeybindingsSettings.tsx
+index 1deedf04..28afd078 100644
+--- a/apps/web/src/components/settings/KeybindingsSettings.tsx
++++ b/apps/web/src/components/settings/KeybindingsSettings.tsx
+@@ -1,3 +1,5 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
++import { isXtworkDesktop, isDesktopShortcutVisible } from "../../desktopFeatureVisibility";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { m as resolveMessage } from "~/i18n/messages";
+ import { useEnvironmentScope } from "../../state/session";
+@@ -1436,6 +1438,9 @@ function useKeybindingCatalog() {
+ }
+ 
+ export function KeybindingsSettingsPanel() {
++  const developerFeatures = useDesktopDeveloperFeatures();
++  const commandVisible = (command: KeybindingCommand) =>
++    !isXtworkDesktop() || isDesktopShortcutVisible(command, developerFeatures);
+   const searchableSetting = useSearchableSetting();
+   const gt = useGT();
+   const m = useMessages();
+@@ -1472,8 +1477,13 @@ export function KeybindingsSettingsPanel() {
+     if (searchTargetId.startsWith("keybinding-")) setQuery("");
+   }
+   const whenVariables = buildWhenVariableOptions();
+-  const { commandOptions, allRows } = useKeybindingCatalog();
+-  const rows = filterKeybindingRows(allRows, query, m);
++  const { commandOptions: allCommandOptions, allRows } = useKeybindingCatalog();
++  const commandOptions = allCommandOptions.filter(commandVisible);
++  const rows = filterKeybindingRows(
++    allRows.filter((row) => commandVisible(row.command)),
++    query,
++    m,
++  );
+   const groups = groupKeybindingRows(rows);
+   const anchorIds = keybindingAnchorIds(rows);
+ 
+@@ -1628,25 +1638,27 @@ export function KeybindingsSettingsPanel() {
+             <PlusIcon aria-hidden className="size-4" />
+             <T>Add keybinding</T>
+           </Button>
+-          <Tooltip>
+-            <TooltipTrigger
+-              render={
+-                <Button
+-                  type="button"
+-                  variant="outline"
+-                  size="icon"
+-                  disabled={!keybindingsConfigPath || !canOpenKeybindingsFile}
+-                  onClick={openKeybindingsFile}
+-                  aria-label={gt("Open keybindings.json")}
+-                >
+-                  <FileJsonIcon aria-hidden className="size-4" />
+-                </Button>
+-              }
+-            />
+-            <TooltipPopup side="top">
+-              <T>Open keybindings.json</T>
+-            </TooltipPopup>
+-          </Tooltip>
++          {commandVisible("editor.openFavorite") ? (
++            <Tooltip>
++              <TooltipTrigger
++                render={
++                  <Button
++                    type="button"
++                    variant="outline"
++                    size="icon"
++                    disabled={!keybindingsConfigPath || !canOpenKeybindingsFile}
++                    onClick={openKeybindingsFile}
++                    aria-label={gt("Open keybindings.json")}
++                  >
++                    <FileJsonIcon aria-hidden className="size-4" />
++                  </Button>
++                }
++              />
++              <TooltipPopup side="top">
++                <T>Open keybindings.json</T>
++              </TooltipPopup>
++            </Tooltip>
++          ) : null}
+         </div>
+       </SettingsSection>
+ 
+diff --git a/apps/web/src/components/settings/LabsSettingsPanel.tsx b/apps/web/src/components/settings/LabsSettingsPanel.tsx
+index 29343597..4948e768 100644
+--- a/apps/web/src/components/settings/LabsSettingsPanel.tsx
++++ b/apps/web/src/components/settings/LabsSettingsPanel.tsx
+@@ -1,3 +1,5 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
++import { isXtworkDesktop } from "../../desktopFeatureVisibility";
+ import { managedCapabilityDenial } from "@t3tools/client-runtime/contract-labels";
+ import { useAuth } from "@clerk/react";
+ import { Link } from "@tanstack/react-router";
+@@ -16,17 +18,24 @@ import { firstManagedDenial, usePrimaryManagedPolicy } from "~/state/managedPoli
+ 
+ /** Features still settling in. */
+ export function LabsSettingsPanel() {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const gt = useGT();
+   return (
+     <SettingsPageContainer>
+       <SettingsSection id="beta" title={gt("Beta")}>
+         <BoringSidebarRow />
+         {/* Clerk is only mounted when this build has T3 Connect. */}
+-        {hasCloudPublicConfig() ? <GuestLinksRowWithSignIn /> : <GuestLinksRow />}
+-        <LinkedEnvironmentsRow />
++        {!isXtworkDesktop() ? (
++          hasCloudPublicConfig() ? (
++            <GuestLinksRowWithSignIn />
++          ) : (
++            <GuestLinksRow />
++          )
++        ) : null}
++        {!isXtworkDesktop() ? <LinkedEnvironmentsRow /> : null}
+         <PromptSuggestionsRow />
+-        <SimlockHostsRow />
+-        <FastWorktreeCheckoutRow />
++        {!isXtworkDesktop() ? <SimlockHostsRow /> : null}
++        {developerFeatures ? <FastWorktreeCheckoutRow /> : null}
+       </SettingsSection>
+     </SettingsPageContainer>
+   );
+diff --git a/apps/web/src/components/settings/ProjectDefaultsSettings.tsx b/apps/web/src/components/settings/ProjectDefaultsSettings.tsx
+index 49d97745..18461f3c 100644
+--- a/apps/web/src/components/settings/ProjectDefaultsSettings.tsx
++++ b/apps/web/src/components/settings/ProjectDefaultsSettings.tsx
+@@ -1,3 +1,4 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import { managedRuntimeModeDenial } from "@t3tools/client-runtime/contract-labels";
+ import {
+   DEFAULT_SERVER_SETTINGS,
+@@ -50,6 +51,7 @@ function isWorktreeSubmodules(value: string | null): value is WorktreeSubmodules
+ }
+ 
+ export function ProjectDefaultsSettings({ category }: { category: ProjectSettingsCategory }) {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const searchableSetting = useSearchableSetting();
+   const gt = useGT();
+   const m = useMessages();
+@@ -357,14 +359,22 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
+     >
+       {category === "project" ? (
+         <>
+-          {modelRow}
+-          {fallbackRow}
+-          {workspaceRow}
++          {developerFeatures ? (
++            <>
++              {modelRow}
++              {fallbackRow}
++              {workspaceRow}
++            </>
++          ) : null}
+         </>
+       ) : category === "general" ? (
+         <>
+-          {modelRow}
+-          {fallbackRow}
++          {developerFeatures ? (
++            <>
++              {modelRow}
++              {fallbackRow}
++            </>
++          ) : null}
+           <SettingsRow
+             serverScoped
+             settingKeys={["defaultRuntimeMode"]}
+@@ -437,7 +447,7 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
+               </Select>
+             }
+           />
+-          {workspaceRow}
++          {developerFeatures ? workspaceRow : null}
+         </>
+       ) : (
+         <>
+diff --git a/apps/web/src/components/settings/ProjectSettingsPanel.logic.test.ts b/apps/web/src/components/settings/ProjectSettingsPanel.logic.test.ts
+index c42c375a..1b22f676 100644
+--- a/apps/web/src/components/settings/ProjectSettingsPanel.logic.test.ts
++++ b/apps/web/src/components/settings/ProjectSettingsPanel.logic.test.ts
+@@ -136,7 +136,7 @@ describe("project removal confirmation", () => {
+     });
+     expect(plan.projectThreads).toHaveLength(3);
+     expect(plan.confirmationMessage).toBe(
+-      'Remove checkout "Repo" and delete its 1 thread?\nPath: /work/repo\nEnvironment: Local\nThose threads and any archived threads are deleted from T3 Code. Provider sessions are kept.\nOther entries in this grouped project are unaffected.\nThis action cannot be undone.',
++      'Remove checkout "Repo" and delete its 1 thread?\nPath: /work/repo\nEnvironment: Local\nThose threads and any archived threads are deleted from 小瞳 Work. Provider sessions are kept.\nOther entries in this grouped project are unaffected.\nThis action cannot be undone.',
+     );
+   });
+ 
+@@ -154,7 +154,7 @@ describe("project removal confirmation", () => {
+       "Other entries in this grouped project are unaffected.",
+     );
+     expect(plan.confirmationMessage).toContain(
+-      "Any archived threads are deleted from T3 Code. Provider sessions are kept.",
++      "Any archived threads are deleted from 小瞳 Work. Provider sessions are kept.",
+     );
+   });
+ 
+diff --git a/apps/web/src/components/settings/ScheduledTasksSettings.tsx b/apps/web/src/components/settings/ScheduledTasksSettings.tsx
+index 4988ba93..8f8fa67a 100644
+--- a/apps/web/src/components/settings/ScheduledTasksSettings.tsx
++++ b/apps/web/src/components/settings/ScheduledTasksSettings.tsx
+@@ -1,3 +1,5 @@
++import { BUILT_IN_ASSISTANT_ID } from "../../desktopFeatureVisibility";
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { managedCapabilityDenial } from "@t3tools/client-runtime/contract-labels";
+ import { useAtomValue } from "@effect/atom-react";
+@@ -1474,6 +1476,7 @@ function ScheduledTaskEditorForm({
+   const offersOnce =
+     environment?.serverConfig?.environment.capabilities.oneTimeSchedules === true ||
+     task?.schedule.type === "once";
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const offersThreadModes =
+     environment?.serverConfig?.environment.capabilities.scheduledTaskThreadModes === true;
+   const connected =
+@@ -1489,8 +1492,12 @@ function ScheduledTaskEditorForm({
+     );
+   const scopedProjects = projectsOn(environmentId);
+   const settings = useEnvironmentSettings(environmentId);
+-  const providers =
++  const allProviders =
+     useAtomValue(serverEnvironment.providersValueAtom(environmentId)) ?? EMPTY_SERVER_PROVIDERS;
++  const providers =
++    developerFeatures || task !== null
++      ? allProviders
++      : allProviders.filter((provider) => provider.instanceId === BUILT_IN_ASSISTANT_ID);
+   const canOperate = useAtomValue(
+     serverEnvironment.upsertScheduledTask.permissionAtom(environmentId),
+   );
+@@ -1510,6 +1517,7 @@ function ScheduledTaskEditorForm({
+           projectId: defaultScheduledTaskProjectId(scopedProjects, scope),
+         },
+   );
++  const workspaceMode = developerFeatures || task !== null ? draft.workspaceMode : "root";
+   // Pinned first. The chosen project stays listed after it is archived.
+   const projects = scopedProjects
+     .filter(
+@@ -1584,7 +1592,9 @@ function ScheduledTaskEditorForm({
+       tasksQuery.data === null
+     )
+       return;
+-    const selection = activeSelection;
++    const selection = developerFeatures
++      ? activeSelection
++      : (draft.baseModelSelection ?? activeSelection);
+     if (
+       !draft.title.trim() ||
+       !draft.prompt.trim() ||
+@@ -1633,7 +1643,7 @@ function ScheduledTaskEditorForm({
+       );
+       return;
+     }
+-    if (draft.workspaceMode === "existing_worktree" && !draft.existingWorktreePath.trim()) {
++    if (workspaceMode === "existing_worktree" && !draft.existingWorktreePath.trim()) {
+       reportFailure(
+         gt("Checkout path is required"),
+         gt("Enter the path of the checkout to run in."),
+@@ -1647,9 +1657,9 @@ function ScheduledTaskEditorForm({
+         ? draft.baseModelSelection
+         : selection;
+     const workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy =
+-      draft.workspaceMode === "root"
++      workspaceMode === "root"
+         ? { type: "root" }
+-        : draft.workspaceMode === "existing_worktree"
++        : workspaceMode === "existing_worktree"
+           ? { type: "existing_worktree", worktreePath: draft.existingWorktreePath.trim() }
+           : {
+               type: "worktree",
+@@ -1849,32 +1859,36 @@ function ScheduledTaskEditorForm({
+               </Select>
+             </Field>
+ 
+-            <Field label={gt("Workspace")} htmlFor="scheduled-task-workspace">
+-              <Select
+-                value={draft.workspaceMode}
+-                onValueChange={(value) =>
+-                  setDraft((current) => ({ ...current, workspaceMode: value as WorkspaceMode }))
+-                }
+-              >
+-                <SelectTrigger size="sm" id="scheduled-task-workspace">
+-                  <SelectValue>{messages(WORKSPACE_MODE_LABELS[draft.workspaceMode])}</SelectValue>
+-                </SelectTrigger>
+-                <SelectPopup>
+-                  <SelectItem value="worktree">
+-                    <T>Create a new worktree</T>
+-                  </SelectItem>
+-                  <SelectItem value="root">
+-                    <T>Use the project checkout</T>
+-                  </SelectItem>
+-                  <SelectItem value="existing_worktree">
+-                    <T>Use a specific checkout</T>
+-                  </SelectItem>
+-                </SelectPopup>
+-              </Select>
+-            </Field>
++            {developerFeatures ? (
++              <Field label={gt("Workspace")} htmlFor="scheduled-task-workspace">
++                <Select
++                  value={draft.workspaceMode}
++                  onValueChange={(value) =>
++                    setDraft((current) => ({ ...current, workspaceMode: value as WorkspaceMode }))
++                  }
++                >
++                  <SelectTrigger size="sm" id="scheduled-task-workspace">
++                    <SelectValue>
++                      {messages(WORKSPACE_MODE_LABELS[draft.workspaceMode])}
++                    </SelectValue>
++                  </SelectTrigger>
++                  <SelectPopup>
++                    <SelectItem value="worktree">
++                      <T>Create a new worktree</T>
++                    </SelectItem>
++                    <SelectItem value="root">
++                      <T>Use the project checkout</T>
++                    </SelectItem>
++                    <SelectItem value="existing_worktree">
++                      <T>Use a specific checkout</T>
++                    </SelectItem>
++                  </SelectPopup>
++                </Select>
++              </Field>
++            ) : null}
+           </div>
+ 
+-          {draft.workspaceMode === "worktree" ? (
++          {developerFeatures && draft.workspaceMode === "worktree" ? (
+             <Field label={gt("Base branch")} htmlFor="scheduled-task-base-ref">
+               <WorktreeBaseBranchPicker
+                 key={`${environmentId}:${selectedProjectId}`}
+@@ -1891,7 +1905,7 @@ function ScheduledTaskEditorForm({
+               />
+             </Field>
+           ) : null}
+-          {draft.workspaceMode === "existing_worktree" ? (
++          {developerFeatures && draft.workspaceMode === "existing_worktree" ? (
+             <Field label={gt("Checkout path")} htmlFor="scheduled-task-checkout">
+               <Input
+                 id="scheduled-task-checkout"
+@@ -1922,26 +1936,27 @@ function ScheduledTaskEditorForm({
+             />
+           </Field>
+ 
+-          <Field label={gt("Model")}>
+-            <div>
+-              <ProviderModelPicker
+-                environmentId={environmentId}
+-                // The saved selection only seeds new threads; bound runs ignore it.
+-                disabled={saving || !connected || draft.threadId !== ""}
+-                activeInstanceId={shownInstanceId}
+-                model={shownModel}
+-                lockedProvider={null}
+-                instanceEntries={instanceEntries}
+-                modelOptionsByInstance={modelOptionsByInstance}
+-                isComposerOwned={false}
+-                triggerClassName={SETTINGS_PICKER_TRIGGER_CLASSNAME}
+-                onInstanceModelChange={(instanceId, model) =>
+-                  setDraft((current) => ({ ...current, modelKey: `${instanceId}:${model}` }))
+-                }
+-              />
+-            </div>
+-          </Field>
+-
++          {developerFeatures ? (
++            <Field label={gt("Model")}>
++              <div>
++                <ProviderModelPicker
++                  environmentId={environmentId}
++                  // The saved selection only seeds new threads; bound runs ignore it.
++                  disabled={saving || !connected || draft.threadId !== ""}
++                  activeInstanceId={shownInstanceId}
++                  model={shownModel}
++                  lockedProvider={null}
++                  instanceEntries={instanceEntries}
++                  modelOptionsByInstance={modelOptionsByInstance}
++                  isComposerOwned={false}
++                  triggerClassName={SETTINGS_PICKER_TRIGGER_CLASSNAME}
++                  onInstanceModelChange={(instanceId, model) =>
++                    setDraft((current) => ({ ...current, modelKey: `${instanceId}:${model}` }))
++                  }
++                />
++              </div>
++            </Field>
++          ) : null}
+           <div className="space-y-3">
+             {task?.schedule.type === "interval" &&
+             task.schedule.everyMs < MIN_SCHEDULED_TASK_INTERVAL_MS ? (
+diff --git a/apps/web/src/components/settings/SettingsBreadcrumb.tsx b/apps/web/src/components/settings/SettingsBreadcrumb.tsx
+index e4e302a3..8b20e93c 100644
+--- a/apps/web/src/components/settings/SettingsBreadcrumb.tsx
++++ b/apps/web/src/components/settings/SettingsBreadcrumb.tsx
+@@ -1,3 +1,5 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
++import { isXtworkDesktop } from "../../desktopFeatureVisibility";
+ import { msg, useGT, useMessages } from "gt-react";
+ 
+ import {
+@@ -23,7 +25,11 @@ function settingsBreadcrumbLabel(pathname: string): string | null {
+ export function SettingsBreadcrumb({ pathname }: { pathname: string }) {
+   const gt = useGT();
+   const m = useMessages();
+-  const sectionLabel = settingsBreadcrumbLabel(pathname);
++  const developerFeatures = useDesktopDeveloperFeatures();
++  const sectionLabel =
++    !developerFeatures && isXtworkDesktop() && pathname === "/settings/diffs"
++      ? msg("Diffs")
++      : settingsBreadcrumbLabel(pathname);
+ 
+   return (
+     <WorkspaceBreadcrumb ariaLabel={gt("Settings breadcrumb")}>
+diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
+index 96b821ea..6dc0b865 100644
+--- a/apps/web/src/components/settings/SettingsPanels.tsx
++++ b/apps/web/src/components/settings/SettingsPanels.tsx
+@@ -1,3 +1,5 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
++import { isXtworkDesktop } from "../../desktopFeatureVisibility";
+ import { DeveloperFeaturesSettings } from "./DeveloperFeaturesSettings";
+ import { RemoteImSettings } from "./RemoteImSettings";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+@@ -458,7 +460,7 @@ function AboutVersionSection() {
+           }
+         />
+       ) : null}
+-      {hasDesktopBridge ? <CliCommandSettingsRow /> : null}
++      {hasDesktopBridge && !isXtworkDesktop() ? <CliCommandSettingsRow /> : null}
+       {switchChannel === null ? null : (
+         <UpdateTrackSwitchDialog channel={switchChannel} onClose={() => setSwitchChannel(null)} />
+       )}
+@@ -825,6 +827,7 @@ function AutoSettleDaysInput({
+ }
+ 
+ export function GeneralSettingsPanel() {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const gt = useGT();
+   const m = useMessages();
+   const setting = useSearchableSetting();
+@@ -1047,31 +1050,33 @@ export function GeneralSettingsPanel() {
+             />
+           }
+         />
+-        <SettingsRow
+-          {...setting("terminal-close-confirmation")}
+-          description={<T>Ask before closing terminals and stopping their running processes.</T>}
+-          resetAction={
+-            settings.confirmTerminalClose !== DEFAULT_UNIFIED_SETTINGS.confirmTerminalClose ? (
+-              <SettingResetButton
+-                ariaLabel={gt("Reset terminal close confirmation to default")}
+-                onClick={() =>
+-                  updateSettings({
+-                    confirmTerminalClose: DEFAULT_UNIFIED_SETTINGS.confirmTerminalClose,
+-                  })
++        {developerFeatures ? (
++          <SettingsRow
++            {...setting("terminal-close-confirmation")}
++            description={<T>Ask before closing terminals and stopping their running processes.</T>}
++            resetAction={
++              settings.confirmTerminalClose !== DEFAULT_UNIFIED_SETTINGS.confirmTerminalClose ? (
++                <SettingResetButton
++                  ariaLabel={gt("Reset terminal close confirmation to default")}
++                  onClick={() =>
++                    updateSettings({
++                      confirmTerminalClose: DEFAULT_UNIFIED_SETTINGS.confirmTerminalClose,
++                    })
++                  }
++                />
++              ) : null
++            }
++            control={
++              <Switch
++                checked={settings.confirmTerminalClose}
++                onCheckedChange={(checked) =>
++                  updateSettings({ confirmTerminalClose: Boolean(checked) })
+                 }
++                aria-label={gt("Confirm terminal closing")}
+               />
+-            ) : null
+-          }
+-          control={
+-            <Switch
+-              checked={settings.confirmTerminalClose}
+-              onCheckedChange={(checked) =>
+-                updateSettings({ confirmTerminalClose: Boolean(checked) })
+-              }
+-              aria-label={gt("Confirm terminal closing")}
+-            />
+-          }
+-        />
++            }
++          />
++        ) : null}
+         {isElectron ? (
+           <SettingsRow
+             {...setting("quit-confirmation")}
+@@ -1623,6 +1628,7 @@ function DiffColorsSettingsRow() {
+ }
+ 
+ export function DiffsSettingsPanel() {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const messages = useMessages();
+   const setting = useSearchableSetting();
+   const gt = useGT();
+@@ -1742,36 +1748,39 @@ export function DiffsSettingsPanel() {
+         <DiffColorsSettingsRow />
+       </SettingsSection>
+ 
+-      <SettingsSection id="pull-requests" title={gt("Pull requests")}>
+-        <SettingsRow
+-          {...setting("proactive-panels")}
+-          description={gt(
+-            "Open linked pull requests first. Otherwise, open Changes for edits to at least 3 files or 50 lines.",
+-          )}
+-          resetAction={
+-            settings.proactivePanelsEnabled !== DEFAULT_UNIFIED_SETTINGS.proactivePanelsEnabled ? (
+-              <SettingResetButton
+-                ariaLabel={gt("Reset proactive panels to default")}
+-                onClick={() =>
+-                  updateSettings({
+-                    proactivePanelsEnabled: DEFAULT_UNIFIED_SETTINGS.proactivePanelsEnabled,
+-                  })
++      {developerFeatures ? (
++        <SettingsSection id="pull-requests" title={gt("Pull requests")}>
++          <SettingsRow
++            {...setting("proactive-panels")}
++            description={gt(
++              "Open linked pull requests first. Otherwise, open Changes for edits to at least 3 files or 50 lines.",
++            )}
++            resetAction={
++              settings.proactivePanelsEnabled !==
++              DEFAULT_UNIFIED_SETTINGS.proactivePanelsEnabled ? (
++                <SettingResetButton
++                  ariaLabel={gt("Reset proactive panels to default")}
++                  onClick={() =>
++                    updateSettings({
++                      proactivePanelsEnabled: DEFAULT_UNIFIED_SETTINGS.proactivePanelsEnabled,
++                    })
++                  }
++                />
++              ) : null
++            }
++            control={
++              <Switch
++                checked={settings.proactivePanelsEnabled}
++                onCheckedChange={(checked) =>
++                  updateSettings({ proactivePanelsEnabled: Boolean(checked) })
+                 }
++                aria-label={gt("Open pull requests and changes panels proactively")}
+               />
+-            ) : null
+-          }
+-          control={
+-            <Switch
+-              checked={settings.proactivePanelsEnabled}
+-              onCheckedChange={(checked) =>
+-                updateSettings({ proactivePanelsEnabled: Boolean(checked) })
+-              }
+-              aria-label={gt("Open pull requests and changes panels proactively")}
+-            />
+-          }
+-        />
+-        <PullRequestLinksOpenInAppSetting />
+-      </SettingsSection>
++            }
++          />
++          <PullRequestLinksOpenInAppSetting />
++        </SettingsSection>
++      ) : null}
+     </SettingsPageContainer>
+   );
+ }
+@@ -2302,6 +2311,7 @@ export function ThreadsSettingsPanel() {
+ }
+ 
+ export function MaintenanceSettingsPanel() {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const setting = useSearchableSetting();
+   const gt = useGT();
+   const settings = useScopedSettings();
+@@ -2314,37 +2324,40 @@ export function MaintenanceSettingsPanel() {
+   return (
+     <SettingsPageContainer>
+       <SettingsSection id="updates" title={gt("Updates")}>
+-        <SettingsRow
+-          serverScoped
+-          settingKeys={["enableProviderUpdateChecks"]}
+-          {...setting("provider-update-checks")}
+-          description={gt(
+-            "Check installed provider CLIs for newer available versions and fetch model catalog updates. When off, new models may not appear.",
+-          )}
+-          resetAction={
+-            settings.enableProviderUpdateChecks !==
+-            DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks ? (
+-              <SettingResetButton
+-                ariaLabel={gt("Reset provider update checks to default")}
+-                onClick={() =>
+-                  updateSettings({
+-                    enableProviderUpdateChecks: DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
+-                  })
++        {developerFeatures ? (
++          <SettingsRow
++            serverScoped
++            settingKeys={["enableProviderUpdateChecks"]}
++            {...setting("provider-update-checks")}
++            description={gt(
++              "Check installed provider CLIs for newer available versions and fetch model catalog updates. When off, new models may not appear.",
++            )}
++            resetAction={
++              settings.enableProviderUpdateChecks !==
++              DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks ? (
++                <SettingResetButton
++                  ariaLabel={gt("Reset provider update checks to default")}
++                  onClick={() =>
++                    updateSettings({
++                      enableProviderUpdateChecks:
++                        DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
++                    })
++                  }
++                />
++              ) : null
++            }
++            control={
++              <ScopedSwitch
++                settingKeys={["enableProviderUpdateChecks"]}
++                checked={settings.enableProviderUpdateChecks}
++                onCheckedChange={(checked) =>
++                  updateSettings({ enableProviderUpdateChecks: Boolean(checked) })
+                 }
++                aria-label={gt("Check provider versions")}
+               />
+-            ) : null
+-          }
+-          control={
+-            <ScopedSwitch
+-              settingKeys={["enableProviderUpdateChecks"]}
+-              checked={settings.enableProviderUpdateChecks}
+-              onCheckedChange={(checked) =>
+-                updateSettings({ enableProviderUpdateChecks: Boolean(checked) })
+-              }
+-              aria-label={gt("Check provider versions")}
+-            />
+-          }
+-        />
++            }
++          />
++        ) : null}
+         <SettingsRow
+           {...setting("continue-threads-after-server-update")}
+           serverScoped
+@@ -2493,7 +2506,7 @@ export function AboutSettingsPanel() {
+           </>
+         )}
+         <MobileAppSettingsRow />
+-        {primaryEnvironmentId === null ? null : (
++        {isXtworkDesktop() || primaryEnvironmentId === null ? null : (
+           <SettingsRow
+             {...setting("welcome-page")}
+             description={gt("See your agents, import projects, and set up your phone.")}
+diff --git a/apps/web/src/components/settings/SettingsSidebarNav.tsx b/apps/web/src/components/settings/SettingsSidebarNav.tsx
+index 174a80bf..d03c2847 100644
+--- a/apps/web/src/components/settings/SettingsSidebarNav.tsx
++++ b/apps/web/src/components/settings/SettingsSidebarNav.tsx
+@@ -1,3 +1,5 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
++import { isXtworkDesktop, isDesktopSettingsPathVisible } from "../../desktopFeatureVisibility";
+ import {
+   lazy,
+   Suspense,
+@@ -142,6 +144,13 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
+   // Below md the nav is an icon rail; searching expands it over the page.
+   const [compactSearchOpen, setCompactSearchOpen] = useState(false);
+   const [activeResultIndex, setActiveResultIndex] = useState(0);
++  const developerFeatures = useDesktopDeveloperFeatures();
++  const navGroups = isXtworkDesktop()
++    ? SETTINGS_NAV_GROUPS.map((group) => ({
++        ...group,
++        paths: group.paths.filter((path) => isDesktopSettingsPathVisible(path, developerFeatures)),
++      })).filter((group) => group.paths.length > 0)
++    : SETTINGS_NAV_GROUPS;
+   const searchableItems = useAvailableSettingsSearchItems();
+   const results = searchSettings(query, searchableItems, m);
+   const isSearching = query.trim().length > 0;
+@@ -379,7 +388,7 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
+                   </SidebarMenu>
+                 )}
+                 <div onKeyDown={handleSettingsSectionKeyDown} className="flex flex-col gap-4">
+-                  {SETTINGS_NAV_GROUPS.map((group, index) => (
++                  {navGroups.map((group, index) => (
+                     <div
+                       key={group.heading}
+                       className="flex flex-col gap-1 max-md:border-t max-md:border-sidebar-border max-md:pt-4 max-md:first:border-t-0 max-md:first:pt-0"
+@@ -414,7 +423,11 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
+                                       !compactSearchOpen && "max-md:sr-only",
+                                     )}
+                                   >
+-                                    {m(SETTINGS_NAV_LABELS[to])}
++                                    {isXtworkDesktop() &&
++                                    !developerFeatures &&
++                                    to === "/settings/diffs"
++                                      ? gt("Diffs")
++                                      : m(SETTINGS_NAV_LABELS[to])}
+                                   </span>
+                                 </SidebarMenuButton>
+                               </SidebarMenuItem>
+diff --git a/apps/web/src/components/settings/TypographySettings.tsx b/apps/web/src/components/settings/TypographySettings.tsx
+index 5487991a..698ccb81 100644
+--- a/apps/web/src/components/settings/TypographySettings.tsx
++++ b/apps/web/src/components/settings/TypographySettings.tsx
+@@ -1,3 +1,4 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import type { ReactNode } from "react";
+ import { useEffect, useEffectEvent, useRef, useState } from "react";
+ import {
+@@ -286,12 +287,13 @@ function WordWrapRow() {
+ }
+ 
+ function FontSettingsGroup() {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   return (
+     <>
+       <InterfaceFontRow />
+       <PromptFontRow />
+       <CodeFontRow />
+-      <TerminalFontRow />
++      {developerFeatures ? <TerminalFontRow /> : null}
+     </>
+   );
+ }
+@@ -303,14 +305,17 @@ function SeparateFontsRow({
+   readonly checked: boolean;
+   readonly onCheckedChange: (checked: boolean) => void;
+ }) {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const gt = useGT();
+   const searchableSetting = useSearchableSetting();
+   return (
+     <SettingsRow
+       {...searchableSetting("separate-fonts")}
+-      description={gt(
+-        "Set the prompt, code, and terminal fonts separately instead of one monospace font.",
+-      )}
++      description={
++        developerFeatures
++          ? gt("Set the prompt, code, and terminal fonts separately instead of one monospace font.")
++          : gt("Set the prompt and code fonts separately.")
++      }
+       control={
+         <Switch
+           checked={checked}
+@@ -323,6 +328,7 @@ function SeparateFontsRow({
+ }
+ 
+ function SimpleFontRows() {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const gt = useGT();
+   const settings = useScopedSettings();
+   return (
+@@ -331,22 +337,28 @@ function SimpleFontRows() {
+       <CodeFontRow
+         title={gt("Monospace font")}
+         resetLabel={gt("Reset monospace font to default")}
+-        description={gt("Code blocks, diffs, file previews, and the terminal.")}
++        description={
++          developerFeatures
++            ? gt("Code blocks, diffs, file previews, and the terminal.")
++            : gt("Code blocks, diffs, and file previews.")
++        }
+         preview={
+           <>
+             <CodeFontPreview />
+-            <TerminalFontPreview
+-              family={resolveTerminalFontPreference({
+-                advanced: false,
+-                code: settings.fontFamilyCode,
+-                terminal: settings.fontFamilyTerminal,
+-              })}
+-              size={resolveTerminalFontSizePreference({
+-                advanced: false,
+-                code: settings.fontSizeCode,
+-                terminal: settings.fontSizeTerminal,
+-              })}
+-            />
++            {developerFeatures ? (
++              <TerminalFontPreview
++                family={resolveTerminalFontPreference({
++                  advanced: false,
++                  code: settings.fontFamilyCode,
++                  terminal: settings.fontFamilyTerminal,
++                })}
++                size={resolveTerminalFontSizePreference({
++                  advanced: false,
++                  code: settings.fontSizeCode,
++                  terminal: settings.fontSizeTerminal,
++                })}
++              />
++            ) : null}
+           </>
+         }
+       />
+diff --git a/apps/web/src/components/settings/scopedSettings.test.ts b/apps/web/src/components/settings/scopedSettings.test.ts
+index 1748f376..8f8dc159 100644
+--- a/apps/web/src/components/settings/scopedSettings.test.ts
++++ b/apps/web/src/components/settings/scopedSettings.test.ts
+@@ -283,7 +283,7 @@ describe("scoped settings writes", () => {
+     const unsupported = [
+       {
+         label: server.label,
+-        message: "This environment does not support this setting. Update T3 Code on it.",
++        message: "This environment does not support this setting. Update 小瞳 Work on it.",
+       },
+     ];
+ 
+diff --git a/apps/web/src/components/settings/useAvailableSettingsSearchItems.ts b/apps/web/src/components/settings/useAvailableSettingsSearchItems.ts
+index e6d94793..903b0758 100644
+--- a/apps/web/src/components/settings/useAvailableSettingsSearchItems.ts
++++ b/apps/web/src/components/settings/useAvailableSettingsSearchItems.ts
+@@ -1,3 +1,5 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
++import { isXtworkDesktop, isDesktopSettingVisible } from "../../desktopFeatureVisibility";
+ import { useMessages } from "gt-react";
+ import { AuthEnvironmentMaintainScope } from "@t3tools/contracts";
+ 
+@@ -18,6 +20,7 @@ import {
+ } from "./settingsSearch";
+ 
+ export function useAvailableSettingsSearchItems() {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const { environments } = useEnvironments();
+   // Explicit booleans keep flags out of the filter cache so environment updates do not rebuild the list.
+   const hasEnvironment =
+@@ -55,14 +58,14 @@ export function useAvailableSettingsSearchItems() {
+   const localEnvironmentDisabled = isLocalEnvironmentDisabled() === true;
+   const canManageLocalBackend = !localEnvironmentDisabled && canMaintain;
+   const desktopWsl = useEnvironmentQuery(
+-    isElectron && canManageLocalBackend ? desktopWslStateAtom : null,
++    isElectron && !isXtworkDesktop() && canManageLocalBackend ? desktopWslStateAtom : null,
+     useMessages(),
+   );
+   const cloudPublicConfig = hasCloudPublicConfig() === true;
+   const wslSettingsRowVisible =
+     isWslSettingsRowVisible({ state: desktopWsl.data, error: desktopWsl.error }) === true;
+ 
+-  return filterAvailableSettingsSearchItems({
++  const items = filterAvailableSettingsSearchItems({
+     localEnvironmentDisabled,
+     hasCloudPublicConfig: cloudPublicConfig,
+     hasEnvironment,
+@@ -76,4 +79,7 @@ export function useAvailableSettingsSearchItems() {
+     hasTextGeneratorsEnvironment,
+     hasPrimaryEnvironment: primaryEnvironmentId !== null,
+   });
++  return isXtworkDesktop()
++    ? items.filter((item) => isDesktopSettingVisible(item, developerFeatures))
++    : items;
+ }
+diff --git a/apps/web/src/components/sidebar/SidebarChrome.tsx b/apps/web/src/components/sidebar/SidebarChrome.tsx
+index 47990d61..25c01f6c 100644
+--- a/apps/web/src/components/sidebar/SidebarChrome.tsx
++++ b/apps/web/src/components/sidebar/SidebarChrome.tsx
+@@ -1,3 +1,4 @@
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import { ArrowLeftIcon, ArrowRightIcon, ChartNoAxesColumnIcon, SettingsIcon } from "lucide-react";
+ import type { ReactNode } from "react";
+ import { T, useGT } from "gt-react";
+@@ -284,9 +285,13 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
+ export const SidebarChromeFooter = memo(function SidebarChromeFooter() {
+   return (
+     <SidebarFooter>
+-      <SidebarProviderUpdatePill />
++      <DesktopProviderUpdatePill />
+       <SidebarUpdateArchitectureWarning />
+       <SidebarUtilityMenu />
+     </SidebarFooter>
+   );
+ });
++
++function DesktopProviderUpdatePill() {
++  return useDesktopDeveloperFeatures() ? <SidebarProviderUpdatePill /> : null;
++}
+diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
+index f3505bd2..4fd567b5 100644
+--- a/apps/web/src/components/sidebar/SidebarThreadRow.tsx
++++ b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
+@@ -132,6 +132,7 @@ import { observeVisibleAnimation } from "~/lib/visibleAnimation";
+ import { useThreadHasUnsentDraft } from "../../composerDraftStore";
+ import { ThreadDetailsIssueRows } from "../chat/ThreadDetailsIssueRows";
+ import { IssueGlyph, issueStatePresentation } from "../issue/issuePresentation";
++import { useDesktopDeveloperFeatures } from "~/hooks/useDeveloperFeatures";
+ 
+ // The fields thread rows show. Provider status pushes refresh `checkedAt`,
+ // status and auth on every provider; leaving those out keeps each
+@@ -284,6 +285,7 @@ function SidebarThreadTooltip({
+   terminalStatus: TerminalStatusIndicator | null;
+   terminalProcessCount: number;
+ }) {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const driverKind = providerEntry?.driverKind ?? null;
+   const previousProviderNames = thread.providerInstanceHistory
+     .filter((instanceId) => instanceId !== modelInstanceId)
+@@ -296,7 +298,7 @@ function SidebarThreadTooltip({
+       <ThreadHoverCard
+         title={thread.title}
+         footer={
+-          supportsMultiplePullRequests && thread.pullRequests.length > 0 ? (
++          developerFeatures && supportsMultiplePullRequests && thread.pullRequests.length > 0 ? (
+             <div className="border-t border-border/60 pt-2 pl-0.5 text-xs text-muted-foreground">
+               <ThreadPullRequestsMiniList pullRequests={thread.pullRequests} />
+             </div>
+@@ -318,13 +320,13 @@ function SidebarThreadTooltip({
+             <div className="min-w-0 truncate text-foreground/75">{environmentLabel}</div>
+           </div>
+         ) : null}
+-        {thread.branch ? (
++        {developerFeatures && thread.branch ? (
+           <div className="flex min-w-0 items-center gap-2">
+             <GitBranchIcon className="size-3 shrink-0 stroke-muted-foreground" />
+             <MiddleTruncate value={thread.branch} className="flex" />
+           </div>
+         ) : null}
+-        {branchMismatch ? (
++        {developerFeatures && branchMismatch ? (
+           <div className="flex min-w-0 items-start gap-2 text-warning">
+             <CircleAlertIcon aria-hidden className="mt-0.5 size-3 shrink-0 stroke-current" />
+             <div className="min-w-0 flex-1 wrap-break-word">
+@@ -332,7 +334,7 @@ function SidebarThreadTooltip({
+             </div>
+           </div>
+         ) : null}
+-        {driverKind ? (
++        {developerFeatures && driverKind ? (
+           <div className="flex min-w-0 items-center gap-2">
+             <ProviderInstanceIcon
+               driverKind={driverKind}
+@@ -354,7 +356,7 @@ function SidebarThreadTooltip({
+             </div>
+           </div>
+         ) : null}
+-        {previousProviderNames.length > 0 ? (
++        {developerFeatures && previousProviderNames.length > 0 ? (
+           <div className="flex min-w-0 items-center gap-2">
+             <ArrowRightLeftIcon className="size-3 shrink-0 stroke-muted-foreground" />
+             <div className="min-w-0 truncate text-foreground/75">
+@@ -364,7 +366,7 @@ function SidebarThreadTooltip({
+             </div>
+           </div>
+         ) : null}
+-        {terminalStatus ? (
++        {developerFeatures && terminalStatus ? (
+           <div className="flex min-w-0 items-center gap-2">
+             <TerminalIcon
+               aria-hidden
+@@ -678,6 +680,7 @@ function ThreadRenameInput(props: {
+ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowProps) {
+   const gt = useGT();
+   const messages = useMessages();
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const {
+     isRenaming,
+     onCancelRename,
+@@ -724,7 +727,9 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+     environmentId: thread.environmentId,
+     threadId: thread.id,
+   });
+-  const terminalStatus = terminalStatusFromRunningIds(runningTerminalIds, messages);
++  const terminalStatus = developerFeatures
++    ? terminalStatusFromRunningIds(runningTerminalIds, messages)
++    : null;
+   const terminalProcessCount = runningTerminalIds.length;
+   const hasUnsentDraft = useThreadHasUnsentDraft(threadRef) && !props.isRouteThread;
+   const handleDiscardDraftClick = (event: ReactMouseEvent) => {
+@@ -737,12 +742,15 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+   const linkedPullRequestStatus = useLinkedThreadPullRequest(
+     thread.environmentId,
+     thread.linkedPullRequest,
+-    leaseLiveStatus,
++    leaseLiveStatus && developerFeatures,
+     thread.pullRequests,
+     thread.branchPullRequest,
+   );
+   const branchTarget =
+-    leaseLiveStatus && (thread.branch != null || thread.worktreePath !== null) && gitCwd !== null
++    developerFeatures &&
++    leaseLiveStatus &&
++    (thread.branch != null || thread.worktreePath !== null) &&
++    gitCwd !== null
+       ? { environmentId: thread.environmentId, cwd: gitCwd }
+       : null;
+   const gitStatus = useEnvironmentQuery(
+@@ -864,7 +872,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+     : thread.modelSelection.model;
+ 
+   const isRemote = thread.environmentId !== props.currentEnvironmentId;
+-  const showsScratchMachine = !checkoutThread.branch && props.scratchMachineLabel !== null;
++  const visibleBranch = developerFeatures ? checkoutThread.branch : null;
++  const showsScratchMachine = !visibleBranch && props.scratchMachineLabel !== null;
+ 
+   const detailsTooltip = (
+     <SidebarThreadTooltip
+@@ -1120,7 +1129,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+     if (!props.isRouteThread) onThreadActivate(threadRef);
+   };
+   const prBadge =
+-    prBadgeShape?.kind === "stack" || pr || currentLinkedPr ? (
++    developerFeatures && (prBadgeShape?.kind === "stack" || pr || currentLinkedPr) ? (
+       <ThreadPullRequestBadgeControl
+         render={<InlineButton />}
+         badge={prBadgeShape}
+@@ -1136,7 +1145,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+   const issueCount = thread.issues?.length ?? 0;
+   const issueDetail = useLinkedIssueDetail(
+     thread.environmentId,
+-    leaseLiveStatus && issueCount === 1 ? firstIssue : undefined,
++    leaseLiveStatus && developerFeatures && issueCount === 1 ? firstIssue : undefined,
+     "sidebar",
+   );
+   const issueStatus = issueDetail === null ? null : issueStatePresentation(issueDetail.state);
+@@ -1153,54 +1162,55 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+       : gt("{count, plural, one {{count} linked issue} other {{count} linked issues}}", {
+           count: issueCount,
+         });
+-  const issueBadge = firstIssue ? (
+-    <Tooltip>
+-      <TooltipTrigger
+-        render={
+-          <InlineButton
+-            tone="muted"
+-            aria-label={issueLabel}
+-            onPointerDown={(event) => event.stopPropagation()}
+-            onClick={(event) => {
+-              event.stopPropagation();
+-              openLinkedItems();
+-            }}
+-          />
+-        }
+-      >
+-        <IssueIcon aria-hidden className={cn("size-3 shrink-0", issueStatus?.toneClassName)} />
+-        <span className="max-w-16 truncate text-xs font-normal text-secondary-label tabular-nums">
+-          {issueCount === 1 ? firstIssue.displayKey : issueCount}
+-        </span>
+-      </TooltipTrigger>
+-      <TooltipPopup
+-        side="top"
+-        sideOffset={0}
+-        variant="glass"
+-        className="pointer-events-auto w-80 max-w-[calc(100vw-2rem)] text-left whitespace-normal"
+-        onContextMenu={(event) => event.stopPropagation()}
+-      >
+-        <div className="-mx-1 max-h-[calc(var(--available-height)-0.5rem-2px)] overflow-y-auto overscroll-contain">
+-          <ThreadDetailsIssueRows
+-            links={thread.issues ?? []}
+-            threadRef={threadRef}
+-            compact={false}
+-            mountScope="sidebar-tooltip"
+-            onOpen={() => {
+-              if (!props.isRouteThread) onThreadActivate(threadRef);
+-            }}
+-          />
+-        </div>
+-      </TooltipPopup>
+-    </Tooltip>
+-  ) : null;
+-  const terminalStatusIcon = (
++  const issueBadge =
++    developerFeatures && firstIssue ? (
++      <Tooltip>
++        <TooltipTrigger
++          render={
++            <InlineButton
++              tone="muted"
++              aria-label={issueLabel}
++              onPointerDown={(event) => event.stopPropagation()}
++              onClick={(event) => {
++                event.stopPropagation();
++                openLinkedItems();
++              }}
++            />
++          }
++        >
++          <IssueIcon aria-hidden className={cn("size-3 shrink-0", issueStatus?.toneClassName)} />
++          <span className="max-w-16 truncate text-xs font-normal text-secondary-label tabular-nums">
++            {issueCount === 1 ? firstIssue.displayKey : issueCount}
++          </span>
++        </TooltipTrigger>
++        <TooltipPopup
++          side="top"
++          sideOffset={0}
++          variant="glass"
++          className="pointer-events-auto w-80 max-w-[calc(100vw-2rem)] text-left whitespace-normal"
++          onContextMenu={(event) => event.stopPropagation()}
++        >
++          <div className="-mx-1 max-h-[calc(var(--available-height)-0.5rem-2px)] overflow-y-auto overscroll-contain">
++            <ThreadDetailsIssueRows
++              links={thread.issues ?? []}
++              threadRef={threadRef}
++              compact={false}
++              mountScope="sidebar-tooltip"
++              onOpen={() => {
++                if (!props.isRouteThread) onThreadActivate(threadRef);
++              }}
++            />
++          </div>
++        </TooltipPopup>
++      </Tooltip>
++    ) : null;
++  const terminalStatusIcon = developerFeatures ? (
+     <ThreadTerminalStatusButton
+       threadRef={threadRef}
+       terminalIds={runningTerminalIds}
+       onThreadActivate={onThreadActivate}
+     />
+-  );
++  ) : null;
+   const draftIndicator = hasUnsentDraft ? (
+     <Tooltip>
+       <TooltipTrigger
+@@ -1264,21 +1274,28 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+       </span>
+     ) : null;
+   const diff = latestRunDiff(thread);
++  const providerStack = developerFeatures ? (
++    <SidebarProviderStack
++      thread={thread}
++      providerEntryByInstanceId={props.providerEntryByInstanceId}
++    />
++  ) : null;
++  const hasTrailingIcons = remoteMachineIcon !== null || providerStack !== null;
+   // Only the trailing icons would remain, so the row moves them to the title line instead.
+   const metaLineEmpty =
+-    !checkoutThread.branch &&
++    !visibleBranch &&
+     !showsScratchMachine &&
+     prBadge === null &&
+     issueBadge === null &&
+     diff === null &&
+-    runningTerminalIds.length === 0;
++    (!developerFeatures || runningTerminalIds.length === 0);
+   const metaLine = metaLineEmpty ? null : (
+     <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-secondary-label text-xs">
+-      {checkoutThread.branch ? (
++      {visibleBranch ? (
+         <>
+           <ThreadWorktreeIndicator thread={checkoutThread} />
+           <span className="flex min-w-0 flex-1">
+-            <MiddleTruncate value={checkoutThread.branch} showTitle={false} />
++            <MiddleTruncate value={visibleBranch} showTitle={false} />
+           </span>
+         </>
+       ) : showsScratchMachine ? (
+@@ -1302,27 +1319,24 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+           <span className="text-diff-deletion-foreground">−{formatDiffCount(diff.deletions)}</span>
+         </span>
+       ) : null}
+-      <span
+-        aria-hidden
+-        className="pointer-events-none ml-auto inline-flex shrink-0 items-center gap-1"
+-      >
+-        {remoteMachineIcon}
+-        <SidebarProviderStack
+-          thread={thread}
+-          providerEntryByInstanceId={props.providerEntryByInstanceId}
+-        />
+-      </span>
++      {hasTrailingIcons ? (
++        <span
++          aria-hidden
++          className="pointer-events-none ml-auto inline-flex shrink-0 items-center gap-1"
++        >
++          {remoteMachineIcon}
++          {providerStack}
++        </span>
++      ) : null}
+     </div>
+   );
+-  const titleLineIcons = metaLineEmpty ? (
+-    <span aria-hidden className="inline-flex shrink-0 items-center gap-1">
+-      {remoteMachineIcon}
+-      <SidebarProviderStack
+-        thread={thread}
+-        providerEntryByInstanceId={props.providerEntryByInstanceId}
+-      />
+-    </span>
+-  ) : null;
++  const titleLineIcons =
++    metaLineEmpty && hasTrailingIcons ? (
++      <span aria-hidden className="inline-flex shrink-0 items-center gap-1">
++        {remoteMachineIcon}
++        {providerStack}
++      </span>
++    ) : null;
+ 
+   if (variant !== "card") {
+     const multiline = variant === "folder-multiline";
+@@ -1780,6 +1794,7 @@ export const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props
+   onFileDropThreads: (threadRef: ScopedThreadRef, files: File[]) => void;
+ }) {
+   const messages = useMessages();
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const thread =
+     useThreadShell(scopeThreadRef(props.thread.environmentId, props.thread.id)) ?? props.thread;
+   const accessibility = resolveSidebarRowAccessibility({
+@@ -1803,7 +1818,10 @@ export const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props
+   };
+   const gitCwd = thread.worktreePath ?? props.project?.workspaceRoot ?? null;
+   const branchTarget =
+-    leaseLiveStatus && (thread.branch != null || thread.worktreePath !== null) && gitCwd !== null
++    developerFeatures &&
++    leaseLiveStatus &&
++    (thread.branch != null || thread.worktreePath !== null) &&
++    gitCwd !== null
+       ? { environmentId: thread.environmentId, cwd: gitCwd }
+       : null;
+   const gitStatus = useEnvironmentQuery(
+@@ -1869,7 +1887,7 @@ export const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props
+               tabIndex={-1}
+               aria-selected={props.isHighlighted}
+               aria-current={accessibility.current}
+-              aria-describedby={`${props.resultId}-pr`}
++              aria-describedby={developerFeatures ? `${props.resultId}-pr` : undefined}
+               aria-label={accessibility.label}
+               {...dragListeners}
+               onMouseMove={props.onHighlight}
+@@ -1925,14 +1943,16 @@ export const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props
+                   </ActivityShimmerOverlay>
+                 ) : null}
+               </span>
+-              <span id={`${props.resultId}-pr`} className="contents">
+-                <ThreadSearchPullRequestNumber
+-                  thread={thread}
+-                  query={props.searchQuery}
+-                  enabled={leaseLiveStatus}
+-                  settled={props.isSettled}
+-                />
+-              </span>
++              {developerFeatures ? (
++                <span id={`${props.resultId}-pr`} className="contents">
++                  <ThreadSearchPullRequestNumber
++                    thread={thread}
++                    query={props.searchQuery}
++                    enabled={leaseLiveStatus}
++                    settled={props.isSettled}
++                  />
++                </span>
++              ) : null}
+               <span className="w-8 shrink-0 text-right text-xs text-muted-foreground/55 tabular-nums">
+                 <RelativeTimeLabel timestamp={resolveThreadActivityTimestamp(thread)} />
+               </span>
+diff --git a/apps/web/src/components/sidebar/SidebarUpdatePill.browser.test.tsx b/apps/web/src/components/sidebar/SidebarUpdatePill.browser.test.tsx
+index 0f751bc5..13cf79a3 100644
+--- a/apps/web/src/components/sidebar/SidebarUpdatePill.browser.test.tsx
++++ b/apps/web/src/components/sidebar/SidebarUpdatePill.browser.test.tsx
+@@ -161,7 +161,7 @@ describe("SidebarUpdatePill update everything", () => {
+ 
+     const table = page.getByRole("table");
+     await expect.element(table.getByRole("columnheader", { name: "Machine" })).toBeVisible();
+-    await expect.element(table.getByRole("columnheader", { name: "T3 Code" })).toBeVisible();
++    await expect.element(table.getByRole("columnheader", { name: "小瞳 Work" })).toBeVisible();
+     await expect.element(table.getByRole("columnheader", { name: "Providers" })).toBeVisible();
+     const row = table.getByRole("row", { name: new RegExp(label) });
+     await expect.element(row.getByRole("cell", { name: label, exact: true })).toBeVisible();
+diff --git a/apps/web/src/components/sidebar/updateEverything.logic.test.ts b/apps/web/src/components/sidebar/updateEverything.logic.test.ts
+index f4b1d005..71d6f6b9 100644
+--- a/apps/web/src/components/sidebar/updateEverything.logic.test.ts
++++ b/apps/web/src/components/sidebar/updateEverything.logic.test.ts
+@@ -124,7 +124,7 @@ describe("collectServerUpdateTargets", () => {
+         entry.label,
+         entry.reason,
+       ]),
+-    ).toEqual([["off", "Example Corp manages T3 Code updates."]]);
++    ).toEqual([["off", "Example Corp manages 小瞳 Work updates."]]);
+     expect(
+       collectServerUpdateTargets(
+         machines.map((entry) => ({
+@@ -257,7 +257,7 @@ describe("collectChannelSwitchTargets", () => {
+       ["old-desktop", "needs a newer desktop app"],
+       [
+         "no-nightly",
+-        "Example Corp manages T3 Code updates. Only stable releases can be installed.",
++        "Example Corp manages 小瞳 Work updates. Only stable releases can be installed.",
+       ],
+     ]);
+   });
+diff --git a/apps/web/src/fileContextMenu.test.ts b/apps/web/src/fileContextMenu.test.ts
+index a5c74929..d338b812 100644
+--- a/apps/web/src/fileContextMenu.test.ts
++++ b/apps/web/src/fileContextMenu.test.ts
+@@ -1,7 +1,12 @@
+ import { EnvironmentId } from "@t3tools/contracts";
+ import { describe, expect, it } from "vite-plus/test";
+ 
+-import { resolveFileContextMenuAbsolutePath } from "./fileContextMenu";
++import {
++  buildFileContextMenuItems,
++  resolveFileContextMenuAbsolutePath,
++  resolveFileContextMenuEditorIds,
++} from "./fileContextMenu";
++import { m } from "./i18n/messages";
+ 
+ const BASE_TARGET = {
+   environmentId: EnvironmentId.make("environment-local"),
+@@ -42,3 +47,53 @@ describe("resolveFileContextMenuAbsolutePath", () => {
+     ).toBeNull();
+   });
+ });
++
++describe("resolveFileContextMenuEditorIds", () => {
++  it("hides external editors when developer features are off while keeping file-manager", () => {
++    expect(resolveFileContextMenuEditorIds(["file-manager", "cursor", "vscode"], false)).toEqual([
++      "file-manager",
++    ]);
++    expect(resolveFileContextMenuEditorIds(["cursor", "vscode"], false)).toEqual([]);
++  });
++
++  it("keeps all available editors when developer features are enabled", () => {
++    expect(resolveFileContextMenuEditorIds(["file-manager", "cursor", "vscode"], true)).toEqual([
++      "file-manager",
++      "cursor",
++      "vscode",
++    ]);
++  });
++});
++
++describe("buildFileContextMenuItems", () => {
++  it("keeps Open and Reveal in Finder without Open with when developer features are off", () => {
++    const items = buildFileContextMenuItems({
++      hasAbsolutePath: true,
++      capabilities: {
++        revealLabel: "Reveal in Finder",
++        canOpenDefault: true,
++        editorIds: resolveFileContextMenuEditorIds(["file-manager", "cursor", "vscode"], false),
++      },
++      resolve: m,
++    });
++    expect(items.map((item) => item.id)).toEqual(["open", "reveal-in-folder"]);
++  });
++
++  it("includes Open with external editors when developer features are enabled", () => {
++    const items = buildFileContextMenuItems({
++      hasAbsolutePath: true,
++      capabilities: {
++        revealLabel: "Reveal in Finder",
++        canOpenDefault: true,
++        editorIds: resolveFileContextMenuEditorIds(["file-manager", "cursor", "vscode"], true),
++      },
++      resolve: m,
++    });
++    expect(items.map((item) => item.id)).toEqual(["open", "reveal-in-folder", "open-with"]);
++    const openWith = items.find((item) => item.id === "open-with");
++    expect(openWith?.children?.map((child) => child.id)).toEqual([
++      "editor:cursor",
++      "editor:vscode",
++    ]);
++  });
++});
+diff --git a/apps/web/src/fileContextMenu.ts b/apps/web/src/fileContextMenu.ts
+index 452a6bbd..2a3d5ac6 100644
+--- a/apps/web/src/fileContextMenu.ts
++++ b/apps/web/src/fileContextMenu.ts
+@@ -19,6 +19,7 @@ import { toastManager } from "./components/ui/toast";
+ import { useAtomValue } from "@effect/atom-react";
+ import { msg, useMessages } from "gt-react";
+ 
++import { useDesktopDeveloperFeatures } from "./hooks/useDeveloperFeatures";
+ import type { MessageResolver } from "./i18n/messages";
+ 
+ export type FileContextMenuAction =
+@@ -59,7 +60,16 @@ export interface FileContextMenuCapabilities {
+   readonly editorIds: ReadonlyArray<EditorId>;
+ }
+ 
+-function buildFileContextMenuItems(input: {
++export function resolveFileContextMenuEditorIds(
++  availableEditors: ReadonlyArray<EditorId>,
++  developerFeatures: boolean,
++): ReadonlyArray<EditorId> {
++  return developerFeatures
++    ? availableEditors
++    : availableEditors.filter((id) => id === "file-manager");
++}
++
++export function buildFileContextMenuItems(input: {
+   readonly hasAbsolutePath: boolean;
+   readonly capabilities: FileContextMenuCapabilities;
+   readonly resolve: MessageResolver;
+@@ -95,6 +105,7 @@ function buildFileContextMenuItems(input: {
+ }
+ 
+ export function useFileContextMenu(environmentId: EnvironmentId | null) {
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const openInEditor = useAtomCommand(shellEnvironment.openInEditor, { reportFailure: false });
+   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
+   const resolve = useMessages();
+@@ -111,7 +122,7 @@ export function useFileContextMenu(environmentId: EnvironmentId | null) {
+           : revealInFileExplorerLabelForKind(serverConfig.shellRevealInFileManagerKind, resolve)
+         : undefined,
+     canOpenDefault: availableEditors.includes("file-manager"),
+-    editorIds: availableEditors,
++    editorIds: resolveFileContextMenuEditorIds(availableEditors, developerFeatures),
+   };
+ 
+   const activate = async (
+diff --git a/apps/web/src/hooks/useHandleNewThread.test.ts b/apps/web/src/hooks/useHandleNewThread.test.ts
+index 7c64d007..a71891a8 100644
+--- a/apps/web/src/hooks/useHandleNewThread.test.ts
++++ b/apps/web/src/hooks/useHandleNewThread.test.ts
+@@ -255,6 +255,7 @@ vi.mock("../uiStateStore", () => ({
+   legacyProjectCwdPreferenceKey: () => "remote-project",
+   useUiStateStore: () => [],
+ }));
++vi.mock("./useDeveloperFeatures", () => ({ readDeveloperFeatures: () => false }));
+ vi.mock("./useSettings", () => ({ getClientSettings: () => ({}) }));
+ 
+ import { resolveDefaultProjectRef, useNewThreadHandler } from "./useHandleNewThread";
+diff --git a/apps/web/src/hooks/useHandleNewThread.ts b/apps/web/src/hooks/useHandleNewThread.ts
+index 49e88126..849ca0ec 100644
+--- a/apps/web/src/hooks/useHandleNewThread.ts
++++ b/apps/web/src/hooks/useHandleNewThread.ts
+@@ -1,3 +1,5 @@
++import { readDeveloperFeatures } from "./useDeveloperFeatures";
++import { isXtworkDesktop } from "../desktopFeatureVisibility";
+ import {
+   scopedProjectKey,
+   scopeProjectRef,
+@@ -198,6 +200,7 @@ export function createNewThreadHandler(router: AnyRouter) {
+         destinationDraftId,
+       });
+     const resolveDefaultEnvMode = async (): Promise<DraftThreadEnvMode> => {
++      if (isXtworkDesktop() && !readDeveloperFeatures()) return "local";
+       // Environment queries wait for a connection, so reading the project file on an
+       // offline machine would never settle and the draft would never open.
+       const consultProjectFile =
+diff --git a/apps/web/src/lib/bootError.test.ts b/apps/web/src/lib/bootError.test.ts
+index e04e8bef..1ba95225 100644
+--- a/apps/web/src/lib/bootError.test.ts
++++ b/apps/web/src/lib/bootError.test.ts
+@@ -5,11 +5,12 @@ import {
+   type BootErrorEnvironment,
+   buildErrorReport,
+   resolveTriageCommand,
++  showBootError,
+   updateActionFor,
+ } from "./bootError";
+ 
+-const desktopWith = (getState: () => Promise<DesktopCliCommandState>) =>
+-  ({ cliCommand: { getState } }) as unknown as DesktopBridge;
++const desktopWith = (getState: () => Promise<DesktopCliCommandState>, platform = "linux") =>
++  ({ cliCommand: { getState }, getClientPlatform: () => platform }) as unknown as DesktopBridge;
+ 
+ const notOnPath = (launcherPath: string | null): DesktopCliCommandState => ({
+   supported: launcherPath !== null,
+@@ -41,20 +42,67 @@ describe("resolveTriageCommand", () => {
+     ).resolves.toBe("& 'C:\\Users\\Jo O''Neil\\.t3\\bin\\t3.cmd' triage");
+   });
+ 
+-  it("falls back to npx without a usable desktop launcher", async () => {
+-    using _warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+-    await expect(resolveTriageCommand(undefined)).resolves.toBe("npx t3 triage");
+-    await expect(resolveTriageCommand({} as DesktopBridge)).resolves.toBe("npx t3 triage");
+-    await expect(resolveTriageCommand(desktopWith(async () => notOnPath(null)))).resolves.toBe(
+-      "npx t3 triage",
++  it("prefers bundled backend logs for xtwork desktop even if a cli launcher exists", async () => {
++    const onPath = { ...notOnPath("/home/me/.t3/bin/t3"), onPath: true };
++    const xtworkBridge = (
++      platform: string,
++      options: { getState?: () => Promise<DesktopCliCommandState>; logPath?: string | null } = {},
++    ) =>
++      ({
++        xtwork: true,
++        cliCommand: { getState: options.getState ?? (async () => onPath) },
++        getClientPlatform: () => platform,
++        ...(options.logPath !== undefined ? { getBackendLogPath: () => options.logPath } : {}),
++      }) as unknown as DesktopBridge;
++    await expect(resolveTriageCommand(xtworkBridge("darwin"))).resolves.toBe(
++      'tail -n 200 "$HOME/Library/Application Support/Xtwork-v2/backend.log"',
++    );
++    await expect(
++      resolveTriageCommand(xtworkBridge("darwin", { logPath: null })),
++    ).resolves.toBe('tail -n 200 "$HOME/Library/Application Support/Xtwork-v2/backend.log"');
++    await expect(
++      resolveTriageCommand(
++        xtworkBridge("darwin", { logPath: "/tmp/xtwork-isolated-profile/backend.log" }),
++      ),
++    ).resolves.toBe("tail -n 200 /tmp/xtwork-isolated-profile/backend.log");
++    await expect(
++      resolveTriageCommand(
++        xtworkBridge("linux", { logPath: "/Users/O'Neil/xtwork profile/backend.log" }),
++      ),
++    ).resolves.toBe(`tail -n 200 '/Users/O'"'"'Neil/xtwork profile/backend.log'`);
++    await expect(resolveTriageCommand(xtworkBridge("win32"))).resolves.toBe(
++      'Get-Content "$env:APPDATA\\Xtwork-v2\\backend.log" -Tail 200',
++    );
++    await expect(
++      resolveTriageCommand(
++        xtworkBridge("win32", { logPath: "C:\\Users\\Jo O'Neil\\xtwork\\backend.log" }),
++      ),
++    ).resolves.toBe("Get-Content 'C:\\Users\\Jo O''Neil\\xtwork\\backend.log' -Tail 200");
++    await expect(resolveTriageCommand(xtworkBridge("linux"))).resolves.toBe(
++      'tail -n 200 "${XDG_CONFIG_HOME:-$HOME/.config}/Xtwork-v2/backend.log"',
+     );
+-    const staleWindowsPathEntry = { ...notOnPath(null), supported: true, onPath: true };
++  });
++
++  it("falls back to bundled backend log paths without a usable desktop launcher", async () => {
++    using _warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    for (const candidate of [
++      undefined,
++      {} as DesktopBridge,
++      desktopWith(async () => notOnPath(null), "linux"),
++      desktopWith(async () => ({ ...notOnPath(null), supported: true, onPath: true }), "linux"),
++      desktopWith(() => Promise.reject(new Error("ipc closed")), "linux"),
++    ]) {
++      const command = await resolveTriageCommand(candidate);
++      expect(command).toContain("Xtwork-v2");
++      expect(command).toContain("backend.log");
++      expect(command).not.toContain("t3 triage");
++    }
+     await expect(
+-      resolveTriageCommand(desktopWith(async () => staleWindowsPathEntry)),
+-    ).resolves.toBe("npx t3 triage");
++      resolveTriageCommand(desktopWith(async () => notOnPath(null), "darwin")),
++    ).resolves.toBe('tail -n 200 "$HOME/Library/Application Support/Xtwork-v2/backend.log"');
+     await expect(
+-      resolveTriageCommand(desktopWith(() => Promise.reject(new Error("ipc closed")))),
+-    ).resolves.toBe("npx t3 triage");
++      resolveTriageCommand(desktopWith(async () => notOnPath(null), "win32")),
++    ).resolves.toBe('Get-Content "$env:APPDATA\\Xtwork-v2\\backend.log" -Tail 200');
+   });
+ });
+ 
+diff --git a/apps/web/src/lib/bootError.ts b/apps/web/src/lib/bootError.ts
+index 49fd3aec..48483183 100644
+--- a/apps/web/src/lib/bootError.ts
++++ b/apps/web/src/lib/bootError.ts
+@@ -1,6 +1,5 @@
+ import type { DesktopBridge, DesktopUpdateState } from "@t3tools/contracts";
+ 
+-const FALLBACK_TRIAGE_COMMAND = "npx t3 triage";
+ const DOWNLOAD_URL = "https://t3.codes/download";
+ const ISSUE_URL = "https://github.com/pingdotgg/t3code/issues/new";
+ const LAST_FAILURE_KEY = "t3code:boot-failed-at";
+@@ -11,20 +10,59 @@ const COPY_BLOCKED = "Copy was blocked. The text is selected so you can copy it
+ const UPDATE_DOWNLOAD_FAILED = "The update download failed. Try Download update again.";
+ const UPDATE_INSTALL_FAILED = "The update install failed. Try Restart to update again.";
+ 
++function posixShellArg(value: string) {
++  return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", `'"'"'`)}'`;
++}
++
++function powerShellSingleQuoted(value: string) {
++  return `'${value.replace(/['\u2018\u2019\u201A\u201B]/g, "$&$&")}'`;
++}
++
++function backendLogPath(bridge: DesktopBridge | undefined): string | null {
++  try {
++    const value = (
++      bridge as (DesktopBridge & { getBackendLogPath?: () => unknown }) | undefined
++    )?.getBackendLogPath?.();
++    return typeof value === "string" && value.trim().length > 0 ? value : null;
++  } catch {
++    return null;
++  }
++}
++
++function bundledLogCommand(platform: string, logPath?: string | null) {
++  const lower = platform.toLowerCase();
++  const isMac = lower.includes("mac") || lower.includes("darwin");
++  const isWindows = !isMac && lower.includes("win");
++  if (logPath) {
++    return isWindows
++      ? `Get-Content ${powerShellSingleQuoted(logPath)} -Tail 200`
++      : `tail -n 200 ${posixShellArg(logPath)}`;
++  }
++  if (isMac) {
++    return 'tail -n 200 "$HOME/Library/Application Support/Xtwork-v2/backend.log"';
++  }
++  if (isWindows) {
++    return 'Get-Content "$env:APPDATA\\Xtwork-v2\\backend.log" -Tail 200';
++  }
++  return 'tail -n 200 "${XDG_CONFIG_HOME:-$HOME/.config}/Xtwork-v2/backend.log"';
++}
++
+ /** The Windows launcher is a `.cmd` run from PowerShell, which needs `&` to run a quoted path. */
+ function launcherCommand(launcherPath: string) {
+   if (launcherPath.endsWith(".cmd")) {
+     return /^[\w:\\.-]+$/.test(launcherPath)
+       ? launcherPath
+-      : `& '${launcherPath.replace(/['\u2018\u2019\u201A\u201B]/g, "$&$&")}'`;
++      : `& ${powerShellSingleQuoted(launcherPath)}`;
+   }
+-  return /^[\w@%+=:,./-]+$/.test(launcherPath)
+-    ? launcherPath
+-    : `'${launcherPath.replaceAll("'", `'"'"'`)}'`;
++  return posixShellArg(launcherPath);
+ }
+ 
+-/** Desktop can run its bundled launcher without Node; everything else falls back to npx. */
++/** Desktop can inspect its bundled log file directly; CLI launchers keep their triage command. */
+ export async function resolveTriageCommand(bridge: DesktopBridge | undefined) {
++  const logPath = backendLogPath(bridge);
++  if (bridge && "xtwork" in bridge) {
++    return bundledLogCommand(clientPlatform(bridge), logPath);
++  }
+   try {
+     const state = await bridge?.cliCommand.getState();
+     // Windows reports onPath from its PATH entry alone; only an existing launcher proves it runs.
+@@ -34,7 +72,7 @@ export async function resolveTriageCommand(bridge: DesktopBridge | undefined) {
+   } catch (error) {
+     console.warn("Could not read the desktop CLI state.", error);
+   }
+-  return FALLBACK_TRIAGE_COMMAND;
++  return bundledLogCommand(clientPlatform(bridge), logPath);
+ }
+ 
+ /** The update button only appears when the desktop updater has a newer build to offer. */
+@@ -293,7 +331,9 @@ export function showBootError(error: unknown) {
+   const updateNote = element("p", { id: "boot-error-update-note", hidden: true });
+   if (bridge) mountUpdateButton(bridge, update, updateNote, announce);
+ 
+-  const command = element("code", { textContent: FALLBACK_TRIAGE_COMMAND });
++  const command = element("code", {
++    textContent: bundledLogCommand(environment.platform, backendLogPath(bridge)),
++  });
+   const copyCommand = element("button", {
+     className: "boot-error-icon",
+     type: "button",
+@@ -348,31 +388,19 @@ export function showBootError(error: unknown) {
+   );
+ 
+   const issue = new URL(ISSUE_URL);
+-  issue.searchParams.set("template", "bug_report.yml");
+   issue.searchParams.set("title", "T3 Code failed to start");
+-  issue.searchParams.set("area", "apps/web");
+   issue.searchParams.set("version", `${environment.version} (${environment.channel})`);
+   issue.searchParams.set("environment", `${environment.surface}, ${environment.platform}`);
+   const link = (href: string, textContent: string) =>
+     element("a", { href, textContent, target: "_blank", rel: "noreferrer" });
+-  const nightly = environment.channel === "nightly";
+ 
+   const more = element("details", { open: isRepeatFailure(Date.now()) }, [
+     element("summary", { textContent: "More options if it keeps failing" }),
+-    ...(bridge
+-      ? [
+-          link(
+-            nightly ? `${DOWNLOAD_URL}?channel=nightly` : DOWNLOAD_URL,
+-            nightly
+-              ? "Download and reinstall the latest nightly build"
+-              : "Download and reinstall T3 Code",
+-          ),
+-        ]
+-      : []),
++    ...(bridge ? [link(DOWNLOAD_URL, "Download and reinstall T3 Code")] : []),
+     element("div", {}, [
+       element("p", {
+         textContent:
+-          "Run this on the computer that runs T3 Code. Your agent can check the local logs and help you file a bug report.",
++          "Run this command on this computer to inspect the local T3 Code logs, or copy the error details below when filing an issue.",
+       }),
+       element("div", { id: "boot-error-command" }, [command, copyCommand]),
+     ]),
+diff --git a/apps/web/src/lib/openPullRequestLink.ts b/apps/web/src/lib/openPullRequestLink.ts
+index b61f98ec..246a7e19 100644
+--- a/apps/web/src/lib/openPullRequestLink.ts
++++ b/apps/web/src/lib/openPullRequestLink.ts
+@@ -1,3 +1,4 @@
++import { useDesktopDeveloperFeatures } from "../hooks/useDeveloperFeatures";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { parsePullRequestAnchor } from "@t3tools/shared/pullRequestAnchor";
+ import type { EnvironmentId, ScopedThreadRef } from "@t3tools/contracts";
+@@ -87,6 +88,7 @@ export function useOpenChangeRequestLink(
+ ) => boolean {
+   const navigate = useNavigate();
+   const primaryEnvironmentId = usePrimaryEnvironmentId();
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const openInApp = useClientSettings((settings) => settings.pullRequestLinksOpenInApp);
+   const ignoreWhitespace = useClientSettings((settings) => settings.diffIgnoreWhitespace);
+   const browserLinkTarget = useClientSettings((settings) => settings.browserLinkTarget);
+@@ -96,7 +98,7 @@ export function useOpenChangeRequestLink(
+   });
+   const openLink = useOpenLink(threadRef);
+   return (event, targetUrl, targetThreadRef, targetEnvironmentId, onCommitUnavailable) => {
+-    if (!openInApp || shouldOpenPullRequestExternally(event)) return false;
++    if (!developerFeatures || !openInApp || shouldOpenPullRequestExternally(event)) return false;
+     const resolvedThreadRef = targetThreadRef ?? threadRef;
+     const resolvedPanelRef = panelRef ?? resolvedThreadRef;
+     const openPullRequest = () => {
+diff --git a/apps/web/src/previewStateStore.ts b/apps/web/src/previewStateStore.ts
+index 6e190e80..147e4586 100644
+--- a/apps/web/src/previewStateStore.ts
++++ b/apps/web/src/previewStateStore.ts
+@@ -1,3 +1,4 @@
++import { isXtworkDesktop } from "./desktopFeatureVisibility";
+ import { useAtomValue } from "@effect/atom-react";
+ import { scopedThreadKey } from "@t3tools/client-runtime/environment";
+ import {
+@@ -522,6 +523,7 @@ export function rememberPreviewUrl(ref: ScopedThreadRef, url: string): void {
+ }
+ 
+ export function isPreviewSupportedInRuntime(): boolean {
++  if (isXtworkDesktop()) return false;
+   if (typeof window === "undefined") return false;
+   return Boolean(window.desktopBridge?.preview);
+ }
+diff --git a/apps/web/src/routes/__root.tsx b/apps/web/src/routes/__root.tsx
+index 8217cd60..0ac52a1f 100644
+--- a/apps/web/src/routes/__root.tsx
++++ b/apps/web/src/routes/__root.tsx
+@@ -1,3 +1,4 @@
++import { isXtworkDesktop } from "../desktopFeatureVisibility";
+ import { type ServerLifecycleWelcomePayload } from "@t3tools/contracts";
+ import { scopedProjectKey, scopeProjectRef } from "@t3tools/client-runtime/environment";
+ import {
+@@ -96,6 +97,7 @@ export const Route = createRootRoute({
+       void configureClientTracing();
+     }
+     if (
++      !isXtworkDesktop() &&
+       authGateState.status === "authenticated" &&
+       getDesktopSnapShotBridge() &&
+       shouldResumeSnapShotSetupOnStartup() &&
+@@ -193,16 +195,20 @@ function RootRouteBranch() {
+         </>
+       ) : null}
+       {isElectron ? <RunningThreadKeepAlive /> : null}
+-      <RelayClientInstallDialog />
+-      <ConnectOnboardingDialog />
+-      <SshPasswordPromptDialog />
+-      <SnapShotCoordinator />
++      {!isXtworkDesktop() ? (
++        <>
++          <RelayClientInstallDialog />
++          <ConnectOnboardingDialog />
++          <SshPasswordPromptDialog />
++          <SnapShotCoordinator />
++        </>
++      ) : null}
+       <ReopenClosedViewShortcut />
+       <ConfirmDialogHost />
+       <CustomSnoozeDialogHost />
+       <GuestShareDialogHost />
+       <ProjectCloneToastCoordinator />
+-      <ConnectDeviceApprovalCoordinator />
++      {!isXtworkDesktop() ? <ConnectDeviceApprovalCoordinator /> : null}
+       <AddProjectToMachineDialogHost />
+       <UseInAnotherAppDialogHost />
+       {import.meta.env.DEV && primaryEnvironmentAuthenticated ? <DevReplayHost /> : null}
+diff --git a/apps/web/src/routes/_chat.issues.tsx b/apps/web/src/routes/_chat.issues.tsx
+index ebe2c9a7..9eb6a96d 100644
+--- a/apps/web/src/routes/_chat.issues.tsx
++++ b/apps/web/src/routes/_chat.issues.tsx
+@@ -1,9 +1,18 @@
+-import { createFileRoute } from "@tanstack/react-router";
++import { useDesktopDeveloperFeaturesState } from "../hooks/useDeveloperFeatures";
++import { isXtworkDesktop } from "../desktopFeatureVisibility";
++import { createFileRoute, Navigate } from "@tanstack/react-router";
+ 
+ import { IssuesPage } from "../components/issue/IssuesPage";
+ import { issuesSearchFromUrl } from "../components/issue/issuesSearch.logic";
+ 
+ export const Route = createFileRoute("/_chat/issues")({
+   validateSearch: issuesSearchFromUrl,
+-  component: IssuesPage,
++  component: function DeveloperPage() {
++    const state = useDesktopDeveloperFeaturesState();
++    if (isXtworkDesktop()) {
++      if (state === null) return null;
++      if (!state) return <Navigate to="/" replace />;
++    }
++    return <IssuesPage />;
++  },
+ });
+diff --git a/apps/web/src/routes/_chat.pull-requests.tsx b/apps/web/src/routes/_chat.pull-requests.tsx
+index 8090e3a1..ec1309cb 100644
+--- a/apps/web/src/routes/_chat.pull-requests.tsx
++++ b/apps/web/src/routes/_chat.pull-requests.tsx
+@@ -1,5 +1,7 @@
++import { useDesktopDeveloperFeaturesState } from "../hooks/useDeveloperFeatures";
++import { isXtworkDesktop } from "../desktopFeatureVisibility";
+ import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
+-import { createFileRoute } from "@tanstack/react-router";
++import { createFileRoute, Navigate } from "@tanstack/react-router";
+ 
+ import { type PullRequestListSort } from "../components/pullRequest/pullRequestListPreferences";
+ import { SORT_OPTIONS } from "../components/pullRequest/pullRequestListOptions";
+@@ -75,5 +77,12 @@ export const Route = createFileRoute("/_chat/pull-requests")({
+         : undefined,
+     labels: pullRequestSearchLabels(raw.labels),
+   }),
+-  component: PullRequestsPage,
++  component: function DeveloperPage() {
++    const state = useDesktopDeveloperFeaturesState();
++    if (isXtworkDesktop()) {
++      if (state === null) return null;
++      if (!state) return <Navigate to="/" replace />;
++    }
++    return <PullRequestsPage />;
++  },
+ });
+diff --git a/apps/web/src/routes/_chat.settings.tsx b/apps/web/src/routes/_chat.settings.tsx
+index c9753493..4188c9f0 100644
+--- a/apps/web/src/routes/_chat.settings.tsx
++++ b/apps/web/src/routes/_chat.settings.tsx
+@@ -1,5 +1,7 @@
++import { useDesktopDeveloperFeaturesState } from "../hooks/useDeveloperFeatures";
++import { isXtworkDesktop, isDesktopSettingsPathVisible } from "../desktopFeatureVisibility";
+ import { workspaceAreaProps } from "../lib/workspaceFocus";
+-import { Outlet, createFileRoute, redirect, useLocation } from "@tanstack/react-router";
++import { Navigate, Outlet, createFileRoute, redirect, useLocation } from "@tanstack/react-router";
+ import { useState, type ReactNode } from "react";
+ import { T, useGT, useMessages, Var } from "gt-react";
+ import { RotateCcwIcon } from "lucide-react";
+@@ -46,11 +48,22 @@ function RestoreDeviceDefaultsButton({ onRestored }: { onRestored: () => void })
+ }
+ 
+ function SettingsScopeBoundary({ pathname, children }: { pathname: string; children: ReactNode }) {
++  const developerFeaturesState = useDesktopDeveloperFeaturesState();
+   const { scope, connectedEnvironments } = useSettingsScope();
+   const { environments } = useEnvironments();
+   const gt = useGT();
+   const m = useMessages();
+   const hash = useLocation({ select: (location) => location.hash });
++  if (isXtworkDesktop()) {
++    if (!isDesktopSettingsPathVisible(pathname, true)) {
++      return <Navigate to="/settings/general" replace />;
++    }
++    if (developerFeaturesState === null) {
++      if (!isDesktopSettingsPathVisible(pathname, false)) return null;
++    } else if (!isDesktopSettingsPathVisible(pathname, developerFeaturesState)) {
++      return <Navigate to="/settings/general" replace />;
++    }
++  }
+   const searchTarget = getSettingsSearchTargetScope(hash);
+   const autoSettlementAvailability = searchTarget?.requiresThreadAutoSettlement
+     ? getThreadAutoSettlementSearchAvailability(environments, scope)
+diff --git a/apps/web/src/shortcuts/chatRouteCommands.ts b/apps/web/src/shortcuts/chatRouteCommands.ts
+index eb05fb3b..e63b5e19 100644
+--- a/apps/web/src/shortcuts/chatRouteCommands.ts
++++ b/apps/web/src/shortcuts/chatRouteCommands.ts
+@@ -5,6 +5,7 @@ import { msg } from "gt-react";
+ import { stackedThreadToast, toastManager } from "~/components/ui/toast";
+ import { m } from "~/i18n/messages";
+ import { isElectron } from "../env";
++import { isXtworkDesktop } from "../desktopFeatureVisibility";
+ import { isPreviewAvailableFor } from "../browser/previewRuntime";
+ import { isCommandPaletteOpen, openCommandPalette } from "../commandPaletteBus";
+ import { useComposerDraftStore } from "../composerDraftStore";
+@@ -66,6 +67,7 @@ export function installChatRouteCommands(router: AnyRouter): () => void {
+       : (useComposerDraftStore.getState().getDraftSession(target.draftId)?.environmentId ?? null);
+   };
+   const readPreviewOpen = () => {
++    if (isXtworkDesktop()) return false;
+     const threadRef = readRouteThreadRef();
+     // Store-only on purpose: the URL-aware arbitration lives in ChatView's
+     // preview toggle, which the action bus reaches.
+@@ -123,6 +125,7 @@ export function installChatRouteCommands(router: AnyRouter): () => void {
+   const previewCommand =
+     (action: PreviewAction): CommandHandler =>
+     (event) => {
++      if (isXtworkDesktop()) return false;
+       claim(event);
+       const environmentId = readRouteEnvironmentId();
+       if (environmentId && canOperatePreview(environmentId)) dispatchPreviewAction(action);
+@@ -163,6 +166,7 @@ export function installChatRouteCommands(router: AnyRouter): () => void {
+         startNewLocal(event);
+       },
+       "preview.toggle": (event) => {
++        if (isXtworkDesktop()) return false;
+         claim(event);
+         const threadRef = readRouteThreadRef();
+         if (!threadRef || (!canOperatePreview(threadRef.environmentId) && !readPreviewOpen())) {
+diff --git a/apps/web/src/versionSkew.test.ts b/apps/web/src/versionSkew.test.ts
+index 2b5f6106..2ae9a26f 100644
+--- a/apps/web/src/versionSkew.test.ts
++++ b/apps/web/src/versionSkew.test.ts
+@@ -17,7 +17,7 @@ import {
+ } from "./versionSkew";
+ 
+ const MISMATCH_HINT =
+-  "Version mismatch. Try syncing the client and server to the same T3 Code version.";
++  "Version mismatch. Try syncing the client and server to the same 小瞳 Work version.";
+ 
+ describe("versionSkew", () => {
+   it("updates only the proven install and safely quotes its paths", () => {
+diff --git a/packages/client-runtime/src/connection/diagnosis.test.ts b/packages/client-runtime/src/connection/diagnosis.test.ts
+index 94396c7c..c69340f3 100644
+--- a/packages/client-runtime/src/connection/diagnosis.test.ts
++++ b/packages/client-runtime/src/connection/diagnosis.test.ts
+@@ -56,7 +56,7 @@ const results = (state: SupervisorConnectionState, via?: "relay" | "direct") =>
+ describe("presentConnectionDiagnosis", () => {
+   it("tells a working tunnel apart from T3 Code not answering", () => {
+     expect(diagnose(backoff(unavailable("origin_unreachable")))?.headline).toBe(
+-      "Tunnel works, but T3 Code on Mac mini did not answer",
++      "Tunnel works, but 小瞳 Work on Mac mini did not answer",
+     );
+     expect(results(backoff(unavailable("origin_unreachable")), "direct")).toEqual([
+       "device:ok",
+@@ -173,7 +173,7 @@ describe("presentConnectionDiagnosis", () => {
+       }),
+     );
+     const steps = diagnose(backoff(failure), "direct")?.steps.join(" ");
+-    expect(steps).not.toContain("Make sure T3 Code is running");
++    expect(steps).not.toContain("Make sure 小瞳 Work is running");
+     expect(steps).toMatch(/pair|sign in/i);
+   });
+ 
+diff --git a/packages/client-runtime/src/connection/resolver.test.ts b/packages/client-runtime/src/connection/resolver.test.ts
+index 9c13e80a..eab94915 100644
+--- a/packages/client-runtime/src/connection/resolver.test.ts
++++ b/packages/client-runtime/src/connection/resolver.test.ts
+@@ -185,7 +185,7 @@ describe("ConnectionResolver", () => {
+       const error = yield* Effect.flip(broker.prepare(catalogEntry(target)));
+ 
+       expect(error).toMatchObject({ reason: "unsupported" });
+-      expect(error.message).toContain("Update T3 Code on Compatible environment");
++      expect(error.message).toContain("Update 小瞳 Work on Compatible environment");
+     }),
+   );
+ 
+diff --git a/packages/shared/src/managedPolicyFile.test.ts b/packages/shared/src/managedPolicyFile.test.ts
+index 2ab3ea71..9ad175b8 100644
+--- a/packages/shared/src/managedPolicyFile.test.ts
++++ b/packages/shared/src/managedPolicyFile.test.ts
+@@ -187,7 +187,7 @@ describe("readManagedPolicy", () => {
+         }
+         assert.include(
+           yield* win32({}, new WindowsRegistryError({})),
+-          "cannot load its registry reader; reinstall T3 Code",
++          "cannot load its registry reader; reinstall 小瞳 Work",
+         );
+         assert.include(
+           yield* win32({}, policyKey([{ name: "Policy", type: "other" }])),
+@@ -294,14 +294,14 @@ describe("readManagedPolicy", () => {
+       // Anything the template does not write fails closed rather than being ignored.
+       for (const [registry, reason] of [
+         [policyKey([organization, dword("Telemetry", 2)]), "DWORD of 0 or 1"],
+-        [policyKey([organization, text("MaxMode", "auto")]), "not a T3 Code policy value"],
+-        [policyKey([organization], { Other: { x: 1 } }), "Other is not a T3 Code policy key"],
++        [policyKey([organization, text("MaxMode", "auto")]), "not a 小瞳 Work policy value"],
++        [policyKey([organization], { Other: { x: 1 } }), "Other is not a 小瞳 Work policy key"],
+         [
+           {
+             ...policyKey([organization, dword("Clients", 1)], { Clients: { desktop: 1 } }),
+             Clients: { values: [dword("desktop", 1)], subkeys: ["Nested"] },
+           },
+-          "Clients\\Nested is not a T3 Code policy key",
++          "Clients\\Nested is not a 小瞳 Work policy key",
+         ],
+         [policyKey([organization, text("Settings", "{")]), "not valid JSON"],
+         [policyKey([organization, dword("Clients", 2)]), "DWORD of 0 or 1"],
+@@ -318,7 +318,7 @@ describe("readManagedPolicy", () => {
+         [policyKey([{ name: "Organization", type: "other" }]), "Organization must be a string"],
+         [
+           policyKey([text("MaxRuntimeMode", "auto-accept-edits")]),
+-          "set the Organization policy whenever another T3 Code policy is set",
++          "set the Organization policy whenever another 小瞳 Work policy is set",
+         ],
+       ] as const) {
+         assert.include(yield* document(registry), reason);

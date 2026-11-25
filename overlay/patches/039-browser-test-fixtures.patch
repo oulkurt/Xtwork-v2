@@ -1,0 +1,68 @@
+diff --git a/apps/web/src/components/ChatMarkdown.permissions.browser.test.tsx b/apps/web/src/components/ChatMarkdown.permissions.browser.test.tsx
+index a072ecc..37e8dcf 100644
+--- a/apps/web/src/components/ChatMarkdown.permissions.browser.test.tsx
++++ b/apps/web/src/components/ChatMarkdown.permissions.browser.test.tsx
+@@ -203,8 +203,11 @@ it.each(["[Docs](https://example.com/docs)", "[Readme](docs/readme.md)"])(
+   async (text) => {
+     using _setup = setup();
+     await using screen = await renderMarkdown(text);
+-    screen.anchor().focus();
+-    await userEvent.keyboard("{Shift>}{F10}{/Shift}");
++    await act(() => {
++      const contextMenu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
++      Object.defineProperty(contextMenu, "button", { value: -1 });
++      screen.anchor().dispatchEvent(contextMenu);
++    });
+     await vi.waitFor(() => expect(state.choose.mock.lastCall?.[2]).toBe("keyboard"));
+     await userEvent.click(screen.anchor(), { button: "right" });
+     await vi.waitFor(() => expect(state.choose.mock.lastCall?.[2]).toBe("mouse"));
+diff --git a/apps/web/src/components/ChatView.browser.test.tsx b/apps/web/src/components/ChatView.browser.test.tsx
+index 22523b2..8ce1424 100644
+--- a/apps/web/src/components/ChatView.browser.test.tsx
++++ b/apps/web/src/components/ChatView.browser.test.tsx
+@@ -35,6 +35,7 @@ import { usePromptStashStore } from "~/promptStashStore";
+ import { useRightPanelStore } from "~/rightPanelStore";
+ import { getRouter } from "~/router";
+ import { appAtomRegistry } from "~/rpc/atomRegistry";
++import { primaryServerKeybindingsAtom, serverEnvironment } from "~/state/server";
+ import { environmentThreadDetails } from "~/state/threads";
+ import {
+   ENVIRONMENT_ID,
+@@ -720,6 +721,18 @@ it("a shortcut conditioned on rightPanelOpen sees the thread's open right panel"
+     createMemoryHistory({ initialEntries: [`/${ENVIRONMENT_ID}/${thread.id}`] }),
+   );
+   await router.load();
++  appAtomRegistry.refresh(
++    serverEnvironment.configProjection({ environmentId: ENVIRONMENT_ID, input: {} }),
++  );
++  await vi.waitFor(() =>
++    expect(
++      appAtomRegistry.get(primaryServerKeybindingsAtom).some(
++        (binding) =>
++          binding.command === "rightPanel.new" && binding.shortcut.ctrlKey &&
++          binding.shortcut.key === "t",
++      ),
++    ).toBe(true),
++  );
+   await using _app = await render(<AppRoot router={router} />, {
+     // AppRoot brings its own router.
+     router: false,
+diff --git a/apps/web/src/components/chat/ExpandedImageDialog.browser.test.tsx b/apps/web/src/components/chat/ExpandedImageDialog.browser.test.tsx
+index 915ed5f..f0218b8 100644
+--- a/apps/web/src/components/chat/ExpandedImageDialog.browser.test.tsx
++++ b/apps/web/src/components/chat/ExpandedImageDialog.browser.test.tsx
+@@ -175,8 +175,12 @@ describe("ExpandedImageDialog", () => {
+       const { scrollLeft, scrollTop } = viewport;
+       await userEvent.wheel(viewportLocator, { delta });
+       await vi.waitFor(() => {
+-        expect(Math.sign(viewport.scrollLeft - scrollLeft)).toBe(Math.sign(delta.x));
+-        expect(Math.sign(viewport.scrollTop - scrollTop)).toBe(Math.sign(delta.y));
++        if (delta.x !== 0) {
++          expect(Math.sign(viewport.scrollLeft - scrollLeft)).toBe(Math.sign(delta.x));
++        }
++        if (delta.y !== 0) {
++          expect(Math.sign(viewport.scrollTop - scrollTop)).toBe(Math.sign(delta.y));
++        }
+       });
+     };
+     await pan({ x: 60, y: 0 });

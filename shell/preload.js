@@ -29,9 +29,11 @@
   native.on("xtwork:fullscreen", (value) => { fullscreen = value; });
 
   Object.defineProperty(window, "desktopBridge", { value: Object.freeze({
+    xtwork: true,
     getAppBranding: () => ({ ...init.branding }),
     getRelayTelemetryEnabled: () => false,
     getClientPlatform: () => init.platform,
+    getBackendLogPath: () => init.backendLogPath ?? null,
     getSystemLocale: () => init.preferredLanguages[0] ?? navigator.language,
     getPreferredSystemLanguages: () => init.preferredLanguages.slice(),
     getPathForFile: () => "",
