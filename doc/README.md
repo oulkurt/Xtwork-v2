@@ -7,7 +7,7 @@
 | 里程碑 | 现状 | 还缺什么 |
 |---|---|---|
 | M0 桌面、T3、Pi | 已验证 Pi 随包启动、待办创建和原对话续聊，旧 Alpha 冒烟数据升级通过。 [桌面验收](desktop-foundation.md#验收) | 桌面取消按钮与交互审批 |
-| M1 通用任务桌面版 | 桌面首启进入本机免项目对话。开发者功能默认关闭，开启后可从设置或 `⌘K` 访问 PR 和 Issues。普通模式保留改动对比。 | 干净机器安装和首发模型授权。 [桌面预览](desktop-foundation.md#通用任务首页) |
+| M1 通用任务桌面版 | 桌面首启进入简体中文（`zh`/`en` 双语）免项目对话，内置浏览器已于普通模式恢复，开发者功能默认关闭，开启后可从设置或 `⌘K` 访问 PR/Issues/Git/终端。 [PR #19](https://github.com/oulkurt/Xtwork-v2/pull/19) · [PR #20](https://github.com/oulkurt/Xtwork-v2/pull/20) · [桌面预览](desktop-foundation.md#通用任务首页) | 按已确认的 [ADR-012](decisions/012-xiaotong-model-channels-and-coding-agents.md) 落地 M1b（内置助手更名「小瞳」、企业微信公司渠道与 19 类成员供应商）与 M1c（6 大编码 Agent 一键安装、Coding Agent 委派路由与干净机器验收）。 |
 | M2 插件通路 | 待办工具、面板、@ 上下文和撤销已接通。Go 宿主、MCP 工具和插件禁用可用。 [工具型插件](plugin-tools.md) | `@` 上下文、交互审批与撤销、公开插件契约冻结。插件 v2 第一阶段正在实现。 |
 | M3 内置插件 | 部分实现。待办可创建、查询、编辑、完成、重开和删除，重启后可读回。 | 待办撤销与提醒、日程、Obsidian 引用。 [工具型插件](plugin-tools.md) · [内置插件规划](plan/06-内置插件-待办日程笔记.md) |
 | M4 远程连接 | 架构与首发范围已定（[ADR-011](decisions/011-mingle-im-bridge.md)）。 | 实现 `im-bridge` 底座，在飞书、企微真机验收绑定、私聊与群聊 `@` 闭环，在个人微信（iLink）验收私聊闭环与合规边界。 [远程连接规划](plan/07-远程连接插件.md) |
@@ -39,7 +39,7 @@ mygo 外壳管理本机 T3 Node 服务，WebView 加载服务提供的 React 界
 | 验收、风险和依据 | [10 里程碑与验收](plan/10-里程碑与验收.md) · [11 风险与待定](plan/11-风险与待定.md) · [附录 已核实事实](plan/附录-已核实事实.md) |
 | 已确认方向与待决策 | [决策索引](../DECISIONS.md) · [工程决策记录](decisions/README.md) |
 
-插件 v2 的已确认协议见 [ADR-010](decisions/010-plugin-v2-runtime.md)，基于 Mingle 渠道层与伴侣范式的 IM 远程连接服务见 [ADR-011](decisions/011-mingle-im-bridge.md)。
+插件 v2 的已确认协议见 [ADR-010](decisions/010-plugin-v2-runtime.md)，基于 Mingle 渠道层与伴侣范式的 IM 远程连接服务见 [ADR-011](decisions/011-mingle-im-bridge.md)，M1 内置助手「小瞳」多渠道模型平面、六大编码 Agent 一键安装与 Coding Agent 委派架构见 [ADR-012](decisions/012-xiaotong-model-channels-and-coding-agents.md)。
 
 历史资料见 [Dim 架构](plan/03-内置运行时-Dim.md) 和 [Dim ACP 未实施待办](plan/dim-acp-flavor-todo.md)。
 
