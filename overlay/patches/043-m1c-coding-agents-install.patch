@@ -1,0 +1,1244 @@
+diff --git a/apps/server/src/os-jank.ts b/apps/server/src/os-jank.ts
+index bc6528f9..aacfa8e5 100644
+--- a/apps/server/src/os-jank.ts
++++ b/apps/server/src/os-jank.ts
+@@ -45,6 +45,18 @@ function readSlowLoginShellEnvironment(shell: string): Partial<Record<string, st
+   );
+ }
+ 
++function applyBundledNodeFallbackPath(
++  env: NodeJS.ProcessEnv,
++  platform: NodeJS.Platform,
++): void {
++  const bundledNodeBin = env.XTWORK_BUNDLED_NODE_BIN?.trim();
++  if (!bundledNodeBin) return;
++  const merged = mergePathEntries(env.PATH, bundledNodeBin, platform);
++  if (merged) {
++    env.PATH = merged;
++  }
++}
++
+ function applyLoginShellEnvironment(
+   env: NodeJS.ProcessEnv,
+   platform: NodeJS.Platform,
+@@ -56,6 +68,7 @@ function applyLoginShellEnvironment(
+   if (mergedPath) {
+     env.PATH = mergedPath;
+   }
++  applyBundledNodeFallbackPath(env, platform);
+   if (shellPath && shellEnvironment.__MISE_DIFF) {
+     env.__MISE_DIFF = shellEnvironment.__MISE_DIFF;
+   }
+@@ -147,7 +160,10 @@ export const fixPath = Effect.fn("fixPath")(function* (options?: {
+       }),
+     ),
+   );
+-  if (options?.shellEnvironmentPrepared === true) return;
++  if (options?.shellEnvironmentPrepared === true) {
++    applyBundledNodeFallbackPath(env, platform);
++    return;
++  }
+   yield* Effect.sync(() => hydratePosixPath(env, platform)).pipe(
+     Effect.catchDefect((defect) =>
+       Effect.sync(() => {
+@@ -155,6 +171,7 @@ export const fixPath = Effect.fn("fixPath")(function* (options?: {
+       }),
+     ),
+   );
++  applyBundledNodeFallbackPath(env, platform);
+ });
+ 
+ const readLoginShellOutput = Effect.fn("readLoginShellOutput")(
+diff --git a/apps/server/src/provider/ProviderInstanceRegistryHydration.ts b/apps/server/src/provider/ProviderInstanceRegistryHydration.ts
+index f3f49c90..35325419 100644
+--- a/apps/server/src/provider/ProviderInstanceRegistryHydration.ts
++++ b/apps/server/src/provider/ProviderInstanceRegistryHydration.ts
+@@ -33,6 +33,7 @@ import type * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
+ import * as ServerConfig from "../config.ts";
+ import type * as PortScanner from "../preview/PortScanner.ts";
+ import { PI_DRIVER, PI_INSTANCE_ID } from "../xtwork/bundledPiSettings.ts";
++import * as XtworkInstallConsent from "../xtwork/installConsent.ts";
+ 
+ type ProviderInstanceRegistryHydrationEnv =
+   | Exclude<
+@@ -213,7 +214,15 @@ export const layer: Layer.Layer<
+         ManagedProviders.disallowedDriverReason(serverSettings.managedPolicy, driver),
+     }).pipe(
+       Layer.provide(ProviderOrchestrationAdapterInfrastructure.layer),
+-      Layer.provide(AcpRegistrySupport.layerFromHost),
++      Layer.provide(
++        AcpRegistrySupport.layerFromHost.pipe(
++          Layer.provide(
++            XtworkInstallConsent.acpConsentGateLayer.pipe(
++              Layer.provide(XtworkInstallConsent.layer),
++            ),
++          ),
++        ),
++      ),
+       Layer.provide(ProviderHostLive.layer),
+       Layer.provide(Layer.succeed(HostProcess.Environment, hostEnvironment)),
+       Layer.provide(SecretResolver.layer),
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index afc9518b..963928d1 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -91,6 +91,8 @@ import * as TerminalManager from "./terminal/Manager.ts";
+ import * as McpHttpServer from "./mcp/McpHttpServer.ts";
+ import * as XtworkPlugins from "./mcp/XtworkPluginService.ts";
+ import * as XtworkIm from "./im/XtworkImService.ts";
++import * as XtworkInstallConsent from "./xtwork/installConsent.ts";
++import * as XtworkProviderProvisioner from "./xtwork/providerProvisioner.ts";
+ import * as PeerForwarding from "./peer/PeerForwarding.ts";
+ import * as RemoteDelegation from "./peer/RemoteDelegation.ts";
+ import * as PeerLinkRequests from "./peer/PeerLinkRequests.ts";
+@@ -768,7 +770,15 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
+ 
+ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
+   Layer.provideMerge(layerPtyAdapter),
+-  Layer.provideMerge(AcpRegistrySupport.layerFromHost.pipe(Layer.provide(ProviderHostLive.layer))),
++  Layer.provideMerge(
++    AcpRegistrySupport.layerFromHost.pipe(
++      Layer.provide(ProviderHostLive.layer),
++      Layer.provide(
++        XtworkInstallConsent.acpConsentGateLayer.pipe(Layer.provide(XtworkInstallConsent.layer)),
++      ),
++    ),
++  ),
++  Layer.provideMerge(XtworkInstallConsent.layer),
+   Layer.provideMerge(
+     Layer.mergeAll(
+       layerProviderEventLoggers,
+@@ -855,6 +865,7 @@ const layerMakeRoutes = Layer.mergeAll(
+     ServerHttp.layerAttachmentUploadRoute,
+     XtworkPlugins.route,
+     XtworkIm.route,
++    XtworkProviderProvisioner.route,
+     GuestHttp.layer,
+     DeviceHubProxy.layer,
+     ServerBrowserStream.routeLayer,
+@@ -909,6 +920,7 @@ const layerMakeRoutes = Layer.mergeAll(
+   Layer.provide(layerCommandReadiness),
+   Layer.provide(XtworkPlugins.layer),
+   Layer.provide(XtworkIm.layer),
++  Layer.provide(XtworkProviderProvisioner.layer),
+   Layer.provide(ServerHttp.layerBrowserApiCors),
+   Layer.provide(ServerHttp.layerHttpCompression),
+ );
+diff --git a/apps/server/src/serverSettings.ts b/apps/server/src/serverSettings.ts
+index e06fc7e0..92526c4a 100644
+--- a/apps/server/src/serverSettings.ts
++++ b/apps/server/src/serverSettings.ts
+@@ -58,6 +58,7 @@ import {
+ import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
+ import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
+ import { seedBundledPi } from "./xtwork/bundledPiSettings.ts";
++import { seedCodingAgentsWithMarker, shouldSeedCodingAgents } from "./xtwork/codingAgentSeed.ts";
+ import { startBundledPi } from "./xtwork/gateway.ts";
+ import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
+ import {
+@@ -940,8 +941,11 @@ const make = Effect.gen(function* () {
+     const settingsWithRuntime = bundledPi === undefined
+       ? sourceControlMigration.settings
+       : seedBundledPi(sourceControlMigration.settings, !hasSettings);
++    const settingsWithCodingAgents = shouldSeedCodingAgents(environment)
++      ? seedCodingAgentsWithMarker(settingsWithRuntime, baseDir)
++      : settingsWithRuntime;
+     const migrated = settingsFileTrusted
+-      ? yield* moveInlineSettingsSecrets(settingsWithRuntime)
++      ? yield* moveInlineSettingsSecrets(settingsWithCodingAgents)
+       : folded;
+     if (
+       migrated !== loaded ||
+diff --git a/apps/web/src/components/settings/ProviderSettingsPanel.tsx b/apps/web/src/components/settings/ProviderSettingsPanel.tsx
+index 892c9cd2..56af46da 100644
+--- a/apps/web/src/components/settings/ProviderSettingsPanel.tsx
++++ b/apps/web/src/components/settings/ProviderSettingsPanel.tsx
+@@ -54,6 +54,12 @@ import {
+   useToggleEnvironmentModelFavorite,
+ } from "../../hooks/useSettings";
+ import { useStableCallback } from "../../hooks/useStableCallback";
++import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
++import {
++  isOrdinaryModeProviderVisible,
++  isXtworkDesktop,
++  sortOrdinaryModeProviderRows,
++} from "../../desktopFeatureVisibility";
+ import { ensureLocalApi } from "../../localApi";
+ import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
+ import { cn } from "../../lib/utils";
+@@ -106,6 +112,10 @@ import { TextGeneratorsSettings } from "./TextGeneratorsSettings";
+ import { UsageProviderSettings } from "./UsageProviderSettings";
+ import { ProviderSetupSection, readAntigravityAuthMethod } from "./ProviderSetupSection";
+ import { ProviderAuthenticationSection } from "./ProviderAuthenticationSection";
++import {
++  XtworkProviderProvisioningSection,
++  isProvisionableCodingAgent,
++} from "./XtworkProviderProvisioningSection";
+ import { CodexSetupSection, CodexManagedRuntimeFields } from "./CodexSetupSection";
+ import { readCodexSetupMode } from "./CodexSetupSection.logic";
+ import { providerClients } from "./providerDriverMeta";
+@@ -577,6 +587,7 @@ export function EnvironmentProviderSettings({
+ }) {
+   const searchableSetting = useSearchableSetting();
+   const gt = useGT();
++  const developerFeatures = useDesktopDeveloperFeatures();
+   const settings = useEnvironmentSettings(environmentId);
+   const managedPolicy = useManagedPolicy(environmentId);
+   // A policy that allows no provider leaves nothing to add.
+@@ -809,13 +820,27 @@ export function EnvironmentProviderSettings({
+     }
+   }
+ 
++  const displayedRows: ReadonlyArray<InstanceRow> =
++    isXtworkDesktop() && !developerFeatures
++      ? sortOrdinaryModeProviderRows(
++          rows.filter((row) =>
++            isOrdinaryModeProviderVisible({
++              instanceId: String(row.instanceId),
++              developerFeatures: false,
++              boundInstanceId: targetInstanceId ?? null,
++              isExplicitCustom: !row.isDefault,
++            }),
++          ),
++        )
++      : rows;
++
+   const targetInstanceMissing =
+     targetInstanceId !== undefined &&
+     selectedInstanceId === targetInstanceId &&
+-    !rows.some((row) => row.instanceId === targetInstanceId);
++    !displayedRows.some((row) => row.instanceId === targetInstanceId);
+   const selectedRow =
+-    rows.find((row) => row.instanceId === selectedInstanceId) ??
+-    (targetInstanceMissing ? null : (rows[0] ?? null));
++    displayedRows.find((row) => row.instanceId === selectedInstanceId) ??
++    (targetInstanceMissing ? null : (displayedRows[0] ?? null));
+ 
+   const persistInstance = async (
+     instanceId: ProviderInstanceId,
+@@ -961,6 +986,7 @@ export function EnvironmentProviderSettings({
+     },
+   );
+ 
++  const stableRefreshProviders = useStableCallback(refreshProviders);
+   const stableUpdateModelPreferences = useStableCallback(updateModelPreferences);
+   const stableToggleModelFavorite = useStableCallback(toggleModelFavorite);
+   const actions: ProviderInstanceRowActions = {
+@@ -974,6 +1000,7 @@ export function EnvironmentProviderSettings({
+     updateModelPreferences: stableUpdateModelPreferences,
+     toggleModelFavorite: stableToggleModelFavorite,
+     selectInstance: setSelectedInstanceId,
++    refreshProviders: stableRefreshProviders,
+   };
+   // resolveModelPreferences falls back to a fresh `[]`; keep it stable for the rows.
+   const favorites = settings.favorites.length > 0 ? settings.favorites : NO_FAVORITES;
+@@ -1111,7 +1138,7 @@ export function EnvironmentProviderSettings({
+               className="@min-[48rem]/providers:min-h-0 @min-[48rem]/providers:flex-1"
+             >
+               <div className="divide-y divide-border/50">
+-                {rows.map((row) => renderProviderInstance(row, "list"))}
++                {displayedRows.map((row) => renderProviderInstance(row, "list"))}
+                 {canAddProvider ? (
+                   <button
+                     type="button"
+@@ -1282,6 +1309,7 @@ interface ProviderInstanceRowActions {
+   readonly updateModelPreferences: ReturnType<typeof useUpdateEnvironmentModelPreferences>;
+   readonly toggleModelFavorite: ReturnType<typeof useToggleEnvironmentModelFavorite>;
+   readonly selectInstance: (instanceId: ProviderInstanceId) => void;
++  readonly refreshProviders: () => void;
+ }
+ 
+ const NO_MODELS: ReadonlyArray<string> = [];
+@@ -1360,6 +1388,69 @@ function ProviderInstanceRow({
+       }
+     : undefined;
+   const codexSetupMode = driver === "codex" ? readCodexSetupMode(instance.config) : null;
++  const showXtworkProvisioner =
++    mode === "editor" &&
++    isXtworkDesktop() &&
++    isProvisionableCodingAgent(String(instanceId), driver, instance);
++  const standardSetupNode =
++    mode === "editor" && driver === "antigravity" ? (
++      <ProviderSetupSection
++        environmentId={environmentId}
++        environmentLabel={environmentLabel}
++        instanceId={instanceId}
++        provider={liveProvider}
++        binaryPath={configuredBinaryPath(instance.config)}
++        authMethod={readAntigravityAuthMethod(instance.config)}
++        enabled={resolveProviderInstanceEnabled(instance)}
++        readOnly={readOnly}
++        onEnable={() => actions.enableInstance(instanceId, { ...instance, enabled: true })}
++      />
++    ) : mode === "editor" && codexSetupMode === "managed" ? (
++      <CodexSetupSection
++        environmentId={environmentId}
++        instanceId={instanceId}
++        provider={liveProvider}
++        mode={codexSetupMode}
++        enabled={resolveProviderInstanceEnabled(instance)}
++        readOnly={readOnly}
++        onModeChange={(setupMode) =>
++          actions.enableInstance(instanceId, {
++            ...instance,
++            enabled: true,
++            config: {
++              ...(instance.config !== null && typeof instance.config === "object"
++                ? instance.config
++                : {}),
++              enabled: true,
++              setupMode,
++            },
++          })
++        }
++      />
++    ) : mode === "editor" &&
++      !readOnly &&
++      liveProvider &&
++      (liveProvider.setup?.canAuthenticate ||
++        (liveProvider.driver === "acpRegistry" && liveProvider.installed)) ? (
++      <ProviderAuthenticationSection
++        key={`${environmentId}:${instanceId}`}
++        environmentId={environmentId}
++        environmentLabel={environmentLabel}
++        instanceId={instanceId}
++        provider={liveProvider}
++        readOnly={readOnly}
++      />
++    ) : mode === "editor" &&
++      !readOnly &&
++      driver === "cursor" &&
++      liveProvider?.setup?.canAuthenticate === false ? (
++      <SettingsRow
++        title={gt("Cursor account")}
++        description={gt(
++          "Using CURSOR_API_KEY. Remove it from this provider's environment to use browser sign-in.",
++        )}
++      />
++    ) : null;
+   const recommendedVersion = liveProvider?.compatibilityAdvisory?.recommendedVersion;
+   const canInstallRecommended =
+     !readOnly &&
+@@ -1396,63 +1487,19 @@ function ProviderInstanceRow({
+       }
+       canWriteSettings={canWriteSettings}
+       setup={
+-        mode === "editor" && driver === "antigravity" ? (
+-          <ProviderSetupSection
+-            environmentId={environmentId}
+-            environmentLabel={environmentLabel}
+-            instanceId={instanceId}
+-            provider={liveProvider}
+-            binaryPath={configuredBinaryPath(instance.config)}
+-            authMethod={readAntigravityAuthMethod(instance.config)}
+-            enabled={resolveProviderInstanceEnabled(instance)}
+-            readOnly={readOnly}
+-            onEnable={() => actions.enableInstance(instanceId, { ...instance, enabled: true })}
+-          />
+-        ) : mode === "editor" && codexSetupMode === "managed" ? (
+-          <CodexSetupSection
+-            environmentId={environmentId}
+-            instanceId={instanceId}
+-            provider={liveProvider}
+-            mode={codexSetupMode}
+-            enabled={resolveProviderInstanceEnabled(instance)}
+-            readOnly={readOnly}
+-            onModeChange={(setupMode) =>
+-              actions.enableInstance(instanceId, {
+-                ...instance,
+-                enabled: true,
+-                config: {
+-                  ...(instance.config !== null && typeof instance.config === "object"
+-                    ? instance.config
+-                    : {}),
+-                  enabled: true,
+-                  setupMode,
+-                },
+-              })
+-            }
+-          />
+-        ) : mode === "editor" &&
+-          !readOnly &&
+-          liveProvider &&
+-          (liveProvider.setup?.canAuthenticate ||
+-            (liveProvider.driver === "acpRegistry" && liveProvider.installed)) ? (
+-          <ProviderAuthenticationSection
+-            key={`${environmentId}:${instanceId}`}
+-            environmentId={environmentId}
+-            environmentLabel={environmentLabel}
+-            instanceId={instanceId}
+-            provider={liveProvider}
+-            readOnly={readOnly}
+-          />
+-        ) : mode === "editor" &&
+-          !readOnly &&
+-          driver === "cursor" &&
+-          liveProvider?.setup?.canAuthenticate === false ? (
+-          <SettingsRow
+-            title={gt("Cursor account")}
+-            description={gt(
+-              "Using CURSOR_API_KEY. Remove it from this provider's environment to use browser sign-in.",
+-            )}
+-          />
++        showXtworkProvisioner || standardSetupNode ? (
++          <>
++            {showXtworkProvisioner ? (
++              <XtworkProviderProvisioningSection
++                key={`provision:${environmentId}:${instanceId}`}
++                instanceId={String(instanceId)}
++                liveProvider={liveProvider}
++                readOnly={readOnly}
++                onProvisioned={actions.refreshProviders}
++              />
++            ) : null}
++            {standardSetupNode}
++          </>
+         ) : null
+       }
+       onUpdate={(next) => actions.updateInstance(instanceId, instance, next)}
+diff --git a/packages/contracts/src/acpRegistry.ts b/packages/contracts/src/acpRegistry.ts
+index fffbe8dd..e3d50741 100644
+--- a/packages/contracts/src/acpRegistry.ts
++++ b/packages/contracts/src/acpRegistry.ts
+@@ -82,6 +82,7 @@ export type AcpRegistrySearchResult = typeof AcpRegistrySearchResult.Type;
+ 
+ export const AcpRegistryPrepareInput = Schema.Struct({
+   agentId: AcpRegistryAgentId,
++  instanceId: Schema.optionalKey(ProviderInstanceId),
+ });
+ export type AcpRegistryPrepareInput = typeof AcpRegistryPrepareInput.Type;
+ 
+@@ -317,6 +318,7 @@ export const AcpRegistryOperationErrorReason = Schema.Literals([
+   "checksum_mismatch",
+   "download_failed",
+   "install_failed",
++  "install_required",
+   "instance_not_found",
+   "logout_unsupported",
+   "logout_failed",
+@@ -334,6 +336,7 @@ export const AcpRegistryOperationErrorReason = Schema.Literals([
+   "provider_configuration_failed",
+   "unsupported_distribution",
+   "unsupported_platform",
++  "update_required",
+ ]);
+ export type AcpRegistryOperationErrorReason = typeof AcpRegistryOperationErrorReason.Type;
+ 
+diff --git a/packages/provider-acp-registry/src/server/AcpRegistrySupport.test.ts b/packages/provider-acp-registry/src/server/AcpRegistrySupport.test.ts
+index 453855e5..c80c0f36 100644
+--- a/packages/provider-acp-registry/src/server/AcpRegistrySupport.test.ts
++++ b/packages/provider-acp-registry/src/server/AcpRegistrySupport.test.ts
+@@ -2105,4 +2105,222 @@ describe("acpRegistryManagedBinaryDirectories", () => {
+       expect(missing).toEqual([]);
+     }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+   );
++
++  it.effect("blocks unconsented npx inspect/resolve/prepare and registry version bumps via AcpInstallConsentGate", () => {
++    let registryVersion = "1.2.3";
++    let packageVersion = "1.2.3";
++    const consents = new Set<string>();
++    const consentKeyId = (key: AcpRegistrySupport.AcpInstallConsentKey) =>
++      JSON.stringify([key.instanceId, key.source, key.version, key.distribution, key.installDir]);
++
++    return Effect.gen(function* () {
++      const fileSystem = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const rootDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-acp-consent-" });
++      const toolchain = yield* makeFakeNpmToolchain(rootDir);
++      const toolsDir = path.join(rootDir, "tools");
++      // Start with a clean tools directory (makeFakeNpmToolchain pre-creates the version folder).
++      yield* fileSystem.remove(toolsDir, { recursive: true, force: true });
++      const consentLayer = Layer.succeed(AcpRegistrySupport.AcpInstallConsentGate, {
++        hasConsent: (key) => Effect.sync(() => consents.has(consentKeyId(key))),
++      });
++      const resolver = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
++        cacheDir: rootDir,
++        toolsDir,
++        registryUrl,
++      }).pipe(
++        Effect.provideService(HostProcess.Environment, toolchain.environment),
++        Effect.provide(consentLayer),
++      );
++
++      // Uninstalled npx agent must inspect as unprepared (never ready -> never silent install).
++      const beforeInspect = yield* resolver.inspect(settings(), toolchain.environment, {
++        instanceId: "xtworkKimiCode",
++      });
++      expect(beforeInspect).toEqual({
++        status: "unprepared",
++        agentId: "example-agent",
++        version: "1.2.3",
++        distribution: "npx",
++      });
++
++      // Unconsented resolve MUST fail with install_required and NOT invoke npm.
++      const unconsentedResolve = yield* Effect.flip(
++        resolver.resolve(settings(), rootDir, toolchain.environment, {
++          instanceId: "xtworkKimiCode",
++        }),
++      );
++      expect(unconsentedResolve.reason).toBe("install_required");
++      expect(yield* fileSystem.readFileString(toolchain.logPath)).toBe("");
++
++      // Unconsented prepare MUST also fail with install_required and NOT invoke npm.
++      const unconsentedPrepare = yield* Effect.flip(
++        resolver.prepare({
++          agentId: "example-agent",
++          instanceId: ProviderInstanceId.make("xtworkKimiCode"),
++        }),
++      );
++      expect(unconsentedPrepare.reason).toBe("install_required");
++      expect(yield* fileSystem.readFileString(toolchain.logPath)).toBe("");
++
++      // Grant exact 5-tuple consent -> prepare and resolve succeed.
++      const described = yield* resolver.describeAgent!("example-agent", "auto");
++      expect(described.version).toBe("1.2.3");
++      expect(described.distribution).toBe("npx");
++      expect(described.installed).toBe(false);
++      consents.add(
++        consentKeyId({
++          instanceId: "xtworkKimiCode",
++          source: "acp-registry",
++          version: described.version,
++          distribution: described.distribution,
++          installDir: described.installDir,
++        }),
++      );
++
++      const prepared = yield* resolver.prepare({
++        agentId: "example-agent",
++        instanceId: ProviderInstanceId.make("xtworkKimiCode"),
++      });
++      expect(prepared.prepared).toBe(true);
++      const readyInspect = yield* resolver.inspect(settings(), toolchain.environment, {
++        instanceId: "xtworkKimiCode",
++      });
++      expect(readyInspect.status).toBe("ready");
++
++      // Missing-package recovery after deleting package + revoking consent MUST return install_required.
++      consents.clear();
++      yield* fileSystem.remove(described.installDir, { recursive: true, force: true });
++      const missingRecovery = yield* Effect.flip(
++        resolver.resolve(settings(), rootDir, toolchain.environment, {
++          instanceId: "xtworkKimiCode",
++        }),
++      );
++      expect(missingRecovery.reason).toBe("install_required");
++
++      // Re-create v1.2.3 directory to simulate an older installed version, then bump registry to 2.0.0.
++      yield* fileSystem.makeDirectory(described.installDir, { recursive: true });
++      registryVersion = "2.0.0";
++      packageVersion = "2.0.0";
++      const bumpedPrepare = yield* Effect.flip(
++        resolver.prepare({
++          agentId: "example-agent",
++          instanceId: ProviderInstanceId.make("xtworkKimiCode"),
++        }),
++      );
++      expect(bumpedPrepare.reason).toBe("update_required");
++      const bumpedInspect = yield* resolver.inspect(settings(), toolchain.environment, {
++        instanceId: "xtworkKimiCode",
++      });
++      expect(bumpedInspect).toEqual({
++        status: "update_required",
++        agentId: "example-agent",
++        version: "2.0.0",
++        distribution: "npx",
++      });
++    }).pipe(
++      Effect.provide(
++        layerResolver((request) =>
++          Effect.succeed(
++            HttpClientResponse.fromWeb(
++              request,
++              new Response(
++                makeRegistry({
++                  ...makeAgent({
++                    npx: { package: `@example/acp@${packageVersion}`, args: ["--stdio"] },
++                  }),
++                  version: registryVersion,
++                }),
++                { status: 200 },
++              ),
++            ),
++          ),
++        ),
++      ),
++    );
++  });
++
++  it.effect("blocks unconsented binary download and version bump via AcpInstallConsentGate", () => {
++    let registryVersion = "1.0.0";
++    let archiveRequests = 0;
++    const consents = new Set<string>();
++    const consentKeyId = (key: AcpRegistrySupport.AcpInstallConsentKey) =>
++      JSON.stringify([key.instanceId, key.source, key.version, key.distribution, key.installDir]);
++
++    return Effect.gen(function* () {
++      const fileSystem = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const rootDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-acp-bin-consent-" });
++      const toolsDir = path.join(rootDir, "tools");
++      const consentLayer = Layer.succeed(AcpRegistrySupport.AcpInstallConsentGate, {
++        hasConsent: (key) => Effect.sync(() => consents.has(consentKeyId(key))),
++      });
++      const resolver = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
++        cacheDir: rootDir,
++        toolsDir,
++        registryUrl,
++      }).pipe(Effect.provide(consentLayer));
++
++      const unconsented = yield* Effect.flip(
++        resolver.resolve(settings(), rootDir, undefined, { instanceId: "xtworkQoder" }),
++      );
++      expect(unconsented.reason).toBe("install_required");
++      expect(archiveRequests).toBe(0);
++
++      const described = yield* resolver.describeAgent!("example-agent", "auto");
++      consents.add(
++        consentKeyId({
++          instanceId: "xtworkQoder",
++          source: "acp-registry",
++          version: described.version,
++          distribution: described.distribution,
++          installDir: described.installDir,
++        }),
++      );
++      const prepared = yield* resolver.prepare({
++        agentId: "example-agent",
++        instanceId: ProviderInstanceId.make("xtworkQoder"),
++      });
++      expect(prepared.prepared).toBe(true);
++      expect(archiveRequests).toBe(1);
++
++      // Registry bumps version -> unconsented prepare/resolve must return update_required without downloading.
++      registryVersion = "1.1.0";
++      const bumped = yield* Effect.flip(
++        resolver.prepare({
++          agentId: "example-agent",
++          instanceId: ProviderInstanceId.make("xtworkQoder"),
++        }),
++      );
++      expect(bumped.reason).toBe("update_required");
++      expect(archiveRequests).toBe(1);
++    }).pipe(
++      Effect.provide(
++        layerResolver((request) => {
++          if (request.url === archiveUrl) {
++            archiveRequests += 1;
++            return Effect.succeed(
++              HttpClientResponse.fromWeb(request, new Response("#!/bin/sh\n", { status: 200 })),
++            );
++          }
++          return Effect.succeed(
++            HttpClientResponse.fromWeb(
++              request,
++              new Response(
++                makeRegistry({
++                  ...makeAgent({
++                    binary: {
++                      "linux-x86_64": { archive: archiveUrl, cmd: "./bin/example-agent", args: ["acp"] },
++                    },
++                  }),
++                  version: registryVersion,
++                }),
++                { status: 200 },
++              ),
++            ),
++          );
++        }),
++      ),
++    );
++  });
+ });
+diff --git a/packages/provider-acp-registry/src/server/AcpRegistrySupport.ts b/packages/provider-acp-registry/src/server/AcpRegistrySupport.ts
+index 05133475..6efb49ea 100644
+--- a/packages/provider-acp-registry/src/server/AcpRegistrySupport.ts
++++ b/packages/provider-acp-registry/src/server/AcpRegistrySupport.ts
+@@ -469,6 +469,36 @@ export interface ResolvedAcpRegistryAgent {
+   readonly spawn: AcpSessionRuntime.AcpSpawnInput;
+ }
+ 
++export interface AcpInstallConsentKey {
++  readonly instanceId: string;
++  readonly source: string;
++  readonly version: string;
++  readonly distribution: string;
++  readonly installDir: string;
++}
++
++export class AcpInstallConsentGate extends Context.Service<
++  AcpInstallConsentGate,
++  {
++    readonly hasConsent: (key: AcpInstallConsentKey) => Effect.Effect<boolean>;
++  }
++>()("@t3tools/provider-acp-registry/server/AcpRegistrySupport/AcpInstallConsentGate") {}
++
++export interface AcpRegistryAgentDescription {
++  readonly agentId: string;
++  readonly version: string;
++  readonly distribution: AcpRegistryDistributionKind;
++  readonly packageName?: string;
++  readonly archiveUrl?: string;
++  readonly installDir: string;
++  readonly installed: boolean;
++  readonly hasOtherInstalledVersion: boolean;
++}
++
++export interface AcpRegistryInstanceOptions {
++  readonly instanceId?: string;
++}
++
+ export type AcpRegistryInspection =
+   | { readonly status: "unconfigured" }
+   | { readonly status: "not_found"; readonly agentId: string }
+@@ -493,7 +523,13 @@ export type AcpRegistryInspection =
+       readonly status: "unprepared";
+       readonly agentId: string;
+       readonly version: string;
+-      readonly distribution: "binary";
++      readonly distribution: AcpRegistryDistributionKind;
++    }
++  | {
++      readonly status: "update_required";
++      readonly agentId: string;
++      readonly version: string;
++      readonly distribution: AcpRegistryDistributionKind;
+     }
+   | {
+       readonly status: "ready";
+@@ -512,14 +548,20 @@ export class AcpRegistryCatalog extends Context.Service<
+     readonly prepare: (
+       input: AcpRegistryPrepareInput,
+     ) => Effect.Effect<AcpRegistryPrepareResult, AcpRegistryError>;
++    readonly describeAgent?: (
++      agentId: string,
++      preference?: AcpRegistryDistributionPreference,
++    ) => Effect.Effect<AcpRegistryAgentDescription, AcpRegistryError>;
+     readonly inspect: (
+       settings: AcpRegistrySettings,
+       environment?: NodeJS.ProcessEnv,
++      options?: AcpRegistryInstanceOptions,
+     ) => Effect.Effect<AcpRegistryInspection, AcpRegistryError>;
+     readonly resolve: (
+       settings: AcpRegistrySettings,
+       cwd: string,
+       environment?: NodeJS.ProcessEnv,
++      options?: AcpRegistryInstanceOptions,
+     ) => Effect.Effect<ResolvedAcpRegistryAgent, AcpRegistryError>;
+     readonly uninstallManagedBinary: (
+       input: AcpRegistryManagedBinaryUninstallInput,
+@@ -650,6 +692,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+   const httpClient = yield* HttpClient.HttpClient;
+   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+   const { settings: hostSettings } = yield* ProviderHost.ProviderHost;
++  const consentGate = yield* Effect.serviceOption(AcpInstallConsentGate);
+   const platform = yield* HostProcess.Platform;
+   const architecture = yield* HostProcess.Architecture;
+   const hostEnvironment = yield* HostProcess.Environment;
+@@ -1220,11 +1263,61 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+     },
+   );
+ 
++  const hasOtherInstalledPackageVersion = Effect.fn(
++    "AcpRegistryCatalog.hasOtherInstalledPackageVersion",
++  )(function* (agentId: string, currentVersion: string) {
++    const encodedCurrent = encodeURIComponent(currentVersion);
++    const agentRoot = path.join(installsDirectory, agentId);
++    const versions = yield* fileSystem
++      .readDirectory(agentRoot)
++      .pipe(Effect.orElseSucceed((): Array<string> => []));
++    for (const version of versions) {
++      if (version === encodedCurrent) continue;
++      for (const subdir of ["npm", "python"]) {
++        if (
++          yield* fileSystem
++            .exists(path.join(agentRoot, version, subdir))
++            .pipe(Effect.orElseSucceed(() => false))
++        ) {
++          return true;
++        }
++      }
++    }
++    return false;
++  });
++
++  const requireInstallConsent = Effect.fn("AcpRegistryCatalog.requireInstallConsent")(function* (input: {
++    readonly instanceId?: string;
++    readonly agentId: string;
++    readonly version: string;
++    readonly distribution: AcpRegistryDistributionKind;
++    readonly installDir: string;
++    readonly isUpdate: boolean;
++  }) {
++    if (Option.isNone(consentGate)) return;
++    const allowed = yield* consentGate.value.hasConsent({
++      instanceId: input.instanceId?.trim() || `acp:${input.agentId}`,
++      source: "acp-registry",
++      version: input.version,
++      distribution: input.distribution,
++      installDir: input.installDir,
++    });
++    if (!allowed) {
++      return yield* new AcpRegistryError({
++        reason: input.isUpdate ? "update_required" : "install_required",
++        detail: input.isUpdate
++          ? `ACP Registry agent '${input.agentId}' has a new version (${input.version}). Confirm the update in provider settings before downloading.`
++          : `ACP Registry agent '${input.agentId}' (${input.version}) requires explicit user confirmation before installing.`,
++      });
++    }
++  });
++
+   const ensureGlobalPackage = Effect.fn("AcpRegistryCatalog.ensureGlobalPackage")(function* (
+     agent: AcpRegistryAgent,
+     distribution: "npx" | "uvx",
+     packageSpec: string,
+     environment: NodeJS.ProcessEnv,
++    instanceId?: string,
+   ) {
+     const managerName = packageManagerFor(distribution)!;
+     const managerPath = resolveExecutable(managerName, platform, environment);
+@@ -1238,16 +1331,9 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+     if (Option.isSome(receipt) && distribution === "npx") return receipt.value;
+ 
+     const packageRoot = packageInstallRoot(agent, distribution);
+-    yield* fileSystem.makeDirectory(packageRoot, { recursive: true }).pipe(
+-      Effect.mapError(
+-        (cause) =>
+-          new AcpRegistryError({
+-            reason: "install_failed",
+-            detail: `Could not create the managed install directory for ${agent.id}.`,
+-            cause,
+-          }),
+-      ),
+-    );
++    const packageRootExists = yield* fileSystem
++      .exists(packageRoot)
++      .pipe(Effect.orElseSucceed(() => false));
+     const packageEnvironment =
+       distribution === "npx"
+         ? { ...environment, npm_config_prefix: packageRoot }
+@@ -1256,7 +1342,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+             UV_TOOL_DIR: packageRoot,
+             UV_TOOL_BIN_DIR: packageBinDirectory(agent, distribution),
+           };
+-    if (Option.isSome(receipt)) {
++    if (packageRootExists && Option.isSome(receipt)) {
+       const installed = yield* discoverUvGlobalPackage(
+         agent,
+         packageSpec,
+@@ -1266,16 +1352,40 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+       if (Option.isSome(installed)) return installed.value;
+     }
+ 
+-    const discover =
+-      distribution === "npx"
+-        ? () => discoverNpmGlobalPackage(agent, packageSpec, managerPath, packageEnvironment)
+-        : () => discoverUvGlobalPackage(agent, packageSpec, managerPath, packageEnvironment);
+-    const existing = yield* discover();
+-    if (Option.isSome(existing)) {
+-      yield* writePackageReceipt(existing.value);
+-      return existing.value;
++    if (packageRootExists) {
++      const discover =
++        distribution === "npx"
++          ? () => discoverNpmGlobalPackage(agent, packageSpec, managerPath, packageEnvironment)
++          : () => discoverUvGlobalPackage(agent, packageSpec, managerPath, packageEnvironment);
++      const existing = yield* discover();
++      if (Option.isSome(existing)) {
++        yield* writePackageReceipt(existing.value);
++        return existing.value;
++      }
+     }
+ 
++    // Never silently download or re-install missing/updated packages without explicit consent.
++    const isUpdate = yield* hasOtherInstalledPackageVersion(agent.id, agent.version);
++    yield* requireInstallConsent({
++      ...(instanceId ? { instanceId } : {}),
++      agentId: agent.id,
++      version: agent.version,
++      distribution,
++      installDir: packageRoot,
++      isUpdate,
++    });
++
++    yield* fileSystem.makeDirectory(packageRoot, { recursive: true }).pipe(
++      Effect.mapError(
++        (cause) =>
++          new AcpRegistryError({
++            reason: "install_failed",
++            detail: `Could not create the managed install directory for ${agent.id}.`,
++            cause,
++          }),
++      ),
++    );
++
+     const managerDirectory = yield* managerBinDirectory(managerPath);
+     const installEnvironment = withPreferredPath(packageEnvironment, managerDirectory, platform);
+     if (distribution === "npx") {
+@@ -1421,6 +1531,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+   const installBinary = Effect.fn("AcpRegistryCatalog.installBinary")(function* (
+     agent: AcpRegistryAgent,
+     target: typeof AcpRegistryBinaryTarget.Type,
++    instanceId?: string,
+   ) {
+     if (platformTarget === undefined) {
+       return yield* new AcpRegistryError({
+@@ -1450,6 +1561,16 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+       );
+     }
+ 
++    const isUpdate = yield* hasInstalledBinaryVersion(agent.id);
++    yield* requireInstallConsent({
++      ...(instanceId ? { instanceId } : {}),
++      agentId: agent.id,
++      version: agent.version,
++      distribution: "binary",
++      installDir: installRoot,
++      isUpdate,
++    });
++
+     yield* fileSystem.makeDirectory(path.dirname(installRoot), { recursive: true }).pipe(
+       Effect.mapError(
+         (cause) =>
+@@ -1697,6 +1818,56 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+     },
+   );
+ 
++  const describeAgent: NonNullable<AcpRegistryCatalog["Service"]["describeAgent"]> = Effect.fn(
++    "AcpRegistryCatalog.describeAgent",
++  )(function* (agentId, preference = "auto") {
++    const registry = yield* recentRegistry();
++    const agent = yield* findAgent(registry, agentId);
++    const distribution = yield* compatibleDistribution(agent, preference);
++    if (distribution.kind === "binary") {
++      const paths = binaryPaths(agent, distribution.binaryTarget!);
++      if (paths === undefined) {
++        return yield* new AcpRegistryError({
++          reason: "archive_invalid",
++          detail: `ACP Registry agent ${agent.id} declares an unsafe command path '${distribution.binaryTarget!.cmd}'.`,
++        });
++      }
++      const installed = yield* fileSystem
++        .exists(paths.executablePath)
++        .pipe(Effect.orElseSucceed(() => false));
++      const hasOtherInstalledVersion = !installed && (yield* hasInstalledBinaryVersion(agent.id));
++      return {
++        agentId: agent.id,
++        version: agent.version,
++        distribution: "binary",
++        archiveUrl: distribution.binaryTarget!.archive,
++        installDir: paths.installRoot,
++        installed,
++        hasOtherInstalledVersion,
++      } satisfies AcpRegistryAgentDescription;
++    }
++
++    const installDir = packageInstallRoot(agent, distribution.kind);
++    const runner = packageManagerFor(distribution.kind)!;
++    const managerPath = resolveExecutable(runner, platform, hostEnvironment);
++    const receipt =
++      managerPath === undefined
++        ? Option.none()
++        : yield* readPackageReceipt(agent, distribution.kind, distribution.packageName!, managerPath);
++    const installed = Option.isSome(receipt);
++    const hasOtherInstalledVersion =
++      !installed && (yield* hasOtherInstalledPackageVersion(agent.id, agent.version));
++    return {
++      agentId: agent.id,
++      version: agent.version,
++      distribution: distribution.kind,
++      packageName: distribution.packageName!,
++      installDir,
++      installed,
++      hasOtherInstalledVersion,
++    } satisfies AcpRegistryAgentDescription;
++  });
++
+   const prepare: AcpRegistryCatalog["Service"]["prepare"] = Effect.fn("AcpRegistryCatalog.prepare")(
+     function* (input) {
+       const registry = yield* refreshRegistry();
+@@ -1705,13 +1876,19 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+       if (distribution.kind === "binary") {
+         // Only explicit command overrides may use PATH copies with different ACP capabilities.
+         yield* withInstallPermit(agent.id)(
+-          installBinary(agent, distribution.binaryTarget!).pipe(
++          installBinary(agent, distribution.binaryTarget!, input.instanceId).pipe(
+             Effect.tap(() => reservePreparedBinary(agent.id)),
+           ),
+         );
+       } else {
+         yield* withInstallPermit(agent.id)(
+-          ensureGlobalPackage(agent, distribution.kind, distribution.packageName!, hostEnvironment),
++          ensureGlobalPackage(
++            agent,
++            distribution.kind,
++            distribution.packageName!,
++            hostEnvironment,
++            input.instanceId,
++          ),
+         );
+       }
+       return {
+@@ -1797,8 +1974,8 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+             const exists = yield* fileSystem
+               .exists(paths.executablePath)
+               .pipe(Effect.orElseSucceed(() => false));
+-            // Any prepared version keeps the agent ready; resolve installs the current one on demand.
+-            if (!exists && !(yield* hasInstalledBinaryVersion(agent.id))) {
++            const hasOtherVersion = !exists && (yield* hasInstalledBinaryVersion(agent.id));
++            if (!exists && !hasOtherVersion) {
+               return {
+                 status: "unprepared",
+                 agentId,
+@@ -1806,6 +1983,14 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+                 distribution: "binary",
+               } as const;
+             }
++            if (!exists && hasOtherVersion && Option.isSome(consentGate)) {
++              return {
++                status: "update_required",
++                agentId,
++                version: agent.version,
++                distribution: "binary",
++              } as const;
++            }
+             if (exists) {
+               yield* assertExecutableInRoot(paths.installRoot, paths.executablePath).pipe(
+                 Effect.mapError((cause) =>
+@@ -1831,28 +2016,52 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+       }
+ 
+       const runner = packageManagerFor(distribution.kind)!;
+-      const available =
+-        resolveExecutable(runner, platform, environment ?? hostEnvironment) !== undefined;
+-      return available
+-        ? ({
+-            status: "ready",
+-            agentId,
+-            version: agent.version,
+-            distribution: distribution.kind,
+-            ...(documentationUrl ? { documentationUrl } : {}),
+-          } as const)
+-        : ({
+-            status: "missing_runner",
+-            agentId,
+-            version: agent.version,
+-            distribution: distribution.kind,
+-            runner,
+-          } as const);
++      const managerPath = resolveExecutable(runner, platform, environment ?? hostEnvironment);
++      if (managerPath === undefined) {
++        return {
++          status: "missing_runner",
++          agentId,
++          version: agent.version,
++          distribution: distribution.kind,
++          runner,
++        } as const;
++      }
++      if (Option.isSome(consentGate)) {
++        const receipt = yield* readPackageReceipt(
++          agent,
++          distribution.kind,
++          distribution.packageName!,
++          managerPath,
++        );
++        if (Option.isNone(receipt)) {
++          const hasOtherVersion = yield* hasOtherInstalledPackageVersion(agent.id, agent.version);
++          return hasOtherVersion
++            ? ({
++                status: "update_required",
++                agentId,
++                version: agent.version,
++                distribution: distribution.kind,
++              } as const)
++            : ({
++                status: "unprepared",
++                agentId,
++                version: agent.version,
++                distribution: distribution.kind,
++              } as const);
++        }
++      }
++      return {
++        status: "ready",
++        agentId,
++        version: agent.version,
++        distribution: distribution.kind,
++        ...(documentationUrl ? { documentationUrl } : {}),
++      } as const;
+     },
+   );
+ 
+   const resolve: AcpRegistryCatalog["Service"]["resolve"] = Effect.fn("AcpRegistryCatalog.resolve")(
+-    function* (settings, cwd, environment) {
++    function* (settings, cwd, environment, options) {
+       if (settings.source === "local") {
+         const executable = settings.commandPath.trim();
+         if (!executable) {
+@@ -1908,6 +2117,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+             distribution.kind,
+             distribution.packageName!,
+             effectiveEnvironment,
++            options?.instanceId,
+           ),
+         );
+         command = installed.executablePath;
+@@ -1916,7 +2126,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+       } else {
+         const target = distribution.binaryTarget!;
+         command = yield* withInstallPermit(agent.id)(
+-          installBinary(agent, target).pipe(
++          installBinary(agent, target, options?.instanceId).pipe(
+             Effect.tap(() => consumePreparedBinaryReservation(agent.id)),
+           ),
+         );
+@@ -2040,6 +2250,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+   return AcpRegistryCatalog.of({
+     search,
+     prepare,
++    describeAgent,
+     inspect,
+     resolve,
+     uninstallManagedBinary,
+diff --git a/packages/provider-acp-registry/src/server/adapter.ts b/packages/provider-acp-registry/src/server/adapter.ts
+index d730cbd5..e3ec48d1 100644
+--- a/packages/provider-acp-registry/src/server/adapter.ts
++++ b/packages/provider-acp-registry/src/server/adapter.ts
+@@ -150,7 +150,9 @@ function makeAcpRegistryRuntime(
+     Effect.gen(function* () {
+       const { processEnvironment, ...runtimeInput } = input;
+       const resolved = yield* catalog
+-        .resolve(options.settings, input.cwd, options.environment)
++        .resolve(options.settings, input.cwd, options.environment, {
++          instanceId: options.instanceId,
++        })
+         .pipe(
+           Effect.mapError(
+             (cause) =>
+diff --git a/packages/provider-acp-registry/src/server/auth.ts b/packages/provider-acp-registry/src/server/auth.ts
+index 0a503c09..1404a8df 100644
+--- a/packages/provider-acp-registry/src/server/auth.ts
++++ b/packages/provider-acp-registry/src/server/auth.ts
+@@ -77,7 +77,7 @@ export const makeAcpRegistryAuth = Effect.fn("makeAcpRegistryAuth")(function* (o
+       cause,
+     });
+   const resolve = catalog
+-    .resolve(options.settings, options.cwd, options.environment)
++    .resolve(options.settings, options.cwd, options.environment, { instanceId: options.instanceId })
+     .pipe(
+       Effect.mapError((cause) =>
+         failure("start", "Could not prepare the selected ACP agent.", cause),
+@@ -123,7 +123,7 @@ export const makeAcpRegistryAuth = Effect.fn("makeAcpRegistryAuth")(function* (o
+   const discoverMethods = Effect.scoped(
+     Effect.gen(function* () {
+       const inspected = yield* catalog
+-        .inspect(options.settings, options.environment)
++        .inspect(options.settings, options.environment, { instanceId: options.instanceId })
+         .pipe(
+           Effect.mapError((cause) =>
+             failure("methods", "Could not inspect the selected ACP agent.", cause),
+diff --git a/packages/provider-acp-registry/src/server/driver.ts b/packages/provider-acp-registry/src/server/driver.ts
+index 2346a9c7..5bdef13c 100644
+--- a/packages/provider-acp-registry/src/server/driver.ts
++++ b/packages/provider-acp-registry/src/server/driver.ts
+@@ -256,7 +256,14 @@ function acpRegistrySnapshotReadiness(
+         installed: false,
+         version: inspection.version,
+         status: "warning",
+-        message: `ACP Registry agent '${inspection.agentId}' has not been prepared on this environment.`,
++        message: `ACP Registry agent '${inspection.agentId}' has not been installed on this environment.`,
++      };
++    case "update_required":
++      return {
++        installed: true,
++        version: inspection.version,
++        status: "warning",
++        message: `ACP Registry agent '${inspection.agentId}' has update v${inspection.version} available. Confirm in provider settings to update.`,
+       };
+     case "failed":
+       return {
+@@ -524,7 +531,9 @@ export const checkAcpRegistryProviderStatus = Effect.fn("AcpRegistryDriver.check
+       return yield* buildInitialAcpRegistrySnapshot(input);
+     }
+     const catalog = yield* AcpRegistrySupport.AcpRegistryCatalog;
+-    const inspected = yield* Effect.result(catalog.inspect(input.settings, input.environment));
++    const inspected = yield* Effect.result(
++      catalog.inspect(input.settings, input.environment, { instanceId: input.instanceId }),
++    );
+     if (Result.isFailure(inspected)) {
+       return buildCheckedAcpRegistrySnapshot({
+         ...input,
+@@ -579,7 +588,9 @@ export const checkAcpRegistryProviderReadiness = Effect.fn(
+     return yield* buildInitialAcpRegistrySnapshot(input);
+   }
+   const catalog = yield* AcpRegistrySupport.AcpRegistryCatalog;
+-  const inspected = yield* Effect.result(catalog.inspect(input.settings, input.environment));
++  const inspected = yield* Effect.result(
++    catalog.inspect(input.settings, input.environment, { instanceId: input.instanceId }),
++  );
+   const snapshot = buildCheckedAcpRegistrySnapshot({
+     ...input,
+     checkedAt,
+diff --git a/packages/provider-acp-registry/src/server/probe.ts b/packages/provider-acp-registry/src/server/probe.ts
+index c012f38d..1a6550d9 100644
+--- a/packages/provider-acp-registry/src/server/probe.ts
++++ b/packages/provider-acp-registry/src/server/probe.ts
+@@ -411,7 +411,7 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
+     const result = yield* Effect.gen(function* () {
+       // Resolution may install packages; bound it by the probe deadline.
+       const resolved = yield* catalog
+-        .resolve(input.settings, input.cwd, input.environment)
++        .resolve(input.settings, input.cwd, input.environment, { instanceId: input.instanceId })
+         .pipe(Effect.mapError(AcpRegistrySupport.toAcpRegistryOperationError));
+       const authMethodsRef = yield* Ref.make<ReadonlyArray<AcpRegistryProbeAuthMethod>>([]);
+       const authActionRef = yield* Ref.make<AcpRegistryUrlAuthAction | undefined>(undefined);
+@@ -600,7 +600,7 @@ const makeAcpRegistryManagementRuntime = Effect.fn("AcpRegistryProbe.makeManagem
+       AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator,
+     );
+     const resolved = yield* catalog
+-      .resolve(input.settings, input.cwd, input.environment)
++      .resolve(input.settings, input.cwd, input.environment, { instanceId: input.instanceId })
+       .pipe(Effect.mapError(AcpRegistrySupport.toAcpRegistryOperationError));
+     const runtimeContext = yield* Layer.build(
+       AcpSessionRuntime.layer({
+diff --git a/apps/web/src/components/chat/ComposerControlsBar.tsx b/apps/web/src/components/chat/ComposerControlsBar.tsx
+index 1f34def9..37ccf286 100644
+--- a/apps/web/src/components/chat/ComposerControlsBar.tsx
++++ b/apps/web/src/components/chat/ComposerControlsBar.tsx
+@@ -1,4 +1,3 @@
+-import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
+ import type { ChatComposerProps } from "./ChatComposer";
+ import type { PromptUltrathink } from "./TraitsPicker";
+ import type { ProviderInstanceEntry } from "../../providerInstances";
+@@ -149,7 +148,6 @@ export function ComposerControlsBar(props: {
+   });
+   const controlSize = composerControlsCollapsed ? "xs" : "sm";
+   const gt = useGT();
+-  const developerFeatures = useDesktopDeveloperFeatures();
+   const m = useMessages();
+   const applyThreadModelPick = useApplyThreadModelPick();
+   const applyRouteThreadModelPick = useStableCallback(() => applyThreadModelPick(routeThreadRef));
+@@ -254,7 +252,7 @@ export function ComposerControlsBar(props: {
+   return showProviderUnavailable ? (
+     <ComposerControl
+       type="button"
+-      disabled={!developerFeatures || !providerSetupInstanceId}
++      disabled={!providerSetupInstanceId}
+       onClick={() => {
+         if (providerSetupInstanceId) {
+           onOpenProviderSetup(providerSetupInstanceId);
+@@ -264,11 +262,7 @@ export function ComposerControlsBar(props: {
+       className="shrink-0"
+     >
+       <CircleAlertIcon className="size-4" />
+-      {!developerFeatures
+-        ? gt("Assistant unavailable")
+-        : providerSetupInstanceId
+-          ? gt("Open provider settings")
+-          : gt("No provider available")}
++      {providerSetupInstanceId ? gt("Open provider settings") : gt("No provider available")}
+     </ComposerControl>
+   ) : (
+     <>

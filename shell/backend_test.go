@@ -7,9 +7,67 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, pair := range env {
+		if strings.HasPrefix(pair, prefix) {
+			return strings.TrimPrefix(pair, prefix)
+		}
+	}
+	return ""
+}
+
+func TestBackendEnvironmentAppendsBundledNodeBinAsFallbackPath(t *testing.T) {
+	tempDir := t.TempDir()
+	nodeBinDir := filepath.Join(tempDir, "resources", "node", "bin")
+	if err := os.MkdirAll(nodeBinDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	bundledNode := filepath.Join(nodeBinDir, "node")
+	userBin := filepath.Join(tempDir, "homebrew", "bin")
+	t.Setenv("PATH", userBin+string(os.PathListSeparator)+"/usr/bin:/bin")
+
+	cfg := config{
+		resources: filepath.Join(tempDir, "resources"),
+		dataDir:   filepath.Join(tempDir, "data"),
+		node:      bundledNode,
+	}
+	env := cfg.backendEnvironment()
+	gotPath := envValue(env, "PATH")
+	parts := filepath.SplitList(gotPath)
+	if len(parts) < 2 {
+		t.Fatalf("expected PATH to contain user entries and fallback node bin, got %q", gotPath)
+	}
+	if parts[0] != userBin {
+		t.Fatalf("expected user bin %q to stay ahead of bundled node bin, got PATH=%q", userBin, gotPath)
+	}
+	if parts[len(parts)-1] != nodeBinDir {
+		t.Fatalf("expected bundled node bin %q appended at end of PATH, got PATH=%q", nodeBinDir, gotPath)
+	}
+	if gotBundled := envValue(env, "XTWORK_BUNDLED_NODE_BIN"); gotBundled != nodeBinDir {
+		t.Fatalf("expected XTWORK_BUNDLED_NODE_BIN=%q, got %q", nodeBinDir, gotBundled)
+	}
+
+	// Idempotent when already present in PATH (does not duplicate or promote ahead of user entries).
+	t.Setenv("PATH", userBin+string(os.PathListSeparator)+nodeBinDir)
+	envSecond := cfg.backendEnvironment()
+	gotSecondPath := envValue(envSecond, "PATH")
+	if strings.Count(gotSecondPath, nodeBinDir) != 1 {
+		t.Fatalf("expected no duplicate bundled node bin in PATH, got %q", gotSecondPath)
+	}
+
+	// Works when PATH is empty.
+	t.Setenv("PATH", "")
+	envEmpty := cfg.backendEnvironment()
+	if gotEmptyPath := envValue(envEmpty, "PATH"); gotEmptyPath != nodeBinDir {
+		t.Fatalf("expected PATH=%q when host PATH is empty, got %q", nodeBinDir, gotEmptyPath)
+	}
+}
 
 func TestDesktopBackendBootstrapAndRestart(t *testing.T) {
 	node, err := exec.LookPath("node")

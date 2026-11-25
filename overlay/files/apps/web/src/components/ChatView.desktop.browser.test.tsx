@@ -106,6 +106,10 @@ vi.mock("../../../../packages/client-runtime/src/connection/driver.ts", async (i
           driver: contracts.ProviderDriverKind.make("pi"),
           enabled: true,
         },
+        [contracts.ProviderInstanceId.make("cursor")]: {
+          driver: contracts.ProviderDriverKind.make("cursor"),
+          enabled: true,
+        },
       },
     },
   });
@@ -180,6 +184,12 @@ const PI_PROVIDER = {
   skills: [],
 };
 
+const CURSOR_PROVIDER = {
+  ...CODEX_PROVIDER,
+  instanceId: ProviderInstanceId.make("cursor"),
+  driver: "cursor" as const,
+};
+
 let previousSettings = getClientSettings();
 
 beforeEach(() => {
@@ -244,7 +254,7 @@ it("hides /model in single-model ordinary mode and restores it in developer mode
     model: "xtwork/standard",
   });
   using _environment = installFakeEnvironment([thread], {
-    providers: [PI_PROVIDER, CODEX_PROVIDER],
+    providers: [PI_PROVIDER, CURSOR_PROVIDER],
   });
   const router = getRouter(
     createMemoryHistory({ initialEntries: [`/${ENVIRONMENT_ID}/${thread.id}`] }),
@@ -265,10 +275,13 @@ it("hides /model in single-model ordinary mode and restores it in developer mode
 
 it("keeps started external-runtime threads sendable after developer features are turned off", async () => {
   await page.viewport(1280, 900);
-  const thread = threadWithHistory("desktop-codex-started", 1);
+  const thread = threadWithHistory("desktop-cursor-started", 1, {
+    instanceId: CURSOR_PROVIDER.instanceId,
+    model: "gpt-5.4",
+  });
   using _environment = installFakeEnvironment([thread], {
     acceptCommands: true,
-    providers: [PI_PROVIDER, CODEX_PROVIDER],
+    providers: [PI_PROVIDER, CURSOR_PROVIDER],
   });
   const router = getRouter(
     createMemoryHistory({ initialEntries: [`/${ENVIRONMENT_ID}/${thread.id}`] }),
@@ -279,23 +292,26 @@ it("keeps started external-runtime threads sendable after developer features are
 
   const editor = page.getByTestId("composer-editor");
   await userEvent.click(editor);
-  await userEvent.keyboard("Continue codex work{Enter}");
+  await userEvent.keyboard("Continue cursor work{Enter}");
 
   await vi.waitFor(() => {
     const dispatched = dispatchedCommands().find((command) => command.type === "message.dispatch");
     expect(dispatched).toBeDefined();
     if (dispatched?.type === "message.dispatch") {
-      expect(dispatched.modelSelection?.instanceId).toBe(CODEX_PROVIDER.instanceId);
+      expect(dispatched.modelSelection?.instanceId).toBe(CURSOR_PROVIDER.instanceId);
     }
   });
 });
 
 it("preserves existing review comments on send when developer features are turned off", async () => {
   await page.viewport(1280, 900);
-  const thread = threadWithHistory("desktop-review-comments", 1);
+  const thread = threadWithHistory("desktop-review-comments", 1, {
+    instanceId: PI_PROVIDER.instanceId,
+    model: "xtwork/standard",
+  });
   using _environment = installFakeEnvironment([thread], {
     acceptCommands: true,
-    providers: [PI_PROVIDER, CODEX_PROVIDER],
+    providers: [PI_PROVIDER, CURSOR_PROVIDER],
   });
   const threadRef = scopeThreadRef(ENVIRONMENT_ID, thread.id);
   useComposerDraftStore.getState().addReviewComment(threadRef, {
