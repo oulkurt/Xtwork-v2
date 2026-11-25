@@ -937,6 +937,17 @@ describe("ChannelManager & Gateway/Live-Pi Coordinator (ADR-012 §2, §3.1–§3
                 updatedAt: 1,
               },
               {
+                id: "legacy-oauth-ssrf",
+                name: "Legacy OAuth SSRF",
+                provider: "xai-oauth",
+                baseUrl: "https://192.168.1.50/v1",
+                enabled: true,
+                secretRef: "oauth:legacy-oauth-ssrf",
+                models: [{ id: "grok-4", name: "Grok 4", enabled: true }],
+                createdAt: 1,
+                updatedAt: 1,
+              },
+              {
                 id: "disabled-models-ch",
                 name: "Enabled Channel Zero Models",
                 provider: "openai",
@@ -957,6 +968,10 @@ describe("ChannelManager & Gateway/Live-Pi Coordinator (ADR-012 §2, §3.1–§3
 
       const backing = memorySecrets();
       await backing.set("channel:legacy-ssrf", "sk-legacy-secret");
+      await backing.set(
+        "oauth:legacy-oauth-ssrf",
+        JSON.stringify({ access: "xai-tok", refresh: "xai-ref", expires: Date.now() + 3600_000 }),
+      );
       await backing.set("channel:disabled-models-ch", "sk-disabled-models");
       let failReads = false;
       const flakySecrets: SecretStore = {
@@ -1008,6 +1023,19 @@ describe("ChannelManager & Gateway/Live-Pi Coordinator (ADR-012 §2, §3.1–§3
         );
         assert.equal(legacyResp.status, 404, "Legacy loopback SSRF channel must not be mounted in gateway");
 
+        const legacyOAuthResp = await fetch(
+          `http://127.0.0.1:${gw.port}/c/legacy-oauth-ssrf/openai-responses/responses`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${gw.gatewayToken}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ model: "grok-4", input: "hi" }),
+          },
+        );
+        assert.equal(legacyOAuthResp.status, 404, "Legacy private-IP OAuth channel must not be mounted in gateway");
+
         // #10: Enabled member channel with all models disabled MUST STILL suppress xtwork/standard dev fallback!
         assert.equal(gw.getDefaultModelSlug(), null);
         assert.equal(manager.getState().defaultModelSlug, null);
@@ -1046,8 +1074,8 @@ describe("ChannelManager & Gateway/Live-Pi Coordinator (ADR-012 §2, §3.1–§3
         );
         await managerLocked.close();
 
-        // #11: Mixed-case Copilot availableModelIds must match identically in BOTH UI and gateway allowlist!
-        assert.equal(isCopilotModelPermitted("claude-sonnet-4.5", ["CLAUDE-SONNET-4.5"]), true);
+        // #11: Mixed-case & whitespace-padded Copilot availableModelIds must match identically in BOTH UI and gateway allowlist!
+        assert.equal(isCopilotModelPermitted("claude-sonnet-4.5", ["  CLAUDE-SONNET-4.5  "]), true);
         assert.equal(isCopilotModelPermitted("GPT-4o", ["gpt-4o"]), true);
         assert.equal(isCopilotModelPermitted("gpt-4o", ["claude-sonnet-4.5"]), false);
       } finally {

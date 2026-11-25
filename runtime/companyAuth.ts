@@ -615,6 +615,10 @@ export class CompanyAuthService {
     return this.apiBase;
   }
 
+  validateEndpointUrl(url: string): void {
+    this.validateUrl(url, this.apiBase);
+  }
+
   isSignedIn(): boolean {
     return Boolean(this.credentials?.member && this.credentials.apiKey);
   }

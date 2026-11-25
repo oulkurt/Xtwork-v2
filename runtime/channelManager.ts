@@ -49,6 +49,7 @@ import {
   type StartOAuthLoginInput,
 } from "./oauthLoginFlows.ts";
 import {
+  isCopilotModelPermitted,
   normalizeEnterpriseDomain,
   OAuthTokenManager,
   type CodexOAuthCredentials,
@@ -853,17 +854,34 @@ export class ChannelManager {
     for (const ch of this.channels) {
       if (ch.id === COMPANY_CHANNEL_ID) {
         if (!companySignedIn || !companyApiKey) continue;
-        compiled.push(
-          compileChannelToGatewayConfig(ch, {
+        const authoritativeBaseUrl = this.companyAuth.getApiBase()
+          ? `${this.companyAuth.getApiBase()}/v1`
+          : COMPANY_TEAM_BASE_URL;
+        const pinnedCompanyRecord: StoredChannelRecord = {
+          ...ch,
+          baseUrl: authoritativeBaseUrl,
+        };
+        try {
+          this.companyAuth.validateEndpointUrl(authoritativeBaseUrl);
+          assertNoUrlCredentials(new URL(authoritativeBaseUrl));
+          const companyCompiled = compileChannelToGatewayConfig(pinnedCompanyRecord, {
             apiKey: companyApiKey,
             secretRef: COMPANY_SECRET_REF,
-          }),
-        );
+          });
+          compiled.push(companyCompiled);
+        } catch {
+          continue;
+        }
         continue;
       }
 
       if (isOAuthProviderType(ch.provider)) {
         if (!ch.secretRef) continue;
+        try {
+          if (ch.baseUrl) this.assertOutbound(ch.baseUrl);
+        } catch {
+          continue;
+        }
         let parsedCreds: OAuthSubscriptionCredentials | undefined;
         try {
           const raw = await this.readSecretValue(ch.secretRef);
@@ -877,16 +895,20 @@ export class ChannelManager {
           parsedCreds = undefined;
         }
         if (!parsedCreds) continue;
-        compiled.push(
-          compileChannelToGatewayConfig(ch, {
+        try {
+          const oauthCompiled = compileChannelToGatewayConfig(ch, {
             oauth: {
               provider: ch.provider,
               secretRef: ch.secretRef,
               initialCredentials: parsedCreds,
               refresh: this.buildOAuthRefresher(ch.provider),
             },
-          }),
-        );
+          });
+          this.assertOutbound(oauthCompiled.baseUrl);
+          compiled.push(oauthCompiled);
+        } catch {
+          continue;
+        }
         continue;
       }
 
@@ -908,12 +930,16 @@ export class ChannelManager {
         apiKey = undefined;
       }
       if (!apiKey) continue;
-      compiled.push(
-        compileChannelToGatewayConfig(ch, {
+      try {
+        const apiCompiled = compileChannelToGatewayConfig(ch, {
           apiKey,
           secretRef: ch.secretRef,
-        }),
-      );
+        });
+        this.assertOutbound(apiCompiled.baseUrl);
+        compiled.push(apiCompiled);
+      } catch {
+        continue;
+      }
     }
 
     return compiled;
@@ -1461,7 +1487,7 @@ export class ChannelManager {
         const permitted =
           availableModelIds !== undefined
             ? GITHUB_COPILOT_STATIC_MODELS.filter((m) =>
-                availableModelIds.some((id) => id.toLowerCase() === m.id.toLowerCase()),
+                isCopilotModelPermitted(m.id, availableModelIds),
               )
             : GITHUB_COPILOT_STATIC_MODELS;
         const prevById = new Map(existing?.models.map((m) => [m.id, m.enabled]) ?? []);
@@ -1931,7 +1957,7 @@ export class ChannelManager {
             };
           }
           const filtered = GITHUB_COPILOT_STATIC_MODELS.filter((m) =>
-            available.some((id) => id.toLowerCase() === m.id.toLowerCase()),
+            isCopilotModelPermitted(m.id, available),
           );
           return {
             success: true,
