@@ -593,6 +593,40 @@ describe("Sol Round 1 regression guards", () => {
           loadThreadLineage: (tid) => Effect.succeed({ parentThreadId: parents.get(tid) ?? null }),
         });
         expect(cycleCheck).toEqual({ blocked: false });
+
+        // Fail closed when looking up a referenced parentThreadId fails!
+        const failingParent = ThreadId.make("parent-lookup-fail");
+        const lookupFailCheck = yield* checkExternalDelegationAncestry({
+          threadId: ThreadId.make("child-of-failing-parent"),
+          initialLineage: { parentThreadId: failingParent },
+          isProtectedThread: () => false,
+          loadThreadLineage: () => Effect.fail("sqlite busy"),
+        });
+        expect(lookupFailCheck).toMatchObject({
+          blocked: true,
+          code: IM_DELEGATION_DENIED_CODE,
+          reason: "ancestry_lookup_failed",
+          blockedAncestorThreadId: failingParent,
+        });
+
+        // Fail closed when ancestry depth exceeds the 64-hop verification cap with unvisited ancestors remaining!
+        const deepChain = new Map<ThreadId, ThreadId | null>();
+        for (let i = 0; i <= 70; i += 1) {
+          deepChain.set(
+            ThreadId.make(`desktop-chain-${i}`),
+            i < 70 ? ThreadId.make(`desktop-chain-${i + 1}`) : null,
+          );
+        }
+        const deepCheck = yield* checkExternalDelegationAncestry({
+          threadId: ThreadId.make("desktop-chain-0"),
+          isProtectedThread: () => false,
+          loadThreadLineage: (tid) => Effect.succeed({ parentThreadId: deepChain.get(tid) ?? null }),
+        });
+        expect(deepCheck).toMatchObject({
+          blocked: true,
+          code: IM_DELEGATION_DENIED_CODE,
+          reason: "ancestry_depth_exceeded",
+        });
       }),
   );
 
@@ -704,9 +738,48 @@ describe("Sol Round 1 regression guards", () => {
         "## 约束与范围",
         "仅修改认证相关代码，不改动数据库迁移。",
         "## 相关文件路径",
-        "apps/server/src/auth.ts",
+        "- apps/server/src/auth.ts: line 42",
       ].join("\n"),
     );
     expect(validZh).toEqual({ valid: true });
+
+    // 3 bare empty headings MUST be rejected!
+    const threeEmptyEn = validateCodingAgentHandoffBrief("## Goal\n## Scope\n## Files");
+    expect(threeEmptyEn.valid).toBe(false);
+    if (!threeEmptyEn.valid) {
+      expect(threeEmptyEn.missingSections).toEqual(["goal", "constraints", "files"]);
+    }
+
+    const threeEmptyZh = validateCodingAgentHandoffBrief("## 目标\n## 范围\n## 文件路径");
+    expect(threeEmptyZh.valid).toBe(false);
+    if (!threeEmptyZh.valid) {
+      expect(threeEmptyZh.missingSections).toEqual(["goal", "constraints", "files"]);
+    }
+
+    // One empty section sandwiched between populated sections MUST be rejected!
+    const oneEmptyMiddle = validateCodingAgentHandoffBrief(
+      "## Goal\nFix auth bug\n## Scope\n## Files\napps/server/src/auth.ts",
+    );
+    expect(oneEmptyMiddle.valid).toBe(false);
+    if (!oneEmptyMiddle.valid) {
+      expect(oneEmptyMiddle.missingSections).toEqual(["constraints"]);
+    }
+
+    // Single combined heading matching multiple categories MUST NOT satisfy multiple sections!
+    const combinedHeading = validateCodingAgentHandoffBrief(
+      "## Goal, Scope & Files\nFix apps/server/src/auth.ts without touching migrations.",
+    );
+    expect(combinedHeading.valid).toBe(false);
+    if (!combinedHeading.valid) {
+      expect(combinedHeading.missingSections).toEqual(["goal", "constraints", "files"]);
+    }
+
+    const combinedTwoCategories = validateCodingAgentHandoffBrief(
+      "1. Goal & Scope: Fix auth only.\n2. Files: apps/server/src/auth.ts",
+    );
+    expect(combinedTwoCategories.valid).toBe(false);
+    if (!combinedTwoCategories.valid) {
+      expect(combinedTwoCategories.missingSections).toEqual(["goal", "constraints"]);
+    }
   });
 });

@@ -593,12 +593,12 @@ export interface ThreadLineageRef {
 }
 
 /**
- * Walks `parentThreadId` (and `rootThreadId`) ancestry with cycle detection to enforce
- * ADR-012 §5.4 IM/group hard-deny on prefixless derived subagent/forked threads.
+ * Walks `parentThreadId`/`rootThreadId` ancestry with cycle detection (ADR-012 §5.4).
+ * Fails closed on lineage lookup errors or when unvisited ancestors remain past the hop limit.
  */
 export const checkExternalDelegationAncestry = Effect.fn(
   "codingAgentDelegation.checkExternalDelegationAncestry",
-)(function* (input: {
+)(function* <E = never>(input: {
   readonly threadId?: string | null | undefined;
   readonly initialLineage?: ThreadLineageRef | null | undefined;
   readonly isProtectedThread: (threadId: string) => boolean;
@@ -611,8 +611,30 @@ export const checkExternalDelegationAncestry = Effect.fn(
     | undefined;
   readonly loadThreadLineage: (
     threadId: ThreadId,
-  ) => Effect.Effect<ThreadLineageRef | null>;
+  ) => Effect.Effect<ThreadLineageRef | null, E>;
 }): Effect.fn.Return<ExternalDelegationThreadCheck> {
+  const failClosedAncestry = (
+    reason: "ancestry_lookup_failed" | "ancestry_depth_exceeded",
+    ancestorId: string | undefined,
+  ): ImDelegationBlockedResult => ({
+    blocked: true,
+    code: IM_DELEGATION_DENIED_CODE,
+    reason,
+    ...(ancestorId ? { blockedAncestorThreadId: ancestorId } : {}),
+    message:
+      reason === "ancestry_depth_exceeded"
+        ? "External Coding Agent delegation is blocked because thread ancestry depth exceeded the verification limit (ADR-012 §5.4 fail-closed)."
+        : "External Coding Agent delegation is blocked because thread ancestry could not be verified (ADR-012 §5.4 fail-closed).",
+  });
+
+  const lookupLineageSafely = (tid: string) =>
+    input.loadThreadLineage(ThreadId.make(tid)).pipe(
+      Effect.matchCause({
+        onSuccess: (lineage) => ({ ok: true as const, lineage }),
+        onFailure: () => ({ ok: false as const }),
+      }),
+    );
+
   const currentId = input.threadId?.trim();
   const direct = isExternalDelegationBlockedForThread({
     threadId: currentId,
@@ -641,9 +663,12 @@ export const checkExternalDelegationAncestry = Effect.fn(
     enqueue(input.initialLineage?.parentThreadId);
     enqueue(input.initialLineage?.rootThreadId);
   } else if (currentId) {
-    const selfLineage = yield* input.loadThreadLineage(ThreadId.make(currentId));
-    enqueue(selfLineage?.parentThreadId);
-    enqueue(selfLineage?.rootThreadId);
+    const selfLookup = yield* lookupLineageSafely(currentId);
+    if (!selfLookup.ok) {
+      return failClosedAncestry("ancestry_lookup_failed", currentId);
+    }
+    enqueue(selfLookup.lineage?.parentThreadId);
+    enqueue(selfLookup.lineage?.rootThreadId);
   }
 
   let hops = 0;
@@ -665,9 +690,17 @@ export const checkExternalDelegationAncestry = Effect.fn(
       };
     }
 
-    const ancestorLineage = yield* input.loadThreadLineage(ThreadId.make(ancestorId));
-    enqueue(ancestorLineage?.parentThreadId);
-    enqueue(ancestorLineage?.rootThreadId);
+    const ancestorLookup = yield* lookupLineageSafely(ancestorId);
+    if (!ancestorLookup.ok) {
+      return failClosedAncestry("ancestry_lookup_failed", ancestorId);
+    }
+    enqueue(ancestorLookup.lineage?.parentThreadId);
+    enqueue(ancestorLookup.lineage?.rootThreadId);
+  }
+
+  const remainingUnvisited = queue.find((candidate) => !visited.has(candidate));
+  if (remainingUnvisited !== undefined) {
+    return failClosedAncestry("ancestry_depth_exceeded", remainingUnvisited);
   }
 
   return { blocked: false };
@@ -849,68 +882,115 @@ const BRIEF_SECTION_RULES: ReadonlyArray<BriefSectionRule> = [
   },
 ];
 
+function hasMeaningfulSectionBody(text: string): boolean {
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
+interface ParsedSectionHeader {
+  readonly header: string;
+  readonly inlineBody: string;
+  readonly structuralHeading: boolean;
+}
+
 /**
- * Extracts structured section heading/label candidates from a handoff brief line.
- * Requires markdown headings (`# ...`), numbered/bulleted labels (`1. Label: ...`, `- **Label**: ...`),
- * XML-like tags (`<goal>`), or explicit `Label:` / `Label：` lines — bare prose sentences do not satisfy it.
+ * Extracts structured section heading/label candidates and optional inline body text.
  */
-function extractSectionHeaderText(rawLine: string): string | null {
+function parseSectionHeaderLine(rawLine: string): ParsedSectionHeader | null {
   const line = rawLine.trim();
   if (line.length === 0) return null;
 
-  // Markdown heading: ## Goal & Acceptance Criteria
+  // Markdown heading: ## Goal & Acceptance Criteria (or ## Goal: Fix auth)
   const mdHeading = /^#{1,6}\s+(.+)$/u.exec(line);
   if (mdHeading?.[1]) {
-    return mdHeading[1].replaceAll(/[*_`]/gu, "").trim();
+    const cleaned = mdHeading[1].replaceAll(/[*_`]/gu, "").trim();
+    const colonInHeading = /^([^:\uFF1A]{2,60}?)\s*[:\uFF1A]\s*(.+)$/u.exec(cleaned);
+    if (colonInHeading?.[1] && colonInHeading[2]) {
+      return {
+        header: colonInHeading[1].trim(),
+        inlineBody: colonInHeading[2].trim(),
+        structuralHeading: true,
+      };
+    }
+    return { header: cleaned, inlineBody: "", structuralHeading: true };
   }
 
   // XML/bracket tag: <goal> or [Goal]
-  const tagHeading = /^(?:<([a-zA-Z_\u4e00-\u9fff][a-zA-Z0-9_\-\s\u4e00-\u9fff]{1,40})>|\[([^\]]{2,48})\])$/u.exec(
-    line,
-  );
+  const tagHeading =
+    /^(?:<([a-zA-Z_\u4e00-\u9fff][a-zA-Z0-9_\-\s\u4e00-\u9fff]{1,40})>|\[([^\]]{2,48})\])(?:\s*[:\uFF1A]?\s*(.*))?$/u.exec(
+      line,
+    );
   if (tagHeading?.[1] || tagHeading?.[2]) {
-    return (tagHeading[1] ?? tagHeading[2] ?? "").trim();
+    return {
+      header: (tagHeading[1] ?? tagHeading[2] ?? "").trim(),
+      inlineBody: (tagHeading[3] ?? "").trim(),
+      structuralHeading: true,
+    };
   }
 
-  // Strip optional list marker (`1.`, `1)`, `-`, `*`, `•`) and bold/backtick wrappers.
+  // Strip optional list marker (`1.`, `1)`, `-`, `*`, `•`).
   const withoutList = line.replace(/^(?:\d+[.)]\s+|[-*•]\s+)/u, "").trim();
-
-  // Explicit `Label: ...` or `Label：...` (label portion up to 60 chars before colon)
-  const colonMatch = /^([^*`:\uFF1A]{2,60}?)(?:\*{1,2})?\s*[:\uFF1A]/u.exec(
-    withoutList.replace(/^\*{1,2}/u, ""),
-  );
-  if (colonMatch?.[1]) {
-    return colonMatch[1].replaceAll(/[*_`]/gu, "").trim();
-  }
 
   // Bold standalone heading line: **Constraints & Scope**
   const boldHeading = /^\*\*([^*]{2,60})\*\*$/u.exec(withoutList);
   if (boldHeading?.[1]) {
-    return boldHeading[1].trim();
+    return { header: boldHeading[1].trim(), inlineBody: "", structuralHeading: true };
+  }
+
+  // Explicit `Label: ...` or `Label：...` (label portion up to 60 chars before colon)
+  const colonMatch = /^([^*`:\uFF1A]{2,60}?)(?:\*{1,2})?\s*[:\uFF1A]\s*(.*)$/u.exec(
+    withoutList.replace(/^\*{1,2}/u, ""),
+  );
+  if (colonMatch?.[1]) {
+    const candidateHeader = colonMatch[1].replaceAll(/[*_`]/gu, "").trim();
+    // Skip file-path-like tokens (e.g. `src/files/auth.ts: line 12`) so they remain body text.
+    if (/[\\/]\S+\.\w+$/u.test(candidateHeader)) {
+      return null;
+    }
+    return {
+      header: candidateHeader,
+      inlineBody: (colonMatch[2] ?? "").trim(),
+      structuralHeading: false,
+    };
   }
 
   return null;
 }
 
 /**
- * Server-side validation of the ADR-012 §5.3 structured handoff brief when built-in「小瞳」
- * delegates coding work to an external Coding Agent under `codingAgent.mode === "provider"`.
- * Accepts both English and Chinese section headings/labels.
+ * Server-side ADR-012 §5.3 handoff brief validator: requires 3 distinct non-empty sections
+ * (Goal, Constraints, Files) with at most one category matched per heading line.
  */
 export function validateCodingAgentHandoffBrief(task: string): HandoffBriefValidation {
-  const found = new Set<HandoffBriefSectionKey>();
-  for (const line of task.split(/\r?\n/u)) {
-    const header = extractSectionHeaderText(line);
-    if (!header) continue;
-    for (const rule of BRIEF_SECTION_RULES) {
-      if (found.has(rule.key)) continue;
-      if (rule.headingPatterns.some((pattern) => pattern.test(header))) {
-        found.add(rule.key);
+  const populated = new Set<HandoffBriefSectionKey>();
+  let currentSection: HandoffBriefSectionKey | null = null;
+
+  for (const rawLine of task.split(/\r?\n/u)) {
+    const parsed = parseSectionHeaderLine(rawLine);
+    if (parsed !== null) {
+      const matchedRules = BRIEF_SECTION_RULES.filter((rule) =>
+        rule.headingPatterns.some((pattern) => pattern.test(parsed.header)),
+      );
+      if (matchedRules.length === 1) {
+        const matchedKey = matchedRules[0]!.key;
+        currentSection = matchedKey;
+        if (hasMeaningfulSectionBody(parsed.inlineBody)) {
+          populated.add(matchedKey);
+        }
+        continue;
       }
+      if (matchedRules.length > 1 || parsed.structuralHeading) {
+        // Reject combined multi-category headings and reset on unrelated structural headings.
+        currentSection = null;
+        continue;
+      }
+    }
+
+    if (currentSection !== null && hasMeaningfulSectionBody(rawLine)) {
+      populated.add(currentSection);
     }
   }
 
-  const missing = BRIEF_SECTION_RULES.filter((rule) => !found.has(rule.key));
+  const missing = BRIEF_SECTION_RULES.filter((rule) => !populated.has(rule.key));
   if (missing.length === 0) {
     return { valid: true };
   }
@@ -919,7 +999,7 @@ export function validateCodingAgentHandoffBrief(task: string): HandoffBriefValid
   return {
     valid: false,
     missingSections: missing.map((rule) => rule.key),
-    message: `Delegated Coding Agent handoff brief is incomplete (ADR-012 §5.3). Because the child starts with no parent chat history, include structured sections for: ${missingLabels}. Retry delegate_task with explicit headings/labels for each missing section.`,
+    message: `Delegated Coding Agent handoff brief is incomplete (ADR-012 §5.3). Because the child starts with no parent chat history, include 3 distinct non-empty sections for: ${missingLabels}. Retry delegate_task with explicit headings/labels and non-empty body content for each missing section.`,
   };
 }
 

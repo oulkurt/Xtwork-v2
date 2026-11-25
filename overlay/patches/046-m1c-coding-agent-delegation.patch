@@ -1,14 +1,15 @@
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
-index 8dcd025c..55ea810b 100644
+index 8dcd025c..1a8b03ed 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.ts
 +++ b/apps/server/src/mcp/OrchestratorMcpService.ts
-@@ -1,5 +1,6 @@
- import {
-   CommandId,
-+  DEFAULT_SERVER_SETTINGS,
-   type RunId,
-   isProviderAvailable,
-   MessageId,
+@@ -76,6 +76,7 @@ import {
+   normalizeThreadPullRequestKey,
+   visibleThreadPullRequests,
+ } from "../sourceControl/threadPullRequests.ts";
++import * as Cause from "effect/Cause";
+ import * as Clock from "effect/Clock";
+ import * as Context from "effect/Context";
+ import * as SecureRandom from "effect/crypto/SecureRandom";
 @@ -116,7 +117,16 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
  import { isSnoozed } from "../orchestration-v2/ThreadSettlementService.ts";
  import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
@@ -36,18 +37,21 @@ index 8dcd025c..55ea810b 100644
    const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
    const gitDriver = yield* GitVcsDriver.GitVcsDriver;
    const serverSettings = yield* ServerSettings.ServerSettingsService;
-@@ -2677,10 +2690,129 @@ const make = Effect.gen(function* () {
+@@ -2677,10 +2690,150 @@ const make = Effect.gen(function* () {
        };
      }),
      delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
++      const isUnimplementedMockDefect = <E>(cause: Cause.Cause<E>): boolean => {
++        const squashed = Cause.squash(cause);
++        return squashed instanceof Error && squashed.name === "UnimplementedError";
++      };
 +      const loadLineageForAncestry = (tid: ThreadId) =>
 +        threadManagement.getThreadShell(tid).pipe(
 +          Effect.map((shell) => shell?.lineage ?? null),
-+          Effect.catchCause(() =>
-+            threadManagement.getThreadRecords(tid, []).pipe(
-+              Effect.map((records) => records.thread.lineage ?? null),
-+              Effect.catchCause(() => Effect.succeed(null)),
-+            ),
++          Effect.catchCauseIf(isUnimplementedMockDefect, () =>
++            threadManagement
++              .getThreadRecords(tid, [])
++              .pipe(Effect.map((records) => records.thread.lineage ?? null)),
 +          ),
 +        );
 +      const imDelegationBlock = yield* checkExternalDelegationAncestry({
@@ -72,6 +76,7 @@ index 8dcd025c..55ea810b 100644
 +
 +      // Enforce one-turn `builtin_once` override and configured local Coding Agent policy BEFORE
 +      // remote forwarding so remote delegation can never bypass readiness or no-fallback rules.
++      // Fail closed if reading active run/message or server settings fails.
 +      const activeTurnCodingAgentOverride =
 +        callerScope.thread?.providerInstanceId === PI_INSTANCE_ID
 +          ? yield* threadManagement
@@ -95,7 +100,15 @@ index 8dcd025c..55ea810b 100644
 +                      ),
 +                    );
 +                }),
-+                Effect.catchCause(() => Effect.undefined),
++                Effect.catchCause((cause) =>
++                  Effect.fail(
++                    new OrchestratorMcpFailure({
++                      code: "orchestration_error",
++                      blocked: true,
++                      message: `Unable to verify active turn codingAgentOverride (${errorMessage(Cause.squash(cause))}); refusing delegation fail-closed.`,
++                    }),
++                  ),
++                ),
 +              )
 +          : undefined;
 +
@@ -118,13 +131,22 @@ index 8dcd025c..55ea810b 100644
 +        }
 +      }
 +
++      const loadSettingsFailClosed = () =>
++        serverSettings.getSettings.pipe(
++          Effect.mapError((cause) =>
++            new OrchestratorMcpFailure({
++              code: "orchestration_error",
++              blocked: true,
++              message: `Unable to read server settings (${errorMessage(cause)}); refusing delegation fail-closed.`,
++            }),
++          ),
++        );
++
 +      if (
 +        callerScope.thread?.providerInstanceId === PI_INSTANCE_ID &&
 +        isRemoteEnvironmentTarget
 +      ) {
-+        const currentSettings = yield* serverSettings.getSettings.pipe(
-+          Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
-+        );
++        const currentSettings = yield* loadSettingsFailClosed();
 +        const providers = yield* loadProviders;
 +        const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
 +        const remoteResolution = resolveCodingAgentTarget({
@@ -166,15 +188,13 @@ index 8dcd025c..55ea810b 100644
        if (input.target !== undefined && environmentId !== undefined) {
          yield* requireCapability(callerScope);
          const scope = yield* requireThreadScope(callerScope, "delegate_task");
-@@ -2724,9 +2856,68 @@ const make = Effect.gen(function* () {
+@@ -2724,9 +2879,66 @@ const make = Effect.gen(function* () {
          operation: "delegate-task",
        });
        const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
 +      let effectiveTarget = input.target;
 +      if (!isRetryOfAcceptedDelegation) {
-+        const currentSettings = yield* serverSettings.getSettings.pipe(
-+          Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
-+        );
++        const currentSettings = yield* loadSettingsFailClosed();
 +        const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
 +        const lockedInstanceId =
 +          currentSettings.codingAgent.mode === "provider"
@@ -236,7 +256,7 @@ index 8dcd025c..55ea810b 100644
          providers,
          skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
        });
-@@ -2742,30 +2933,79 @@ const make = Effect.gen(function* () {
+@@ -2742,30 +2954,79 @@ const make = Effect.gen(function* () {
        let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
        if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
          const project = yield* requireProject(parent.thread.projectId);
@@ -333,7 +353,7 @@ index 8dcd025c..55ea810b 100644
          workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
        }
 diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
-index 605f56f0..73953ea5 100644
+index 605f56f0..a4e7feea 100644
 --- a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 +++ b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 @@ -1,9 +1,22 @@
@@ -371,7 +391,7 @@ index 605f56f0..73953ea5 100644
      const providerAuth = yield* ProviderAuthService.ProviderAuthService;
      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
      const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
-@@ -975,6 +992,86 @@ export const layer: Layer.Layer<
+@@ -975,6 +992,85 @@ export const layer: Layer.Layer<
          restartCancelledWork.length === 0
            ? ""
            : restartCancelledBackgroundWorkNote(restartCancelledWork);
@@ -400,10 +420,9 @@ index 605f56f0..73953ea5 100644
 +            (tid === projection.thread.id && xtworkPolicy.protected) ||
 +            isProtectedXtworkThread(tid),
 +          loadThreadLineage: (tid) =>
-+            projectionStore.getThreadShell(tid).pipe(
-+              Effect.map((shell) => shell?.lineage ?? null),
-+              Effect.catchCause(() => Effect.succeed(null)),
-+            ),
++            projectionStore
++              .getThreadShell(tid)
++              .pipe(Effect.map((shell) => shell?.lineage ?? null)),
 +        });
 +        if (ancestryGuard.blocked) {
 +          return "";
@@ -458,7 +477,7 @@ index 605f56f0..73953ea5 100644
        const tokenCap = yield* handoffTokenCapConfig.pipe(
          Effect.orElseSucceed(() => DEFAULT_HANDOFF_TOKEN_CAP),
        );
-@@ -1932,7 +2029,12 @@ export const layer: Layer.Layer<
+@@ -1932,7 +2028,12 @@ export const layer: Layer.Layer<
              sideChatHandoff === undefined || compact || goalCommand
                ? ""
                : sideChatHandoff.summaryText;
@@ -472,7 +491,7 @@ index 605f56f0..73953ea5 100644
              .filter((part) => part !== "")
              .join("\n\n");
            const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
-@@ -2024,6 +2126,7 @@ export const layer: Layer.Layer<
+@@ -2024,6 +2125,7 @@ export const layer: Layer.Layer<
          retryHandoff.attachments.length === 0 &&
          sideChatHandoff === undefined &&
          restartNote === "" &&

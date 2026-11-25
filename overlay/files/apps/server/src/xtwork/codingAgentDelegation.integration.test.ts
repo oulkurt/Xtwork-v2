@@ -16,6 +16,7 @@ import {
   ProviderThreadId,
   RunAttemptId,
   RunId,
+  ServerSettingsError,
   ThreadId,
   type CodingAgentTurnOverride,
   type OrchestrationV2ServerCommand,
@@ -2476,6 +2477,462 @@ describe("M1c-Gate 2 integration: deterministic routing, workspace contract, can
         } finally {
           NodeFS.rmSync(tmpRoot, { recursive: true, force: true });
         }
+      }),
+  );
+
+  it.effect(
+    "fails closed when ServerSettings read fails, active turn override read fails, ancestor lookup fails, or ancestry depth exceeds 64 hops",
+    () =>
+      Effect.gen(function* () {
+        const readyPi = makeProvider(PI_INSTANCE_ID, "pi", "xtwork/standard");
+        const readyClaude = makeProvider(claudeId, "claudeAgent", "claude-sonnet-4-6");
+        const readyCodex = makeProvider(codexId, "codex", "gpt-5.4");
+        const activeMsgId = MessageId.make("msg:fail-closed-active");
+
+        // 1. ServerSettings read failure MUST fail closed on BOTH local AND remote delegation!
+        let settingsFailDispatches = 0;
+        let settingsFailRemotes = 0;
+        const failingSettingsLayer = Layer.succeed(
+          ServerSettings.ServerSettingsService,
+          ServerSettings.ServerSettingsService.of({
+            getSettings: Effect.fail(
+              new ServerSettingsError({
+                settingsPath: "/tmp/corrupt-settings.json",
+                operation: "read-file",
+                cause: "disk read error",
+              }),
+            ),
+            updateSettings: () => Effect.die("unused"),
+            streamChanges: Stream.empty,
+            managedPolicy: undefined,
+          } as never),
+        );
+        const settingsFailDeps = Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          failingSettingsLayer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            hasReceipt: () => Effect.succeed(false),
+            isProviderInstanceEnabledForProject: () => Effect.succeed(true),
+            getThreadShell: () =>
+              Effect.succeed({
+                id: parentThreadId,
+                lineage: { parentThreadId: null, rootThreadId: parentThreadId },
+              } as never),
+            getMessagesById: () => Effect.succeed(new Map([[activeMsgId, { id: activeMsgId }]] as never)),
+            getThreadRecords: () =>
+              Effect.succeed({
+                ...makeParentProjection(),
+                runs: [
+                  {
+                    id: parentRunId,
+                    ordinal: 1,
+                    status: "running",
+                    rootNodeId: parentNodeId,
+                    providerInstanceId: PI_INSTANCE_ID,
+                    userMessageId: activeMsgId,
+                  },
+                ],
+              } as unknown as OrchestrationV2ThreadProjection),
+            dispatch: () =>
+              Effect.sync(() => {
+                settingsFailDispatches += 1;
+                return { sequence: 1, storedEvents: [] } as never;
+              }),
+          }),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([readyPi, readyClaude, readyCodex]),
+          }),
+          makeAdapterRegistryLayer([PI_INSTANCE_ID, claudeId, codexId]),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({
+            delegate: () =>
+              Effect.sync(() => {
+                settingsFailRemotes += 1;
+                return { taskId };
+              }),
+          }),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+
+        yield* Effect.gen(function* () {
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const localErr = yield* mcp
+            .delegateTask(makeScope(), {
+              task: STRUCTURED_BRIEF_EN,
+              target: { providerInstanceId: codexId },
+              clientRequestId: "fail-closed-settings-local",
+            })
+            .pipe(Effect.flip);
+          expect(localErr.code).toBe("orchestration_error");
+          expect(localErr.blocked).toBe(true);
+
+          const remoteErr = yield* mcp
+            .delegateTask(makeScope(), {
+              task: STRUCTURED_BRIEF_EN,
+              target: { environmentId: EnvironmentId.make("env:remote-box"), providerInstanceId: codexId },
+              clientRequestId: "fail-closed-settings-remote",
+            })
+            .pipe(Effect.flip);
+          expect(remoteErr.code).toBe("orchestration_error");
+          expect(remoteErr.blocked).toBe(true);
+          expect(settingsFailDispatches).toBe(0);
+          expect(settingsFailRemotes).toBe(0);
+        }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(settingsFailDeps))));
+
+        // 2. Active turn/message override read failure MUST fail closed (never silently drop builtin_once)!
+        let overrideFailDispatches = 0;
+        const overrideFailDeps = Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          ServerSettings.layerTest({
+            codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+          }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            hasReceipt: () => Effect.succeed(false),
+            isProviderInstanceEnabledForProject: () => Effect.succeed(true),
+            getThreadShell: () =>
+              Effect.succeed({
+                id: parentThreadId,
+                lineage: { parentThreadId: null, rootThreadId: parentThreadId },
+              } as never),
+            getMessagesById: () => Effect.fail(new Error("projection store offline") as never),
+            getThreadRecords: () =>
+              Effect.succeed({
+                ...makeParentProjection(),
+                runs: [
+                  {
+                    id: parentRunId,
+                    ordinal: 1,
+                    status: "running",
+                    rootNodeId: parentNodeId,
+                    providerInstanceId: PI_INSTANCE_ID,
+                    userMessageId: activeMsgId,
+                  },
+                ],
+              } as unknown as OrchestrationV2ThreadProjection),
+            dispatch: () =>
+              Effect.sync(() => {
+                overrideFailDispatches += 1;
+                return { sequence: 1, storedEvents: [] } as never;
+              }),
+          }),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([readyPi, readyClaude]),
+          }),
+          makeAdapterRegistryLayer([PI_INSTANCE_ID, claudeId]),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+
+        yield* Effect.gen(function* () {
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const err = yield* mcp
+            .delegateTask(makeScope(), {
+              task: STRUCTURED_BRIEF_EN,
+              target: { providerInstanceId: claudeId },
+              clientRequestId: "fail-closed-override-read",
+            })
+            .pipe(Effect.flip);
+          expect(err.code).toBe("orchestration_error");
+          expect(err.blocked).toBe(true);
+          expect(err.message).toContain("codingAgentOverride");
+          expect(overrideFailDispatches).toBe(0);
+        }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(overrideFailDeps))));
+
+        // 3. Ancestor lookup failure AND >64-hop ancestry chain MUST fail closed in BOTH
+        //    OrchestratorMcpService.delegateTask AND ProviderTurnStartService!
+        const childOfFailing = ThreadId.make("thread:child-of-failing-ancestor");
+        const failingAncestor = ThreadId.make("thread:unreadable-ancestor");
+        const deepLeaf = ThreadId.make("thread:deep-chain-0");
+        const deepParents = new Map<ThreadId, ThreadId | null>();
+        for (let i = 0; i <= 70; i += 1) {
+          deepParents.set(
+            ThreadId.make(`thread:deep-chain-${i}`),
+            i < 70 ? ThreadId.make(`thread:deep-chain-${i + 1}`) : null,
+          );
+        }
+
+        let ancestryFailDispatches = 0;
+        const ancestryFailMcpDeps = Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          ServerSettings.layerTest({
+            codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+          }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (tid) => {
+              if (tid === childOfFailing) {
+                return Effect.succeed({
+                  id: tid,
+                  lineage: { parentThreadId: failingAncestor },
+                } as never);
+              }
+              if (tid === failingAncestor) {
+                return Effect.fail(new Error("ancestor store read failed") as never);
+              }
+              if (deepParents.has(tid)) {
+                return Effect.succeed({
+                  id: tid,
+                  lineage: { parentThreadId: deepParents.get(tid) ?? null },
+                } as never);
+              }
+              return Effect.succeed(null);
+            },
+            dispatch: () =>
+              Effect.sync(() => {
+                ancestryFailDispatches += 1;
+                return { sequence: 1, storedEvents: [] } as never;
+              }),
+          }),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([readyPi, readyClaude]),
+          }),
+          makeAdapterRegistryLayer([PI_INSTANCE_ID, claudeId]),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+
+        yield* Effect.gen(function* () {
+          const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const lookupErr = yield* mcp
+            .delegateTask(makeScope({ threadId: childOfFailing }), {
+              task: STRUCTURED_BRIEF_EN,
+              target: { providerInstanceId: claudeId },
+            })
+            .pipe(Effect.flip);
+          expect(lookupErr.code).toBe(IM_DELEGATION_DENIED_CODE);
+          expect(lookupErr.blocked).toBe(true);
+
+          const depthErr = yield* mcp
+            .delegateTask(makeScope({ threadId: deepLeaf }), {
+              task: STRUCTURED_BRIEF_EN,
+              target: { providerInstanceId: claudeId },
+            })
+            .pipe(Effect.flip);
+          expect(depthErr.code).toBe(IM_DELEGATION_DENIED_CODE);
+          expect(depthErr.blocked).toBe(true);
+          expect(ancestryFailDispatches).toBe(0);
+        }).pipe(
+          Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(ancestryFailMcpDeps))),
+        );
+
+        // ProviderTurnStartService also omits delegation instructions on ancestor lookup failure and >64 depth!
+        const runTurnWithAncestry = (
+          tid: ThreadId,
+          parentTid: ThreadId,
+          getShell: (id: ThreadId) => Effect.Effect<unknown, string>,
+        ) =>
+          Effect.gen(function* () {
+            const sentPrompts = yield* Ref.make<Array<string>>([]);
+            const runId = RunId.make(`run:${tid}`);
+            const attemptId = RunAttemptId.make(`attempt:${tid}`);
+            const rootNodeId = NodeId.make(`node:${tid}`);
+            const providerThreadId = ProviderThreadId.make(`pt:${tid}`);
+            const providerSessionId = ProviderSessionId.make(`ps:${tid}`);
+            const messageId = MessageId.make(`msg:${tid}`);
+            const checkpointScopeId = CheckpointScopeId.make(`cp:${tid}`);
+            const now = DateTime.makeUnsafe("2026-11-25T08:00:00Z");
+
+            const run = {
+              id: runId,
+              threadId: tid,
+              ordinal: 1,
+              status: "starting" as const,
+              rootNodeId,
+              activeAttemptId: attemptId,
+              providerThreadId,
+              providerInstanceId: PI_INSTANCE_ID,
+              userMessageId: messageId,
+              modelSelection: { instanceId: PI_INSTANCE_ID, model: "xtwork/standard" },
+              requestedAt: now,
+              startedAt: null,
+              completedAt: null,
+            };
+            const providerThread = {
+              id: providerThreadId,
+              driver: PI_DRIVER,
+              providerInstanceId: PI_INSTANCE_ID,
+              providerSessionId,
+              appThreadId: tid,
+              ownerNodeId: null,
+              nativeThreadRef: null,
+              status: "not_loaded" as const,
+              firstRunOrdinal: null,
+              lastRunOrdinal: null,
+              handoffIds: [],
+              forkedFrom: null,
+              contextUsage: null,
+              createdAt: now,
+              updatedAt: now,
+            };
+            const projection = {
+              thread: {
+                id: tid,
+                projectId,
+                title: "Derived Thread",
+                modelSelection: { instanceId: PI_INSTANCE_ID, model: "xtwork/standard" },
+                runtimeMode: "full-access" as const,
+                interactionMode: "default" as const,
+                worktreePath: null,
+                branch: null,
+                activeProviderThreadId: providerThreadId,
+                lineage: { parentThreadId: parentTid, relationshipToParent: "subagent", sideChat: false },
+              },
+              runs: [run],
+              nodes: [{ id: rootNodeId, runId, checkpointScopeId, status: "starting" }],
+              attempts: [
+                { id: attemptId, runId, providerThreadId, status: "starting", attemptOrdinal: 1 },
+              ],
+              providerThreads: [providerThread],
+              providerSessions: [],
+              providerTurns: [],
+              messages: [
+                {
+                  id: messageId,
+                  text: "Refactor src/app.ts",
+                  attachments: [],
+                  createdBy: "user",
+                  creationSource: "web",
+                },
+              ],
+              checkpointScopes: [{ id: checkpointScopeId }],
+              contextHandoffs: [],
+              contextTransfers: [],
+              turnItems: [],
+              subagents: [],
+              hasConversation: false,
+            } as unknown as OrchestrationV2ThreadProjection;
+
+            let currentStatus: "starting" | "running" = "starting";
+            const turnLayer = ProviderTurnStartService.layer.pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  NodeServices.layer,
+                  NodeCrypto.layer,
+                  IdAllocator.layer,
+                  Layer.mock(ServerConfig.ServerConfig)({
+                    baseDir: "/tmp/xtwork-fail-closed-ancestry",
+                    worktreesDir: "/tmp/wt",
+                  } as never),
+                  ServerSettings.layerTest({
+                    codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+                  }),
+                  Layer.mock(EventSink.EventSinkV2)({
+                    writeIfRunCurrent: () =>
+                      Effect.sync(() => {
+                        currentStatus = "running";
+                        return { committed: true, sequence: 1, storedEvents: [] } as never;
+                      }),
+                    write: () => Effect.succeed({ sequence: 2, storedEvents: [] } as never),
+                  }),
+                  Layer.mock(ProviderUsageAnalytics.ProviderTurnAnalytics)({
+                    runSettled: () => Effect.void,
+                  }),
+                  Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
+                  Layer.mock(GitWorkflow.GitWorkflowService)({}),
+                  Layer.mock(ProjectService.ProjectService)({
+                    getById: () =>
+                      Effect.succeedSome({
+                        id: projectId,
+                        title: "Repo",
+                        workspaceRoot: "/tmp/repo",
+                      } as unknown as Project),
+                  }),
+                  Layer.mock(ProviderAuthService.ProviderAuthService)({}),
+                  Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                    getThreadShell: (id) => getShell(id) as never,
+                    getThreadRecords: () => Effect.succeed(projection as never),
+                    getTurnStartContext: () => Effect.succeed(projection as never),
+                    getRuntimeRecoveryProjection: () => Effect.succeed(projection as never),
+                    getTurnStartHistory: () => Effect.succeed([]),
+                    getRun: () => Effect.sync(() => ({ ...run, status: currentStatus }) as never),
+                  }),
+                  Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+                    open: () =>
+                      Effect.succeed({
+                        driver: PI_DRIVER,
+                        providerSession: {
+                          id: providerSessionId,
+                          capabilities: {
+                            turns: { supportsNativeGoals: false },
+                            threads: { canForkWhileSourceRunning: false },
+                            checkpointing: { providerCanRollbackConversation: false },
+                          },
+                        },
+                        ensureThread: () => Effect.succeed(providerThread),
+                        startTurn: (turnInput: { readonly message: { readonly text: string } }) =>
+                          Ref.update(sentPrompts, (list) => [...list, turnInput.message.text]),
+                      } as never),
+                    isLive: () => Effect.succeed(false),
+                    get: () => Effect.succeedNone,
+                  }),
+                  Layer.mock(RunExecutionService.RunExecutionServiceV2)({
+                    forkBaseline: () => Effect.succeed(undefined as never),
+                    startRootRun: (input) =>
+                      input.session
+                        .startTurn({
+                          appThread: input.appThread,
+                          providerThread: input.providerThread,
+                          message: input.message,
+                          modelSelection: input.modelSelection,
+                          runtimePolicy: input.runtimePolicy,
+                          attemptId: input.attemptId,
+                        } as never)
+                        .pipe(Effect.orDie),
+                  }),
+                  Layer.mock(RuntimePolicy.RuntimePolicyV2)({
+                    resolve: () =>
+                      Effect.succeed({
+                        cwd: "/tmp/repo",
+                        runtimeMode: "full-access",
+                        interactionMode: "default",
+                      } as never),
+                  }),
+                  Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({
+                    allocate: () => Effect.succeed(1),
+                  }),
+                ),
+              ),
+            );
+
+            yield* Effect.gen(function* () {
+              const turnStart = yield* ProviderTurnStartService.ProviderTurnStartServiceV2;
+              yield* turnStart.start({ threadId: tid, runId });
+            }).pipe(Effect.provide(turnLayer));
+
+            return (yield* Ref.get(sentPrompts))[0] ?? "";
+          });
+
+        const promptOnLookupError = yield* runTurnWithAncestry(
+          childOfFailing,
+          failingAncestor,
+          () => Effect.fail("shell read failed"),
+        );
+        expect(promptOnLookupError).not.toContain("<coding_agent_delegation>");
+
+        const promptOnDeepChain = yield* runTurnWithAncestry(
+          deepLeaf,
+          ThreadId.make("thread:deep-chain-1"),
+          (id) =>
+            Effect.succeed(
+              deepParents.has(id)
+                ? { lineage: { parentThreadId: deepParents.get(id) ?? null } }
+                : null,
+            ),
+        );
+        expect(promptOnDeepChain).not.toContain("<coding_agent_delegation>");
       }),
   );
 });
