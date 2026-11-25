@@ -476,7 +476,18 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
             if (events.length > 200) events.shift();
           }
           if (event === "inbound.dispatch" || event === "inbound.stop" || event === "connection.state") {
-            Queue.offerUnsafe(queue, item);
+            const stampedPauseGen =
+              event === "inbound.dispatch"
+                ? leaders.getPauseGenerationSync(
+                    typeof payload.leaderId === "string" && payload.leaderId ? payload.leaderId : DEFAULT_LEADER_ID,
+                  )
+                : undefined;
+            Queue.offerUnsafe(
+              queue,
+              stampedPauseGen !== undefined
+                ? { ...item, payload: { ...payload, __xtworkPauseGeneration: stampedPauseGen } }
+                : item,
+            );
           }
         },
         async (callRaw) => {
@@ -518,7 +529,13 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
       return;
     }
     if (event === "inbound.dispatch") {
-      const accepted = yield* dispatch.accept(payload).pipe(Effect.result);
+      const observedPauseGen =
+        typeof payload.__xtworkPauseGeneration === "number" ? payload.__xtworkPauseGeneration : undefined;
+      const cleanPayload =
+        observedPauseGen !== undefined
+          ? Object.fromEntries(Object.entries(payload).filter(([k]) => k !== "__xtworkPauseGeneration"))
+          : payload;
+      const accepted = yield* dispatch.accept(cleanPayload, observedPauseGen).pipe(Effect.result);
       if (accepted._tag === "Failure") {
         // S4/S14: If a trigger raced with Leader pause, defer ONLY the stamped inbound message!
         // Derive any connection-wide pause flag strictly from the connection's CURRENT active

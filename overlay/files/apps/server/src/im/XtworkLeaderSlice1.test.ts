@@ -1162,6 +1162,130 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
     );
   });
 
+  it("blocks in-flight dispatch across pause -> resume without replay via pause_generation and allows explicit replay afterwards (S23)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xtwork-s23-aba-"));
+    const memory = new XtworkImMemory(dir);
+    let dispatchCalls = 0;
+    let holdFirstRead = true;
+    let enteredRoleRead!: () => void;
+    const roleReadEntered = new Promise<void>((r) => {
+      enteredRoleRead = r;
+    });
+    let releaseRoleRead!: () => void;
+    const roleReadGate = new Promise<void>((r) => {
+      releaseRoleRead = r;
+    });
+    const origRead = memory.read.bind(memory);
+    memory.read = async (scope, note, leaderIdArg) => {
+      if (scope === "role" && holdFirstRead) {
+        holdFirstRead = false;
+        enteredRoleRead();
+        await roleReadGate;
+      }
+      return origRead(scope, note, leaderIdArg);
+    };
+
+    const fakeDeps = Layer.mergeAll(
+      NodeFileSystem.layer,
+      NodeSqliteClient.layer({ filename: ":memory:" }),
+      Layer.succeed(OrchestratorV2, {
+        getThreadRecords: () => Effect.succeed({ runs: [], messages: [] }),
+        getThreadShell: () => Effect.succeed(null),
+        dispatch: () =>
+          Effect.sync(() => {
+            dispatchCalls++;
+            return {
+              storedEvents: [
+                {
+                  event: {
+                    type: "run.created",
+                    payload: { id: "run-s23-replayed" },
+                  },
+                },
+              ],
+            };
+          }),
+      } as never),
+      Layer.succeed(ManagedProjectFolders, {
+        ensureScratchProject: Effect.succeed({ projectId: ProjectId.make("proj-scratch") }),
+      } as never),
+      Layer.succeed(ServerSettingsService, {
+        bundledPi: { instanceId: PI_INSTANCE_ID },
+        getSettings: Effect.succeed({
+          providerInstances: {
+            [PI_INSTANCE_ID]: { driver: PI_DRIVER, enabled: true },
+          },
+        }),
+      } as never),
+    );
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const leaders = yield* makeLeaderStore();
+        const initialLeader = yield* leaders.ensureDefaultLeader();
+        expect(initialLeader.pauseGeneration).toBe(0);
+        const binding = yield* leaders.ensureBinding("conn-feishu", DEFAULT_LEADER_ID);
+        const dispatcher = yield* makeDispatcher(dir, memory, leaders);
+
+        const payload = {
+          connectionId: "conn-feishu",
+          platformMsgId: "pm-s23-aba",
+          chatId: "chat-dm",
+          chatKind: "dm",
+          senderRole: "owner",
+          leaderId: binding.leaderId,
+          bindingId: binding.bindingId,
+          bindingEpoch: binding.epoch,
+        };
+
+        // 1. Start dispatch while Leader is active (gen=0); hold inside role-memory read
+        const fiber = yield* Effect.forkChild(dispatcher.accept(payload, 0).pipe(Effect.result));
+        yield* Effect.promise(() => roleReadEntered);
+
+        // 2. Pause Leader (gen 0 -> 1), then RESUME without selecting Replay (status=active, gen=1)
+        const paused = yield* leaders.updateLeader(DEFAULT_LEADER_ID, { status: "paused" });
+        expect(paused?.pauseGeneration).toBe(1);
+        const resumed = yield* leaders.updateLeader(DEFAULT_LEADER_ID, { status: "active" });
+        expect(resumed?.status).toBe("active");
+        expect(resumed?.pauseGeneration).toBe(1);
+
+        // 3. Release role-memory read -> MUST reject stale gen=0 attempt with LEADER_PAUSED!
+        releaseRoleRead();
+        const staleOutcome = yield* Fiber.await(fiber);
+        expect(staleOutcome._tag).toBe("Success");
+        if (staleOutcome._tag === "Success") {
+          expect(staleOutcome.value._tag).toBe("Failure");
+          if (staleOutcome.value._tag === "Failure") {
+            expect(containsLeaderPausedError(staleOutcome.value.failure)).toBe(true);
+          }
+        }
+        expect(dispatchCalls).toBe(0);
+
+        // 4. Transactional check (`bindRunPolicySql`) ALSO rejects a stale pause_generation=0 policy
+        //    even while Leader is `active` at generation=1!
+        const staleTxnRes = yield* sql
+          .withTransaction(
+            leaders.bindRunPolicySql(
+              `im:conn-feishu:pm-s23-aba`,
+              dispatchIdentity(inboundMessage(payload), dir, undefined, binding).threadId,
+              "run-s23-stale",
+            ),
+          )
+          .pipe(Effect.result);
+        expect(staleTxnRes._tag).toBe("Failure");
+        if (staleTxnRes._tag === "Failure") {
+          expect(containsLeaderPausedError(staleTxnRes.failure)).toBe(true);
+        }
+
+        // 5. Explicit Replay issues a fresh attempt with the original idempotencyKey at gen=1 -> SUCCEEDS!
+        const replayedOutcome = yield* dispatcher.accept(payload, 1).pipe(Effect.result);
+        expect(replayedOutcome._tag).toBe("Success");
+        expect(dispatchCalls).toBe(1);
+      }).pipe(Effect.provide(fakeDeps)),
+    );
+  });
+
   it("shares one final operationKey across liveFinish and fallback reply and clears cached ACK on dropped send response (S17)", async () => {
     const inbound = inboundMessage({
       connectionId: "conn-feishu",

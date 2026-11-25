@@ -213,7 +213,7 @@ export const makeDispatcher = Effect.fnUntraced(function* (
     yield* leaders.registerLegacyProtectedThread(row.threadId, migrated);
   }
 
-  const accept = (payload: BridgePayload) => permits.withPermit(Effect.gen(function* () {
+  const accept = (payload: BridgePayload, observedPauseGeneration?: number) => permits.withPermit(Effect.gen(function* () {
     const inbound = yield* Effect.try({ try: () => inboundMessage(payload), catch: imError });
     const commandId = CommandId.make(inbound.key);
     const [previous] = yield* stored(inbound.key);
@@ -299,11 +299,15 @@ export const makeDispatcher = Effect.fnUntraced(function* (
       }
     }
     if (!turnId) {
-      // S4/S21: Whenever no committed run exists yet (including replays after an earlier failed
-      // dispatch that saved a delivery row without committing a run), enforce the target Leader's
-      // pause state BEFORE creating a new turn!
-      const leader = yield* leaders.getLeader(activeLeaderId);
-      if (leader?.status === "paused") {
+      // S4/S21/S23: Whenever no committed run exists yet (including replays after an earlier failed
+      // dispatch that saved a delivery row without committing a run), snapshot the target Leader's
+      // pause generation and enforce both status and generation BEFORE creating a new turn!
+      const startLeader = yield* leaders.getLeader(activeLeaderId);
+      const expectedPauseGeneration = observedPauseGeneration ?? startLeader?.pauseGeneration ?? 0;
+      if (
+        startLeader?.status === "paused" ||
+        (startLeader !== undefined && startLeader.pauseGeneration !== expectedPauseGeneration)
+      ) {
         return yield* imError(`${LEADER_PAUSED_ERROR}: Leader is currently paused; new IM tasks are deferred.`);
       }
       const current = yield* settings.getSettings;
@@ -313,8 +317,8 @@ export const makeDispatcher = Effect.fnUntraced(function* (
       }
       yield* fs.makeDirectory(context.isolatedWorkspaceRoot!, { recursive: true, mode: 0o700 });
 
-      // ADR-013 §2: Persist the run's execution policy BEFORE Orchestrator dispatches / Pi launches!
-      yield* leaders.persistPolicyBeforeLaunch({ commandId, threadId, context });
+      // ADR-013 §2 + S23: Persist the run's execution policy and pause generation BEFORE Orchestrator dispatches!
+      yield* leaders.persistPolicyBeforeLaunch({ commandId, threadId, context, expectedPauseGeneration });
 
       const [contextJson, payloadJson] = serializeDelivery(context, payload);
       yield* sql`INSERT INTO xtwork_im_delivery (key, thread_id, message_id, context_json, payload_json)
@@ -338,12 +342,15 @@ export const makeDispatcher = Effect.fnUntraced(function* (
         untrustedEnvelope(content, context),
       ].filter(Boolean).join("\n\n");
       const initialMessage = { messageId, text, attachments: [] };
-      // S22: Re-check Leader status immediately before dispatching (in addition to the atomic
-      // SQLite check inside `EventSink.commitCommand` -> `bindRunPolicySql`) and unwrap any
-      // transactional `LEADER_PAUSED` failure so the inbound message returns to `paused_pending`.
+      // S22/S23: Re-check Leader status AND pause_generation immediately before dispatching
+      // (in addition to the atomic SQLite check inside `EventSink.commitCommand` -> `bindRunPolicySql`)
+      // so a pause -> resume cycle cannot let an earlier in-flight dispatch bypass the paused backlog!
       const latestLeader = yield* leaders.getLeader(activeLeaderId);
-      if (latestLeader?.status === "paused") {
-        return yield* imError(`${LEADER_PAUSED_ERROR}: Leader is currently paused; new IM tasks are deferred.`);
+      if (
+        latestLeader?.status === "paused" ||
+        (latestLeader !== undefined && latestLeader.pauseGeneration !== expectedPauseGeneration)
+      ) {
+        return yield* imError(`${LEADER_PAUSED_ERROR}: Leader pause state changed during dispatch; IM task deferred.`);
       }
       const thread = yield* orchestrator.getThreadShell(threadId);
       const result = yield* (thread === null

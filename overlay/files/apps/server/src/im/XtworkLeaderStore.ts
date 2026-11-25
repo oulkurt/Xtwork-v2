@@ -21,6 +21,7 @@ export interface LeaderRecord {
   readonly avatar: string;
   readonly role: string;
   readonly status: LeaderStatus;
+  readonly pauseGeneration: number;
   readonly pinnedThreadId: string | null;
   readonly awarenessScope: AwarenessScope;
   readonly ownerDmDesktopGrants: readonly string[];
@@ -62,6 +63,7 @@ type LeaderRow = {
   readonly avatar: string;
   readonly role: string;
   readonly status: string;
+  readonly pauseGeneration: number;
   readonly pinnedThreadId: string | null;
   readonly awarenessScopeJson: string;
   readonly ownerDmGrantsJson: string;
@@ -86,6 +88,7 @@ type PolicyRow = {
   readonly threadId: string;
   readonly policyDigest: string;
   readonly policyJson: string;
+  readonly pauseGeneration?: number | null;
   readonly createdAt: number;
 };
 
@@ -140,6 +143,7 @@ function rowToLeader(row: LeaderRow): LeaderRecord {
     avatar: row.avatar,
     role: row.role,
     status,
+    pauseGeneration: Number(row.pauseGeneration ?? 0),
     pinnedThreadId: row.pinnedThreadId,
     awarenessScope: parseAwarenessScope(row.awarenessScopeJson),
     ownerDmDesktopGrants: parseGrants(row.ownerDmGrantsJson),
@@ -197,12 +201,17 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     avatar TEXT NOT NULL DEFAULT '瞳',
     role TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'active',
+    pause_generation INTEGER NOT NULL DEFAULT 0,
     pinned_thread_id TEXT,
     awareness_scope_json TEXT NOT NULL DEFAULT '{"kind":"all_local","projectIds":[]}',
     owner_dm_grants_json TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   )`;
+  const leaderCols = yield* sql<{ readonly name: string }>`PRAGMA table_info(xtwork_leaders)`;
+  if (!leaderCols.some((c) => c.name === "pause_generation")) {
+    yield* sql`ALTER TABLE xtwork_leaders ADD COLUMN pause_generation INTEGER NOT NULL DEFAULT 0`;
+  }
 
   yield* sql`CREATE TABLE IF NOT EXISTS xtwork_leader_bindings (
     binding_id TEXT PRIMARY KEY,
@@ -223,8 +232,13 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     thread_id TEXT NOT NULL,
     policy_digest TEXT NOT NULL,
     policy_json TEXT NOT NULL,
+    pause_generation INTEGER,
     created_at INTEGER NOT NULL
   )`;
+  const policyCols = yield* sql<{ readonly name: string }>`PRAGMA table_info(xtwork_run_policies)`;
+  if (!policyCols.some((c) => c.name === "pause_generation")) {
+    yield* sql`ALTER TABLE xtwork_run_policies ADD COLUMN pause_generation INTEGER`;
+  }
   yield* sql`CREATE INDEX IF NOT EXISTS idx_xtwork_run_policies_thread
     ON xtwork_run_policies(thread_id, created_at DESC)`;
 
@@ -254,6 +268,7 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   const policyByRunId = new Map<string, PersistedRunPolicy>();
   const policyByCommandId = new Map<string, PersistedRunPolicy>();
   const nativePolicyDigestByKey = new Map<string, string>();
+  const pauseGenerationByLeader = new Map<string, number>();
   const nativePolicyKey = (threadId: string, nativeThreadId: string) => `${threadId}\0${nativeThreadId}`;
 
   const existingProtected = yield* sql<ProtectedThreadRow>`
@@ -272,7 +287,7 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   const existingPolicies = yield* sql<PolicyRow>`
     SELECT policy_id AS "policyId", run_id AS "runId", command_id AS "commandId",
       thread_id AS "threadId", policy_digest AS "policyDigest",
-      policy_json AS "policyJson", created_at AS "createdAt"
+      policy_json AS "policyJson", pause_generation AS "pauseGeneration", created_at AS "createdAt"
     FROM xtwork_run_policies
     ORDER BY created_at ASC
   `;
@@ -301,7 +316,8 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
 
   const getLeader = (id: string) =>
     sql<LeaderRow>`
-      SELECT id, name, avatar, role, status, pinned_thread_id AS "pinnedThreadId",
+      SELECT id, name, avatar, role, status, pause_generation AS "pauseGeneration",
+        pinned_thread_id AS "pinnedThreadId",
         awareness_scope_json AS "awarenessScopeJson", owner_dm_grants_json AS "ownerDmGrantsJson",
         created_at AS "createdAt", updated_at AS "updatedAt"
       FROM xtwork_leaders WHERE id = ${id}
@@ -321,10 +337,18 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   });
 
   yield* ensureDefaultLeader();
+  const initialLeaders = yield* sql<{ readonly id: string; readonly pauseGeneration: number }>`
+    SELECT id, pause_generation AS "pauseGeneration" FROM xtwork_leaders
+  `;
+  for (const row of initialLeaders) {
+    pauseGenerationByLeader.set(row.id, Number(row.pauseGeneration ?? 0));
+  }
+  const getPauseGenerationSync = (leaderId: string): number => pauseGenerationByLeader.get(leaderId) ?? 0;
 
   const listLeaders = () =>
     sql<LeaderRow>`
-      SELECT id, name, avatar, role, status, pinned_thread_id AS "pinnedThreadId",
+      SELECT id, name, avatar, role, status, pause_generation AS "pauseGeneration",
+        pinned_thread_id AS "pinnedThreadId",
         awareness_scope_json AS "awarenessScopeJson", owner_dm_grants_json AS "ownerDmGrantsJson",
         created_at AS "createdAt", updated_at AS "updatedAt"
       FROM xtwork_leaders
@@ -351,6 +375,7 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
       ${id}, ${name}, ${avatar}, ${role}, ${"active"}, ${null},
       ${JSON.stringify(scope)}, ${"[]"}, ${now}, ${now}
     )`;
+    pauseGenerationByLeader.set(id, 0);
     return (yield* getLeader(id))!;
   });
 
@@ -373,6 +398,9 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
       patch.avatar !== undefined ? (patch.avatar.trim() || Array.from(nextName)[0] || current.avatar).slice(0, 8) : current.avatar;
     const nextRole = patch.role !== undefined ? patch.role : current.role;
     const nextStatus = patch.status !== undefined ? patch.status : current.status;
+    // S23: Advance pause_generation whenever a Leader pauses so in-flight dispatches started
+    // before the pause cannot bypass the paused backlog even if the Leader is resumed later.
+    const advancePauseGeneration = patch.status === "paused" ? 1 : 0;
     const nextPinned = patch.pinnedThreadId !== undefined ? patch.pinnedThreadId : current.pinnedThreadId;
     const nextScope = patch.awarenessScope !== undefined ? patch.awarenessScope : current.awarenessScope;
     const nextGrants =
@@ -383,12 +411,17 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
       avatar = ${nextAvatar},
       role = ${nextRole},
       status = ${nextStatus},
+      pause_generation = pause_generation + ${advancePauseGeneration},
       pinned_thread_id = ${nextPinned},
       awareness_scope_json = ${JSON.stringify(nextScope)},
       owner_dm_grants_json = ${JSON.stringify(nextGrants)},
       updated_at = ${now}
       WHERE id = ${id}`;
-    return yield* getLeader(id);
+    const updated = yield* getLeader(id);
+    if (updated) {
+      pauseGenerationByLeader.set(updated.id, updated.pauseGeneration);
+    }
+    return updated;
   });
 
   const activeBindingForConnection = (connectionId: string) =>
@@ -501,21 +534,24 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     readonly threadId: string;
     readonly context: TurnExecutionContext;
     readonly runId?: string;
+    readonly expectedPauseGeneration?: number;
   }) {
     const normalized = normalizeExecutionContext(input.context);
     const digest = normalized.policyDigest!;
     const policyJson = JSON.stringify(normalized);
     const now = Date.now();
     const policyId = `pol-${randomUUID().slice(0, 12)}`;
+    const pauseGen = input.expectedPauseGeneration ?? null;
 
     yield* sql`INSERT INTO xtwork_run_policies (
-      policy_id, run_id, command_id, thread_id, policy_digest, policy_json, created_at
+      policy_id, run_id, command_id, thread_id, policy_digest, policy_json, pause_generation, created_at
     ) VALUES (
-      ${policyId}, ${input.runId ?? null}, ${input.commandId}, ${input.threadId}, ${digest}, ${policyJson}, ${now}
+      ${policyId}, ${input.runId ?? null}, ${input.commandId}, ${input.threadId}, ${digest}, ${policyJson}, ${pauseGen}, ${now}
     ) ON CONFLICT(command_id) DO UPDATE SET
       run_id = COALESCE(excluded.run_id, xtwork_run_policies.run_id),
       policy_digest = excluded.policy_digest,
-      policy_json = excluded.policy_json`;
+      policy_json = excluded.policy_json,
+      pause_generation = excluded.pause_generation`;
 
     yield* sql`INSERT INTO xtwork_protected_threads (
       thread_id, leader_id, binding_id, binding_epoch, policy_digest, policy_json, created_at
@@ -583,7 +619,7 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     const [existing] = yield* sql<PolicyRow>`
       SELECT policy_id AS "policyId", run_id AS "runId", command_id AS "commandId",
         thread_id AS "threadId", policy_digest AS "policyDigest",
-        policy_json AS "policyJson", created_at AS "createdAt"
+        policy_json AS "policyJson", pause_generation AS "pauseGeneration", created_at AS "createdAt"
       FROM xtwork_run_policies WHERE command_id = ${commandId} AND thread_id = ${threadId} LIMIT 1
     `;
     if (!existing) {
@@ -593,16 +629,22 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
       return yield* imError("Protected run refused: dispatch command policy is already bound to another run.");
     }
     const record = rowToPolicy(existing);
-    // S22: Re-check persisted Leader status INSIDE the atomic SQLite transaction that commits
-    // `run.created` so a concurrent pause rolls back `run.created` and never starts an IM turn while paused!
+    // S22/S23: Re-check persisted Leader status AND pause_generation INSIDE the atomic SQLite
+    // transaction that commits `run.created`. Even if a Leader was paused and resumed while an
+    // earlier dispatch was in flight, its advanced pause_generation rolls back `run.created`!
     if (record.context.source === "im") {
       const leaderId = record.context.leaderId ?? DEFAULT_LEADER_ID;
-      const [leaderRow] = yield* sql<{ readonly status: string }>`
-        SELECT status FROM xtwork_leaders WHERE id = ${leaderId} LIMIT 1
+      const [leaderRow] = yield* sql<{ readonly status: string; readonly pauseGeneration: number }>`
+        SELECT status, pause_generation AS "pauseGeneration" FROM xtwork_leaders WHERE id = ${leaderId} LIMIT 1
       `;
-      if (leaderRow?.status === "paused") {
+      if (
+        leaderRow?.status === "paused" ||
+        (existing.pauseGeneration != null &&
+          leaderRow !== undefined &&
+          Number(leaderRow.pauseGeneration) !== Number(existing.pauseGeneration))
+      ) {
         return yield* imError(
-          `${LEADER_PAUSED_ERROR}: Leader is currently paused; new IM tasks are deferred.`,
+          `${LEADER_PAUSED_ERROR}: Leader pause state changed during dispatch; IM task deferred.`,
         );
       }
     }
@@ -770,6 +812,7 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   return {
     ensureDefaultLeader,
     getLeader,
+    getPauseGenerationSync,
     listLeaders,
     createLeader,
     updateLeader,
