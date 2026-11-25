@@ -891,6 +891,13 @@ export class ChannelManager {
       }
 
       if (!ch.secretRef) continue;
+      // Enforce SSRF & URL credential validation even on legacy persisted `channels.json` records
+      // before compiling them into the live gateway so tampered/legacy loopback/private URLs are never proxied.
+      try {
+        this.assertOutbound(ch.baseUrl);
+      } catch {
+        continue;
+      }
       let apiKey: string | undefined;
       try {
         const raw = await this.readSecretValue(ch.secretRef);
@@ -1229,7 +1236,7 @@ export class ChannelManager {
       const providerChanged = !isTeam && nextProvider !== current.provider;
       const baseUrlChanged =
         !isTeam && normalizeBaseUrl(nextBaseUrl) !== normalizeBaseUrl(current.baseUrl);
-      const hasStoredSecret = Boolean(current.secretRef && this.credentialsPresence.get(current.id));
+      const hasStoredSecret = Boolean(current.secretRef || this.credentialsPresence.get(current.id));
 
       if (!isTeam && !nextIsOAuth) {
         const newSecret =

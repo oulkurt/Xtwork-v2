@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { generateKeyPairSync, sign as cryptoSign } from "node:crypto";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -13,7 +13,7 @@ import {
   type GatewayChannelConfig,
 } from "./gateway.ts";
 import { queryApiKeyPlanQuota } from "./oauthLoginFlows.ts";
-import { createCodexPlaceholderJwt } from "./oauthProxy.ts";
+import { createCodexPlaceholderJwt, isCopilotModelPermitted } from "./oauthProxy.ts";
 import { compileChannelToGatewayConfig } from "./providerCatalog.ts";
 import {
   memorySecrets,
@@ -909,6 +909,152 @@ describe("ChannelManager & Gateway/Live-Pi Coordinator (ADR-012 §2, §3.1–§3
       await manager.close();
       await gw.close();
       await stub.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks legacy SSRF/auth_token URLs on load, blocks endpoint change when SecretStore is unavailable, suppresses dev fallback when an enabled member channel has all models disabled, and matches Copilot availableModelIds case-insensitively (Sol R2)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xtwork-cm-r2-"));
+    try {
+      // 1. Legacy channels.json with loopback SSRF URL and ?auth_token=... MUST be stripped on load and NOT compiled into gateway!
+      const channelsFile = join(dir, "channels", "channels.json");
+      await mkdir(join(dir, "channels"), { recursive: true });
+      await writeFile(
+        channelsFile,
+        JSON.stringify(
+          {
+            version: 1,
+            channels: [
+              {
+                id: "legacy-ssrf",
+                name: "Legacy SSRF",
+                provider: "openai",
+                baseUrl: "https://127.0.0.1:9443/v1?auth_token=leaked-secret&api-version=2025-01",
+                enabled: true,
+                secretRef: "channel:legacy-ssrf",
+                models: [{ id: "gpt-4o", name: "GPT-4o", enabled: true }],
+                createdAt: 1,
+                updatedAt: 1,
+              },
+              {
+                id: "disabled-models-ch",
+                name: "Enabled Channel Zero Models",
+                provider: "openai",
+                baseUrl: "https://api.openai.com/v1",
+                enabled: true,
+                secretRef: "channel:disabled-models-ch",
+                models: [{ id: "gpt-4o", name: "GPT-4o", enabled: false }],
+                createdAt: 1,
+                updatedAt: 1,
+              },
+            ],
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+
+      const backing = memorySecrets();
+      await backing.set("channel:legacy-ssrf", "sk-legacy-secret");
+      await backing.set("channel:disabled-models-ch", "sk-disabled-models");
+      let failReads = false;
+      const flakySecrets: SecretStore = {
+        backend: backing.backend,
+        get: async (k) => {
+          if (failReads) throw new SecretStoreUnavailableError("SECRET_STORE_UNAVAILABLE", "keychain locked");
+          return backing.get(k);
+        },
+        set: (k, v) => backing.set(k, v),
+        delete: (k) => backing.delete(k),
+      };
+
+      const gw = await startBundledPi(
+        "/bin/true",
+        dir,
+        { XTWORK_MODEL_UPSTREAM_URL: "https://dev-fallback.example.com/v1" },
+        {
+          secretStore: flakySecrets,
+          skipBinaryAccessCheck: true,
+        },
+      );
+      const manager = new ChannelManager({
+        dataDir: dir,
+        secretStore: flakySecrets,
+        gateway: gw,
+        devFallbackActive: true,
+      });
+
+      try {
+        await manager.initialize();
+
+        // #1: auth_token stripped on load AND loopback legacy channel refused from gateway compilation
+        const loadedLegacy = manager.listRedacted().find((c) => c.id === "legacy-ssrf");
+        assert.ok(loadedLegacy);
+        assert.equal(loadedLegacy.baseUrl.includes("auth_token"), false);
+        assert.equal(loadedLegacy.baseUrl.includes("leaked-secret"), false);
+        assert.equal(loadedLegacy.baseUrl.includes("api-version=2025-01"), true);
+
+        const legacyResp = await fetch(
+          `http://127.0.0.1:${gw.port}/c/legacy-ssrf/openai-completions/chat/completions`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${gw.gatewayToken}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
+          },
+        );
+        assert.equal(legacyResp.status, 404, "Legacy loopback SSRF channel must not be mounted in gateway");
+
+        // #10: Enabled member channel with all models disabled MUST STILL suppress xtwork/standard dev fallback!
+        assert.equal(gw.getDefaultModelSlug(), null);
+        assert.equal(manager.getState().defaultModelSlug, null);
+        const devResp = await fetch(`http://127.0.0.1:${gw.port}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${gw.gatewayToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ model: "standard", messages: [{ role: "user", content: "hi" }] }),
+        });
+        assert.equal(devResp.status, 404, "Dev fallback must stay disabled when a member channel is enabled even with 0 enabled models");
+
+        // #2: Even when SecretStore is temporarily unavailable during init (credentialsPresence=false),
+        // changing baseUrl or provider on a channel with an existing secretRef MUST still require a new API key!
+        failReads = true;
+        const managerLocked = new ChannelManager({
+          dataDir: dir,
+          secretStore: flakySecrets,
+        });
+        await managerLocked.initialize();
+        await assert.rejects(
+          () =>
+            managerLocked.updateChannel("disabled-models-ch", {
+              baseUrl: "https://attacker.example.com/v1",
+            }),
+          /必须重新输入新的 API Key/,
+        );
+        await assert.rejects(
+          () =>
+            managerLocked.updateChannel("disabled-models-ch", {
+              provider: "anthropic",
+              baseUrl: "https://api.anthropic.com",
+            }),
+          /必须重新输入新的 API Key/,
+        );
+        await managerLocked.close();
+
+        // #11: Mixed-case Copilot availableModelIds must match identically in BOTH UI and gateway allowlist!
+        assert.equal(isCopilotModelPermitted("claude-sonnet-4.5", ["CLAUDE-SONNET-4.5"]), true);
+        assert.equal(isCopilotModelPermitted("GPT-4o", ["gpt-4o"]), true);
+        assert.equal(isCopilotModelPermitted("gpt-4o", ["claude-sonnet-4.5"]), false);
+      } finally {
+        await manager.close();
+        await gw.close();
+      }
+    } finally {
       await rm(dir, { recursive: true, force: true });
     }
   });

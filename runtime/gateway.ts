@@ -289,16 +289,39 @@ export function rewriteDeepSeekV4AnthropicBody(
   return body;
 }
 
+function hasCredentialQueryParam(url: URL): boolean {
+  for (const rawKey of url.searchParams.keys()) {
+    const k = rawKey.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (
+      !k ||
+      k === "pwd" ||
+      k === "sig" ||
+      k === "signature" ||
+      k.endsWith("key") ||
+      k.endsWith("token") ||
+      k.endsWith("secret") ||
+      k.includes("password") ||
+      k.includes("passwd") ||
+      k.includes("credential") ||
+      k.startsWith("auth")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function validateUpstreamBaseUrl(rawUrl: string): URL {
   const url = new URL(rawUrl.trim());
   if (
     !["http:", "https:"].includes(url.protocol) ||
     url.username ||
     url.password ||
-    url.hash
+    url.hash ||
+    hasCredentialQueryParam(url)
   ) {
     throw new Error(
-      `Upstream base URL "${rawUrl}" must be an HTTP(S) URL without credentials or fragment.`,
+      `Upstream base URL "${rawUrl}" must be an HTTP(S) URL without credentials, credential query parameters, or fragment.`,
     );
   }
   return url;
@@ -629,14 +652,7 @@ interface GatewayRouteSnapshot {
 function hasConfiguredOrActiveChannels(channels: readonly GatewayChannelConfig[]): boolean {
   for (const ch of channels) {
     if (ch.id === COMPANY_CHANNEL_ID) return true;
-    if (!ch.enabled) continue;
-    for (const model of ch.models) {
-      const cleanId = stripLegacyContextSuffix(model.id);
-      const targetUpstreamId = effectiveUpstreamModelId({ ...model, id: cleanId });
-      if (model.enabled && isCopilotModelPermitted(targetUpstreamId, ch.availableModelIds)) {
-        return true;
-      }
-    }
+    if (ch.enabled) return true;
   }
   return false;
 }
@@ -686,7 +702,7 @@ function compileRouteSnapshot(
       ...(oauthBinding !== undefined ? { oauthBinding } : {}),
     });
   }
-  const hasActiveChannels = hasCompanyChannel || activeRouteCount > 0;
+  const hasActiveChannels = hasConfiguredOrActiveChannels(channels);
   // Dev fallback (`XTWORK_MODEL_UPSTREAM_URL`) is ONLY enabled in true zero-channel state
   // (no company channel logged in AND no active member channels).
   const effectiveDevFallback = hasActiveChannels ? null : devFallback;

@@ -328,6 +328,14 @@ export function XtworkModelChannelsSettings() {
     setLoadError(null);
   }, []);
 
+  const applyAuthoritativeCompanyAuth = useCallback((nextCompanyAuth: CompanyAuthStateView) => {
+    loadSeqRef.current += 1;
+    loadAbortRef.current?.abort();
+    loadAbortRef.current = null;
+    prevCompanyPhaseRef.current = nextCompanyAuth.phase;
+    setState((prev) => (prev ? { ...prev, companyAuth: nextCompanyAuth } : prev));
+  }, []);
+
   const loadState = useCallback(async (silent = false) => {
     const seq = ++loadSeqRef.current;
     loadAbortRef.current?.abort();
@@ -458,8 +466,7 @@ export function XtworkModelChannelsSettings() {
         readonly state: CompanyAuthStateView;
         readonly authUrl: string;
       }>("company/login", { method: "POST", body: {} });
-      prevCompanyPhaseRef.current = res.state.phase;
-      setState((prev) => (prev ? { ...prev, companyAuth: res.state } : prev));
+      applyAuthoritativeCompanyAuth(res.state);
       openExternalUrl(res.authUrl);
     } catch (error) {
       const isConflict =
@@ -479,7 +486,7 @@ export function XtworkModelChannelsSettings() {
         "company/cancel",
         { method: "POST", body: {} },
       );
-      setState((prev) => (prev ? { ...prev, companyAuth: res.companyAuth } : prev));
+      applyAuthoritativeCompanyAuth(res.companyAuth);
       setCompanyError(null);
     } finally {
       setCompanyBusy(false);

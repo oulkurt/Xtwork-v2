@@ -1385,17 +1385,32 @@ function normalizeQueryKey(key: string): string {
   return key.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+function isCredentialQueryParamKey(rawKey: string): boolean {
+  const normalized = normalizeQueryKey(rawKey);
+  if (!normalized) return false;
+  if (CREDENTIAL_QUERY_PARAM_KEYS.has(normalized)) return true;
+  return (
+    normalized.endsWith("key") ||
+    normalized.endsWith("token") ||
+    normalized.endsWith("secret") ||
+    normalized.includes("password") ||
+    normalized.includes("passwd") ||
+    normalized.includes("credential") ||
+    normalized.startsWith("auth")
+  );
+}
+
 /**
  * Reject URLs containing embedded userinfo (`user:pass@`) or credential-like query parameters
- * (e.g., `?key=sk-...`, `?api_key=...`, `?token=...`, `?secret=...`, `?sig=...`) while
- * preserving benign proxy query parameters like `?api-version=...`.
+ * (e.g., `?key=sk-...`, `?api_key=...`, `?token=...`, `?auth_token=...`, `?secret=...`, `?sig=...`)
+ * while preserving benign proxy query parameters like `?api-version=...`.
  */
 export function assertNoUrlCredentials(url: URL): void {
   if (url.username || url.password) {
     throw new Error("渠道接口地址不允许包含用户名或密码凭据。");
   }
   for (const paramKey of url.searchParams.keys()) {
-    if (CREDENTIAL_QUERY_PARAM_KEYS.has(normalizeQueryKey(paramKey))) {
+    if (isCredentialQueryParamKey(paramKey)) {
       throw new Error(`渠道接口地址不允许在查询参数中携带凭据字段（${paramKey}），请通过 API Key 输入框配置。`);
     }
   }
@@ -1414,7 +1429,7 @@ export function stripUrlCredentialsForLoad(rawUrl: string): string {
     parsed.hash = "";
     const keysToDelete: string[] = [];
     for (const key of parsed.searchParams.keys()) {
-      if (CREDENTIAL_QUERY_PARAM_KEYS.has(normalizeQueryKey(key))) {
+      if (isCredentialQueryParamKey(key)) {
         keysToDelete.push(key);
       }
     }

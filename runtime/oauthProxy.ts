@@ -259,7 +259,8 @@ export function isCopilotModelPermitted(
   availableModelIds: readonly string[] | undefined,
 ): boolean {
   if (availableModelIds === undefined) return true;
-  return availableModelIds.includes(modelId);
+  const needle = modelId.trim().toLowerCase();
+  return availableModelIds.some((id) => id.trim().toLowerCase() === needle);
 }
 
 function containsImageContent(value: unknown): boolean {
