@@ -1999,6 +1999,69 @@ export function makeProviderProvisioner(
           probedVersion || readInstalledNpmPackageVersion(stagingDir, input.packageName);
 
         const commitOp = activeOps.get(input.instanceId);
+        const backupDir = `${input.installDir}.prev-${input.operationId}`;
+        let movedExistingToBackup = false;
+        let activatedStaging = false;
+        const rollbackSwap = () => {
+          if (activatedStaging) {
+            try {
+              NodeFs.rmSync(input.installDir, { recursive: true, force: true });
+            } catch {
+              // ignore
+            }
+          }
+          if (movedExistingToBackup && NodeFs.existsSync(backupDir)) {
+            try {
+              NodeFs.renameSync(backupDir, input.installDir);
+            } catch {
+              // ignore
+            }
+          }
+        };
+        const swapStagingIntoInstallDir = ():
+          | { readonly ok: true }
+          | { readonly ok: false; readonly error: unknown } => {
+          try {
+            if (NodeFs.existsSync(input.installDir)) {
+              NodeFs.rmSync(backupDir, { recursive: true, force: true });
+              NodeFs.renameSync(input.installDir, backupDir);
+              movedExistingToBackup = true;
+            }
+            NodeFs.renameSync(stagingDir, input.installDir);
+            activatedStaging = true;
+            return { ok: true };
+          } catch (error) {
+            return { ok: false, error };
+          }
+        };
+        const persistInstallReceipt = ():
+          | { readonly ok: true }
+          | { readonly ok: false; readonly error: unknown } => {
+          try {
+            upsertReceipt(deps.baseDir, {
+              instanceId: input.instanceId,
+              agentKind: input.agentKind,
+              mode: "app-managed",
+              source: input.option.consentKey.source,
+              version: installedVersion ?? input.option.consentKey.version,
+              distribution: input.option.consentKey.distribution,
+              installDir: input.installDir,
+              executablePath: managedBin,
+              installedAt: new Date().toISOString(),
+            });
+            return { ok: true };
+          } catch (error) {
+            return { ok: false, error };
+          }
+        };
+        const cleanupOldBackup = () => {
+          if (!movedExistingToBackup) return;
+          try {
+            NodeFs.rmSync(backupDir, { recursive: true, force: true });
+          } catch {
+            // best-effort cleanup of old backup
+          }
+        };
         const runCommit = Effect.gen(function* () {
           if (isOpCancelled(input.instanceId, input.operationId)) {
             setState(input.instanceId, (prev) => ({
@@ -2015,42 +2078,15 @@ export function makeProviderProvisioner(
             commitOp.committing = true;
           }
 
-          const backupDir = `${input.installDir}.prev-${input.operationId}`;
-          let movedExistingToBackup = false;
-          let activatedStaging = false;
-          const rollbackSwap = () => {
-            if (activatedStaging) {
-              try {
-                NodeFs.rmSync(input.installDir, { recursive: true, force: true });
-              } catch {
-                // ignore
-              }
-            }
-            if (movedExistingToBackup && NodeFs.existsSync(backupDir)) {
-              try {
-                NodeFs.renameSync(backupDir, input.installDir);
-              } catch {
-                // ignore
-              }
-            }
-          };
-
-          try {
-            if (NodeFs.existsSync(input.installDir)) {
-              NodeFs.rmSync(backupDir, { recursive: true, force: true });
-              NodeFs.renameSync(input.installDir, backupDir);
-              movedExistingToBackup = true;
-            }
-            NodeFs.renameSync(stagingDir, input.installDir);
-            activatedStaging = true;
-          } catch (swapError) {
+          const swapResult = swapStagingIntoInstallDir();
+          if (!swapResult.ok) {
             rollbackSwap();
             if (commitOp && commitOp.operationId === input.operationId) {
               commitOp.committing = false;
             }
             const detail = redactSecrets(
-              swapError instanceof Error
-                ? swapError.message
+              swapResult.error instanceof Error
+                ? swapResult.error.message
                 : `Failed to activate managed runtime at '${input.installDir}'.`,
             );
             appendLog(input.instanceId, detail);
@@ -2093,33 +2129,16 @@ export function makeProviderProvisioner(
             return;
           }
 
-          try {
-            upsertReceipt(deps.baseDir, {
-              instanceId: input.instanceId,
-              agentKind: input.agentKind,
-              mode: "app-managed",
-              source: input.option.consentKey.source,
-              version: installedVersion ?? input.option.consentKey.version,
-              distribution: input.option.consentKey.distribution,
-              installDir: input.installDir,
-              executablePath: managedBin,
-              installedAt: new Date().toISOString(),
-            });
-          } catch (receiptError) {
+          const receiptResult = persistInstallReceipt();
+          if (!receiptResult.ok) {
             rollbackSwap();
             if (commitOp && commitOp.operationId === input.operationId) {
               commitOp.committing = false;
             }
-            throw receiptError;
+            return yield* Effect.die(receiptResult.error);
           }
 
-          if (movedExistingToBackup) {
-            try {
-              NodeFs.rmSync(backupDir, { recursive: true, force: true });
-            } catch {
-              // best-effort cleanup of old backup
-            }
-          }
+          cleanupOldBackup();
 
           if (commitOp && commitOp.operationId === input.operationId) {
             commitOp.committed = true;
