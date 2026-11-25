@@ -14,7 +14,7 @@ index e06fc7e0..0897507f 100644
        ? yield* moveInlineSettingsSecrets(settingsWithRuntime)
        : folded;
 diff --git a/packages/provider-pi/src/server/adapter.test.ts b/packages/provider-pi/src/server/adapter.test.ts
-index 4af5beda..4a018ed5 100644
+index 4af5beda..b95b8fa7 100644
 --- a/packages/provider-pi/src/server/adapter.test.ts
 +++ b/packages/provider-pi/src/server/adapter.test.ts
 @@ -56,7 +56,10 @@ import {
@@ -103,7 +103,7 @@ index 4af5beda..4a018ed5 100644
      promptThinkingLevels,
      promptModels,
      changeNatively: (change) => {
-@@ -7183,3 +7209,136 @@ process.stdout.write('{"type":"ready"}\\n');
+@@ -7183,3 +7209,245 @@ process.stdout.write('{"type":"ready"}\\n');
        }).pipe(Effect.provide(NodeServices.layer)),
    );
  });
@@ -239,9 +239,118 @@ index 4af5beda..4a018ed5 100644
 +        );
 +      }).pipe(Effect.scoped, Effect.provide(layerTest)),
 +  );
++
++  it.effect(
++    "restores inherited baselineModel after models.json reload when both baseline and explicit models stay enabled",
++    () =>
++      Effect.gen(function* () {
++        const fileSystem = yield* FileSystem.FileSystem;
++        const agentDir = yield* fileSystem.makeTempDirectoryScoped();
++        const modelsPath = `${agentDir}/models.json`;
++        const settingsPath = `${agentDir}/settings.json`;
++        yield* fileSystem.writeFileString(
++          modelsPath,
++          JSON.stringify({
++            providers: {
++              "chan-a": { models: [{ id: "model-a" }] },
++              "chan-b": { models: [{ id: "model-b" }] },
++            },
++          }),
++        );
++        yield* fileSystem.writeFileString(
++          settingsPath,
++          JSON.stringify({ defaultProvider: "chan-a", defaultModel: "model-a" }),
++        );
++
++        const fake = yield* makeFakePi;
++        fake.changeNatively({ model: "chan-a/model-a" });
++        fake.queueModels([
++          { provider: "chan-a", id: "model-a", contextWindow: 128000 },
++          { provider: "chan-b", id: "model-b", contextWindow: 128000 },
++        ]);
++
++        const adapter = yield* makePiAdapterV2({
++          instanceId: PI_INSTANCE_ID,
++          settings: { enabled: true, binaryPath: "pi", launchArgs: "", customModels: [] },
++          environment: { PI_CODING_AGENT_DIR: agentDir },
++        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, fake.spawner));
++
++        const runtime = yield* adapter.openSession({
++          threadId: THREAD_ID,
++          providerSessionId: SESSION_ID,
++          modelSelection: modelSelection("default"),
++          runtimePolicy,
++        });
++        const emitted = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
++        yield* runtime.events.pipe(
++          Stream.runForEach((event) => Queue.offer(emitted, event)),
++          Effect.forkScoped,
++        );
++        const takeEvent = (
++          predicate: (event: ProviderAdapter.ProviderAdapterV2Event) => boolean,
++        ) =>
++          Effect.gen(function* () {
++            while (true) {
++              const event = yield* Queue.take(emitted);
++              if (predicate(event)) return event;
++            }
++          });
++        const providerThread = yield* runtime.ensureThread({
++          threadId: THREAD_ID,
++          modelSelection: modelSelection("default"),
++          runtimePolicy,
++        });
++
++        const completeTurn = (ordinal: number, selectionModel: string) =>
++          Effect.gen(function* () {
++            yield* startTurn(
++              runtime,
++              providerThread,
++              selectionModel,
++              [],
++              `turn-${ordinal}`,
++              modelSelection(selectionModel),
++              ordinal,
++            );
++            while (true) {
++              const promptReq = yield* fake.takeRequest("prompt");
++              if (String(promptReq["message"]) !== `/${PI_XTWORK_RELOAD_MODELS_COMMAND}`) break;
++            }
++            yield* fake.emit({ type: "agent_settled" });
++            yield* takeEvent((event) => event.type === "turn.terminal");
++          });
++
++        // Turn 1: Inherited default uses baseline `chan-a/model-a`.
++        yield* completeTurn(1, "default");
++        assert.equal(fake.promptModels[0], "chan-a/model-a");
++
++        // Turn 2: Explicitly select `chan-b/model-b`.
++        yield* completeTurn(2, "chan-b/model-b");
++        assert.equal(fake.promptModels[1], "chan-b/model-b");
++
++        // Update models.json (e.g. metadata edit) while keeping BOTH `chan-a/model-a` and `chan-b/model-b` enabled.
++        yield* fileSystem.writeFileString(
++          modelsPath,
++          JSON.stringify({
++            providers: {
++              "chan-a": { models: [{ id: "model-a", maxTokens: 8192 }] },
++              "chan-b": { models: [{ id: "model-b", maxTokens: 8192 }] },
++            },
++          }),
++        );
++        fake.queueModels([
++          { provider: "chan-a", id: "model-a", contextWindow: 128000 },
++          { provider: "chan-b", id: "model-b", contextWindow: 128000 },
++        ]);
++
++        // Turn 3: Switch back to inherited `default` -> MUST restore `chan-a/model-a` instead of staying stuck on B!
++        yield* completeTurn(3, "default");
++        assert.equal(fake.promptModels[2], "chan-a/model-a");
++      }).pipe(Effect.scoped, Effect.provide(layerTest)),
++  );
 +});
 diff --git a/packages/provider-pi/src/server/adapter.ts b/packages/provider-pi/src/server/adapter.ts
-index 3befbaba..42d1c14a 100644
+index 3befbaba..4f4a9553 100644
 --- a/packages/provider-pi/src/server/adapter.ts
 +++ b/packages/provider-pi/src/server/adapter.ts
 @@ -79,7 +79,11 @@ import {
@@ -304,7 +413,7 @@ index 3befbaba..42d1c14a 100644
        });
  
        // CLI --fork uses Pi's own session format and sets the destination cwd. RPC
-@@ -3198,8 +3234,69 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+@@ -3198,12 +3234,75 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
            ),
        );
  
@@ -357,9 +466,9 @@ index 3befbaba..42d1c14a 100644
 +            // Acknowledge the new models.json revision ONLY AFTER both `/xtwork-reload-models`
 +            // AND `discoverModels()` succeed; otherwise leave it unacknowledged so the next turn retries.
 +            appliedModelsJsonSnapshot = latestModelsJsonSnapshot;
-+            // Re-bind the model on the next turn so metadata edits (baseUrl/compat) for the same
-+            // provider/model take effect and deleted/disabled models reconcile cleanly.
-+            appliedModel = null;
++            // Preserve `appliedModel` across reload so returning to the inherited default still
++            // restores `baselineModel` when both models remain enabled; explicit turns still re-bind
++            // whenever `modelsReloaded` is true so metadata edits take effect.
 +            if (
 +              baselineModel !== null &&
 +              findReportedPiModel(
@@ -374,15 +483,37 @@ index 3befbaba..42d1c14a 100644
          // pi.setModel and /preset can change the model without an RPC event.
          // Confirm cached selections against Pi before skipping them.
          const modelCached =
-@@ -3213,6 +3310,41 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+-          modelSelection.model !== PI_INHERIT_MODEL_SLUG && modelSelection.model === appliedModel;
++          !modelsReloaded &&
++          modelSelection.model !== PI_INHERIT_MODEL_SLUG &&
++          modelSelection.model === appliedModel;
+         let modelDrifted = false;
+         if (modelCached || (thinking !== undefined && thinking === appliedThinking)) {
+           const state = yield* request({ type: "get_state" });
+@@ -3213,11 +3312,13 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
            appliedThinking = recordString(state, "thinkingLevel") ?? null;
          }
          if (modelSelection.model === PI_INHERIT_MODEL_SLUG) {
++          let baselineRestored = false;
+           if (appliedModel !== null && baselineModel !== null) {
+             const restoredModel = yield* request({ type: "set_model", ...baselineModel });
+             appliedThinking = null;
+             contextWindow = rememberModelContextWindow(restoredModel);
+             appliedModel = null;
++            baselineRestored = true;
+             const updatedAt = yield* DateTime.now;
+             sessionEntity = { ...sessionEntity, model: PI_INHERIT_MODEL_SLUG, updatedAt };
+             yield* emit({
+@@ -3226,6 +3327,53 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+               providerSession: sessionEntity,
+             });
+           }
 +          const needsFallbackCheck =
-+            modelsReloaded ||
-+            (latestModelsJsonSnapshot !== null &&
-+              Array.isArray(discoveredModels) &&
-+              discoveredModels.length === 0);
++            !baselineRestored &&
++            (modelsReloaded ||
++              (latestModelsJsonSnapshot !== null &&
++                (appliedModel !== null ||
++                  (Array.isArray(discoveredModels) && discoveredModels.length === 0))));
 +          if (needsFallbackCheck) {
 +            const state = yield* request({ type: "get_state" });
 +            const stateModel = recordField(state, "model");
@@ -394,7 +525,8 @@ index 3befbaba..42d1c14a 100644
 +                : null;
 +            if (
 +              activeSlug === null ||
-+              findReportedPiModel(activeSlug, discoveredModels) === undefined
++              findReportedPiModel(activeSlug, discoveredModels) === undefined ||
++              (appliedModel !== null && baselineModel === null)
 +            ) {
 +              const fallback = yield* resolveFallbackPiModel();
 +              if (fallback !== null) {
@@ -406,6 +538,16 @@ index 3befbaba..42d1c14a 100644
 +                baselineModel = fallback;
 +                appliedThinking = null;
 +                contextWindow = rememberModelContextWindow(selectedFallback);
++                if (appliedModel !== null) {
++                  appliedModel = null;
++                  const updatedAt = yield* DateTime.now;
++                  sessionEntity = { ...sessionEntity, model: PI_INHERIT_MODEL_SLUG, updatedAt };
++                  yield* emit({
++                    type: "provider_session.updated",
++                    driver: PI_PROVIDER,
++                    providerSession: sessionEntity,
++                  });
++                }
 +              } else {
 +                return yield* protocolError(
 +                  "No enabled models are available in 小瞳. Configure a model channel in Settings.",
@@ -413,10 +555,16 @@ index 3befbaba..42d1c14a 100644
 +              }
 +            }
 +          }
-           if (appliedModel !== null && baselineModel !== null) {
-             const restoredModel = yield* request({ type: "set_model", ...baselineModel });
-             appliedThinking = null;
-@@ -3239,28 +3371,57 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+           if (
+             thinking === undefined &&
+             baselineThinking !== null &&
+@@ -3234,33 +3382,62 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+             yield* request({ type: "set_thinking_level", level: baselineThinking });
+             appliedThinking = baselineThinking;
+           }
+-        } else if (modelDrifted || modelSelection.model !== appliedModel) {
++        } else if (modelsReloaded || modelDrifted || modelSelection.model !== appliedModel) {
+           // Extensions and models.json edits can add providers after the first discovery.
            if (findReportedPiModel(modelSelection.model, discoveredModels) === undefined) {
              yield* discoverModels();
            }

@@ -1320,7 +1320,11 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
     const afterMetaEdit = await manager.getValidCredentials<XaiOAuthCredentials>("xai-meta");
     assert.equal(afterMetaEdit.access, "tok-rotated-v1");
 
-    // Start a slow refresh on acct-1, then swap secretRef to acct-2 -> old refresh MUST be aborted/fenced and new account loaded!
+    // Start a slow refresh on acct-swap-1, then swap secretRef to acct-2 -> old refresh MUST be aborted/fenced and new account loaded!
+    await store.set(
+      "oauth:acct-swap-1",
+      JSON.stringify({ access: "old-1", refresh: "r-1", expires: 0 }),
+    );
     await store.set(
       "oauth:acct-2",
       JSON.stringify({ access: "tok-acct-2", refresh: "ref-acct-2", expires: Date.now() + 3_600_000 }),
@@ -1338,7 +1342,7 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
     manager.register<XaiOAuthCredentials>({
       channelId: "xai-swap",
       provider: "xai",
-      secretRef: "oauth:acct-1",
+      secretRef: "oauth:acct-swap-1",
       initialCredentials: { access: "old-1", refresh: "r-1", expires: 0 },
       refresh: async (_cur, sig) => {
         sig.addEventListener("abort", () => {
@@ -2079,6 +2083,139 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         );
         assert.equal(retryRefreshCalls, 0);
         assert.equal(await retryStore.get("oauth:retry-del"), undefined);
+
+        // --- Proof G (post-commit request joins in-flight staged refresh instead of starting duplicate refresh) ---
+        const promoStore = memorySecrets();
+        await promoStore.set(
+          "oauth:promo-single-flight",
+          JSON.stringify({ access: "exp-promo", refresh: "r-promo-0", expires: 100 }),
+        );
+        let promoRefreshCalls = 0;
+        let enteredPromoRefresh!: () => void;
+        const enteredPromoRefreshP = new Promise<void>((r) => {
+          enteredPromoRefresh = r;
+        });
+        let releasePromoRefresh!: () => void;
+        const releasePromoRefreshP = new Promise<void>((r) => {
+          releasePromoRefresh = r;
+        });
+        const promoMgr = new OAuthTokenManager({
+          secretStore: promoStore,
+          fence: new ChannelCredentialFence(),
+          now: () => 500_000,
+        });
+        const promoTx = promoMgr.stageUpdate([
+          {
+            channelId: "promo-ch",
+            provider: "xai",
+            secretRef: "oauth:promo-single-flight",
+            refresh: async (cur) => {
+              promoRefreshCalls += 1;
+              assert.equal(cur.refresh, "r-promo-0");
+              enteredPromoRefresh();
+              await releasePromoRefreshP;
+              return { access: "promo-tok-1", refresh: "r-promo-1", expires: 9_999_999 };
+            },
+          },
+        ]);
+        const promoBindingId = promoTx.bindingIdsByChannel.get("promo-ch")!;
+        const reqBeforeCommit = promoMgr.getValidCredentials("promo-ch", {
+          expectedProvider: "xai",
+          expectedSecretRef: "oauth:promo-single-flight",
+          expectedBindingId: promoBindingId,
+        });
+        await enteredPromoRefreshP;
+
+        // Commit while the staged refresh is still in flight, then issue a second request on the promoted active channel!
+        promoMgr.commitUpdate(promoTx);
+        const reqAfterCommit = promoMgr.getValidCredentials("promo-ch", {
+          expectedProvider: "xai",
+          expectedSecretRef: "oauth:promo-single-flight",
+          expectedBindingId: promoBindingId,
+        });
+        releasePromoRefresh();
+        const [res1, res2] = await Promise.all([reqBeforeCommit, reqAfterCommit]);
+        assert.equal(promoRefreshCalls, 1, "Post-commit request must join the in-flight staged refresh");
+        assert.equal(res1.access, "promo-tok-1");
+        assert.equal(res2.access, "promo-tok-1");
+        assert.equal(promoMgr.getCached("promo-ch")?.refresh, "r-promo-1");
+
+        // --- Proof H (shared-secretRef siblings observe rotated refresh token & coalesce concurrent refreshes) ---
+        let sharedRotNow = 1_000_000;
+        let expectedRefreshToken = "rot-r0";
+        let sharedRotCalls = 0;
+        let enteredRotRefresh!: () => void;
+        let releaseRotRefresh!: () => void;
+        let enteredRotRefreshP = new Promise<void>((r) => {
+          enteredRotRefresh = r;
+        });
+        let releaseRotRefreshP = new Promise<void>((r) => {
+          releaseRotRefresh = r;
+        });
+        const rotStore = memorySecrets();
+        await rotStore.set(
+          "oauth:shared-rot",
+          JSON.stringify({ access: "rot-a0", refresh: "rot-r0", expires: sharedRotNow + 300_000 }),
+        );
+        const rotMgr = new OAuthTokenManager({
+          secretStore: rotStore,
+          fence: new ChannelCredentialFence(),
+          now: () => sharedRotNow,
+        });
+        const rotRefresh = async (cur: { access: string; refresh: string; expires: number }) => {
+          sharedRotCalls += 1;
+          assert.equal(
+            cur.refresh,
+            expectedRefreshToken,
+            "Sibling must never submit an already-consumed refresh token",
+          );
+          if (sharedRotCalls === 1) {
+            enteredRotRefresh();
+            await releaseRotRefreshP;
+          }
+          const nextNum = sharedRotCalls;
+          expectedRefreshToken = `rot-r${nextNum}`;
+          return {
+            access: `rot-a${nextNum}`,
+            refresh: `rot-r${nextNum}`,
+            expires: sharedRotNow + 300_000,
+          };
+        };
+        rotMgr.register({
+          channelId: "rot-ch-a",
+          provider: "xai",
+          secretRef: "oauth:shared-rot",
+          refresh: rotRefresh,
+        });
+        rotMgr.register({
+          channelId: "rot-ch-b",
+          provider: "xai",
+          secretRef: "oauth:shared-rot",
+          refresh: rotRefresh,
+        });
+        // Warm both sibling channels
+        assert.equal((await rotMgr.getValidCredentials("rot-ch-a")).access, "rot-a0");
+        assert.equal((await rotMgr.getValidCredentials("rot-ch-b")).access, "rot-a0");
+
+        // Advance time past expiry -> concurrent requests on A and B must share ONE single-flight refresh!
+        sharedRotNow += 400_000;
+        const pA = rotMgr.getValidCredentials("rot-ch-a");
+        await enteredRotRefreshP;
+        const pB = rotMgr.getValidCredentials("rot-ch-b");
+        releaseRotRefresh();
+        const [rA, rB] = await Promise.all([pA, pB]);
+        assert.equal(sharedRotCalls, 1);
+        assert.equal(rA.access, "rot-a1");
+        assert.equal(rB.access, "rot-a1");
+        assert.equal(rotMgr.getCached("rot-ch-b")?.refresh, "rot-r1");
+
+        // Advance time past second expiry -> channel B refreshes using the rotated `rot-r1` (never stale `rot-r0`)!
+        sharedRotNow += 400_000;
+        const rB2 = await rotMgr.getValidCredentials("rot-ch-b");
+        assert.equal(sharedRotCalls, 2);
+        assert.equal(rB2.access, "rot-a2");
+        assert.equal(rB2.refresh, "rot-r2");
+        assert.equal(rotMgr.getCached("rot-ch-a")?.access, "rot-a2");
       } finally {
         await runtime.close();
       }
