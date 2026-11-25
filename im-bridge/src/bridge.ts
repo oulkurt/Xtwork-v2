@@ -733,6 +733,9 @@ export class ImBridge {
     if (typeof params.defaultLeaderPaused === "boolean") {
       for (const conn of this.store.connections()) {
         if (seen.has(conn.id)) continue;
+        // S4: Apply default Leader pause fallback ONLY to unbound connections;
+        // never overwrite connections bound to another Leader!
+        if (conn.bindingId !== null || conn.leaderId !== "leader-default") continue;
         const next = this.store.syncConnectionBinding({
           connectionId: conn.id,
           leaderId: conn.leaderId,
@@ -1553,6 +1556,13 @@ export class ImBridge {
       senderName: senderDisplayName,
     });
 
+    // S6: Resolve historical binding identity as ONE atomic tuple so a pre-sync row
+    // (`leader-default / null / epoch 1`) never inherits a later Leader's `bindingId`!
+    const hasStampedBinding = msg.leaderId !== null || msg.bindingId !== null || msg.bindingEpoch !== null;
+    const dispatchLeaderId = hasStampedBinding ? (msg.leaderId ?? "leader-default") : conn.leaderId;
+    const dispatchBindingId = hasStampedBinding ? msg.bindingId : conn.bindingId;
+    const dispatchBindingEpoch = hasStampedBinding ? (msg.bindingEpoch ?? 1) : conn.bindingEpoch;
+
     this.emit({
       method: "inbound.dispatch",
       params: {
@@ -1566,9 +1576,9 @@ export class ImBridge {
         messageId: msg.id,
         platformMsgId: msg.platformMsgId,
         idempotencyKey: msg.idempotencyKey,
-        leaderId: msg.leaderId ?? conn.leaderId,
-        bindingId: msg.bindingId ?? conn.bindingId,
-        bindingEpoch: msg.bindingEpoch ?? conn.bindingEpoch,
+        leaderId: dispatchLeaderId,
+        bindingId: dispatchBindingId,
+        bindingEpoch: dispatchBindingEpoch,
         senderId: msg.senderId,
         senderName: senderDisplayName,
         contactId: contact?.id ?? null,

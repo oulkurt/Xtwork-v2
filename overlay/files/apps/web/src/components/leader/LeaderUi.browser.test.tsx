@@ -172,8 +172,14 @@ it("renders LeaderSupervisoryBar Needs You approvals with snapshot verification,
         return json({ decided: true });
       }
       if (path === "leaders/leader-default/paused-decide") {
+        // First click tests S13 (skipped while connection paused -> accurate non-success notice);
+        // second click succeeds and clears backlog.
+        const replayClicks = calls.filter((c) => c.path === "leaders/leader-default/paused-decide").length;
+        if (replayClicks === 1) {
+          return json({ count: 0, messageIds: [], skippedIds: ["msg-paused-1"], blockedIds: [], heldIds: [] });
+        }
         currentOverview = { ...currentOverview, pausedPending: [] };
-        return json({ updated: 1 });
+        return json({ count: 1, messageIds: ["msg-paused-1"], skippedIds: [], blockedIds: [], heldIds: [] });
       }
       if (path === "leaders/leader-default/update") {
         currentOverview = {
@@ -228,8 +234,15 @@ it("renders LeaderSupervisoryBar Needs You approvals with snapshot verification,
     ).toBe(true);
   });
 
-  // Replay paused backlog item
+  // S13: First replay click returns skippedIds (connection paused) -> MUST report skipped status, NOT redelivered!
   await page.getByRole("button", { name: "重投", exact: true }).click();
+  await expect
+    .element(page.getByRole("status"))
+    .toHaveTextContent("当前连接或 Leader 处于暂停/未激活状态，消息仍保留在暂停积压队列中。");
+
+  // Second replay click succeeds -> reports redelivered and clears backlog!
+  await page.getByRole("button", { name: "重投", exact: true }).click();
+  await expect.element(page.getByRole("status")).toHaveTextContent("已按原幂等键重新投递。");
   await vi.waitFor(() => {
     expect(
       calls.some(

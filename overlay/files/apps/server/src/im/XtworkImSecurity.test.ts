@@ -54,9 +54,12 @@ describe("XtworkImSecurity", () => {
     const pending = approvals.require(execution, "bash", { command: "pwd" });
     const request = approvals.list()[0];
     expect(request?.replyAudience).toBe("group");
-    expect(approvals.decide(request!.id, true)).toBe(true);
+    const validVerify = { desktopOwnerVerified: true, expectedRunId: "turn", expectedAudience: "group" as const };
+    // S8: Missing verification object must be rejected even at the direct method boundary
+    expect(approvals.decide(request!.id, true, undefined as never)).toBe(false);
+    expect(approvals.decide(request!.id, true, validVerify)).toBe(true);
     await expect(pending).resolves.toBeUndefined();
-    expect(approvals.decide(request!.id, true)).toBe(false);
+    expect(approvals.decide(request!.id, true, validVerify)).toBe(false);
   });
 
   it("rejects symlink escapes", async () => {

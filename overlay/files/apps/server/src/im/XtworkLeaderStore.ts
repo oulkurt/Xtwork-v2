@@ -237,15 +237,23 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     created_at INTEGER NOT NULL
   )`;
 
+  // S2: Track the exact policy digest recorded for each native provider conversation
+  // so cancelled/queued intermediate runs can never mask a digest mismatch on resume!
+  yield* sql`CREATE TABLE IF NOT EXISTS xtwork_native_session_policies (
+    thread_id TEXT NOT NULL,
+    native_thread_id TEXT NOT NULL,
+    policy_digest TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (thread_id, native_thread_id)
+  )`;
+
   // Synchronous mirrors kept in lockstep with SQLite for fail-closed policy hooks.
   const protectedThreads = new Map<string, TurnExecutionContext>();
   const latestPolicyByThread = new Map<string, PersistedRunPolicy>();
   const policyByRunId = new Map<string, PersistedRunPolicy>();
   const policyByCommandId = new Map<string, PersistedRunPolicy>();
-  // Track the digest of the previous bound run on each thread so policy digest changes
-  // force a clean Pi conversation even across idle closes or restarts (S2).
-  const latestBoundDigestByThread = new Map<string, string>();
-  const previousBoundDigestByRunId = new Map<string, string | null>();
+  const nativePolicyDigestByKey = new Map<string, string>();
+  const nativePolicyKey = (threadId: string, nativeThreadId: string) => `${threadId}\0${nativeThreadId}`;
 
   const existingProtected = yield* sql<ProtectedThreadRow>`
     SELECT thread_id AS "threadId", leader_id AS "leaderId", binding_id AS "bindingId",
@@ -273,12 +281,21 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
       latestPolicyByThread.set(policy.threadId, policy);
       policyByCommandId.set(policy.commandId, policy);
       if (policy.runId) {
-        const prevDigest = latestBoundDigestByThread.get(policy.threadId) ?? null;
-        previousBoundDigestByRunId.set(policy.runId, prevDigest);
-        latestBoundDigestByThread.set(policy.threadId, policy.policyDigest);
         policyByRunId.set(policy.runId, policy);
       }
     }
+  }
+
+  const existingNativePolicies = yield* sql<{
+    readonly threadId: string;
+    readonly nativeThreadId: string;
+    readonly policyDigest: string;
+  }>`
+    SELECT thread_id AS "threadId", native_thread_id AS "nativeThreadId", policy_digest AS "policyDigest"
+    FROM xtwork_native_session_policies
+  `;
+  for (const row of existingNativePolicies) {
+    nativePolicyDigestByKey.set(nativePolicyKey(row.threadId, row.nativeThreadId), row.policyDigest);
   }
 
   const getLeader = (id: string) =>
@@ -446,6 +463,20 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
       FROM xtwork_leader_bindings WHERE binding_id = ${bindingId} LIMIT 1
     `.pipe(Effect.map(([row]) => (row ? rowToBinding(row) : undefined)));
 
+  const findBindingByTuple = (connectionId: string, leaderId: string, epoch: number) =>
+    sql<BindingRow>`
+      SELECT binding_id AS "bindingId", leader_id AS "leaderId", connection_id AS "connectionId",
+        epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt"
+      FROM xtwork_leader_bindings
+      WHERE connection_id = ${connectionId} AND leader_id = ${leaderId} AND epoch = ${epoch}
+      LIMIT 1
+    `.pipe(Effect.map(([row]) => (row ? rowToBinding(row) : undefined)));
+
+  const hasAnyBindingForConnection = (connectionId: string) =>
+    sql<{ readonly count: number }>`
+      SELECT COUNT(*) AS count FROM xtwork_leader_bindings WHERE connection_id = ${connectionId}
+    `.pipe(Effect.map(([row]) => Number(row?.count ?? 0) > 0));
+
   const listBindings = (leaderId?: string) =>
     (leaderId
       ? sql<BindingRow>`
@@ -519,11 +550,6 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     latestPolicyByThread.set(input.threadId, record);
     policyByCommandId.set(record.commandId, record);
     if (record.runId) {
-      if (!previousBoundDigestByRunId.has(record.runId)) {
-        const prevDigest = latestBoundDigestByThread.get(record.threadId) ?? null;
-        previousBoundDigestByRunId.set(record.runId, prevDigest);
-      }
-      latestBoundDigestByThread.set(record.threadId, record.policyDigest);
       policyByRunId.set(record.runId, record);
     }
     return record;
@@ -549,11 +575,10 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   });
 
   /**
-   * Atomically bind a pre-persisted execution policy for `(commandId, threadId)` to the exact
-   * `runId` BEFORE `Orchestrator` commits `run.created` and before Pi launches (S1).
-   * Fails closed if no matching persisted policy exists for `(commandId, threadId)`.
+   * S12: SQLite-only binding step executed INSIDE `EventSink.commitCommand`'s atomic transaction.
+   * Does NOT mutate in-memory caches until the transaction commits; rollback leaves zero stale state.
    */
-  const bindRunPolicy = Effect.fnUntraced(function* (commandId: string, threadId: string, runId: string) {
+  const bindRunPolicySql = Effect.fnUntraced(function* (commandId: string, threadId: string, runId: string) {
     const [existing] = yield* sql<PolicyRow>`
       SELECT policy_id AS "policyId", run_id AS "runId", command_id AS "commandId",
         thread_id AS "threadId", policy_digest AS "policyDigest",
@@ -567,15 +592,27 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
       return yield* imError("Protected run refused: dispatch command policy is already bound to another run.");
     }
     yield* sql`UPDATE xtwork_run_policies SET run_id = ${runId} WHERE command_id = ${commandId} AND thread_id = ${threadId}`;
-    const record: PersistedRunPolicy = { ...rowToPolicy(existing), runId };
-    if (!previousBoundDigestByRunId.has(runId)) {
-      const prevDigest = latestBoundDigestByThread.get(record.threadId) ?? null;
-      previousBoundDigestByRunId.set(runId, prevDigest);
-    }
-    latestBoundDigestByThread.set(record.threadId, record.policyDigest);
+    return { ...rowToPolicy(existing), runId } satisfies PersistedRunPolicy;
+  });
+
+  /**
+   * S12: Post-commit synchronous cache update called right AFTER SQLite commits and BEFORE
+   * `EventSink` notifies `ProviderTurnStartService` or publishes events.
+   */
+  const publishBoundRunPolicySync = (record: PersistedRunPolicy): void => {
     latestPolicyByThread.set(record.threadId, record);
     policyByCommandId.set(record.commandId, record);
-    policyByRunId.set(runId, record);
+    if (record.runId) {
+      policyByRunId.set(record.runId, record);
+    }
+  };
+
+  /**
+   * Convenience wrapper for tests / direct callers composing SQL bind + cache publish.
+   */
+  const bindRunPolicy = Effect.fnUntraced(function* (commandId: string, threadId: string, runId: string) {
+    const record = yield* bindRunPolicySql(commandId, threadId, runId);
+    publishBoundRunPolicySync(record);
     return record;
   });
 
@@ -589,15 +626,28 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     `;
     if (!row) return undefined;
     const record = rowToPolicy(row);
-    if (!previousBoundDigestByRunId.has(runId)) {
-      const prevDigest = latestBoundDigestByThread.get(record.threadId) ?? null;
-      previousBoundDigestByRunId.set(runId, prevDigest);
-    }
-    latestBoundDigestByThread.set(record.threadId, record.policyDigest);
-    latestPolicyByThread.set(record.threadId, record);
-    policyByCommandId.set(record.commandId, record);
-    policyByRunId.set(runId, record);
+    publishBoundRunPolicySync(record);
     return record;
+  });
+
+  /**
+   * S2: Record the exact policy digest active for a concrete native provider conversation ID
+   * so future turns compare against THAT conversation's recorded policy regardless of cancelled/queued runs.
+   */
+  const recordNativeThreadPolicy = Effect.fnUntraced(function* (
+    threadId: string,
+    nativeThreadId: string,
+    policyDigest: string,
+  ) {
+    const now = Date.now();
+    yield* sql`INSERT INTO xtwork_native_session_policies (
+      thread_id, native_thread_id, policy_digest, updated_at
+    ) VALUES (
+      ${threadId}, ${nativeThreadId}, ${policyDigest}, ${now}
+    ) ON CONFLICT(thread_id, native_thread_id) DO UPDATE SET
+      policy_digest = excluded.policy_digest,
+      updated_at = excluded.updated_at`;
+    nativePolicyDigestByKey.set(nativePolicyKey(threadId, nativeThreadId), policyDigest);
   });
 
   const resolvePolicy = Effect.fnUntraced(function* (query: {
@@ -662,12 +712,17 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   };
 
   /**
-   * Synchronous policy check used by ProviderSessionManager before opening/reusing a Pi session
-   * or starting a specific run (S1/S2).
-   * Strictly requires an exact bound `(threadId, runId)` policy row — NEVER borrows unattached
-   * or another run's policy! Missing runId or missing binding always returns `failClosed: true`.
+   * Synchronous policy check used by ProviderSessionManager & ProviderTurnStartService before
+   * opening/reusing a Pi session or resuming a native conversation (S1/S2).
+   * - Requires an exact bound `(threadId, runId)` policy row — NEVER borrows unattached policies.
+   * - When `resumingNativeThreadId` is supplied, compares against the EXACT policy digest recorded
+   *   for THAT native conversation (fail-closed if unknown or mismatched, immune to cancelled intermediate runs).
    */
-  const resolveProviderPolicySync = (threadId: string, runId?: string | null): ProviderPolicyState => {
+  const resolveProviderPolicySync = (
+    threadId: string,
+    runId?: string | null,
+    resumingNativeThreadId?: string | null,
+  ): ProviderPolicyState => {
     const isProtected = isProtectedThreadSync(threadId);
     if (!isProtected) {
       return { protected: false, policyDigest: null, failClosed: false, policyChanged: false };
@@ -679,8 +734,9 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     if (!exact || exact.threadId !== threadId || !exact.policyDigest) {
       return { protected: true, policyDigest: null, failClosed: true, policyChanged: false };
     }
-    const prevDigest = previousBoundDigestByRunId.get(runId) ?? null;
-    const policyChanged = prevDigest !== null && prevDigest !== exact.policyDigest;
+    const policyChanged = resumingNativeThreadId
+      ? nativePolicyDigestByKey.get(nativePolicyKey(threadId, resumingNativeThreadId)) !== exact.policyDigest
+      : false;
     return {
       protected: true,
       policyDigest: exact.policyDigest,
@@ -704,13 +760,18 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     updateLeader,
     activeBindingForConnection,
     getBindingById,
+    findBindingByTuple,
+    hasAnyBindingForConnection,
     ensureBinding,
     rebindConnection,
     listBindings,
     persistPolicyBeforeLaunch,
     registerLegacyProtectedThread,
+    bindRunPolicySql,
+    publishBoundRunPolicySync,
     bindRunPolicy,
     attachRunId,
+    recordNativeThreadPolicy,
     resolvePolicy,
     isProtectedThreadSync,
     getProtectedContextSync,

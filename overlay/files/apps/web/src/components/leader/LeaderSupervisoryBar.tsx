@@ -151,14 +151,15 @@ export function LeaderSupervisoryBar({
     setOverview(detail);
   }
 
-  async function runAction(work: () => Promise<void>, successMessage?: string) {
+  async function runAction(work: () => Promise<string | void>, successMessage?: string) {
     setBusy(true);
     setError("");
     setNotice("");
     try {
-      await work();
+      const customNotice = await work();
       await refreshOverview();
-      if (successMessage) setNotice(successMessage);
+      const message = typeof customNotice === "string" ? customNotice : successMessage;
+      if (message) setNotice(message);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "操作失败，请重试。");
     } finally {
@@ -452,11 +453,27 @@ export function LeaderSupervisoryBar({
                       disabled={busy || isPaused}
                       onClick={() =>
                         void runAction(async () => {
-                          await leaderRequest(`leaders/${leader.id}/paused-decide`, {
+                          const res = await leaderRequest<{
+                            count?: number;
+                            blockedIds?: string[];
+                            heldIds?: string[];
+                            skippedIds?: string[];
+                          }>(`leaders/${leader.id}/paused-decide`, {
                             messageIds: [item.id],
                             decision: "replay",
                           });
-                        }, "已按原幂等键重新投递。")
+                          if ((res.count ?? 0) > 0) return "已按原幂等键重新投递。";
+                          if (res.blockedIds && res.blockedIds.length > 0) {
+                            return "该消息所属聊天或联系人已被屏蔽，已拒绝重投。";
+                          }
+                          if (res.heldIds && res.heldIds.length > 0) {
+                            return "该消息权限已变更为需审批，已退回待批准列表。";
+                          }
+                          if (res.skippedIds && res.skippedIds.length > 0) {
+                            return "当前连接或 Leader 处于暂停/未激活状态，消息仍保留在暂停积压队列中。";
+                          }
+                          return "未找到可重投的积压消息。";
+                        })
                       }
                     >
                       重投

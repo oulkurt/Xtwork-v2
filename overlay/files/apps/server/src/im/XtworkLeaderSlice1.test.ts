@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off globalJsonInEffect:off effectTryWithoutCatch:off
 import { EnvironmentId, ProjectId, RuntimeRequestId, ThreadId } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
@@ -232,24 +233,77 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
           policyChanged: false,
         });
 
-        // S2: Policy digest change on run-2 marks policyChanged=true so Pi starts a clean conversation
+        // S2: Run A opens Pi with policy X -> Run B queues with policy Y and is cancelled before opening Pi ->
+        // Run C also uses policy Y -> comparing against native session A ("native-pi-1") MUST STILL detect policyChanged=true!
         const narrower = narrowDelegatedPolicy(ctx1, { isolatedWorkspaceRoot: "/tmp/ws/ops/sub" });
         expect(canReuseProviderSession(ctx1.policyDigest, narrower.policyDigest)).toBe(false);
         expect(canReuseProviderSession(ctx1.policyDigest, ctx1.policyDigest)).toBe(true);
+        yield* store.recordNativeThreadPolicy(derivedThreadId, "native-pi-1", pol1.policyDigest);
+
+        // Run B binds policy Y (never opens Pi / cancelled)
         yield* store.persistPolicyBeforeLaunch({
           commandId: "im:conn-feishu:msg-2",
           threadId: derivedThreadId,
           context: narrower,
         });
         yield* store.bindRunPolicy("im:conn-feishu:msg-2", derivedThreadId, "run-2");
-        expect(store.resolveProviderPolicySync(derivedThreadId, "run-2")).toEqual({
+
+        // Run C also binds policy Y and tries to resume native-pi-1 (which belongs to policy X!)
+        yield* store.persistPolicyBeforeLaunch({
+          commandId: "im:conn-feishu:msg-3",
+          threadId: derivedThreadId,
+          context: narrower,
+        });
+        yield* store.bindRunPolicy("im:conn-feishu:msg-3", derivedThreadId, "run-3");
+
+        expect(store.resolveProviderPolicySync(derivedThreadId, "run-3", "native-pi-1")).toEqual({
           protected: true,
           policyDigest: narrower.policyDigest!,
           failClosed: false,
           policyChanged: true,
         });
-        // Run-1 retains its exact original policy digest even after run-2 is queued/bound!
-        expect(store.resolveProviderPolicySync(derivedThreadId, "run-1").policyDigest).toBe(pol1.policyDigest);
+        // Once Run C opens a clean conversation "native-pi-2" and records policy Y, subsequent turns with Y reuse it cleanly!
+        yield* store.recordNativeThreadPolicy(derivedThreadId, "native-pi-2", narrower.policyDigest!);
+        expect(store.resolveProviderPolicySync(derivedThreadId, "run-3", "native-pi-2")).toEqual({
+          protected: true,
+          policyDigest: narrower.policyDigest!,
+          failClosed: false,
+          policyChanged: false,
+        });
+        // Unknown / unrecorded native session also triggers policyChanged=true (fail-closed)
+        expect(store.resolveProviderPolicySync(derivedThreadId, "run-3", "native-unknown").policyChanged).toBe(true);
+        // Run-1 retains its exact original policy digest even after run-2/run-3 are queued/bound!
+        expect(store.resolveProviderPolicySync(derivedThreadId, "run-1", "native-pi-1")).toEqual({
+          protected: true,
+          policyDigest: pol1.policyDigest,
+          failClosed: false,
+          policyChanged: false,
+        });
+
+        // S12: bindRunPolicySql inside a rolled-back transaction leaves BOTH SQLite and in-memory cache untouched!
+        yield* store.persistPolicyBeforeLaunch({
+          commandId: "im:conn-feishu:msg-rollback",
+          threadId: derivedThreadId,
+          context: ctx1,
+        });
+        const sqlClient = yield* SqlClient.SqlClient;
+        const rolledBack = yield* sqlClient.withTransaction(
+          Effect.gen(function* () {
+            yield* store.bindRunPolicySql("im:conn-feishu:msg-rollback", derivedThreadId, "run-reusable-ordinal");
+            return yield* Effect.fail("simulated-crash-before-commit");
+          }),
+        ).pipe(Effect.result);
+        expect(rolledBack._tag).toBe("Failure");
+        expect(store.resolveProviderPolicySync(derivedThreadId, "run-reusable-ordinal").failClosed).toBe(true);
+        // Another message after restart can bind the exact same ordinal run_id without hitting UNIQUE constraint!
+        yield* store.persistPolicyBeforeLaunch({
+          commandId: "im:conn-feishu:msg-after-crash",
+          threadId: derivedThreadId,
+          context: ctx1,
+        });
+        const boundAfterCrash = yield* store.bindRunPolicy("im:conn-feishu:msg-after-crash", derivedThreadId, "run-reusable-ordinal");
+        expect(boundAfterCrash.runId).toBe("run-reusable-ordinal");
+        expect(store.resolveProviderPolicySync(derivedThreadId, "run-reusable-ordinal").failClosed).toBe(false);
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
     );
   });
@@ -652,7 +706,7 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         yield* store.ensureDefaultLeader();
         yield* store.updateLeader(DEFAULT_LEADER_ID, { name: "小瞳总管", status: "paused" });
         yield* store.ensureBinding("conn-wechat", DEFAULT_LEADER_ID);
-        yield* store.persistPolicyBeforeLaunch({
+        const persisted = yield* store.persistPolicyBeforeLaunch({
           commandId: "im:conn-wechat:m1",
           threadId: "derived-restart-thread",
           runId: "run-restart-1",
@@ -668,6 +722,7 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
             companionScope: "private",
           }),
         });
+        yield* store.recordNativeThreadPolicy("derived-restart-thread", "native-restart-1", persisted.policyDigest);
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath }))),
     );
 
@@ -679,8 +734,18 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         expect(leader?.name).toBe("小瞳总管");
         expect(leader?.status).toBe("paused");
         expect(reopened.isProtectedThreadSync("derived-restart-thread")).toBe(true);
-        expect(reopened.resolveProviderPolicySync("derived-restart-thread", "run-restart-1").failClosed).toBe(false);
+        const sameNative = reopened.resolveProviderPolicySync("derived-restart-thread", "run-restart-1", "native-restart-1");
+        expect(sameNative.failClosed).toBe(false);
+        expect(sameNative.policyChanged).toBe(false);
+        // Unknown native session fails closed (`policyChanged: true`) even after restart
+        const unknownNative = reopened.resolveProviderPolicySync("derived-restart-thread", "run-restart-1", "native-unseen");
+        expect(unknownNative.failClosed).toBe(false);
+        expect(unknownNative.policyChanged).toBe(true);
         expect(reopened.resolveProviderPolicySync("derived-restart-thread", "run-unknown").failClosed).toBe(true);
+        // S6: Historical binding tuple lookup survives restart
+        const tuple = yield* reopened.findBindingByTuple("conn-wechat", DEFAULT_LEADER_ID, 1);
+        expect(tuple?.leaderId).toBe(DEFAULT_LEADER_ID);
+        expect(yield* reopened.findBindingByTuple("conn-wechat", "leader-other", 1)).toBeUndefined();
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath }))),
     );
   });

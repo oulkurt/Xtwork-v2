@@ -33,14 +33,28 @@ import {
   type ReplyAudience,
   type TurnExecutionContext,
 } from "./XtworkImSecurity.ts";
-import { makeLeaderStore, type LeaderStore, type ProviderPolicyState } from "./XtworkLeaderStore.ts";
+import { makeLeaderStore, type LeaderStore, type PersistedRunPolicy, type ProviderPolicyState } from "./XtworkLeaderStore.ts";
 import { buildOwnerNeedsYou, redactDiagnosticText } from "./XtworkLeaderAwareness.ts";
 
 export interface XtworkPolicyHook {
   readonly isProtectedThread: (threadId: string | undefined) => boolean;
-  readonly resolveProviderPolicy: (threadId: string, runId?: string | null) => ProviderPolicyState;
+  readonly resolveProviderPolicy: (
+    threadId: string,
+    runId?: string | null,
+    resumingNativeThreadId?: string | null,
+  ) => ProviderPolicyState;
   readonly hasPersistedRunPolicy: (query: { readonly runId?: string | null; readonly commandId?: string | null; readonly threadId?: string | null }) => boolean;
-  readonly bindRunPolicy: (commandId: string, threadId: string, runId: string) => Effect.Effect<void, ImError>;
+  readonly bindRunPolicyInTxn: (
+    commandId: string,
+    threadId: string,
+    runId: string,
+  ) => Effect.Effect<PersistedRunPolicy, ImError>;
+  readonly publishBoundRunPolicySync: (record: PersistedRunPolicy) => void;
+  readonly recordNativeThreadPolicy: (
+    threadId: string,
+    nativeThreadId: string,
+    policyDigest: string,
+  ) => Effect.Effect<void, ImError>;
   readonly getProtectedContext: (threadId: string | undefined) => TurnExecutionContext | undefined;
 }
 
@@ -56,8 +70,12 @@ export function isProtectedXtworkThread(threadId: string | undefined): boolean {
   return isImThread(threadId);
 }
 
-export function resolveXtworkProviderPolicy(threadId: string, runId?: string | null): ProviderPolicyState {
-  if (activePolicyHook) return activePolicyHook.resolveProviderPolicy(threadId, runId);
+export function resolveXtworkProviderPolicy(
+  threadId: string,
+  runId?: string | null,
+  resumingNativeThreadId?: string | null,
+): ProviderPolicyState {
+  if (activePolicyHook) return activePolicyHook.resolveProviderPolicy(threadId, runId, resumingNativeThreadId);
   if (isImThread(threadId)) {
     return { protected: true, policyDigest: null, failClosed: true, policyChanged: false };
   }
@@ -69,15 +87,28 @@ export function hasPersistedXtworkRunPolicy(query: { readonly runId?: string | n
   return false;
 }
 
-export function bindXtworkRunPolicy(
+export function bindXtworkRunPolicyInTxn(
   commandId: string,
   threadId: string,
   runId: string,
-): Effect.Effect<void, ImError> {
-  if (activePolicyHook) return activePolicyHook.bindRunPolicy(commandId, threadId, runId);
+): Effect.Effect<PersistedRunPolicy | undefined, ImError> {
+  if (activePolicyHook) return activePolicyHook.bindRunPolicyInTxn(commandId, threadId, runId);
   if (isImThread(threadId)) {
     return Effect.fail(imError("Protected run refused: Leader policy service is unavailable."));
   }
+  return Effect.undefined;
+}
+
+export function publishXtworkBoundRunPolicySync(record: PersistedRunPolicy): void {
+  activePolicyHook?.publishBoundRunPolicySync(record);
+}
+
+export function recordXtworkNativeThreadPolicy(
+  threadId: string,
+  nativeThreadId: string,
+  policyDigest: string,
+): Effect.Effect<void, ImError> {
+  if (activePolicyHook) return activePolicyHook.recordNativeThreadPolicy(threadId, nativeThreadId, policyDigest);
   return Effect.void;
 }
 
@@ -109,8 +140,11 @@ const tryWork = <A>(work: (signal: AbortSignal) => Promise<A>) =>
 const call = (host: XtworkImBridgeHost, method: string, params: BridgePayload) =>
   tryWork((signal) => host.request(method, params, signal));
 
+const TERMINAL_BRIDGE_STATES = new Set(["replied", "ignored", "blocked", "unanswered", "failed"]);
+
 const makeDeliveryWorker = (host: XtworkImBridgeHost, dispatch: ImDispatcher, hasReplySucceeded: (turnId: string) => boolean) => {
   const live = new Map<string, { text: string; liveId: string | null }>();
+  const ackedInBridge = new Set<string>();
   const sync = Effect.fnUntraced(function* (row: Effect.Success<ImDispatcher["unsettled"]>[number]) {
     const inbound = decodeInbound(row.payloadJson);
     const threadId = ThreadId.make(row.threadId);
@@ -118,6 +152,27 @@ const makeDeliveryWorker = (host: XtworkImBridgeHost, dispatch: ImDispatcher, ha
     const records = yield* dispatch.orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
     const run = records.runs.find((run) => run.userMessageId === messageId);
     if (run === undefined) return;
+    // S3: Reconcile any lost `inbound.ack` FIRST so a committed run stranded in `paused_pending`
+    // or `received` transitions to `delivered` before sending or settling its reply!
+    if (!ackedInBridge.has(inbound.key)) {
+      const ackRes = yield* call(host, "inbound.ack", {
+        idempotencyKey: inbound.key,
+        t3ThreadId: threadId,
+        t3TurnId: run.id,
+      }).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value }));
+      if (ackRes === undefined) return;
+      const ackedState =
+        isRecord(ackRes) && isRecord(ackRes.message) && typeof ackRes.message.state === "string"
+          ? ackRes.message.state
+          : "";
+      if (TERMINAL_BRIDGE_STATES.has(ackedState)) {
+        live.delete(inbound.key);
+        ackedInBridge.delete(inbound.key);
+        yield* dispatch.settle(inbound.key);
+        return;
+      }
+      ackedInBridge.add(inbound.key);
+    }
     const text = records.messages.filter((message) => message.runId === run.id && message.role === "assistant")
       .map((message) => message.text).filter(Boolean).join("\n\n");
     const current = live.get(inbound.key);
@@ -150,7 +205,18 @@ const makeDeliveryWorker = (host: XtworkImBridgeHost, dispatch: ImDispatcher, ha
       }
       live.delete(inbound.key);
       const event = replied ? "reply" : run.status === "failed" ? "fail" : run.status === "completed" && finalText ? "reply" : "give_up";
-      yield* call(host, "inbound.settle", { idempotencyKey: inbound.key, event });
+      const settled = yield* call(host, "inbound.settle", { idempotencyKey: inbound.key, event });
+      const bridgeMoved = isRecord(settled) && settled.moved === true;
+      const bridgeState =
+        isRecord(settled) && isRecord(settled.message) && typeof settled.message.state === "string"
+          ? settled.message.state
+          : "";
+      // S3: Only mark local delivery settled once bridge confirms settlement or terminal state!
+      if (!bridgeMoved && !TERMINAL_BRIDGE_STATES.has(bridgeState)) {
+        ackedInBridge.delete(inbound.key);
+        return;
+      }
+      ackedInBridge.delete(inbound.key);
       yield* dispatch.settle(inbound.key);
       return;
     }
@@ -177,6 +243,7 @@ const makeDeliveryWorker = (host: XtworkImBridgeHost, dispatch: ImDispatcher, ha
   return Effect.gen(function* () {
     if (!host.available) {
       live.clear();
+      ackedInBridge.clear();
       return;
     }
     const rows = yield* dispatch.unsettled;
@@ -198,8 +265,11 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
       isProtectedThread: leaders.isProtectedThreadSync,
       resolveProviderPolicy: leaders.resolveProviderPolicySync,
       hasPersistedRunPolicy: leaders.hasRunPolicySync,
-      bindRunPolicy: (commandId, threadId, runId) =>
-        leaders.bindRunPolicy(commandId, threadId, runId).pipe(Effect.asVoid, Effect.mapError(imError)),
+      bindRunPolicyInTxn: (commandId, threadId, runId) =>
+        leaders.bindRunPolicySql(commandId, threadId, runId).pipe(Effect.mapError(imError)),
+      publishBoundRunPolicySync: leaders.publishBoundRunPolicySync,
+      recordNativeThreadPolicy: (threadId, nativeThreadId, policyDigest) =>
+        leaders.recordNativeThreadPolicy(threadId, nativeThreadId, policyDigest).pipe(Effect.mapError(imError)),
       getProtectedContext: leaders.getProtectedContextSync,
     };
     yield* Effect.acquireRelease(
@@ -737,6 +807,16 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
       const scopedIds = requestedIds.filter((id) => allowedIds.has(id));
       if (requestedIds.length > 0 && scopedIds.length === 0) {
         return failure("所选积压消息不属于该 Leader。", 403);
+      }
+      if (params.decision === "replay" && leader.status === "paused") {
+        return response({
+          decision: "replay",
+          count: 0,
+          messageIds: [],
+          blockedIds: [],
+          heldIds: [],
+          skippedIds: scopedIds,
+        });
       }
       return yield* call(service.host, "paused.decide", {
         ...params,

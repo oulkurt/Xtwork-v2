@@ -399,19 +399,17 @@ export class ImApprovals {
     return { totalCount, countByThreadId: counts };
   }
 
-  decide(id: string, approved: boolean, verify?: ApprovalDecisionVerify): boolean {
+  decide(id: string, approved: boolean, verify: ApprovalDecisionVerify): boolean {
     const entry = this.pending.get(id);
     if (!entry) return false;
-    if (verify) {
-      if (!verify.desktopOwnerVerified) return false;
-      // S8: Both runId and replyAudience MUST be explicitly supplied and match the pending request.
-      if (!verify.expectedRunId || entry.request.turnId !== verify.expectedRunId) return false;
-      if (!verify.expectedAudience || entry.request.replyAudience !== verify.expectedAudience) return false;
-      if (approved && entry.request.snapshotHash !== undefined) {
-        if (verify.expectedSnapshotHash !== entry.request.snapshotHash) return false;
-      } else if (verify.expectedSnapshotHash !== undefined && entry.request.snapshotHash !== verify.expectedSnapshotHash) {
-        return false;
-      }
+    // S8: Verification is strictly mandatory at the decision boundary.
+    if (!verify || !verify.desktopOwnerVerified) return false;
+    if (!verify.expectedRunId || entry.request.turnId !== verify.expectedRunId) return false;
+    if (!verify.expectedAudience || entry.request.replyAudience !== verify.expectedAudience) return false;
+    if (approved && entry.request.snapshotHash !== undefined) {
+      if (verify.expectedSnapshotHash !== entry.request.snapshotHash) return false;
+    } else if (verify.expectedSnapshotHash !== undefined && entry.request.snapshotHash !== verify.expectedSnapshotHash) {
+      return false;
     }
     entry.finish(approved);
     return true;

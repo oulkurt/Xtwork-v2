@@ -661,6 +661,70 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
       assert.equal(store.message(preRestart.message.id)?.state, "blocked");
       assert.equal(notifications.filter((n) => n.method === "inbound.dispatch").length, 0);
 
+      // S4: Pausing default Leader MUST NOT overwrite pause flag on a connection bound to another Leader!
+      const connB = store.createConnection({
+        platform: "feishu",
+        lifecycleState: "active",
+        ownerId: "owner-1",
+      });
+      store.syncConnectionBinding({
+        connectionId: connB.id,
+        leaderId: "leader-b",
+        bindingId: "bind-b-1",
+        bindingEpoch: 1,
+        leaderPaused: false,
+      });
+      const pauseDefaultOnly = await bridge.handleRequest({
+        id: 6,
+        method: "connections.syncBindings",
+        params: { bindings: [], defaultLeaderPaused: true },
+      });
+      assert.equal(pauseDefaultOnly.ok, true);
+      assert.equal(store.connection(connB.id)?.leaderPaused, false);
+
+      // S6: Pre-sync message (`leader-default / null / epoch 1`) replayed after rebind MUST NOT mix in Leader B's bindingId!
+      const connC = store.createConnection({
+        platform: "feishu",
+        lifecycleState: "active",
+        ownerId: "owner-1",
+        askAll: false,
+      });
+      store.updateConnection(connC.id, { leaderPaused: true });
+      const preSyncMsg = store.ingestInbound(connC.id, "org", {
+        platformId: "pre-sync-msg",
+        chat: { platformId: "grp-c", kind: "group", name: "Group C" },
+        sender: { id: "alice", name: "Alice", isBot: false },
+        text: "arrived before first binding sync",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_010_000,
+      });
+      assert.equal(preSyncMsg.kind, "paused_pending");
+      assert.equal(preSyncMsg.message.leaderId, "leader-default");
+      assert.equal(preSyncMsg.message.bindingId, null);
+      assert.equal(preSyncMsg.message.bindingEpoch, 1);
+
+      // Rebind connC to Leader B
+      store.syncConnectionBinding({
+        connectionId: connC.id,
+        leaderId: "leader-b",
+        bindingId: "bind-c-2",
+        bindingEpoch: 2,
+        leaderPaused: false,
+      });
+      notifications.length = 0;
+      const replayedPreSync = await bridge.handleRequest({
+        id: 7,
+        method: "paused.decide",
+        params: { messageIds: [preSyncMsg.message.id], decision: "replay", leaderId: "leader-default" },
+      });
+      assert.equal(replayedPreSync.ok, true);
+      const dispatches = notifications.filter((n) => n.method === "inbound.dispatch");
+      assert.equal(dispatches.length, 1);
+      assert.equal(dispatches[0]!.params.leaderId, "leader-default");
+      assert.equal(dispatches[0]!.params.bindingId, null);
+      assert.equal(dispatches[0]!.params.bindingEpoch, 1);
+
       await bridge.shutdown();
     } finally {
       // store already closed by bridge.shutdown()

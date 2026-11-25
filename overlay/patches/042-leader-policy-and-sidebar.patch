@@ -124,14 +124,85 @@ index 9a7142ce..8fe5377a 100644
      revokeProviderSession: Effect.fn("McpSessionRegistry.revokeProviderSession")(
        function* (providerSessionId) {
          yield* revokeWhere((record) => record.scope.thread.providerSessionId === providerSessionId);
+diff --git a/apps/server/src/orchestration-v2/EventSink.ts b/apps/server/src/orchestration-v2/EventSink.ts
+index cad0aff3..69f59598 100644
+--- a/apps/server/src/orchestration-v2/EventSink.ts
++++ b/apps/server/src/orchestration-v2/EventSink.ts
+@@ -38,6 +38,12 @@ import * as EventStore from "./EventStore.ts";
+ import * as ProjectionStore from "./ProjectionStore.ts";
+ import * as ProjectStore from "./ProjectStore.ts";
+ import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
++import {
++  bindXtworkRunPolicyInTxn,
++  isProtectedXtworkThread,
++  publishXtworkBoundRunPolicySync,
++} from "../im/XtworkImService.ts";
++import type { PersistedRunPolicy } from "../im/XtworkLeaderStore.ts";
+ 
+ export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
+   "EventSinkWriteError",
+@@ -798,7 +804,7 @@ const layerBase: Layer.Layer<
+           });
+           if (!reserved) {
+             const existing = yield* existingCommandResult(input.commandId);
+-            return { ...existing, committed: false as const, cancelledEffectIds: [] };
++            return { ...existing, committed: false as const, cancelledEffectIds: [], xtworkBoundPolicies: [] as ReadonlyArray<PersistedRunPolicy> };
+           }
+ 
+           // Planning does not lock the source. Once deletion commits, maintenance
+@@ -828,6 +834,7 @@ const layerBase: Layer.Layer<
+                   storedEvents: [],
+                   committed: false as const,
+                   cancelledEffectIds: [],
++                  xtworkBoundPolicies: [] as ReadonlyArray<PersistedRunPolicy>,
+                 };
+               }
+             }
+@@ -843,6 +850,19 @@ const layerBase: Layer.Layer<
+             commandId: input.commandId,
+             events: normalized,
+           });
++          // ADR-013 S12: Bind persisted run policy INSIDE the atomic event transaction so a crash
++          // before commit rolls back both run.created and run_id reservation together.
++          const xtworkBoundPolicies: Array<PersistedRunPolicy> = [];
++          for (const stored of storedEvents) {
++            if (stored.event.type === "run.created" && isProtectedXtworkThread(stored.event.threadId)) {
++              const bound = yield* bindXtworkRunPolicyInTxn(
++                input.commandId,
++                stored.event.threadId,
++                stored.event.payload.id,
++              );
++              if (bound !== undefined) xtworkBoundPolicies.push(bound);
++            }
++          }
+           // A Stop that changes nothing can still queue the stop of its delegated tasks.
+           const sequence =
+             storedEvents.at(-1)?.sequence ??
+@@ -873,10 +893,15 @@ const layerBase: Layer.Layer<
+                   threadId: input.threadId,
+                   ...input.cancelUnsettledEffects,
+                 });
+-          return { receipt, storedEvents, outcomes, committed: true as const, cancelledEffectIds };
++          return { receipt, storedEvents, outcomes, committed: true as const, cancelledEffectIds, xtworkBoundPolicies };
+         }),
+         (result) =>
+           Effect.gen(function* () {
++            if (result.committed) {
++              for (const policy of result.xtworkBoundPolicies) {
++                publishXtworkBoundRunPolicySync(policy);
++              }
++            }
+             yield* effectOutbox.signalCancellations(result.cancelledEffectIds);
+             if (result.committed && input.effects.length > 0) {
+               yield* effectOutbox.notifyAvailable(input.effects.length);
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 060b199d..0f1dd2ab 100644
+index 060b199d..c5369faf 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
 @@ -1,4 +1,5 @@
 -import { ImDispatchAuthority, isImThread, localForkThreadId } from "../im/XtworkImSecurity.ts";
 +import { ImDispatchAuthority, localForkThreadId } from "../im/XtworkImSecurity.ts";
-+import { bindXtworkRunPolicy, hasPersistedXtworkRunPolicy, isProtectedXtworkThread } from "../im/XtworkImService.ts";
++import { hasPersistedXtworkRunPolicy, isProtectedXtworkThread } from "../im/XtworkImService.ts";
  import type {
    OrchestrationV2ThreadLinkMetadata,
    GuestShareId,
@@ -153,30 +224,7 @@ index 060b199d..0f1dd2ab 100644
      });
      yield* emitEvent({
        type: "context-transfer.created",
-@@ -15683,6 +15684,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
-       } satisfies OrchestratorV2DispatchResult;
-     }
-     const acceptedAt = plan.events.at(-1)?.occurredAt ?? (yield* DateTime.now);
-+    // ADR-013 S1: Bind persisted execution policy to the exact (threadId, runId) BEFORE commit
-+    // so ProviderTurnStartService and MCP never borrow unattached or stale run policies.
-+    for (const event of plan.events) {
-+      if (event.type === "run.created" && isProtectedXtworkThread(event.threadId)) {
-+        yield* bindXtworkRunPolicy(command.commandId, event.threadId, event.payload.id).pipe(
-+          Effect.mapError(
-+            (cause) =>
-+              new OrchestratorDispatchError({
-+                commandId: command.commandId,
-+                commandType: command.type,
-+                cause,
-+              }),
-+          ),
-+        );
-+      }
-+    }
-     const committed = yield* eventSink
-       .commitCommand({
-         commandId: command.commandId,
-@@ -15840,14 +15857,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -15840,14 +15841,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
  
    const dispatchAudienceSafe = Effect.fnUntraced(function* (command: OrchestrationV2ServerCommand) {
      const threadId = commandThreadId(command);
@@ -209,7 +257,7 @@ index 060b199d..0f1dd2ab 100644
      }
      if (command.type === "message.dispatch" && command.guestMessageId === undefined &&
 diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
-index 113821ea..a09c0256 100644
+index 113821ea..dc7db499 100644
 --- a/apps/server/src/orchestration-v2/ProviderSessionManager.ts
 +++ b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
 @@ -1,6 +1,8 @@
@@ -347,7 +395,7 @@ index 113821ea..a09c0256 100644
                  }
                }
                const key = sessionKey(input.providerSessionId);
-+              const nextPolicy = resolveXtworkProviderPolicy(input.threadId, input.runId);
++              const nextPolicy = resolveXtworkProviderPolicy(input.threadId, input.runId, input.initialNativeThreadId);
 +              if (nextPolicy.failClosed) {
 +                return yield* new ProviderSessionOpenError({
 +                  instanceId: input.modelSelection.instanceId,
@@ -423,27 +471,31 @@ index 113821ea..a09c0256 100644
                    runtime.providerSession.capabilities.sessions
                      .supportsMultipleProviderThreadsPerSession,
 diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
-index 8208ee0a..346075a2 100644
+index 8208ee0a..5094a5ae 100644
 --- a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 +++ b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 @@ -1,4 +1,5 @@
  import { modelSelectionsEqual } from "@t3tools/shared/model";
-+import { resolveXtworkProviderPolicy } from "../im/XtworkImService.ts";
++import { recordXtworkNativeThreadPolicy, resolveXtworkProviderPolicy } from "../im/XtworkImService.ts";
  import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
  import { expandAssistantCitationsForProvider } from "@t3tools/shared/assistantCitations";
  import {
-@@ -874,7 +875,9 @@ export const layer: Layer.Layer<
+@@ -874,7 +875,13 @@ export const layer: Layer.Layer<
          run,
          checkpointScope,
        });
 -      const brokenNativeThread = providerThread.status === "error";
-+      const xtworkPolicy = resolveXtworkProviderPolicy(projection.thread.id, run.id);
++      const xtworkPolicy = resolveXtworkProviderPolicy(
++        projection.thread.id,
++        run.id,
++        providerThread.nativeThreadRef?.nativeId,
++      );
 +      const xtworkPolicyChanged = xtworkPolicy.policyChanged;
 +      const brokenNativeThread = providerThread.status === "error" || xtworkPolicyChanged;
        // Opened without the broken native id, a session that was not live starts fresh.
        const opensFreshSession =
          brokenNativeThread &&
-@@ -883,16 +886,17 @@ export const layer: Layer.Layer<
+@@ -883,16 +890,17 @@ export const layer: Layer.Layer<
        const sessionResult = yield* Effect.result(
          providerSessions.open({
            threadId: projection.thread.id,
@@ -463,7 +515,7 @@ index 8208ee0a..346075a2 100644
              ? {}
              : {
                  initialProviderItemIdentityVersion:
-@@ -1436,8 +1440,9 @@ export const layer: Layer.Layer<
+@@ -1436,8 +1444,9 @@ export const layer: Layer.Layer<
            });
            return loaded;
          }
@@ -474,7 +526,7 @@ index 8208ee0a..346075a2 100644
            return yield* loadFromProvider(
              session.ensureThread({
                threadId: projection.thread.id,
-@@ -1445,7 +1450,10 @@ export const layer: Layer.Layer<
+@@ -1445,7 +1454,10 @@ export const layer: Layer.Layer<
                modelSelection: run.modelSelection,
                runtimePolicy: resolvedRuntimePolicy,
                providerSessionId,
@@ -486,6 +538,26 @@ index 8208ee0a..346075a2 100644
              }),
            );
          }
+@@ -1672,6 +1684,19 @@ export const layer: Layer.Layer<
+         return replacement;
+       });
+       if (loadedProviderThread === undefined) return;
++      if (
++        xtworkPolicy.protected &&
++        xtworkPolicy.policyDigest !== null &&
++        loadedProviderThread.nativeThreadRef?.nativeId
++      ) {
++        yield* recordXtworkNativeThreadPolicy(
++          projection.thread.id,
++          loadedProviderThread.nativeThreadRef.nativeId,
++          xtworkPolicy.policyDigest,
++        ).pipe(
++          Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })),
++        );
++      }
+       if (!(yield* isCurrentAttemptInStatus("starting"))) {
+         return;
+       }
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
 index a15da677..b984a694 100644
 --- a/apps/web/src/components/ChatView.tsx
