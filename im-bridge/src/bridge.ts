@@ -263,14 +263,21 @@ export class ImBridge {
   /** Replay all gate-approved unacked `received`/`delivered` triggers with their stable idempotency keys. */
   replayUnackedTriggers(): number {
     const pending = this.store.listUnackedTriggers();
+    let dispatched = 0;
     for (const msg of pending) {
       const chat = this.store.chat(msg.chatId);
       const conn = this.store.connection(msg.connectionId);
       if (!chat || !conn) continue;
+      const msgLeaderId = msg.leaderId ?? "leader-default";
+      if (this.store.isLeaderPausedForConnection(msgLeaderId, conn)) {
+        this.store.moveInbound([msg.id], "pause");
+        continue;
+      }
       const contact = msg.senderId ? this.store.contactByPlatformId(conn.id, msg.senderId) : undefined;
       this.emitDispatch(conn, chat, msg, contact);
+      dispatched++;
     }
-    return pending.length;
+    return dispatched;
   }
 
   async shutdown(): Promise<void> {
@@ -682,6 +689,11 @@ export class ImBridge {
   private handleSetLeaderPaused(params: Record<string, unknown>) {
     const paused = Boolean(params.paused);
     const filterLeaderId = optStr(params, "leaderId");
+    if (filterLeaderId) {
+      this.store.setLeaderPauseState(filterLeaderId, { paused });
+    } else if (!Array.isArray(params.connectionIds)) {
+      this.store.setLeaderPauseState("leader-default", { paused });
+    }
     const connectionIds = Array.isArray(params.connectionIds)
       ? params.connectionIds.filter((id): id is string => typeof id === "string" && id.length > 0)
       : this.store.connections().map((c) => c.id);
@@ -692,6 +704,9 @@ export class ImBridge {
       // S14: Never overwrite pause state for a connection currently bound to a different Leader.
       if (filterLeaderId && conn.leaderId !== filterLeaderId) continue;
       const next = this.store.updateConnection(conn.id, { leaderPaused: paused })!;
+      if (!filterLeaderId) {
+        this.store.setLeaderPauseState(next.leaderId, { paused });
+      }
       if (paused) {
         this.store.pauseConnectionMessages(conn.id, next.leaderId);
       }
@@ -702,11 +717,19 @@ export class ImBridge {
   }
 
   private handleSyncBindings(params: Record<string, unknown>) {
-    // S23: Persist any synced per-Leader pause generations BEFORE processing bindings / startup replay.
+    // S23/S25/S26: Persist synced per-Leader pause generations & pause flags BEFORE processing
+    // bindings, new onboarding connections, or startup replay!
     if (params.leaderPauseGenerations && typeof params.leaderPauseGenerations === "object" && !Array.isArray(params.leaderPauseGenerations)) {
       for (const [leaderId, gen] of Object.entries(params.leaderPauseGenerations as Record<string, unknown>)) {
         if (typeof gen === "number" && Number.isInteger(gen) && gen >= 0) {
-          this.store.setLeaderPauseGeneration(leaderId, gen);
+          this.store.setLeaderPauseState(leaderId, { pauseGeneration: gen });
+        }
+      }
+    }
+    if (params.leaderPausedById && typeof params.leaderPausedById === "object" && !Array.isArray(params.leaderPausedById)) {
+      for (const [leaderId, pausedFlag] of Object.entries(params.leaderPausedById as Record<string, unknown>)) {
+        if (typeof pausedFlag === "boolean") {
+          this.store.setLeaderPauseState(leaderId, { paused: pausedFlag });
         }
       }
     }
@@ -715,7 +738,10 @@ export class ImBridge {
       Number.isInteger(params.defaultLeaderPauseGeneration) &&
       params.defaultLeaderPauseGeneration >= 0
     ) {
-      this.store.setLeaderPauseGeneration("leader-default", params.defaultLeaderPauseGeneration);
+      this.store.setLeaderPauseState("leader-default", { pauseGeneration: params.defaultLeaderPauseGeneration });
+    }
+    if (typeof params.defaultLeaderPaused === "boolean") {
+      this.store.setLeaderPauseState("leader-default", { paused: params.defaultLeaderPaused });
     }
     const rawBindings = Array.isArray(params.bindings) ? params.bindings : [];
     const seen = new Set<string>();
@@ -859,12 +885,12 @@ export class ImBridge {
         skippedIds.push(id);
         continue;
       }
-      // S5/S18: Validate active/unpaused connection state BEFORE transitioning out of `paused_pending`.
-      // Apply `conn.leaderPaused` ONLY to rows owned by the connection's current Leader (`conn.leaderId`)
-      // so a paused newer Leader B never blocks manual replay of active prior Leader A's backlog.
+      // S5/S18/S26: Validate active/unpaused connection and target Leader state BEFORE transitioning
+      // out of `paused_pending`. Checks the message's stamped Leader's pause state rather than another
+      // Leader's pause state on a rebound connection so paused Leader B never blocks active Leader A,
+      // while paused Leader A still blocks its own backlog even after rebind to active Leader B.
       const msgLeaderId = msg.leaderId ?? "leader-default";
-      const blockedByCurrentLeaderPause = conn.leaderPaused && msgLeaderId === conn.leaderId;
-      if (conn.lifecycleState !== "active" || conn.paused || blockedByCurrentLeaderPause) {
+      if (conn.lifecycleState !== "active" || this.store.isLeaderPausedForConnection(msgLeaderId, conn)) {
         skippedIds.push(id);
         continue;
       }
@@ -884,9 +910,12 @@ export class ImBridge {
       const moved = this.store.decidePausedPending([msg.id], "replay");
       const replayed = moved[0];
       if (!replayed) continue;
-      const contact = replayed.senderId ? this.store.contactByPlatformId(conn.id, replayed.senderId) : undefined;
-      this.emitDispatch(conn, chat, replayed, contact, replayPauseGeneration);
-      replayedIds.push(replayed.id);
+      // S24: Explicit Replay refreshes the persisted pause_generation on the message row!
+      const freshGen = replayPauseGeneration ?? this.store.getLeaderPauseGeneration(msgLeaderId);
+      const stamped = this.store.stampMessagePauseGeneration(replayed.id, freshGen) ?? replayed;
+      const contact = stamped.senderId ? this.store.contactByPlatformId(conn.id, stamped.senderId) : undefined;
+      this.emitDispatch(conn, chat, stamped, contact, freshGen);
+      replayedIds.push(stamped.id);
     }
 
     return {
@@ -1027,7 +1056,32 @@ export class ImBridge {
       const chat = this.store.chat(msg.chatId);
       if (!conn || !chat) continue;
       const contact = msg.senderId ? this.store.contactByPlatformId(conn.id, msg.senderId) : undefined;
-      this.emitDispatch(conn, chat, msg, contact);
+      const msgLeaderId = msg.leaderId ?? "leader-default";
+      // S26: Approving a held message while its stamped Leader (or connection) is paused MUST
+      // move it to `paused_pending` rather than emitting an immediate dispatch!
+      if (this.store.isLeaderPausedForConnection(msgLeaderId, conn)) {
+        this.store.moveInbound([msg.id], "pause");
+        this.emit({
+          method: "inbound.paused",
+          params: {
+            connectionId: conn.id,
+            platform: conn.platform,
+            chatId: chat.id,
+            chatKind: chat.kind,
+            chatName: chat.name,
+            messageId: msg.id,
+            idempotencyKey: msg.idempotencyKey,
+            senderName: contactName(contact) ?? msg.senderName,
+            body: msg.body,
+            createdAt: msg.createdAt,
+          },
+        });
+        continue;
+      }
+      // S24: Stamp the Leader's current pause_generation when the message first becomes dispatchable.
+      const freshGen = this.store.getLeaderPauseGeneration(msgLeaderId);
+      const stamped = this.store.stampMessagePauseGeneration(msg.id, freshGen) ?? msg;
+      this.emitDispatch(conn, chat, stamped, contact, freshGen);
     }
 
     return { targetKind, targetId, decision, affectedMessages: admittedIds };
@@ -1721,10 +1775,18 @@ export class ImBridge {
     const dispatchLeaderId = msg.leaderId ?? "leader-default";
     const dispatchBindingId = msg.bindingId;
     const dispatchBindingEpoch = msg.bindingEpoch ?? 1;
-    // S23: Stamp the bridge's observed pause generation for this Leader when emitting the dispatch
-    // so dispatches emitted before a pause reaches the bridge cannot be mistaken for post-resume replays!
-    const dispatchPauseGeneration =
-      overridePauseGeneration ?? this.store.getLeaderPauseGeneration(dispatchLeaderId);
+    // S23/S24: Reuse the message's persisted dispatchable pause_generation on automatic redelivery
+    // (never upgrade it to a newer generation across bridge downtime!); only explicit Replay
+    // overrides and refreshes the generation.
+    let dispatchPauseGeneration: number;
+    if (overridePauseGeneration !== undefined) {
+      dispatchPauseGeneration = overridePauseGeneration;
+    } else if (msg.pauseGeneration !== null) {
+      dispatchPauseGeneration = msg.pauseGeneration;
+    } else {
+      dispatchPauseGeneration = this.store.getLeaderPauseGeneration(dispatchLeaderId);
+      this.store.stampMessagePauseGeneration(msg.id, dispatchPauseGeneration);
+    }
 
     this.emit({
       method: "inbound.dispatch",

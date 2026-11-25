@@ -388,6 +388,7 @@ export const makeBridgeEventHandler = (
               },
             ],
             leaderPauseGenerations: { [binding.leaderId]: ownerLeader?.pauseGeneration ?? 0 },
+            leaderPausedById: { [binding.leaderId]: desiredPaused },
           }).pipe(Effect.ignore);
         }
       }
@@ -430,6 +431,7 @@ export const makeBridgeEventHandler = (
                   },
                 ],
                 leaderPauseGenerations: { [currentBinding.leaderId]: currentPauseGen },
+                leaderPausedById: { [currentBinding.leaderId]: currentPaused },
               }).pipe(Effect.ignore);
             }
           }
@@ -573,6 +575,7 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
     const allLeaders = yield* leaders.listLeaders();
     const leaderById = new Map(allLeaders.map((l) => [l.id, l]));
     const leaderPauseGenerations = Object.fromEntries(allLeaders.map((l) => [l.id, l.pauseGeneration]));
+    const leaderPausedById = Object.fromEntries(allLeaders.map((l) => [l.id, l.status === "paused"]));
     const listed = yield* tryWork((signal) => callRaw("connections.list", {}, signal)).pipe(
       Effect.map((val) => (isRecord(val) && Array.isArray(val.connections) ? val.connections : [])),
       Effect.orElseSucceed(() => []),
@@ -598,6 +601,7 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
         {
           bindings: bindingsPayload,
           leaderPauseGenerations,
+          leaderPausedById,
           defaultLeaderPaused: defaultLdr.status === "paused",
           defaultLeaderPauseGeneration: defaultLdr.pauseGeneration,
           ...(triggerReplay ? { triggerReplay: true } : {}),
@@ -718,6 +722,7 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
   const allLeaders = yield* service.leaders.listLeaders();
   const leaderById = new Map(allLeaders.map((l) => [l.id, l]));
   const leaderPauseGenerations = Object.fromEntries(allLeaders.map((l) => [l.id, l.pauseGeneration]));
+  const leaderPausedById = Object.fromEntries(allLeaders.map((l) => [l.id, l.status === "paused"]));
   const toSync: Array<Record<string, unknown>> = [];
   for (const conn of rawConnections) {
     if (isRecord(conn) && typeof conn.id === "string") {
@@ -749,6 +754,7 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
     yield* call(service.host, "connections.syncBindings", {
       bindings: toSync,
       leaderPauseGenerations,
+      leaderPausedById,
     }).pipe(Effect.ignore);
   }
   const refreshedBindings = yield* service.leaders.listBindings(leader.id);
@@ -970,6 +976,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
         yield* call(service.host, "connections.syncBindings", {
           bindings: bindingsPayload,
           leaderPauseGenerations: { [updated.id]: updated.pauseGeneration },
+          leaderPausedById: { [updated.id]: nextPaused },
           ...(updated.id === DEFAULT_LEADER_ID
             ? {
                 defaultLeaderPaused: nextPaused,

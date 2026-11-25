@@ -683,6 +683,12 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
       });
       assert.equal(pauseDefaultOnly.ok, true);
       assert.equal(store.connection(connB.id)?.leaderPaused, false);
+      // Restore leader-default to active before testing S6 historical replay / held approval for active leader-default.
+      await bridge.handleRequest({
+        id: 601,
+        method: "connections.syncBindings",
+        params: { bindings: [], defaultLeaderPaused: false },
+      });
 
       // S6: Pre-sync message (`leader-default / null / epoch 1`) replayed after rebind MUST NOT mix in Leader B's bindingId!
       const connC = store.createConnection({
@@ -1208,6 +1214,226 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
       await bridge.shutdown();
     } finally {
       // store closed by bridge.shutdown()
+    }
+  });
+
+  it("preserves pause_generation on startup redelivery (S24), inherits default pause on new onboarding (S25), and defers held approvals during pause (S26)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "xtwork-s24-s26-"));
+    const dbPath = join(dir, "im.sqlite");
+    try {
+      // S24: Message becomes dispatchable at generation 0, bridge goes down, Pause + Resume happen while down
+      {
+        const store1 = new Store(dbPath);
+        const notifications1: RpcNotification[] = [];
+        const mock1 = createMockChannel({ platform: "feishu", trust: "org", onboardOwnerId: "owner-1" });
+        const bridge1 = new ImBridge({
+          store: store1,
+          secrets: memorySecrets(),
+          channels: { feishu: mock1.channel },
+          notify: (n) => notifications1.push(n),
+          sleepCheckIntervalMs: 0,
+        });
+        await bridge1.start();
+        const conn = store1.createConnection({
+          platform: "feishu",
+          secretRef: null,
+          lifecycleState: "active",
+          ownerId: "owner-1",
+          askAll: false,
+        });
+        const ingested = store1.ingestInbound(conn.id, "org", {
+          platformId: "s24-down-msg",
+          chat: { platformId: "dm-owner", kind: "dm" },
+          sender: { id: "owner-1", name: "Owner", isBot: false },
+          text: "arrived at gen 0 before crash",
+          attachments: [],
+          addressedToBot: true,
+          sentAt: 1_700_000_200_000,
+        });
+        assert.equal(ingested.kind, "dispatch");
+        assert.equal(ingested.message.pauseGeneration, 0);
+        await bridge1.shutdown();
+      }
+
+      // Bridge restarts AFTER Pause (0 -> 1) + Resume (active, gen=1) happened while down
+      {
+        const store2 = new Store(dbPath);
+        const notifications2: RpcNotification[] = [];
+        const mock2 = createMockChannel({ platform: "feishu", trust: "org", onboardOwnerId: "owner-1" });
+        const bridge2 = new ImBridge({
+          store: store2,
+          secrets: memorySecrets(),
+          channels: { feishu: mock2.channel },
+          notify: (n) => notifications2.push(n),
+          sleepCheckIntervalMs: 0,
+        });
+        const conn = store2.connections()[0]!;
+        await bridge2.handleRequest({ id: 1, method: "bridge.hello", params: { protocolVersion: 1, deferReplay: true } });
+        await bridge2.handleRequest({
+          id: 2,
+          method: "connections.syncBindings",
+          params: {
+            bindings: [
+              {
+                connectionId: conn.id,
+                leaderId: "leader-default",
+                bindingId: "bind-default-1",
+                bindingEpoch: 1,
+                leaderPaused: false,
+                pauseGeneration: 1,
+              },
+            ],
+            leaderPauseGenerations: { "leader-default": 1 },
+            leaderPausedById: { "leader-default": false },
+            defaultLeaderPaused: false,
+            defaultLeaderPauseGeneration: 1,
+            triggerReplay: true,
+          },
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        const startupDispatches = notifications2.filter((n) => n.method === "inbound.dispatch");
+        assert.equal(startupDispatches.length, 1);
+        // MUST reuse persisted generation 0 (NOT upgrade to 1!)
+        assert.equal(startupDispatches[0]!.params.pauseGeneration, 0);
+        const msgId = String(startupDispatches[0]!.params.messageId);
+        const origKey = String(startupDispatches[0]!.params.idempotencyKey);
+
+        // T3 rejects gen 0 -> settles as pause -> explicit Replay refreshes generation to 1!
+        await bridge2.handleRequest({ id: 3, method: "inbound.settle", params: { idempotencyKey: origKey, event: "pause" } });
+        assert.equal(store2.message(msgId)?.state, "paused_pending");
+        notifications2.length = 0;
+        const replayed = await bridge2.handleRequest({
+          id: 4,
+          method: "paused.decide",
+          params: { messageIds: [msgId], decision: "replay", leaderId: "leader-default", pauseGeneration: 1 },
+        });
+        assert.equal(replayed.ok, true);
+        const replayDispatches = notifications2.filter((n) => n.method === "inbound.dispatch");
+        assert.equal(replayDispatches.length, 1);
+        assert.equal(replayDispatches[0]!.params.idempotencyKey, origKey);
+        assert.equal(replayDispatches[0]!.params.pauseGeneration, 1);
+        assert.equal(store2.message(msgId)?.pauseGeneration, 1);
+        await bridge2.shutdown();
+      }
+
+      // S25 & S26: Fresh bridge with default Leader paused -> onboard new Feishu connection ->
+      // (S25) Owner DM before T3 reconciles binding enters `paused_pending` (ZERO dispatch!)
+      // (S26) Approving a held stranger message during Pause moves it to `paused_pending` (ZERO dispatch!)
+      {
+        const store3 = new Store(":memory:");
+        const notifications3: RpcNotification[] = [];
+        const mock3 = createMockChannel({ platform: "feishu", trust: "public", onboardOwnerId: "owner-1" });
+        const bridge3 = new ImBridge({
+          store: store3,
+          secrets: memorySecrets(),
+          channels: { feishu: mock3.channel },
+          notify: (n) => notifications3.push(n),
+          sleepCheckIntervalMs: 0,
+        });
+        await bridge3.start();
+        // Pause default Leader while there are ZERO connections yet!
+        await bridge3.handleRequest({
+          id: 1,
+          method: "connections.syncBindings",
+          params: {
+            bindings: [],
+            leaderPauseGenerations: { "leader-default": 1 },
+            leaderPausedById: { "leader-default": true },
+            defaultLeaderPaused: true,
+            defaultLeaderPauseGeneration: 1,
+          },
+        });
+        assert.equal(store3.getLeaderPaused("leader-default"), true);
+
+        // Onboard mock Feishu connection during Pause
+        const onboard = await bridge3.handleRequest({
+          id: 2,
+          method: "onboarding.start",
+          params: { platform: "feishu", mode: "qr" },
+        });
+        assert.equal(onboard.ok, true);
+        await new Promise((r) => setTimeout(r, 30));
+        const newConn = store3.connections()[0]!;
+        assert.equal(newConn.leaderPaused, true);
+
+        // S25: Owner sends DM before T3 reconciles binding -> MUST enter `paused_pending`, NOT emit `inbound.dispatch`!
+        notifications3.length = 0;
+        await mock3.events!.onMessage({
+          platformId: "s25-owner-dm",
+          chat: { platformId: "dm-owner", kind: "dm" },
+          sender: { id: "owner-1", name: "Owner", isBot: false },
+          text: "arrived right after onboarding while paused",
+          attachments: [],
+          addressedToBot: true,
+          sentAt: 1_700_000_201_000,
+        });
+        assert.equal(notifications3.filter((n) => n.method === "inbound.dispatch").length, 0);
+        assert.equal(store3.pausedPendingMessages({ leaderId: "leader-default" }).length, 1);
+
+        // S26: Stranger sends DM -> `held`; Owner approves contact while Leader is STILL paused ->
+        // MUST move to `paused_pending` and emit ZERO `inbound.dispatch`!
+        notifications3.length = 0;
+        await mock3.events!.onMessage({
+          platformId: "s26-stranger-dm",
+          chat: { platformId: "dm-stranger", kind: "dm" },
+          sender: { id: "stranger-1", name: "Stranger", isBot: false },
+          text: "held while paused",
+          attachments: [],
+          addressedToBot: true,
+          sentAt: 1_700_000_202_000,
+        });
+        const heldList = store3.heldMessages(newConn.id);
+        assert.equal(heldList.length, 1);
+        const heldMsg = heldList[0]!;
+
+        notifications3.length = 0;
+        const approved = await bridge3.handleRequest({
+          id: 3,
+          method: "access.decide",
+          params: { targetKind: "contact", targetId: heldMsg.contactId, decision: "allowed" },
+        });
+        assert.equal(approved.ok, true);
+        assert.equal(notifications3.filter((n) => n.method === "inbound.dispatch").length, 0);
+        assert.equal(notifications3.filter((n) => n.method === "inbound.paused").length, 1);
+        assert.equal(store3.message(heldMsg.id)?.state, "paused_pending");
+
+        // Only after Resume + explicit Owner Replay is the approved message dispatched!
+        await bridge3.handleRequest({
+          id: 4,
+          method: "connections.syncBindings",
+          params: {
+            bindings: [
+              {
+                connectionId: newConn.id,
+                leaderId: "leader-default",
+                bindingId: "bind-default-1",
+                bindingEpoch: 1,
+                leaderPaused: false,
+                pauseGeneration: 1,
+              },
+            ],
+            leaderPauseGenerations: { "leader-default": 1 },
+            leaderPausedById: { "leader-default": false },
+            defaultLeaderPaused: false,
+            defaultLeaderPauseGeneration: 1,
+          },
+        });
+        notifications3.length = 0;
+        const replayedHeld = await bridge3.handleRequest({
+          id: 5,
+          method: "paused.decide",
+          params: { messageIds: [heldMsg.id], decision: "replay", leaderId: "leader-default", pauseGeneration: 1 },
+        });
+        assert.equal(replayedHeld.ok, true);
+        const dispatchesAfterReplay = notifications3.filter((n) => n.method === "inbound.dispatch");
+        assert.equal(dispatchesAfterReplay.length, 1);
+        assert.equal(dispatchesAfterReplay[0]!.params.messageId, heldMsg.id);
+        assert.equal(dispatchesAfterReplay[0]!.params.pauseGeneration, 1);
+
+        await bridge3.shutdown();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

@@ -122,6 +122,7 @@ export interface Message {
   readonly leaderId: string | null;
   readonly bindingId: string | null;
   readonly bindingEpoch: number | null;
+  readonly pauseGeneration: number | null;
   readonly ackedAt: number | null;
   readonly retryAt: number | null;
   readonly notice: boolean;
@@ -249,6 +250,7 @@ CREATE TABLE IF NOT EXISTS messages (
   leader_id TEXT,
   binding_id TEXT,
   binding_epoch INTEGER,
+  pause_generation INTEGER,
   acked_at INTEGER,
   retry_at INTEGER,
   notice INTEGER NOT NULL DEFAULT 0,
@@ -271,7 +273,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_unacked
 
 CREATE TABLE IF NOT EXISTS leader_pause_generations (
   leader_id TEXT PRIMARY KEY,
-  pause_generation INTEGER NOT NULL DEFAULT 0
+  pause_generation INTEGER NOT NULL DEFAULT 0,
+  paused INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -316,7 +319,7 @@ export class Store {
   private migrate(): void {
     const row = this.db.prepare("PRAGMA user_version").get() as Row;
     const version = Number(row.user_version ?? 0);
-    if (version >= 7) return;
+    if (version >= 8) return;
     this.db.exec("BEGIN");
     try {
       if (version < 1) {
@@ -355,6 +358,9 @@ export class Store {
         if (!msgCols.includes("binding_epoch")) {
           this.db.exec("ALTER TABLE messages ADD COLUMN binding_epoch INTEGER");
         }
+        if (!msgCols.includes("pause_generation")) {
+          this.db.exec("ALTER TABLE messages ADD COLUMN pause_generation INTEGER");
+        }
         // S6: Backfill pre-Leader legacy inbound rows so they retain their historical
         // default-Leader epoch-1 identity even after the connection is rebound.
         this.db.exec(
@@ -362,6 +368,13 @@ export class Store {
            SET leader_id = COALESCE(leader_id, 'leader-default'),
                binding_epoch = COALESCE(binding_epoch, 1)
            WHERE direction = 'in' AND (leader_id IS NULL OR binding_epoch IS NULL)`,
+        );
+        // S24: Backfill already-dispatchable pre-v8 inbound rows with generation 0 so automatic
+        // startup redelivery after an upgrade never upgrades their generation to a newer one.
+        this.db.exec(
+          `UPDATE messages
+           SET pause_generation = 0
+           WHERE direction = 'in' AND triggers = 1 AND state IN ('received', 'delivered') AND pause_generation IS NULL`,
         );
         // S20: Backfill existing chat thread pointers from their acknowledged message (or default
         // Leader epoch 1) so upgrading an ADR-011 DB preserves DM/thread pointers across the
@@ -397,16 +410,24 @@ export class Store {
            WHERE thread_id IS NOT NULL
              AND (thread_leader_id IS NULL OR thread_binding_epoch IS NULL)`,
         );
-        // S23: Track per-Leader pause generations in the bridge so emitted dispatches stamp the
-        // exact generation the bridge had observed at emit time.
+        // S23/S25: Track per-Leader pause generations & pause flags in the bridge so emitted
+        // dispatches stamp the exact generation observed at emit time and newly onboarded
+        // connections inherit default Leader pause state immediately.
         this.db.exec(
           `CREATE TABLE IF NOT EXISTS leader_pause_generations (
             leader_id TEXT PRIMARY KEY,
-            pause_generation INTEGER NOT NULL DEFAULT 0
+            pause_generation INTEGER NOT NULL DEFAULT 0,
+            paused INTEGER NOT NULL DEFAULT 0
           )`,
         );
+        const lpgCols = (this.db.prepare("PRAGMA table_info(leader_pause_generations)").all() as Row[]).map((c) =>
+          String(c.name),
+        );
+        if (!lpgCols.includes("paused")) {
+          this.db.exec("ALTER TABLE leader_pause_generations ADD COLUMN paused INTEGER NOT NULL DEFAULT 0");
+        }
       }
-      this.db.exec("PRAGMA user_version = 7");
+      this.db.exec("PRAGMA user_version = 8");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -458,16 +479,20 @@ export class Store {
     readonly claimCode?: string | null;
     readonly claimExpiresAt?: number | null;
     readonly askAll?: boolean;
+    readonly leaderPaused?: boolean;
   }): Connection {
     const id = this.mint("connections", "n", 6);
     const t = this.now();
     const lifecycleState = input.lifecycleState ?? (input.ownerId ? "active" : "idle");
     const state: StoredLinkState = lifecycleState === "idle" ? "idle" : "reconnecting";
+    // S25: Initialize new connections from the persisted default Leader pause flag so connections
+    // onboarded during Pause never emit unpaused dispatches before T3 reconciles the binding!
+    const leaderPaused = input.leaderPaused ?? this.getLeaderPaused("leader-default");
     this.db
       .prepare(
         `INSERT INTO connections
-          (id, platform, bot_id, bot_name, lifecycle_state, state, secret_ref, owner_id, claim_code, claim_expires_at, claim_attempts, ask_all, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+          (id, platform, bot_id, bot_name, lifecycle_state, state, leader_paused, secret_ref, owner_id, claim_code, claim_expires_at, claim_attempts, ask_all, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
       )
       .run(
         id,
@@ -476,6 +501,7 @@ export class Store {
         input.botName ?? null,
         lifecycleState,
         state,
+        leaderPaused ? 1 : 0,
         input.secretRef,
         input.ownerId ?? null,
         input.claimCode ?? null,
@@ -1187,11 +1213,14 @@ export class Store {
     const deferredByPause = isTrigger && conn.leaderPaused;
     const state: InboundState = !isTrigger ? "ignored" : deferredByPause ? "paused_pending" : "received";
     const idempotencyKey = isTrigger ? makeIdempotencyKey(connectionId, msg.platformId) : null;
+    // S24: Persist the Leader's observed pause_generation the moment the message first becomes
+    // dispatchable (`state === 'received'`) so automatic startup redelivery reuses it unchanged!
+    const initialPauseGeneration = state === "received" ? this.getLeaderPauseGeneration(conn.leaderId) : null;
     this.db
       .prepare(
         `INSERT INTO messages
-          (id, connection_id, chat_id, direction, platform_msg_id, idempotency_key, sender_id, sender_name, body, attachments, reply_to, reply_to_platform_id, triggers, state, leader_id, binding_id, binding_epoch, created_at)
-         VALUES (?, ?, ?, 'in', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id, connection_id, chat_id, direction, platform_msg_id, idempotency_key, sender_id, sender_name, body, attachments, reply_to, reply_to_platform_id, triggers, state, leader_id, binding_id, binding_epoch, pause_generation, created_at)
+         VALUES (?, ?, ?, 'in', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1210,6 +1239,7 @@ export class Store {
         conn.leaderId,
         conn.bindingId,
         conn.bindingEpoch,
+        initialPauseGeneration,
         msg.sentAt,
       );
     // Allowed chat message -> index into FTS5 `trigram`!
@@ -1685,19 +1715,35 @@ export class Store {
     );
   }
 
-  /** Record the latest pause generation synced from T3 for a Leader (S23). */
-  setLeaderPauseGeneration(leaderId: string, pauseGeneration: number): void {
-    if (!leaderId || !Number.isInteger(pauseGeneration) || pauseGeneration < 0) return;
+  /** Record the latest pause generation and/or paused flag synced from T3 for a Leader (S23/S25/S26). */
+  setLeaderPauseState(
+    leaderId: string,
+    state: { readonly pauseGeneration?: number; readonly paused?: boolean },
+  ): void {
+    if (!leaderId) return;
+    const currentGen = this.getLeaderPauseGeneration(leaderId);
+    const currentPaused = this.getLeaderPaused(leaderId);
+    const nextGen =
+      typeof state.pauseGeneration === "number" && Number.isInteger(state.pauseGeneration) && state.pauseGeneration >= 0
+        ? Math.max(currentGen, state.pauseGeneration)
+        : currentGen;
+    const nextPaused = typeof state.paused === "boolean" ? state.paused : currentPaused;
     this.stmt(
-      `INSERT INTO leader_pause_generations (leader_id, pause_generation)
-       VALUES (?, ?)
+      `INSERT INTO leader_pause_generations (leader_id, pause_generation, paused)
+       VALUES (?, ?, ?)
        ON CONFLICT(leader_id) DO UPDATE SET
          pause_generation = CASE
            WHEN excluded.pause_generation > leader_pause_generations.pause_generation
            THEN excluded.pause_generation
            ELSE leader_pause_generations.pause_generation
-         END`,
-    ).run(leaderId, pauseGeneration);
+         END,
+         paused = excluded.paused`,
+    ).run(leaderId, nextGen, nextPaused ? 1 : 0);
+  }
+
+  /** Record the latest pause generation synced from T3 for a Leader (S23). */
+  setLeaderPauseGeneration(leaderId: string, pauseGeneration: number): void {
+    this.setLeaderPauseState(leaderId, { pauseGeneration });
   }
 
   /** Read the pause generation currently known to the bridge for a Leader (S23). */
@@ -1706,6 +1752,30 @@ export class Store {
       leaderId,
     ) as Row | undefined;
     return row?.pause_generation == null ? 0 : Number(row.pause_generation);
+  }
+
+  /** Read the persisted paused flag currently known to the bridge for a Leader (S25/S26). */
+  getLeaderPaused(leaderId: string): boolean {
+    const row = this.stmt("SELECT paused FROM leader_pause_generations WHERE leader_id = ?").get(
+      leaderId,
+    ) as Row | undefined;
+    return Number(row?.paused ?? 0) === 1;
+  }
+
+  /** Whether a message's target Leader (or its connection) is currently paused (S26). */
+  isLeaderPausedForConnection(leaderId: string, conn: Connection): boolean {
+    if (conn.paused) return true;
+    if (this.getLeaderPaused(leaderId)) return true;
+    return leaderId === conn.leaderId && conn.leaderPaused;
+  }
+
+  /** Persist a message's dispatchable pause_generation (S24: initial stamp or explicit Replay refresh). */
+  stampMessagePauseGeneration(messageId: string, pauseGeneration: number): Message | undefined {
+    this.stmt("UPDATE messages SET pause_generation = ? WHERE id = ? AND direction = 'in'").run(
+      pauseGeneration,
+      messageId,
+    );
+    return this.message(messageId);
   }
 
   /** Reconcile Leader binding identity and pause flag onto a bridge connection. */
@@ -1717,9 +1787,10 @@ export class Store {
     readonly leaderPaused: boolean;
     readonly pauseGeneration?: number;
   }): Connection | undefined {
-    if (typeof input.pauseGeneration === "number") {
-      this.setLeaderPauseGeneration(input.leaderId, input.pauseGeneration);
-    }
+    this.setLeaderPauseState(input.leaderId, {
+      paused: input.leaderPaused,
+      ...(typeof input.pauseGeneration === "number" ? { pauseGeneration: input.pauseGeneration } : {}),
+    });
     const prev = this.connection(input.connectionId);
     const updated = this.updateConnection(input.connectionId, {
       leaderId: input.leaderId,
@@ -1920,6 +1991,7 @@ function toMessage(r: Row): Message {
     leaderId: str(r.leader_id),
     bindingId: str(r.binding_id),
     bindingEpoch: r.binding_epoch == null ? null : Number(r.binding_epoch),
+    pauseGeneration: r.pause_generation == null ? null : Number(r.pause_generation),
     ackedAt: r.acked_at == null ? null : Number(r.acked_at),
     retryAt: r.retry_at == null ? null : Number(r.retry_at),
     notice: Number(r.notice) === 1,
