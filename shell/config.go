@@ -94,15 +94,61 @@ func environmentPath(key string, fallback ...string) string {
 	return filepath.Join(fallback...)
 }
 
+func (cfg config) bundledNodeBinDir() string {
+	if cfg.node != "" {
+		return filepath.Dir(cfg.node)
+	}
+	if cfg.resources != "" {
+		candidate := filepath.Join(cfg.resources, "node", "bin")
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func appendFallbackPath(currentPath, fallbackDir string) string {
+	fallbackDir = strings.TrimSpace(fallbackDir)
+	if fallbackDir == "" {
+		return currentPath
+	}
+	cleanedFallback := filepath.Clean(fallbackDir)
+	if strings.TrimSpace(currentPath) == "" {
+		return cleanedFallback
+	}
+	entries := filepath.SplitList(currentPath)
+	for _, entry := range entries {
+		if entry != "" && filepath.Clean(entry) == cleanedFallback {
+			return currentPath
+		}
+	}
+	return currentPath + string(os.PathListSeparator) + cleanedFallback
+}
+
 func (cfg config) backendEnvironment() []string {
-	env := make([]string, 0, len(os.Environ())+10)
+	nodeBinDir := cfg.bundledNodeBinDir()
+	env := make([]string, 0, len(os.Environ())+12)
+	var currentPath string
+	pathKey := "PATH"
+	hasPath := false
 	for _, pair := range os.Environ() {
-		key, _, _ := strings.Cut(pair, "=")
+		key, value, _ := strings.Cut(pair, "=")
 		switch key {
-		case "XTWORK_IM_BRIDGE_ENTRY", "XTWORK_IM_DATA_DIR", "XTWORK_COMPANION_DIR":
+		case "XTWORK_IM_BRIDGE_ENTRY", "XTWORK_IM_DATA_DIR", "XTWORK_COMPANION_DIR", "XTWORK_BUNDLED_NODE_BIN":
+		case "PATH":
+			currentPath = value
+			hasPath = true
 		default:
 			env = append(env, pair)
 		}
+	}
+	if nodeBinDir != "" {
+		env = append(env,
+			pathKey+"="+appendFallbackPath(currentPath, nodeBinDir),
+			"XTWORK_BUNDLED_NODE_BIN="+nodeBinDir,
+		)
+	} else if hasPath {
+		env = append(env, pathKey+"="+currentPath)
 	}
 	env = append(env,
 		"T3CODE_TELEMETRY_ENABLED=false",

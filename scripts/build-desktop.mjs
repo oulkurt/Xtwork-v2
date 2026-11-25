@@ -54,7 +54,41 @@ if (digest.digest("hex") !== lock.nodeMacArm64Sha256) {
 if (downloaded !== archive) renameSync(downloaded, archive);
 const nodeDir = join(resources, "node");
 mkdirSync(nodeDir);
-run("tar", ["-xJf", archive, "-C", nodeDir, "--strip-components=1", `${nodeRelease}/bin/node`, `${nodeRelease}/LICENSE`]);
+run("tar", [
+  "-xJf",
+  archive,
+  "-C",
+  nodeDir,
+  "--strip-components=1",
+  `${nodeRelease}/bin/node`,
+  `${nodeRelease}/bin/npm`,
+  `${nodeRelease}/bin/npx`,
+  `${nodeRelease}/lib/node_modules/npm`,
+  `${nodeRelease}/LICENSE`,
+]);
+// Replace relative symlinks (which rely on #!/usr/bin/env node and can break when packaged)
+// with direct POSIX wrappers pinned to the bundled Node executable.
+for (const [name, script] of [
+  ["npm", "npm-cli.js"],
+  ["npx", "npx-cli.js"],
+]) {
+  const wrapperPath = join(nodeDir, "bin", name);
+  rmSync(wrapperPath, { force: true });
+  writeFileSync(
+    wrapperPath,
+    `#!/bin/sh
+set -eu
+BIN_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+case ":\${PATH:-}:" in
+  *":$BIN_DIR:"*) ;;
+  *) PATH="\${PATH:+$PATH:}$BIN_DIR" ;;
+esac
+export PATH
+exec "$BIN_DIR/node" "$BIN_DIR/../lib/node_modules/npm/bin/${script}" "$@"
+`,
+  );
+  chmodSync(wrapperPath, 0o755);
+}
 
 // Deploy the upstream server as a portable package, then use the branded build output.
 // mygo omits hidden resource directories, including pnpm's default .pnpm store.
@@ -141,6 +175,31 @@ const appResources = join(app, "Contents", "Resources");
 assertNoLeakedUserVisibleBrand(join(appResources, "server", "dist"));
 run(join(appResources, "node", "bin", "node"), [join(appResources, "server", "dist", "bin.mjs"), "--version"]);
 run(join(appResources, "runtime", "pi", "pi"), ["--version"]);
+{
+  const nodeSmoke = mkdtempSync(join(tmpdir(), "xtwork-node-smoke-"));
+  try {
+    for (const tool of ["npm", "npx"]) {
+      const toolPath = join(appResources, "node", "bin", tool);
+      const probe = spawnSync(toolPath, ["--version"], {
+        cwd: nodeSmoke,
+        env: { PATH: "/usr/bin:/bin", HOME: nodeSmoke },
+        encoding: "utf8",
+        timeout: 15_000,
+        killSignal: "SIGKILL",
+      });
+      if (probe.error) throw probe.error;
+      const version = probe.stdout.trim();
+      if (probe.status !== 0 || !/^\d+\.\d+\.\d+/.test(version)) {
+        throw new Error(
+          `Bundled ${tool} failed under minimal PATH (status=${probe.status}): ${probe.stderr || probe.stdout}`,
+        );
+      }
+      console.log(`Packaged bundled ${tool} ${version} verified under minimal PATH`);
+    }
+  } finally {
+    rmSync(nodeSmoke, { recursive: true, force: true });
+  }
+}
 
 if (hasImBridge) {
   const packagedBridge = join(appResources, "im-bridge");

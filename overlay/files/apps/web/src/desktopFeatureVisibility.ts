@@ -1,15 +1,73 @@
 export const BUILT_IN_ASSISTANT_ID = "xtworkPi";
 
+export const ORDINARY_MODE_CODING_AGENT_IDS = [
+  "claudeAgent",
+  "codex",
+  "xtworkKimiCode",
+  "xtworkQoder",
+  "xtworkCodebuddyCode",
+  "xtworkDeepseekHarness",
+] as const;
+
+export const ORDINARY_MODE_PROVIDER_ORDER = [
+  BUILT_IN_ASSISTANT_ID,
+  ...ORDINARY_MODE_CODING_AGENT_IDS,
+] as const;
+
+export const ORDINARY_MODE_PROVIDER_IDS: ReadonlySet<string> = new Set(
+  ORDINARY_MODE_PROVIDER_ORDER,
+);
+
+const DEVELOPER_ONLY_DEFAULT_PROVIDER_IDS: ReadonlySet<string> = new Set([
+  "cursor",
+  "grok",
+  "fx",
+  "opencode",
+  "antigravity",
+  "kiro",
+  "muse",
+  "pi",
+  "devReplay",
+]);
+
+export function isOrdinaryModeProviderVisible(input: {
+  readonly instanceId: string;
+  readonly developerFeatures: boolean;
+  readonly boundInstanceId?: string | null | undefined;
+  readonly isExplicitCustom?: boolean | undefined;
+}): boolean {
+  if (input.developerFeatures) return true;
+  if (ORDINARY_MODE_PROVIDER_IDS.has(input.instanceId)) return true;
+  if (input.boundInstanceId != null && input.instanceId === input.boundInstanceId) return true;
+  if (input.isExplicitCustom === true) return true;
+  return !DEVELOPER_ONLY_DEFAULT_PROVIDER_IDS.has(input.instanceId);
+}
+
+export function sortOrdinaryModeProviderRows<T extends { readonly instanceId: string }>(
+  rows: ReadonlyArray<T>,
+): ReadonlyArray<T> {
+  const rank = (instanceId: string): number => {
+    const index = (ORDINARY_MODE_PROVIDER_ORDER as ReadonlyArray<string>).indexOf(instanceId);
+    return index === -1 ? ORDINARY_MODE_PROVIDER_ORDER.length : index;
+  };
+  return rows
+    .map((row, index) => ({ row, index, order: rank(row.instanceId) }))
+    .toSorted((left, right) => left.order - right.order || left.index - right.index)
+    .map(({ row }) => row);
+}
+
 export function resolveVisibleProviderStatuses<T extends { readonly instanceId: string }>(input: {
   readonly allProviders: ReadonlyArray<T>;
   readonly developerFeatures: boolean;
   readonly boundInstanceId: string | null;
 }): ReadonlyArray<T> {
   if (input.developerFeatures) return input.allProviders;
-  return input.allProviders.filter(
-    (provider) =>
-      provider.instanceId === BUILT_IN_ASSISTANT_ID ||
-      (input.boundInstanceId !== null && provider.instanceId === input.boundInstanceId),
+  return input.allProviders.filter((provider) =>
+    isOrdinaryModeProviderVisible({
+      instanceId: provider.instanceId,
+      developerFeatures: false,
+      boundInstanceId: input.boundInstanceId,
+    }),
   );
 }
 
@@ -42,13 +100,21 @@ export function showAssistantModelPicker(
     readonly instanceId: string;
     readonly enabled: boolean;
     readonly isAvailable: boolean;
+    readonly installed?: boolean;
+    readonly status?: string;
     readonly models: ReadonlyArray<{ readonly slug: string }>;
   }>,
   developerFeatures: boolean,
 ): boolean {
   if (developerFeatures) return true;
   const models = entries
-    .filter((entry) => entry.enabled && entry.isAvailable)
+    .filter(
+      (entry) =>
+        entry.enabled &&
+        entry.isAvailable &&
+        entry.installed !== false &&
+        (entry.status === undefined || entry.status === "ready"),
+    )
     .flatMap((entry) =>
       entry.models.flatMap(({ slug }) =>
         entry.instanceId === BUILT_IN_ASSISTANT_ID && slug === "default"
@@ -70,7 +136,6 @@ const unsupportedSettingsPaths = new Set([
 ]);
 
 const developerSettingsPaths = new Set([
-  "/settings/providers",
   "/settings/source-control",
   "/settings/worktrees",
 ]);
@@ -93,6 +158,15 @@ const developerSettingIds = new Set([
   "git-fetch-interval",
   "default-model",
   "fallback-model",
+  "secret-providers",
+  "secret-providers-add",
+]);
+
+const ordinaryProviderSettingIds = new Set([
+  "providers",
+  "usage-providers",
+  "provider-health-check-interval",
+  "provider-update-checks",
 ]);
 
 export function isDesktopSettingsPathVisible(path: string, developerFeatures: boolean): boolean {
@@ -111,6 +185,8 @@ export function isDesktopSettingVisible(
     (!item.id.startsWith("keybinding-") ||
       isDesktopShortcutVisible(item.id.slice("keybinding-".length), developerFeatures)) &&
     (developerFeatures ||
-      (!developerSettingIds.has(item.id) && !/(?:worktree|terminal|provider)/.test(item.id)))
+      (!developerSettingIds.has(item.id) &&
+        (ordinaryProviderSettingIds.has(item.id) ||
+          !/(?:worktree|terminal|provider)/.test(item.id))))
   );
 }

@@ -100,8 +100,11 @@ const server = spawn(
   {
     env: {
       ...process.env,
+      HOME: state,
+      PATH: "/usr/bin:/bin",
       T3CODE_TELEMETRY_ENABLED: "false",
       SHELL: "/bin/sh",
+      XTWORK_BUNDLED_NODE_BIN: join(resources, "node", "bin"),
       XTWORK_DATA_DIR: data,
       XTWORK_BRAND_CONFIG: join(resources, "brand.json"),
       XTWORK_PI_BINARY: join(resources, "runtime", "pi", "pi"),
@@ -211,7 +214,7 @@ try {
   const developerToggle = page.getByRole("switch", { name: "Show developer features" });
   const settingsNav = (path) => page.locator(`[data-settings-section="/settings/${path}"]`);
   const go = async (path) => page.goto(`${origin}/#${path}`);
-  const developerNav = ["providers", "source-control", "worktrees"];
+  const developerNav = ["source-control", "worktrees"];
   const unavailableNav = ["snap-shot", "connections", "access", "devices"];
   async function checkSettings(enabled) {
     await developerToggle.waitFor({ state: "visible" });
@@ -220,6 +223,7 @@ try {
       await settingsNav(path).waitFor({ state: enabled ? "visible" : "hidden" });
     }
     for (const path of unavailableNav) assert.equal(await settingsNav(path).count(), 0, path);
+    await settingsNav("providers").waitFor({ state: "visible" });
     await settingsNav("diffs").waitFor({ state: "visible" });
     await settingsNav("browser").waitFor({ state: "visible" });
     await settingsNav("remote-connections").waitFor({ state: "visible" });
@@ -378,6 +382,30 @@ try {
 
   await go("/settings/general");
   await checkSettings(false);
+  // M10: Verify Providers is visible in ordinary mode with the curated 1+6 set (and non-core drivers hidden).
+  await settingsNav("providers").click();
+  await page.getByText("Kimi Code", { exact: true }).first().waitFor({ state: "visible" });
+  for (const curatedLabel of ["Codex", "Kimi Code", "Qoder", "Codebuddy Code", "DeepSeek Harness"]) {
+    await page.getByText(curatedLabel, { exact: true }).first().waitFor({ state: "visible" });
+  }
+  const ordinaryProvidersText = await page.locator("body").innerText();
+  assert.match(ordinaryProvidersText, /Built-in Assistant|内置助手|小瞳/);
+  assert.match(ordinaryProvidersText, /Claude/);
+  for (const devOnlyDriver of ["Cursor", "OpenCode", "Grok", "Antigravity", "Kiro", "Muse"]) {
+    assert.equal(
+      await page.getByRole("button", { name: new RegExp(`^${devOnlyDriver}\\b`) }).count(),
+      0,
+      `Developer-only driver '${devOnlyDriver}' should stay hidden in ordinary mode`,
+    );
+  }
+  await button("Select Kimi Code").click();
+  await page.getByText("Installation", { exact: true }).first().waitFor({ state: "visible" });
+  await page.getByRole("button", { name: "One-Click Install", exact: true }).waitFor({
+    state: "visible",
+  });
+  await page.screenshot({ path: join(testOutput, "ordinary-providers.png") });
+  console.log("Passed ordinary-mode curated 1+6 Providers visibility and one-click install card.");
+  await go("/settings/general");
   await developerToggle.click();
   await checkSettings(true);
   await page.screenshot({ path: join(testOutput, "developer-settings.png") });

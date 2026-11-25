@@ -3,12 +3,22 @@ import {
   isDesktopSettingsPathVisible,
   isDesktopSettingVisible,
   isDesktopShortcutVisible,
+  isOrdinaryModeProviderVisible,
   resolveVisibleProviderStatuses,
   showAssistantModelPicker,
+  sortOrdinaryModeProviderRows,
 } from "./desktopFeatureVisibility";
+import { isProvisionableCodingAgent } from "./components/settings/XtworkProviderProvisioningSection";
+import { ProviderDriverKind } from "@t3tools/contracts";
 
-it("keeps developer settings and commands behind the switch while leaving changes available", () => {
-  for (const path of ["/settings/providers", "/settings/worktrees", "/settings/source-control"]) {
+it("exposes providers in ordinary mode while keeping git/worktree/terminal developer entries gated", () => {
+  expect(isDesktopSettingsPathVisible("/settings/providers", false)).toBe(true);
+  expect(isDesktopSettingsPathVisible("/settings/providers", true)).toBe(true);
+  expect(isDesktopSettingVisible({ to: "/settings/providers", id: "providers" }, false)).toBe(true);
+  expect(isDesktopSettingVisible({ to: "/settings/secrets", id: "secret-providers" }, false)).toBe(
+    false,
+  );
+  for (const path of ["/settings/worktrees", "/settings/source-control"]) {
     expect(isDesktopSettingsPathVisible(path, false)).toBe(false);
     expect(isDesktopSettingsPathVisible(path, true)).toBe(true);
   }
@@ -72,31 +82,70 @@ it("omits the picker for the only built-in model and restores it when there is a
     ...assistant,
     models: [...assistant.models, { ...assistant.models[0]!, slug: "xtwork/second" }],
   };
+  const uninstalledClaude = {
+    instanceId: "claudeAgent",
+    enabled: true,
+    isAvailable: true,
+    installed: false,
+    status: "error",
+    models: [{ slug: "claude-sonnet-4-6" }],
+  };
+  const readyClaude = {
+    ...uninstalledClaude,
+    installed: true,
+    status: "ready",
+  };
   expect(showAssistantModelPicker([assistant], false)).toBe(false);
+  expect(showAssistantModelPicker([assistant, uninstalledClaude], false)).toBe(false);
+  expect(showAssistantModelPicker([assistant, readyClaude], false)).toBe(true);
   expect(showAssistantModelPicker([assistant], true)).toBe(true);
   expect(showAssistantModelPicker([otherModel], false)).toBe(true);
 });
 
-it("keeps an already-started external runtime available when developer features are turned off", () => {
+it("curates ordinary-mode providers to the 1+6 set plus custom and bound providers", () => {
   const allProviders = [
     { instanceId: "xtworkPi" },
-    { instanceId: "codex" },
     { instanceId: "claudeAgent" },
+    { instanceId: "codex" },
+    { instanceId: "xtworkKimiCode" },
+    { instanceId: "xtworkQoder" },
+    { instanceId: "xtworkCodebuddyCode" },
+    { instanceId: "xtworkDeepseekHarness" },
+    { instanceId: "customAcpAgent" },
+    { instanceId: "cursor" },
+    { instanceId: "grok" },
+    { instanceId: "fx" },
+    { instanceId: "opencode" },
+    { instanceId: "antigravity" },
+    { instanceId: "kiro" },
+    { instanceId: "muse" },
   ];
+
   expect(
     resolveVisibleProviderStatuses({
       allProviders,
       developerFeatures: false,
       boundInstanceId: null,
-    }),
-  ).toEqual([{ instanceId: "xtworkPi" }]);
+    }).map((item) => item.instanceId),
+  ).toEqual([
+    "xtworkPi",
+    "claudeAgent",
+    "codex",
+    "xtworkKimiCode",
+    "xtworkQoder",
+    "xtworkCodebuddyCode",
+    "xtworkDeepseekHarness",
+    "customAcpAgent",
+  ]);
+
   expect(
     resolveVisibleProviderStatuses({
       allProviders,
       developerFeatures: false,
-      boundInstanceId: "codex",
-    }),
-  ).toEqual([{ instanceId: "xtworkPi" }, { instanceId: "codex" }]);
+      boundInstanceId: "cursor",
+    }).map((item) => item.instanceId),
+  ).toContain("cursor");
+
   expect(
     resolveVisibleProviderStatuses({
       allProviders,
@@ -104,4 +153,43 @@ it("keeps an already-started external runtime available when developer features 
       boundInstanceId: null,
     }),
   ).toEqual(allProviders);
+
+  expect(
+    isOrdinaryModeProviderVisible({
+      instanceId: "antigravity",
+      developerFeatures: false,
+      isExplicitCustom: true,
+    }),
+  ).toBe(true);
+
+  expect(
+    sortOrdinaryModeProviderRows([
+      { instanceId: "customAcpAgent" },
+      { instanceId: "xtworkDeepseekHarness" },
+      { instanceId: "codex" },
+      { instanceId: "xtworkPi" },
+      { instanceId: "claudeAgent" },
+    ]).map((item) => item.instanceId),
+  ).toEqual([
+    "xtworkPi",
+    "claudeAgent",
+    "codex",
+    "xtworkDeepseekHarness",
+    "customAcpAgent",
+  ]);
+});
+
+it("enables the local provisioning card for all non-local ACP Registry instances (M3)", () => {
+  expect(
+    isProvisionableCodingAgent("acpRegistry_gemini", ProviderDriverKind.make("acpRegistry"), {
+      driver: ProviderDriverKind.make("acpRegistry"),
+      config: { source: "registry", agentId: "gemini" },
+    }),
+  ).toBe(true);
+  expect(
+    isProvisionableCodingAgent("acpRegistry_custom", ProviderDriverKind.make("acpRegistry"), {
+      driver: ProviderDriverKind.make("acpRegistry"),
+      config: { source: "local", commandPath: "/usr/local/bin/my-local-acp" },
+    }),
+  ).toBe(false);
 });

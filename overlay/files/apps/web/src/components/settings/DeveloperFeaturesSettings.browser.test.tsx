@@ -49,7 +49,7 @@ vi.mock("../../state/session", async (original) => ({
 
 afterEach(() => vi.unstubAllGlobals());
 
-it("restores developer settings and navigation without restoring unsupported desktop settings", async () => {
+it("keeps Providers visible in ordinary mode while gating developer settings and unsupported items", async () => {
   vi.stubGlobal("desktopBridge", {
     xtwork: true,
     getLocalEnvironmentEnabled: () => true,
@@ -69,20 +69,22 @@ it("restores developer settings and navigation without restoring unsupported des
     "Open pull requests",
     "Open issues",
     "Worktrees",
-    "Providers",
     "Source control & issues",
   ];
   const unsupported = ["SnapShots", "Environments", "Sharing & access", "Mobile app"];
   await expect.element(toggle).not.toBeChecked();
   for (const name of [...developer, ...unsupported])
     await expect.element(nav(name)).not.toBeInTheDocument();
+  await expect.element(nav("Providers")).toBeVisible();
   await expect.element(nav("Diffs")).toBeVisible();
   await expect.element(nav("Browser")).toBeVisible();
   await toggle.click();
   for (const name of developer) await expect.element(nav(name)).toBeVisible();
+  await expect.element(nav("Providers")).toBeVisible();
   await expect.element(nav("Browser")).toBeVisible();
   for (const name of unsupported) await expect.element(nav(name)).not.toBeInTheDocument();
   await toggle.click();
   for (const name of developer) await expect.element(nav(name)).not.toBeInTheDocument();
+  await expect.element(nav("Providers")).toBeVisible();
   await expect.element(nav("Browser")).toBeVisible();
 });
