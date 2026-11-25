@@ -10,6 +10,8 @@ const fields = [
 ];
 const key = (id) => `item:${id}`;
 const undoKey = (id) => `undo:${id}`;
+const scopeOf = (value) => value?.scope ?? "private";
+const matchesScope = (item, context) => item && scopeOf(item) === scopeOf(context);
 const dateKey = (date) =>
   `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 const length = (s) => Array.from(s).length;
@@ -71,7 +73,8 @@ async function create(input, context) {
   if (context?.operationKey) {
     id = `req-${context.operationKey}`;
     const previous = await xtwork.storage.get(key(id));
-    if (previous) return previous;
+    if (matchesScope(previous, context)) return previous;
+    if (previous) throw new Error("Todo not found.");
     if (await xtwork.storage.get(undoKey(id))) return { id, undone: true };
   }
   if ((await xtwork.storage.list("item:")).length >= 1000)
@@ -90,6 +93,7 @@ async function create(input, context) {
     due: input.due || "",
     time: input.time || "",
     priority: input.priority || "none",
+    scope: scopeOf(context),
     done: false,
     doneAt: "",
     createdAt: now,
@@ -134,10 +138,10 @@ function select(items, input = {}) {
 }
 const actions = {
   create,
-  update: async (input) => {
+  update: async (input, context) => {
     validateId(input);
     const current = await xtwork.storage.get(key(input.id));
-    if (!current) throw new Error("Todo not found.");
+    if (!matchesScope(current, context)) throw new Error("Todo not found.");
     const changes = { ...input };
     delete changes.id;
     const next = {
@@ -156,10 +160,10 @@ const actions = {
     await xtwork.storage.set(key(item.id), item);
     return item;
   },
-  complete: async (input) => {
+  complete: async (input, context) => {
     validateId(input);
     const current = await xtwork.storage.get(key(input.id));
-    if (!current) throw new Error("Todo not found.");
+    if (!matchesScope(current, context)) throw new Error("Todo not found.");
     const done = input.done === undefined ? true : input.done;
     if (typeof done !== "boolean") throw new Error("done must be a boolean.");
     const now = new Date().toISOString();
@@ -172,11 +176,11 @@ const actions = {
     await xtwork.storage.set(key(item.id), item);
     return item;
   },
-  delete: async (input) => {
+  delete: async (input, context) => {
     validateId(input);
     const current = await xtwork.storage.get(key(input.id));
     if (input.undoCreatedAt !== undefined) {
-      if (!current) return { id: input.id, deleted: true };
+      if (!matchesScope(current, context)) return { id: input.id, deleted: true };
       if (
         !current.sourceThreadId ||
         current.createdAt !== input.undoCreatedAt ||
@@ -189,11 +193,11 @@ const actions = {
         await xtwork.storage.set(undoKey(input.id), true);
       }
     }
-    if (!current) throw new Error("Todo not found.");
+    if (!matchesScope(current, context)) throw new Error("Todo not found.");
     await xtwork.storage.delete(key(input.id));
     return { id: input.id, deleted: true };
   },
-  list: async (input) => {
+  list: async (input, context) => {
     const { limit = 50, offset = 0, fullNotes = false } = input;
     if (!Number.isInteger(limit) || limit < 1 || limit > 200)
       throw new Error("limit must be an integer from 1 to 200.");
@@ -201,8 +205,8 @@ const actions = {
       throw new Error("offset must be an integer from 0 to 1000.");
     if (typeof fullNotes !== "boolean") throw new Error("fullNotes must be a boolean.");
     const items = input.id
-      ? [await xtwork.storage.get(key(input.id))].filter(Boolean)
-      : select(await all(), input);
+      ? [await xtwork.storage.get(key(input.id))].filter((item) => matchesScope(item, context))
+      : select((await all()).filter((item) => matchesScope(item, context)), input);
     const result = [];
     let size = 0;
     for (const item of items.slice(offset, offset + limit)) {

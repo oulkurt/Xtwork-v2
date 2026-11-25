@@ -31,7 +31,10 @@ if (!existsSync(t3)) {
 
 const patchDir = join(overlay, "patches");
 const patches = existsSync(patchDir)
-  ? readdirSync(patchDir).filter((name) => name.endsWith(".patch")).sort()
+  ? readdirSync(patchDir).filter((name) => name.endsWith(".patch")).sort((left, right) => {
+      const number = (name) => Number.parseInt(name.match(/^\d+/)?.[0] ?? "999999", 10);
+      return number(left) - number(right) || left.localeCompare(right);
+    })
   : [];
 for (const patch of patches) {
   run("git", ["-C", t3, "apply", "--index", join(patchDir, patch)]);

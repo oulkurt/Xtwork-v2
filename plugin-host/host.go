@@ -56,12 +56,14 @@ type toolDescriptor struct {
 	Title       string          `json:"title"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"inputSchema"`
+	Confirm     bool            `json:"confirm,omitempty"`
 }
 
 type toolEntry struct {
 	plugin     *pluginEntry
 	workerName string
 	schema     *jsonschema.Schema
+	confirm    bool
 }
 
 type request struct {
@@ -77,9 +79,10 @@ type response struct {
 }
 
 type toolInvocation struct {
-	Name    string          `json:"name"`
-	Input   json.RawMessage `json:"input"`
-	Context json.RawMessage `json:"context"`
+	Name     string          `json:"name"`
+	Input    json.RawMessage `json:"input"`
+	Context  json.RawMessage `json:"context"`
+	Approved bool            `json:"approved"`
 }
 
 // Each installation supplies its own built-ins. Manifests define the tool catalog.
@@ -178,9 +181,6 @@ func (h *host) loadPlugin(files fs.FS, id, dataDir, zone string) error {
 		return err
 	}
 	for _, tool := range manifest.Contributes.Tools {
-		if tool.Confirm {
-			return fmt.Errorf("tool %q requires confirmation support", tool.Name)
-		}
 		if len(h.catalog) >= 128 {
 			return errors.New("plugin tool limit exceeded")
 		}
@@ -191,8 +191,8 @@ func (h *host) loadPlugin(files fs.FS, id, dataDir, zone string) error {
 		}
 		plugin.load.Tools = append(plugin.load.Tools, tool.Name)
 		plugin.snapshot.Tools = append(plugin.snapshot.Tools, name)
-		h.catalog = append(h.catalog, toolDescriptor{name, tool.Title, tool.Description, tool.InputSchema})
-		h.tools[name] = toolEntry{plugin, tool.Name, schema}
+		h.catalog = append(h.catalog, toolDescriptor{name, tool.Title, tool.Description, tool.InputSchema, tool.Confirm})
+		h.tools[name] = toolEntry{plugin, tool.Name, schema, tool.Confirm}
 	}
 	h.plugins = append(h.plugins, plugin)
 	return nil
@@ -274,6 +274,10 @@ func (h *host) dispatch(ctx context.Context, req request) response {
 		}
 		tool, ok := h.tools[call.Name]
 		if !ok || req.Method == "views.call" && !tool.plugin.load.View {
+			resp.Error = wireError(protocol.CodePluginNotEnabled)
+			return resp
+		}
+		if tool.confirm && !call.Approved {
 			resp.Error = wireError(protocol.CodePluginNotEnabled)
 			return resp
 		}
