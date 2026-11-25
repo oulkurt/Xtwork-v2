@@ -857,6 +857,7 @@ interface BriefSectionRule {
   readonly label: string;
   readonly enTokens: ReadonlyArray<string>;
   readonly zhTokens: ReadonlyArray<string>;
+  readonly exactTokens: ReadonlyArray<string>;
   readonly headingPatterns: ReadonlyArray<RegExp>;
 }
 
@@ -871,10 +872,9 @@ const BRIEF_SECTION_RULES: ReadonlyArray<BriefSectionRule> = (
         "acceptance(?:\\s+criteria)?",
         "success\\s+criteria",
         "expected\\s+result",
-        "tasks?",
-        "requirements?",
       ],
-      zhTokens: ["目标", "验收标准", "验收", "完成标准", "预期结果", "任务", "需求"],
+      zhTokens: ["目标", "验收标准", "验收", "完成标准", "预期结果"],
+      exactTokens: ["tasks?", "requirements?", "任务", "需求"],
     },
     {
       key: "constraints",
@@ -888,6 +888,7 @@ const BRIEF_SECTION_RULES: ReadonlyArray<BriefSectionRule> = (
         "rules?",
       ],
       zhTokens: ["约束", "范围", "边界", "限制", "规则", "禁止", "不要修改", "不改"],
+      exactTokens: [],
     },
     {
       key: "files",
@@ -901,9 +902,9 @@ const BRIEF_SECTION_RULES: ReadonlyArray<BriefSectionRule> = (
         "files?",
         "paths?",
         "attachments?",
-        "targets?",
       ],
       zhTokens: ["文件路径", "相关文件", "涉及文件", "文件", "路径", "附件", "目录"],
+      exactTokens: ["targets?"],
     },
   ] as const
 ).map((spec) => ({
@@ -911,12 +912,16 @@ const BRIEF_SECTION_RULES: ReadonlyArray<BriefSectionRule> = (
   headingPatterns: [
     new RegExp(`(?<![a-z0-9-])(?:${spec.enTokens.join("|")})(?![a-z0-9-])`, "iu"),
     new RegExp(spec.zhTokens.join("|"), "u"),
+    ...(spec.exactTokens.length > 0
+      ? [new RegExp(`^(?:${spec.exactTokens.join("|")})$`, "iu")]
+      : []),
   ],
 }));
 
 const ALL_EXPLICIT_SECTION_TOKENS = BRIEF_SECTION_RULES.flatMap((rule) => [
   ...rule.enTokens,
   ...rule.zhTokens,
+  ...rule.exactTokens,
 ]).join("|");
 
 const EXPLICIT_SECTION_LABEL_PATTERN = new RegExp(

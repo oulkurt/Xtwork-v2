@@ -878,6 +878,25 @@ describe("Sol Round 1 regression guards", () => {
     );
     expect(validNonGoals).toEqual({ valid: true });
 
+    // Valid compound headings (`Task Scope:`, `Task Files:`, `任务范围：`) MUST NOT collide with standalone `Task`/`任务`!
+    const validTaskCompoundEn = validateCodingAgentHandoffBrief(
+      [
+        "Task: Fix retry backoff on upload errors.",
+        "Task Scope: Only touch uploads module.",
+        "Task Files: apps/server/src/uploads.ts",
+      ].join("\n"),
+    );
+    expect(validTaskCompoundEn).toEqual({ valid: true });
+
+    const validTaskCompoundZh = validateCodingAgentHandoffBrief(
+      [
+        "任务：修复上传重试退避逻辑。",
+        "任务范围：仅修改上传模块，不改动数据库。",
+        "相关文件：apps/server/src/uploads.ts",
+      ].join("\n"),
+    );
+    expect(validTaskCompoundZh).toEqual({ valid: true });
+
     // Normal prose containing a colon, bold text, or Markdown link with keywords like "file" MUST still be accepted!
     const colonInNormalProse = validateCodingAgentHandoffBrief(
       [
