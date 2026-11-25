@@ -967,7 +967,14 @@ export class OAuthTokenManager {
     }
     this.assertNotDeleting(channelId, secretRef);
     lease.assertCurrent();
-    this.getOrCreateSecretRefState(secretRef).cache = parsed;
+    // Do NOT overwrite a credential already populated/rotated into the shared cache while
+    // `secretStore.get()` was in flight (prevents a late keychain read from clobbering a newer
+    // rotated refresh token).
+    const state = this.getOrCreateSecretRefState(secretRef);
+    if (state.cache !== undefined) {
+      return state.cache;
+    }
+    state.cache = parsed;
     return parsed;
   }
 

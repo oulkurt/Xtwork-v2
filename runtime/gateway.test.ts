@@ -2216,6 +2216,75 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         assert.equal(rB2.access, "rot-a2");
         assert.equal(rB2.refresh, "rot-r2");
         assert.equal(rotMgr.getCached("rot-ch-a")?.access, "rot-a2");
+
+        // --- Proof I (late SecretStore.get on sibling X must NOT overwrite newer rotated cache from sibling Y) ---
+        const lateBase = memorySecrets();
+        await lateBase.set(
+          "oauth:late-read",
+          JSON.stringify({ access: "t0-exp", refresh: "r0", expires: 100 }),
+        );
+        let releaseSlowGet!: () => void;
+        const releaseSlowGetP = new Promise<void>((r) => {
+          releaseSlowGet = r;
+        });
+        let slowGetEntered!: () => void;
+        const slowGetEnteredP = new Promise<void>((r) => {
+          slowGetEntered = r;
+        });
+        let getCount = 0;
+        const lateStore: SecretStore = {
+          backend: lateBase.backend,
+          get: async (k) => {
+            getCount += 1;
+            const val = await lateBase.get(k);
+            if (getCount === 1) {
+              slowGetEntered();
+              await releaseSlowGetP;
+            }
+            return val;
+          },
+          set: (k, v) => lateBase.set(k, v),
+          delete: (k) => lateBase.delete(k),
+        };
+        let lateRefreshCount = 0;
+        const lateMgr = new OAuthTokenManager({
+          secretStore: lateStore,
+          fence: new ChannelCredentialFence(),
+          now: () => 500_000,
+        });
+        const lateRefresh = async (cur: { access: string; refresh: string; expires: number }) => {
+          lateRefreshCount += 1;
+          assert.equal(cur.refresh, "r0", "Must not re-submit consumed r0 after rotation");
+          return { access: "t1-fresh", refresh: "r1-rotated", expires: 9_999_999 };
+        };
+        lateMgr.register({
+          channelId: "late-x",
+          provider: "xai",
+          secretRef: "oauth:late-read",
+          refresh: lateRefresh,
+        });
+        lateMgr.register({
+          channelId: "late-y",
+          provider: "xai",
+          secretRef: "oauth:late-read",
+          refresh: lateRefresh,
+        });
+
+        // X starts cold SecretStore.get(t0) and pauses before returning.
+        const pLateX = lateMgr.getValidCredentials("late-x");
+        await slowGetEnteredP;
+        // Y reads t0, refreshes t0 -> t1-fresh, persists t1-fresh, and populates shared cache!
+        const resY = await lateMgr.getValidCredentials("late-y");
+        assert.equal(resY.access, "t1-fresh");
+        assert.equal(lateRefreshCount, 1);
+
+        // Now release X's stale SecretStore.get(t0) -> MUST return cached t1-fresh, keep cache intact, and NOT re-refresh!
+        releaseSlowGet();
+        const resX = await pLateX;
+        assert.equal(resX.access, "t1-fresh");
+        assert.equal(lateRefreshCount, 1);
+        assert.equal(lateMgr.getCached("late-x")?.refresh, "r1-rotated");
+        assert.equal(lateMgr.getCached("late-y")?.refresh, "r1-rotated");
       } finally {
         await runtime.close();
       }
