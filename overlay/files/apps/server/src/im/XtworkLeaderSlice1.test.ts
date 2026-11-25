@@ -176,7 +176,7 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
           companionScope: "group:ops",
         });
 
-        // Persist execution policy BEFORE launch
+        // Persist execution policy BEFORE launch (unattached — run_id IS NULL)
         const pol1 = yield* store.persistPolicyBeforeLaunch({
           commandId: "im:conn-feishu:msg-1",
           threadId: derivedThreadId,
@@ -187,37 +187,69 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         expect(imToolAllowed(derivedThreadId, "im__native_policy", true, store.isProtectedThreadSync(derivedThreadId))).toBe(false);
         expect(imToolAllowed(derivedThreadId, "im__native_policy", false, store.isProtectedThreadSync(derivedThreadId))).toBe(true);
 
-        // Before runId attaches, freshly persisted unattached policy is valid
+        // S1: Unattached policy (no bindRunPolicy yet, or missing runId) MUST fail closed!
+        expect(store.resolveProviderPolicySync(derivedThreadId)).toEqual({
+          protected: true,
+          policyDigest: null,
+          failClosed: true,
+          policyChanged: false,
+        });
+        expect(store.resolveProviderPolicySync(derivedThreadId, "run-1")).toEqual({
+          protected: true,
+          policyDigest: null,
+          failClosed: true,
+          policyChanged: false,
+        });
+
+        // S1: Binding wrong commandId/threadId fails closed
+        const badBind = yield* store.bindRunPolicy("im:conn-feishu:unknown", derivedThreadId, "run-1").pipe(Effect.result);
+        expect(badBind._tag).toBe("Failure");
+
+        // Bind exact (commandId, threadId) -> run-1 before provider launch
+        yield* store.bindRunPolicy("im:conn-feishu:msg-1", derivedThreadId, "run-1");
+        expect(store.hasRunPolicySync({ runId: "run-1" })).toBe(true);
         expect(store.resolveProviderPolicySync(derivedThreadId, "run-1")).toEqual({
           protected: true,
           policyDigest: pol1.policyDigest,
           failClosed: false,
+          policyChanged: false,
         });
 
-        // Attach run-1
-        yield* store.attachRunId("im:conn-feishu:msg-1", "run-1");
-        expect(store.hasRunPolicySync({ runId: "run-1" })).toBe(true);
-        expect(store.resolveProviderPolicySync(derivedThreadId, "run-1").failClosed).toBe(false);
-
-        // A rogue/scheduled run on the SAME protected thread without its own persisted policy MUST fail closed!
+        // A rogue/scheduled run on the SAME protected thread without its own bound policy MUST fail closed!
         expect(store.hasRunPolicySync({ commandId: "scheduled-unpersisted-cmd" })).toBe(false);
         expect(store.resolveProviderPolicySync(derivedThreadId, "run-rogue")).toEqual({
           protected: true,
           policyDigest: null,
           failClosed: true,
+          policyChanged: false,
         });
 
         // An unpersisted xtwork-im-* thread also fails closed
-        expect(store.resolveProviderPolicySync("xtwork-im-group-unpersisted")).toEqual({
+        expect(store.resolveProviderPolicySync("xtwork-im-group-unpersisted", "run-x")).toEqual({
           protected: true,
           policyDigest: null,
           failClosed: true,
+          policyChanged: false,
         });
 
-        // Policy digest change forces fresh provider session
+        // S2: Policy digest change on run-2 marks policyChanged=true so Pi starts a clean conversation
         const narrower = narrowDelegatedPolicy(ctx1, { isolatedWorkspaceRoot: "/tmp/ws/ops/sub" });
         expect(canReuseProviderSession(ctx1.policyDigest, narrower.policyDigest)).toBe(false);
         expect(canReuseProviderSession(ctx1.policyDigest, ctx1.policyDigest)).toBe(true);
+        yield* store.persistPolicyBeforeLaunch({
+          commandId: "im:conn-feishu:msg-2",
+          threadId: derivedThreadId,
+          context: narrower,
+        });
+        yield* store.bindRunPolicy("im:conn-feishu:msg-2", derivedThreadId, "run-2");
+        expect(store.resolveProviderPolicySync(derivedThreadId, "run-2")).toEqual({
+          protected: true,
+          policyDigest: narrower.policyDigest!,
+          failClosed: false,
+          policyChanged: true,
+        });
+        // Run-1 retains its exact original policy digest even after run-2 is queued/bound!
+        expect(store.resolveProviderPolicySync(derivedThreadId, "run-1").policyDigest).toBe(pol1.policyDigest);
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
     );
   });
@@ -255,14 +287,25 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         expect(sameAudience(idEpoch1.context, idEpoch2.context)).toBe(false);
         expect(idEpoch1.context.leaderId).toBe(leaderA.id);
         expect(idEpoch2.context.leaderId).toBe(leaderB.id);
+
+        // S7: Legacy pre-ADR-013 context (bindingId=null, bindingEpoch=null) matches initial default epoch-1 binding,
+        // preserving linked chat threads on upgrade while NEVER matching rebound epoch-2!
+        const legacyCtx = dispatchIdentity(route, "/tmp/im").context;
+        expect(legacyCtx.bindingId).toBeNull();
+        expect(legacyCtx.bindingEpoch).toBeNull();
+        expect(sameAudience(legacyCtx, idEpoch1.context)).toBe(true);
+        expect(sameAudience(legacyCtx, idEpoch2.context)).toBe(false);
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
     );
   });
 
-  it("binds group private-memory sharing to an exact content snapshot hash and never grants live read access", async () => {
+  it("binds group private-memory sharing to an exact full content snapshot hash, enforces runId+audience, and never grants live read access (S8/S9)", async () => {
     const dir = await mkdtemp(join(tmpdir(), "xtwork-snapshot-share-"));
     const memory = new XtworkImMemory(dir);
-    await memory.write("private", "Q4 roadmap: launch Leader Slice 1.", "roadmap.md", DEFAULT_LEADER_ID);
+    // S9: Ensure snapshot > 1200 chars is NOT truncated in approval payload!
+    const fullNote = `Q4 roadmap: launch Leader Slice 1.\n${"detail-line ".repeat(150)}END_OF_COMPLETE_SNAPSHOT`;
+    expect(fullNote.length).toBeGreaterThan(1500);
+    await memory.write("private", fullNote, "roadmap.md", DEFAULT_LEADER_ID);
 
     const approvals = new ImApprovals();
     const groupCtx = normalizeExecutionContext({
@@ -280,6 +323,14 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
       turnId: "run-share-1",
       threadId: "xtwork-im-group-team",
       context: groupCtx,
+      inbound: inboundMessage({
+        connectionId: "conn-feishu",
+        platformMsgId: "pm-share-1",
+        chatId: "chat-team",
+        chatName: "核心研发群",
+        chatKind: "group",
+        senderRole: "member",
+      }),
     };
 
     const controller = new AbortController();
@@ -300,12 +351,32 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
     expect(req.snapshotHash).toBeTruthy();
     const snapshotHash = req.snapshotHash!;
     expect(req.targetScope).toBe("group:team");
-    expect(req.contentPreview).toContain("launch Leader Slice 1");
+    expect(req.targetChatName).toBe("核心研发群");
+    expect(req.contentSnapshot).toBe(fullNote);
+    expect(req.contentSnapshot).toContain("END_OF_COMPLETE_SNAPSHOT");
 
-    // 1. status_read summary MUST NEVER expose raw details or contentPreview
+    // 1. status_read summary MUST NEVER expose raw details or contentSnapshot
     const summary = approvals.listStatusSummary(new Set(["xtwork-im-group-team"]));
     expect(summary).toEqual({ totalCount: 1, countByThreadId: { "xtwork-im-group-team": 1 } });
     expect(JSON.stringify(summary)).not.toContain("Q4 roadmap");
+
+    // 2. S8: Missing expectedRunId or missing expectedAudience MUST be rejected!
+    expect(
+      approvals.decide(req.id, true, {
+        desktopOwnerVerified: true,
+        expectedRunId: undefined,
+        expectedAudience: "group",
+        expectedSnapshotHash: snapshotHash,
+      }),
+    ).toBe(false);
+    expect(
+      approvals.decide(req.id, true, {
+        desktopOwnerVerified: true,
+        expectedRunId: "run-share-1",
+        expectedAudience: undefined,
+        expectedSnapshotHash: snapshotHash,
+      }),
+    ).toBe(false);
 
     // 2. Non-desktop caller MUST be rejected
     expect(
@@ -374,27 +445,33 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
     expect(groupCopy).not.toContain("TOP SECRET SALARY DATA");
   });
 
-  it("migrates legacy companion/ directory idempotently without clobbering existing Leader files", async () => {
+  it("migrates legacy companion/ directory per-file idempotently and finishes interrupted partial copies (S10)", async () => {
     const dir = await mkdtemp(join(tmpdir(), "xtwork-legacy-migrate-"));
     await mkdir(join(dir, "private", "notes"), { recursive: true });
     await mkdir(join(dir, "groups", "g1"), { recursive: true });
+    await mkdir(join(dir, "groups", "g2"), { recursive: true });
     await writeFile(join(dir, "ROLE.md"), "Legacy role prompt", "utf8");
     await writeFile(join(dir, "private", "MEMORY.md"), "Legacy private memory", "utf8");
     await writeFile(join(dir, "private", "notes", "plan.md"), "Legacy note", "utf8");
-    await writeFile(join(dir, "groups", "g1", "MEMORY.md"), "Legacy group memory", "utf8");
+    await writeFile(join(dir, "groups", "g1", "MEMORY.md"), "Legacy group g1 memory", "utf8");
+    await writeFile(join(dir, "groups", "g2", "MEMORY.md"), "Legacy group g2 memory", "utf8");
+
+    // Simulate a crash mid-migration where `leaders/leader-default/private/` and `groups/g1/`
+    // were partially created with ONE file, leaving the remaining files uncopied!
+    await mkdir(join(dir, "leaders", DEFAULT_LEADER_ID, "private"), { recursive: true });
+    await writeFile(join(dir, "leaders", DEFAULT_LEADER_ID, "private", "MEMORY.md"), "Newer existing memory", "utf8");
 
     const memory = new XtworkImMemory(dir);
     await memory.ensureMigrated(DEFAULT_LEADER_ID);
 
     expect(await memory.read("role", undefined, DEFAULT_LEADER_ID)).toBe("Legacy role prompt");
-    expect(await memory.read("private", undefined, DEFAULT_LEADER_ID)).toBe("Legacy private memory");
+    // Existing Leader file MUST NOT be clobbered!
+    expect(await memory.read("private", undefined, DEFAULT_LEADER_ID)).toBe("Newer existing memory");
+    // Missing sibling files inside already-existing directories MUST still be copied!
     expect(await memory.read("private", "plan.md", DEFAULT_LEADER_ID)).toBe("Legacy note");
-    expect(await memory.read("group:g1", undefined, DEFAULT_LEADER_ID)).toBe("Legacy group memory");
+    expect(await memory.read("group:g1", undefined, DEFAULT_LEADER_ID)).toBe("Legacy group g1 memory");
+    expect(await memory.read("group:g2", undefined, DEFAULT_LEADER_ID)).toBe("Legacy group g2 memory");
 
-    // Mutate Leader's ROLE.md and re-run ensureMigrated -> MUST NOT overwrite newer Leader file!
-    await memory.write("role", "Updated Leader role", undefined, DEFAULT_LEADER_ID);
-    await memory.ensureMigrated(DEFAULT_LEADER_ID);
-    expect(await memory.read("role", undefined, DEFAULT_LEADER_ID)).toBe("Updated Leader role");
     // Original legacy file remains untouched as backup
     expect(await readFile(join(dir, "ROLE.md"), "utf8")).toBe("Legacy role prompt");
   });

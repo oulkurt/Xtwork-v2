@@ -42,10 +42,16 @@ export class XtworkImBridgeHost {
 
   private readonly options: BridgeOptions;
   private readonly onEvent: (event: string, payload: BridgePayload) => void;
+  private readonly onReady: ((call: (method: string, params?: BridgePayload, signal?: AbortSignal) => Promise<unknown>) => Promise<void>) | undefined;
 
-  constructor(options: BridgeOptions, onEvent: (event: string, payload: BridgePayload) => void) {
+  constructor(
+    options: BridgeOptions,
+    onEvent: (event: string, payload: BridgePayload) => void,
+    onReady?: (call: (method: string, params?: BridgePayload, signal?: AbortSignal) => Promise<unknown>) => Promise<void>,
+  ) {
     this.options = options;
     this.onEvent = onEvent;
+    this.onReady = onReady;
   }
 
   get available() {
@@ -126,12 +132,21 @@ export class XtworkImBridgeHost {
       }, delay);
       this.restart.unref();
     });
-    void this.call(connection, "bridge.hello", { protocolVersion: 1 }, AbortSignal.timeout(5000))
-      .then((result) => {
+    void this.call(
+      connection,
+      "bridge.hello",
+      { protocolVersion: 1, ...(this.onReady ? { deferReplay: true } : {}) },
+      AbortSignal.timeout(5000),
+    )
+      .then(async (result) => {
         if (!isRecord(result) || Number(result.protocolVersion) !== 1) {
           throw new Error("Incompatible IM bridge protocol.");
         }
         if (this.connection !== connection || this.closing) return;
+        if (this.onReady) {
+          await this.onReady((method, params = {}, signal) => this.call(connection, method, params, signal));
+          if (this.connection !== connection || this.closing) return;
+        }
         connection.ready = true;
         for (const [event, payload] of connection.events.splice(0)) this.onEvent(event, payload);
       })

@@ -73,7 +73,14 @@ export async function runImTool(service: ToolService, execution: ImExecution, na
   const leaderId = context.leaderId ?? DEFAULT_LEADER_ID;
   const approve = (
     details: BridgePayload = args,
-    meta?: { readonly snapshotHash?: string; readonly targetScope?: typeof context.companionScope; readonly contentPreview?: string },
+    meta?: {
+      readonly snapshotHash?: string;
+      readonly targetScope?: typeof context.companionScope;
+      readonly targetChatId?: string;
+      readonly targetChatName?: string;
+      readonly contentSnapshot?: string;
+      readonly contentPreview?: string;
+    },
   ) => service.approvals.require(execution, name, details, signal, meta);
 
   if (name === "im__native_policy") {
@@ -113,13 +120,18 @@ export async function runImTool(service: ToolService, execution: ImExecution, na
         sourceScope: "private",
         note: note ?? "MEMORY.md",
         targetScope: context.companionScope,
+        ...(context.chatId ? { targetChatId: context.chatId } : {}),
+        ...(inbound?.chatName ? { targetChatName: inbound.chatName } : {}),
         snapshotHash,
       },
       signal,
       {
         snapshotHash,
         targetScope: context.companionScope,
-        contentPreview: content.slice(0, 1200),
+        ...(context.chatId ? { targetChatId: context.chatId } : {}),
+        ...(inbound?.chatName ? { targetChatName: inbound.chatName } : {}),
+        contentSnapshot: content,
+        contentPreview: content,
       },
     );
     const sharedNote = await service.memory.writeSharedSnapshot(context.companionScope, snapshotHash, content, leaderId);

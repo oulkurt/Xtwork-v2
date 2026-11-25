@@ -66,6 +66,8 @@ export type InboundEvent =
   | "replay_paused"
   /** Owner dismisses a paused backlog item. */
   | "dismiss_paused"
+  /** Access gate changed to ask while paused: return item to owner approval queue. */
+  | "rehold_paused"
   /** Owner approved the held sender or group: enters delivery queue. */
   | "admit"
   /** Owner rejected the held sender or group: permanently blocked. */
@@ -87,8 +89,9 @@ export const INBOUND: Readonly<
   pause: { from: ["received", "waiting"], to: "paused_pending" },
   replay_paused: { from: ["paused_pending"], to: "received" },
   dismiss_paused: { from: ["paused_pending"], to: "ignored" },
+  rehold_paused: { from: ["paused_pending"], to: "held" },
   admit: { from: ["held"], to: "received" },
-  refuse: { from: ["held"], to: "blocked" },
+  refuse: { from: ["held", "paused_pending"], to: "blocked" },
 };
 
 export const FINAL_INBOUND: readonly InboundState[] = ["replied", "ignored", "blocked"];

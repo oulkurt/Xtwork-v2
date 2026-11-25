@@ -38,6 +38,9 @@ export interface Connection {
   readonly stateDetail: string | null;
   readonly paused: boolean;
   readonly leaderPaused: boolean;
+  readonly leaderId: string;
+  readonly bindingId: string | null;
+  readonly bindingEpoch: number;
   readonly secretRef: string | null;
   readonly ownerId: string | null;
   readonly claimCode: string | null;
@@ -113,6 +116,9 @@ export interface Message {
   readonly state: InboundState | OutboundState;
   readonly t3ThreadId: string | null;
   readonly t3TurnId: string | null;
+  readonly leaderId: string | null;
+  readonly bindingId: string | null;
+  readonly bindingEpoch: number | null;
   readonly ackedAt: number | null;
   readonly retryAt: number | null;
   readonly notice: boolean;
@@ -163,6 +169,9 @@ CREATE TABLE IF NOT EXISTS connections (
   state_detail TEXT,
   paused INTEGER NOT NULL DEFAULT 0,
   leader_paused INTEGER NOT NULL DEFAULT 0,
+  leader_id TEXT NOT NULL DEFAULT 'leader-default',
+  binding_id TEXT,
+  binding_epoch INTEGER NOT NULL DEFAULT 1,
   secret_ref TEXT,
   owner_id TEXT,
   claim_code TEXT,
@@ -231,6 +240,9 @@ CREATE TABLE IF NOT EXISTS messages (
   state TEXT NOT NULL,
   t3_thread_id TEXT,
   t3_turn_id TEXT,
+  leader_id TEXT,
+  binding_id TEXT,
+  binding_epoch INTEGER,
   acked_at INTEGER,
   retry_at INTEGER,
   notice INTEGER NOT NULL DEFAULT 0,
@@ -293,18 +305,37 @@ export class Store {
   private migrate(): void {
     const row = this.db.prepare("PRAGMA user_version").get() as Row;
     const version = Number(row.user_version ?? 0);
-    if (version >= 2) return;
+    if (version >= 3) return;
     this.db.exec("BEGIN");
     try {
       if (version < 1) {
         this.db.exec(SCHEMA_V1);
       } else {
-        const cols = (this.db.prepare("PRAGMA table_info(connections)").all() as Row[]).map((c) => String(c.name));
-        if (!cols.includes("leader_paused")) {
+        const connCols = (this.db.prepare("PRAGMA table_info(connections)").all() as Row[]).map((c) => String(c.name));
+        if (!connCols.includes("leader_paused")) {
           this.db.exec("ALTER TABLE connections ADD COLUMN leader_paused INTEGER NOT NULL DEFAULT 0");
         }
+        if (!connCols.includes("leader_id")) {
+          this.db.exec("ALTER TABLE connections ADD COLUMN leader_id TEXT NOT NULL DEFAULT 'leader-default'");
+        }
+        if (!connCols.includes("binding_id")) {
+          this.db.exec("ALTER TABLE connections ADD COLUMN binding_id TEXT");
+        }
+        if (!connCols.includes("binding_epoch")) {
+          this.db.exec("ALTER TABLE connections ADD COLUMN binding_epoch INTEGER NOT NULL DEFAULT 1");
+        }
+        const msgCols = (this.db.prepare("PRAGMA table_info(messages)").all() as Row[]).map((c) => String(c.name));
+        if (!msgCols.includes("leader_id")) {
+          this.db.exec("ALTER TABLE messages ADD COLUMN leader_id TEXT");
+        }
+        if (!msgCols.includes("binding_id")) {
+          this.db.exec("ALTER TABLE messages ADD COLUMN binding_id TEXT");
+        }
+        if (!msgCols.includes("binding_epoch")) {
+          this.db.exec("ALTER TABLE messages ADD COLUMN binding_epoch INTEGER");
+        }
       }
-      this.db.exec("PRAGMA user_version = 2");
+      this.db.exec("PRAGMA user_version = 3");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -404,6 +435,9 @@ export class Store {
       stateDetail: string | null;
       paused: boolean;
       leaderPaused: boolean;
+      leaderId: string;
+      bindingId: string | null;
+      bindingEpoch: number;
       secretRef: string | null;
       ownerId: string | null;
       claimCode: string | null;
@@ -421,6 +455,9 @@ export class Store {
       stateDetail: "state_detail",
       paused: "paused",
       leaderPaused: "leader_paused",
+      leaderId: "leader_id",
+      bindingId: "binding_id",
+      bindingEpoch: "binding_epoch",
       secretRef: "secret_ref",
       ownerId: "owner_id",
       claimCode: "claim_code",
@@ -965,8 +1002,8 @@ export class Store {
       this.db
         .prepare(
           `INSERT INTO messages
-            (id, connection_id, chat_id, direction, platform_msg_id, idempotency_key, sender_id, sender_name, body, attachments, reply_to, reply_to_platform_id, triggers, state, created_at)
-           VALUES (?, ?, ?, 'in', ?, ?, ?, ?, ?, ?, ?, ?, 1, 'held', ?)`,
+            (id, connection_id, chat_id, direction, platform_msg_id, idempotency_key, sender_id, sender_name, body, attachments, reply_to, reply_to_platform_id, triggers, state, leader_id, binding_id, binding_epoch, created_at)
+           VALUES (?, ?, ?, 'in', ?, ?, ?, ?, ?, ?, ?, ?, 1, 'held', ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -980,6 +1017,9 @@ export class Store {
           attachments.length ? JSON.stringify(attachments) : null,
           replyTarget?.id ?? null,
           msg.replyTo ?? null,
+          conn.leaderId,
+          conn.bindingId,
+          conn.bindingEpoch,
           msg.sentAt,
         );
       // NOTE: Deliberately NOT indexed in messages_fts while held!
@@ -1003,8 +1043,8 @@ export class Store {
       this.db
         .prepare(
           `INSERT INTO messages
-            (id, connection_id, chat_id, direction, platform_msg_id, idempotency_key, sender_id, sender_name, body, attachments, reply_to, reply_to_platform_id, triggers, state, acked_at, created_at)
-           VALUES (?, ?, ?, 'in', ?, ?, ?, ?, ?, ?, ?, ?, 1, 'replied', ?, ?)`,
+            (id, connection_id, chat_id, direction, platform_msg_id, idempotency_key, sender_id, sender_name, body, attachments, reply_to, reply_to_platform_id, triggers, state, leader_id, binding_id, binding_epoch, acked_at, created_at)
+           VALUES (?, ?, ?, 'in', ?, ?, ?, ?, ?, ?, ?, ?, 1, 'replied', ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -1018,6 +1058,9 @@ export class Store {
           attachments.length ? JSON.stringify(attachments) : null,
           replyTarget?.id ?? null,
           msg.replyTo ?? null,
+          conn.leaderId,
+          conn.bindingId,
+          conn.bindingEpoch,
           this.now(),
           msg.sentAt,
         );
@@ -1030,8 +1073,8 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO messages
-          (id, connection_id, chat_id, direction, platform_msg_id, idempotency_key, sender_id, sender_name, body, attachments, reply_to, reply_to_platform_id, triggers, state, created_at)
-         VALUES (?, ?, ?, 'in', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id, connection_id, chat_id, direction, platform_msg_id, idempotency_key, sender_id, sender_name, body, attachments, reply_to, reply_to_platform_id, triggers, state, leader_id, binding_id, binding_epoch, created_at)
+         VALUES (?, ?, ?, 'in', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1047,6 +1090,9 @@ export class Store {
         msg.replyTo ?? null,
         isTrigger ? 1 : 0,
         state,
+        conn.leaderId,
+        conn.bindingId,
+        conn.bindingEpoch,
         msg.sentAt,
       );
     // Allowed chat message -> index into FTS5 `trigram`!
@@ -1170,6 +1216,8 @@ export class Store {
         if (event === "admit") {
           const msg = this.message(id);
           if (msg) this.indexMessageInFts(msg.id, msg.body);
+        } else if (event === "rehold_paused") {
+          this.stmt("DELETE FROM messages_fts WHERE msg_id = ?").run(id);
         } else if (event === "refuse") {
           this.stmt("UPDATE messages SET body = '', attachments = NULL WHERE id = ?").run(id);
           this.stmt("DELETE FROM messages_fts WHERE msg_id = ?").run(id);
@@ -1196,7 +1244,7 @@ export class Store {
       this.stmt(
         `UPDATE messages
          SET t3_thread_id = ?, t3_turn_id = ?, acked_at = COALESCE(acked_at, ?),
-             state = CASE WHEN state = 'received' THEN 'delivered' ELSE state END
+             state = CASE WHEN state IN ('received', 'waiting', 'paused_pending') THEN 'delivered' ELSE state END
          WHERE id = ?`,
       ).run(ack.t3ThreadId, ack.t3TurnId, t, msg.id);
       const chat = this.chat(msg.chatId);
@@ -1453,10 +1501,13 @@ export class Store {
     );
   }
 
-  /** Defer queued/waiting inbound messages for a paused connection/leader into `paused_pending` without touching in-flight `delivered` runs. */
+  /** Defer unacked queued/waiting inbound messages for a paused connection/leader into `paused_pending` without touching committed runs. */
   pauseConnectionMessages(connectionId: string): string[] {
     const rows = this.stmt(
-      "SELECT id FROM messages WHERE connection_id = ? AND direction = 'in' AND state IN ('received', 'waiting')",
+      `SELECT id FROM messages
+       WHERE connection_id = ? AND direction = 'in'
+         AND acked_at IS NULL AND t3_turn_id IS NULL
+         AND state IN ('received', 'waiting')`,
     ).all(connectionId) as Row[];
     if (!rows.length) return [];
     return this.moveInbound(
@@ -1465,22 +1516,76 @@ export class Store {
     );
   }
 
+  /** Reconcile Leader binding identity and pause flag onto a bridge connection. */
+  syncConnectionBinding(input: {
+    readonly connectionId: string;
+    readonly leaderId: string;
+    readonly bindingId: string | null;
+    readonly bindingEpoch: number;
+    readonly leaderPaused: boolean;
+  }): Connection | undefined {
+    const updated = this.updateConnection(input.connectionId, {
+      leaderId: input.leaderId,
+      bindingId: input.bindingId,
+      bindingEpoch: input.bindingEpoch,
+      leaderPaused: input.leaderPaused,
+    });
+    if (updated && input.leaderPaused) {
+      this.pauseConnectionMessages(updated.id);
+    }
+    return updated;
+  }
+
+  /** Re-evaluate current access gate for a stored inbound message before selective replay (S5). */
+  evaluateInboundGate(msg: Message, trust: Trust): "deliver" | "ask" | "drop" {
+    const conn = this.connection(msg.connectionId);
+    const chat = this.chat(msg.chatId);
+    if (!conn || !chat) return "drop";
+    const isOwner = Boolean(conn.ownerId && msg.senderId === conn.ownerId);
+    const contact = msg.senderId ? this.contactByPlatformId(conn.id, msg.senderId) : undefined;
+    let groupAccess: Access = chat.kind === "dm" ? null : chat.access;
+    if (chat.parentId) {
+      const parent = this.chat(chat.parentId);
+      if (parent?.access === "blocked") groupAccess = "blocked";
+      else if (groupAccess === null && parent) groupAccess = parent.access;
+    }
+    return gate({
+      lifecycleState: conn.lifecycleState,
+      trust,
+      askAll: conn.askAll,
+      isOwner,
+      chatKind: chat.kind,
+      contact: contact?.access ?? null,
+      group: groupAccess,
+    });
+  }
+
   /** Paused backlog messages awaiting Owner review on resume, oldest first. */
   pausedPendingMessages(
-    connectionIds?: readonly string[],
+    filter?: readonly string[] | { readonly connectionIds?: readonly string[]; readonly leaderId?: string },
   ): (Message & { readonly chat: Chat; readonly platform: Platform; readonly contact?: Contact })[] {
-    const filterIds = connectionIds && connectionIds.length > 0 ? connectionIds : undefined;
-    const whereClause = filterIds
-      ? `AND m.connection_id IN (${filterIds.map(() => "?").join(", ")})`
-      : "";
+    const isList = Array.isArray(filter);
+    const opts = isList ? undefined : (filter as { readonly connectionIds?: readonly string[]; readonly leaderId?: string } | undefined);
+    const connectionIds = isList ? (filter as readonly string[]) : opts?.connectionIds;
+    const leaderId = opts?.leaderId;
+    const clauses: string[] = ["m.direction = 'in'", "m.state = 'paused_pending'"];
+    const args: SQLInputValue[] = [];
+    if (connectionIds && connectionIds.length > 0) {
+      clauses.push(`m.connection_id IN (${connectionIds.map(() => "?").join(", ")})`);
+      args.push(...connectionIds);
+    }
+    if (leaderId) {
+      clauses.push("COALESCE(m.leader_id, n.leader_id) = ?");
+      args.push(leaderId);
+    }
     const sql = `
       SELECT m.*, n.platform
       FROM messages m
       JOIN connections n ON n.id = m.connection_id
-      WHERE m.direction = 'in' AND m.state = 'paused_pending' ${whereClause}
+      WHERE ${clauses.join(" AND ")}
       ORDER BY m.created_at ASC, m.rowid ASC
     `;
-    const rows = (filterIds ? this.db.prepare(sql).all(...filterIds) : this.db.prepare(sql).all()) as Row[];
+    const rows = this.db.prepare(sql).all(...args) as Row[];
     const out: (Message & { readonly chat: Chat; readonly platform: Platform; readonly contact?: Contact })[] = [];
     for (const r of rows) {
       const msg = toMessage(r);
@@ -1519,6 +1624,9 @@ function toConnection(r: Row): Connection {
     stateDetail: str(r.state_detail),
     paused: Number(r.paused) === 1,
     leaderPaused: Number(r.leader_paused ?? 0) === 1,
+    leaderId: str(r.leader_id) ?? "leader-default",
+    bindingId: str(r.binding_id),
+    bindingEpoch: Number(r.binding_epoch ?? 1),
     secretRef: str(r.secret_ref),
     ownerId: str(r.owner_id),
     claimCode: str(r.claim_code),
@@ -1594,6 +1702,9 @@ function toMessage(r: Row): Message {
     state: String(r.state) as Message["state"],
     t3ThreadId: str(r.t3_thread_id),
     t3TurnId: str(r.t3_turn_id),
+    leaderId: str(r.leader_id),
+    bindingId: str(r.binding_id),
+    bindingEpoch: r.binding_epoch == null ? null : Number(r.binding_epoch),
     ackedAt: r.acked_at == null ? null : Number(r.acked_at),
     retryAt: r.retry_at == null ? null : Number(r.retry_at),
     notice: Number(r.notice) === 1,

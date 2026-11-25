@@ -343,6 +343,8 @@ export class ImBridge {
         return this.handleConnectionResume(reqStr(params, "connectionId"));
       case "connections.setLeaderPaused":
         return this.handleSetLeaderPaused(params);
+      case "connections.syncBindings":
+        return this.handleSyncBindings(params);
       case "paused.list":
         return this.handlePausedList(params);
       case "paused.decide":
@@ -407,8 +409,9 @@ export class ImBridge {
       );
     }
     const platforms = Object.keys(this.channels).sort();
-    // Schedule crash-recovery redelivery right after hello response flushes.
-    if (!this.replayedOnHello) {
+    // Schedule crash-recovery redelivery right after hello response flushes unless
+    // the server requests deferred replay until Leader bindings & pause flags sync (S4).
+    if (params.deferReplay !== true && !this.replayedOnHello) {
       this.replayedOnHello = true;
       queueMicrotask(() => {
         if (!this.closed) this.replayUnackedTriggers();
@@ -694,13 +697,75 @@ export class ImBridge {
     return { paused, connections: updated, pausedPending: this.handlePausedList({ connectionIds }).items };
   }
 
+  private handleSyncBindings(params: Record<string, unknown>) {
+    const rawBindings = Array.isArray(params.bindings) ? params.bindings : [];
+    const seen = new Set<string>();
+    const updated: Record<string, unknown>[] = [];
+    for (const entry of rawBindings) {
+      if (!entry || typeof entry !== "object") continue;
+      const item = entry as Record<string, unknown>;
+      const connectionId = typeof item.connectionId === "string" ? item.connectionId : "";
+      const leaderId = typeof item.leaderId === "string" && item.leaderId ? item.leaderId : "leader-default";
+      const bindingId = typeof item.bindingId === "string" && item.bindingId ? item.bindingId : null;
+      const bindingEpoch = typeof item.bindingEpoch === "number" && Number.isInteger(item.bindingEpoch) ? item.bindingEpoch : 1;
+      const leaderPaused = Boolean(item.leaderPaused);
+      if (!connectionId) continue;
+      seen.add(connectionId);
+      const prev = this.store.connection(connectionId);
+      const next = this.store.syncConnectionBinding({
+        connectionId,
+        leaderId,
+        bindingId,
+        bindingEpoch,
+        leaderPaused,
+      });
+      if (next) {
+        const changed =
+          !prev ||
+          prev.leaderId !== next.leaderId ||
+          prev.bindingId !== next.bindingId ||
+          prev.bindingEpoch !== next.bindingEpoch ||
+          prev.leaderPaused !== next.leaderPaused;
+        if (changed) this.emitConnectionState(next);
+        updated.push(sanitizeConnection(next));
+      }
+    }
+    if (typeof params.defaultLeaderPaused === "boolean") {
+      for (const conn of this.store.connections()) {
+        if (seen.has(conn.id)) continue;
+        const next = this.store.syncConnectionBinding({
+          connectionId: conn.id,
+          leaderId: conn.leaderId,
+          bindingId: conn.bindingId,
+          bindingEpoch: conn.bindingEpoch,
+          leaderPaused: params.defaultLeaderPaused,
+        });
+        if (next) {
+          if (conn.leaderPaused !== next.leaderPaused) this.emitConnectionState(next);
+          updated.push(sanitizeConnection(next));
+        }
+      }
+    }
+    if (params.triggerReplay === true && !this.replayedOnHello) {
+      this.replayedOnHello = true;
+      queueMicrotask(() => {
+        if (!this.closed) this.replayUnackedTriggers();
+      });
+    }
+    return { synced: updated.length, connections: updated };
+  }
+
   private handlePausedList(params: Record<string, unknown>) {
     const connectionIds = Array.isArray(params.connectionIds)
       ? params.connectionIds.filter((id): id is string => typeof id === "string" && id.length > 0)
       : optStr(params, "connectionId")
         ? [reqStr(params, "connectionId")]
         : undefined;
-    const items = this.store.pausedPendingMessages(connectionIds).map((item) => ({
+    const leaderId = optStr(params, "leaderId");
+    const items = this.store.pausedPendingMessages({
+      ...(connectionIds ? { connectionIds } : {}),
+      ...(leaderId ? { leaderId } : {}),
+    }).map((item) => ({
       id: item.id,
       connectionId: item.connectionId,
       platform: item.platform,
@@ -711,6 +776,9 @@ export class ImBridge {
       senderName: contactName(item.contact) ?? item.senderName,
       platformMsgId: item.platformMsgId,
       idempotencyKey: item.idempotencyKey,
+      leaderId: item.leaderId,
+      bindingId: item.bindingId,
+      bindingEpoch: item.bindingEpoch,
       body: item.body,
       createdAt: item.createdAt,
     }));
@@ -722,22 +790,76 @@ export class ImBridge {
     if (decision !== "replay" && decision !== "dismiss") {
       throw new BridgeError("INVALID_PARAMS", 'decision must be "replay" or "dismiss"');
     }
+    const leaderId = optStr(params, "leaderId");
     const messageIds = Array.isArray(params.messageIds)
       ? params.messageIds.filter((id): id is string => typeof id === "string" && id.length > 0)
       : optStr(params, "messageId")
         ? [reqStr(params, "messageId")]
         : [];
-    const changed = this.store.decidePausedPending(messageIds, decision);
-    if (decision === "replay") {
-      for (const msg of changed) {
+    if (decision === "dismiss") {
+      const eligible = messageIds.filter((id) => {
+        const msg = this.store.message(id);
+        if (!msg || msg.state !== "paused_pending") return false;
         const conn = this.store.connection(msg.connectionId);
-        const chat = this.store.chat(msg.chatId);
-        if (!conn || !chat || conn.paused || conn.leaderPaused) continue;
-        const contact = msg.senderId ? this.store.contactByPlatformId(conn.id, msg.senderId) : undefined;
-        this.emitDispatch(conn, chat, msg, contact);
-      }
+        if (leaderId && (msg.leaderId ?? conn?.leaderId ?? "leader-default") !== leaderId) return false;
+        return true;
+      });
+      const changed = this.store.decidePausedPending(eligible, "dismiss");
+      return { decision, count: changed.length, messageIds: changed.map((m) => m.id), blockedIds: [], heldIds: [], skippedIds: [] };
     }
-    return { decision, count: changed.length, messageIds: changed.map((m) => m.id) };
+
+    const replayedIds: string[] = [];
+    const blockedIds: string[] = [];
+    const heldIds: string[] = [];
+    const skippedIds: string[] = [];
+
+    for (const id of messageIds) {
+      const msg = this.store.message(id);
+      if (!msg || msg.state !== "paused_pending") continue;
+      const conn = this.store.connection(msg.connectionId);
+      const chat = this.store.chat(msg.chatId);
+      if (!conn || !chat) {
+        skippedIds.push(id);
+        continue;
+      }
+      if (leaderId && (msg.leaderId ?? conn.leaderId) !== leaderId) {
+        skippedIds.push(id);
+        continue;
+      }
+      // S5: Validate active/unpaused connection state BEFORE transitioning out of `paused_pending`.
+      if (conn.lifecycleState !== "active" || conn.paused || conn.leaderPaused) {
+        skippedIds.push(id);
+        continue;
+      }
+      // S5: Re-evaluate current access gate BEFORE transitioning out of `paused_pending`.
+      const trust = this.channels[conn.platform]?.trust ?? "public";
+      const verdict = this.store.evaluateInboundGate(msg, trust);
+      if (verdict === "drop") {
+        this.store.moveInbound([msg.id], "refuse");
+        blockedIds.push(msg.id);
+        continue;
+      }
+      if (verdict === "ask") {
+        this.store.moveInbound([msg.id], "rehold_paused");
+        heldIds.push(msg.id);
+        continue;
+      }
+      const moved = this.store.decidePausedPending([msg.id], "replay");
+      const replayed = moved[0];
+      if (!replayed) continue;
+      const contact = replayed.senderId ? this.store.contactByPlatformId(conn.id, replayed.senderId) : undefined;
+      this.emitDispatch(conn, chat, replayed, contact);
+      replayedIds.push(replayed.id);
+    }
+
+    return {
+      decision,
+      count: replayedIds.length,
+      messageIds: replayedIds,
+      blockedIds,
+      heldIds,
+      skippedIds,
+    };
   }
 
   private async handleConnectionDisconnect(connectionId: string) {
@@ -1444,6 +1566,9 @@ export class ImBridge {
         messageId: msg.id,
         platformMsgId: msg.platformMsgId,
         idempotencyKey: msg.idempotencyKey,
+        leaderId: msg.leaderId ?? conn.leaderId,
+        bindingId: msg.bindingId ?? conn.bindingId,
+        bindingEpoch: msg.bindingEpoch ?? conn.bindingEpoch,
         senderId: msg.senderId,
         senderName: senderDisplayName,
         contactId: contact?.id ?? null,
@@ -1532,6 +1657,9 @@ function sanitizeConnection(conn: Connection) {
     stateDetail: conn.stateDetail,
     paused: conn.paused,
     leaderPaused: conn.leaderPaused,
+    leaderId: conn.leaderId,
+    bindingId: conn.bindingId,
+    bindingEpoch: conn.bindingEpoch,
     ownerId: conn.ownerId,
     claimCode: conn.claimCode,
     claimExpiresAt: conn.claimExpiresAt,

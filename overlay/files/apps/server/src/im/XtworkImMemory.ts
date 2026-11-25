@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off globalDateInEffect:off globalJsonInEffect:off effectTryWithoutCatch:off globalErrorInEffectCatch:off globalErrorInEffectFailure:off effectFnOpportunity:off deterministicKeys:off matchBooleanToIsSuccess:off
-import { access, cp, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { DEFAULT_LEADER_ID, scopedPath, type CompanionScope, type MemoryScope } from "./XtworkImSecurity.ts";
@@ -28,6 +28,43 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+/**
+ * Recursively copy individual missing files from `src` into `dst` without ever overwriting
+ * existing files in `dst`. Safe to resume after partial/interrupted migrations (S10).
+ */
+async function copyMissingEntries(src: string, dst: string): Promise<void> {
+  let stat;
+  try {
+    stat = await lstat(src);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+    throw error;
+  }
+  if (stat.isSymbolicLink()) return;
+  if (stat.isFile()) {
+    if (await exists(dst)) return;
+    await mkdir(dirname(dst), { recursive: true, mode: 0o700 });
+    const data = await readFile(src);
+    const temp = join(dirname(dst), `.${randomUUID()}.migrate.tmp`);
+    try {
+      await writeFile(temp, data, { flag: "wx", mode: 0o600 });
+      if (await exists(dst)) return;
+      await rename(temp, dst);
+    } finally {
+      await rm(temp, { force: true });
+    }
+    return;
+  }
+  if (stat.isDirectory()) {
+    await mkdir(dst, { recursive: true, mode: 0o700 });
+    const entries = await readdir(src, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      await copyMissingEntries(join(src, entry.name), join(dst, entry.name));
+    }
+  }
+}
+
 export class XtworkImMemory {
   private readonly root: string;
   private migrated = false;
@@ -38,7 +75,8 @@ export class XtworkImMemory {
 
   /**
    * Idempotently migrate legacy ADR-011 root companion files (`ROLE.md`, `private/`, `groups/`)
-   * into `leaders/<defaultLeaderId>/` per ADR-013 §5. Never overwrites existing leader files.
+   * into `leaders/<defaultLeaderId>/` per ADR-013 §5. Copies missing files individually so an
+   * interrupted migration finishes cleanly on restart without ever clobbering existing Leader files.
    */
   async ensureMigrated(defaultLeaderId = DEFAULT_LEADER_ID): Promise<void> {
     if (this.migrated) return;
@@ -51,8 +89,8 @@ export class XtworkImMemory {
     for (const item of legacyItems) {
       const src = join(this.root, item);
       const dst = join(leaderDir, item);
-      if ((await exists(src)) && !(await exists(dst))) {
-        await cp(src, dst, { recursive: true, force: false, errorOnExist: false });
+      if (await exists(src)) {
+        await copyMissingEntries(src, dst);
       }
     }
     this.migrated = true;

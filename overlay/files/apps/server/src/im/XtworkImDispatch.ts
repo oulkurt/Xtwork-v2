@@ -52,11 +52,35 @@ export const inboundMessage = (payload: BridgePayload) => {
   if (payload.idempotencyKey !== undefined && payload.idempotencyKey !== key) {
     throw new Error("Invalid IM delivery key.");
   }
+  const chatName =
+    typeof payload.chatName === "string" && payload.chatName
+      ? payload.chatName
+      : typeof message.chatName === "string" && message.chatName
+        ? message.chatName
+        : undefined;
+  const leaderId =
+    typeof payload.leaderId === "string" && payload.leaderId
+      ? payload.leaderId
+      : typeof message.leaderId === "string" && message.leaderId
+        ? message.leaderId
+        : undefined;
+  const bindingId =
+    typeof payload.bindingId === "string" && payload.bindingId
+      ? payload.bindingId
+      : typeof message.bindingId === "string" && message.bindingId
+        ? message.bindingId
+        : undefined;
+  const rawEpoch = payload.bindingEpoch ?? message.bindingEpoch;
+  const bindingEpoch = typeof rawEpoch === "number" && Number.isInteger(rawEpoch) ? rawEpoch : undefined;
   return {
     key,
     connectionId,
     platformMsgId,
     chatId,
+    ...(chatName ? { chatName } : {}),
+    ...(leaderId ? { leaderId } : {}),
+    ...(bindingId ? { bindingId } : {}),
+    ...(bindingEpoch !== undefined ? { bindingEpoch } : {}),
     chatKind,
     senderRole,
     replyAudience: (replyAudience === "owner_dm" || replyAudience === undefined) && chatKind === "dm" && senderRole === "owner"
@@ -116,13 +140,30 @@ export const dispatchIdentity = (
   return { threadId, context };
 };
 
-export const sameAudience = (a: TurnExecutionContext, b: TurnExecutionContext) =>
-  a.replyAudience === b.replyAudience &&
-  a.connectionId === b.connectionId &&
-  a.chatId === b.chatId &&
-  (a.leaderId ?? DEFAULT_LEADER_ID) === (b.leaderId ?? DEFAULT_LEADER_ID) &&
-  (a.bindingId ?? null) === (b.bindingId ?? null) &&
-  (a.bindingEpoch ?? null) === (b.bindingEpoch ?? null);
+export const sameAudience = (a: TurnExecutionContext, b: TurnExecutionContext) => {
+  if (
+    a.replyAudience !== b.replyAudience ||
+    a.connectionId !== b.connectionId ||
+    a.chatId !== b.chatId ||
+    (a.leaderId ?? DEFAULT_LEADER_ID) !== (b.leaderId ?? DEFAULT_LEADER_ID)
+  ) {
+    return false;
+  }
+  const aBinding = a.bindingId ?? null;
+  const bBinding = b.bindingId ?? null;
+  const aEpoch = a.bindingEpoch ?? null;
+  const bEpoch = b.bindingEpoch ?? null;
+  if (aBinding === bBinding && aEpoch === bEpoch) return true;
+  // S7: Allow legacy pre-ADR-013 rows (no bindingId/epoch, default Leader) to match
+  // the initial default Leader binding (epoch 1) without weakening epoch >= 2 rebind isolation!
+  const leader = a.leaderId ?? DEFAULT_LEADER_ID;
+  if (leader !== DEFAULT_LEADER_ID) return false;
+  const aLegacy = aBinding === null && aEpoch === null;
+  const bLegacy = bBinding === null && bEpoch === null;
+  return (aLegacy && bEpoch === 1) || (bLegacy && aEpoch === 1);
+};
+
+export const LEADER_PAUSED_ERROR = "LEADER_PAUSED";
 
 export const makeDispatcher = Effect.fnUntraced(function* (
   dataDir: string,
@@ -150,23 +191,54 @@ export const makeDispatcher = Effect.fnUntraced(function* (
     SELECT context_json AS "contextJson" FROM xtwork_im_delivery WHERE thread_id = ${threadId} LIMIT 1
   `.pipe(Effect.map(([row]) => (row === undefined ? undefined : contextOf(row))));
 
+  // S7: Backfill legacy ADR-011 delivery rows to the initial default Leader binding while
+  // preserving their original thread_id and idempotency key untouched.
+  const legacyRows = yield* sql<StoredDelivery>`
+    SELECT key, thread_id AS "threadId", context_json AS "contextJson", payload_json AS "payloadJson"
+    FROM xtwork_im_delivery
+  `;
+  for (const row of legacyRows) {
+    const ctx = contextOf(row);
+    if (!ctx.connectionId || ctx.bindingId) continue;
+    const binding = yield* leaders.ensureBinding(ctx.connectionId, ctx.leaderId ?? DEFAULT_LEADER_ID);
+    const migrated = normalizeExecutionContext({
+      ...ctx,
+      leaderId: binding.leaderId,
+      bindingId: binding.bindingId,
+      bindingEpoch: binding.epoch,
+    });
+    yield* sql`UPDATE xtwork_im_delivery SET context_json = ${JSON.stringify(migrated)} WHERE key = ${row.key}`;
+    yield* leaders.registerLegacyProtectedThread(row.threadId, migrated);
+  }
+
   const accept = (payload: BridgePayload) => permits.withPermit(Effect.gen(function* () {
     const inbound = yield* Effect.try({ try: () => inboundMessage(payload), catch: imError });
     const commandId = CommandId.make(inbound.key);
     const [previous] = yield* stored(inbound.key);
-    const binding = previous
-      ? undefined
-      : yield* leaders.ensureBinding(inbound.connectionId);
+
+    // S6: Honor binding identity stamped in the bridge when the message arrived (verified against LeaderStore).
+    let binding: LeaderBindingRecord | undefined;
+    if (!previous) {
+      if (inbound.bindingId) {
+        const stamped = yield* leaders.getBindingById(inbound.bindingId);
+        if (stamped && stamped.connectionId === inbound.connectionId) {
+          binding = stamped;
+        }
+      }
+      if (!binding) {
+        binding = yield* leaders.ensureBinding(inbound.connectionId, inbound.leaderId ?? DEFAULT_LEADER_ID);
+      }
+    }
     const activeLeaderId = previous
       ? (contextOf(previous).leaderId ?? DEFAULT_LEADER_ID)
       : (binding?.leaderId ?? DEFAULT_LEADER_ID);
 
     // If this is a brand-new trigger (not an already-accepted replay) and its Leader is paused,
-    // refuse starting a new turn so it remains deferred in `paused_pending`.
+    // refuse starting a new turn so caller can durably defer it into `paused_pending` (S4).
     if (!previous) {
       const leader = yield* leaders.getLeader(activeLeaderId);
       if (leader?.status === "paused") {
-        return yield* imError("Leader is currently paused; new IM tasks are deferred.");
+        return yield* imError(`${LEADER_PAUSED_ERROR}: Leader is currently paused; new IM tasks are deferred.`);
       }
     }
 
@@ -249,39 +321,28 @@ export const makeDispatcher = Effect.fnUntraced(function* (
   }));
 
   /**
-   * Resolve persisted per-run execution policy for MCP tool enforcement.
-   * Checks persisted `xtwork_run_policies` by exact `runId` FIRST (never guessing across runs
-   * or relying on `xtwork-im-` prefix alone), and returns `undefined` (fail-closed) when missing.
+   * Resolve persisted per-run execution policy for MCP tool enforcement and approval checks (S1).
+   * Strictly requires an explicit `runId` bound in `xtwork_run_policies` for the exact `threadId`
+   * and an active run on that thread. NEVER falls back to `runs.at(-1)` or unverified delivery rows.
    */
   const resolveExecution = Effect.fnUntraced(function* (threadId: ThreadId, explicitRunId?: RunId) {
+    if (!explicitRunId) return undefined;
+    const persisted = yield* leaders.resolvePolicy({ runId: explicitRunId });
+    if (!persisted || persisted.threadId !== threadId) return undefined;
+
     const records = yield* orchestrator.getThreadRecords(threadId, ["runs"], { runStatuses: activeStatuses });
-    const run = explicitRunId
-      ? records.runs.find((candidate) => candidate.id === explicitRunId)
-      : records.runs.at(-1);
+    const run = records.runs.find((candidate) => candidate.id === explicitRunId);
     if (run === undefined) return undefined;
 
     const [row] = yield* sql<StoredDelivery>`
       SELECT context_json AS "contextJson", key, payload_json AS "payloadJson" FROM xtwork_im_delivery
-      WHERE thread_id = ${threadId} AND message_id = ${run.userMessageId}`;
-    const persisted =
-      (yield* leaders.resolvePolicy({ runId: run.id })) ??
-      (row ? yield* leaders.resolvePolicy({ commandId: row.key }) : undefined);
-
-    if (persisted !== undefined) {
-      const inbound = row ? decodeInbound(row.payloadJson) : undefined;
-      return {
-        turnId: run.id,
-        threadId,
-        context: persisted.context,
-        ...(inbound ? { inbound } : {}),
-      } as Execution & { readonly inbound?: Route };
-    }
-    if (row === undefined) return undefined;
+      WHERE key = ${persisted.commandId} AND thread_id = ${threadId} LIMIT 1`;
+    const inbound = row ? decodeInbound(row.payloadJson) : undefined;
     return {
       turnId: run.id,
       threadId,
-      context: contextOf(row),
-      inbound: decodeInbound(row.payloadJson),
+      context: persisted.context,
+      ...(inbound ? { inbound } : {}),
     } as Execution & { readonly inbound?: Route };
   });
 

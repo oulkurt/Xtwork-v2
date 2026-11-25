@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off globalDateInEffect:off globalJsonInEffect:off effectTryWithoutCatch:off globalErrorInEffectCatch:off globalErrorInEffectFailure:off effectFnOpportunity:off deterministicKeys:off matchBooleanToIsSuccess:off
-import { AuthOrchestrationOperateScope, AuthOrchestrationReadScope, CommandId, ThreadId } from "@t3tools/contracts";
+import { AuthOrchestrationOperateScope, AuthOrchestrationReadScope, CommandId, RunId, ThreadId } from "@t3tools/contracts";
 import * as ByteSize from "effect/ByteSize";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -18,7 +18,7 @@ import { forkParked } from "../serverActivation.ts";
 import { PI_INSTANCE_ID } from "../xtwork/bundledPiSettings.ts";
 import { MODEL_PROVIDER, STANDARD_MODEL } from "../xtwork/gateway.ts";
 import { bridgeOptions, type BridgePayload, isRecord, XtworkImBridgeHost } from "./XtworkImBridgeHost.ts";
-import { activeStatuses, decodeInbound, isTerminal, makeDispatcher, type ImDispatcher } from "./XtworkImDispatch.ts";
+import { activeStatuses, decodeInbound, isTerminal, LEADER_PAUSED_ERROR, makeDispatcher, type ImDispatcher } from "./XtworkImDispatch.ts";
 import { XtworkImMemory, memoryScope } from "./XtworkImMemory.ts";
 import {
   DEFAULT_LEADER_ID,
@@ -29,6 +29,7 @@ import {
   isImThread,
   untrustedEnvelope,
   type AwarenessScope,
+  type ImError,
   type ReplyAudience,
   type TurnExecutionContext,
 } from "./XtworkImSecurity.ts";
@@ -39,6 +40,7 @@ export interface XtworkPolicyHook {
   readonly isProtectedThread: (threadId: string | undefined) => boolean;
   readonly resolveProviderPolicy: (threadId: string, runId?: string | null) => ProviderPolicyState;
   readonly hasPersistedRunPolicy: (query: { readonly runId?: string | null; readonly commandId?: string | null; readonly threadId?: string | null }) => boolean;
+  readonly bindRunPolicy: (commandId: string, threadId: string, runId: string) => Effect.Effect<void, ImError>;
   readonly getProtectedContext: (threadId: string | undefined) => TurnExecutionContext | undefined;
 }
 
@@ -57,14 +59,26 @@ export function isProtectedXtworkThread(threadId: string | undefined): boolean {
 export function resolveXtworkProviderPolicy(threadId: string, runId?: string | null): ProviderPolicyState {
   if (activePolicyHook) return activePolicyHook.resolveProviderPolicy(threadId, runId);
   if (isImThread(threadId)) {
-    return { protected: true, policyDigest: null, failClosed: true };
+    return { protected: true, policyDigest: null, failClosed: true, policyChanged: false };
   }
-  return { protected: false, policyDigest: null, failClosed: false };
+  return { protected: false, policyDigest: null, failClosed: false, policyChanged: false };
 }
 
 export function hasPersistedXtworkRunPolicy(query: { readonly runId?: string | null; readonly commandId?: string | null; readonly threadId?: string | null }): boolean {
   if (activePolicyHook) return activePolicyHook.hasPersistedRunPolicy(query);
   return false;
+}
+
+export function bindXtworkRunPolicy(
+  commandId: string,
+  threadId: string,
+  runId: string,
+): Effect.Effect<void, ImError> {
+  if (activePolicyHook) return activePolicyHook.bindRunPolicy(commandId, threadId, runId);
+  if (isImThread(threadId)) {
+    return Effect.fail(imError("Protected run refused: Leader policy service is unavailable."));
+  }
+  return Effect.void;
 }
 
 interface ImService {
@@ -184,6 +198,8 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
       isProtectedThread: leaders.isProtectedThreadSync,
       resolveProviderPolicy: leaders.resolveProviderPolicySync,
       hasPersistedRunPolicy: leaders.hasRunPolicySync,
+      bindRunPolicy: (commandId, threadId, runId) =>
+        leaders.bindRunPolicy(commandId, threadId, runId).pipe(Effect.asVoid, Effect.mapError(imError)),
       getProtectedContext: leaders.getProtectedContextSync,
     };
     yield* Effect.acquireRelease(
@@ -225,16 +241,62 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
   const queue = yield* Queue.unbounded<BridgeEvent>();
   const epoch = (yield* Clock.currentTimeMillis) * 1000;
   let sequence = epoch;
+  const syncBridgeBindings = Effect.fnUntraced(function* (
+    callRaw: (method: string, params?: BridgePayload, signal?: AbortSignal) => Promise<unknown>,
+    triggerReplay = false,
+  ) {
+    const defaultLdr = yield* leaders.ensureDefaultLeader();
+    const allLeaders = yield* leaders.listLeaders();
+    const leaderStatusById = new Map(allLeaders.map((l) => [l.id, l.status]));
+    const listed = yield* tryWork((signal) => callRaw("connections.list", {}, signal)).pipe(
+      Effect.map((val) => (isRecord(val) && Array.isArray(val.connections) ? val.connections : [])),
+      Effect.orElseSucceed(() => []),
+    );
+    const bindingsPayload: Array<Record<string, unknown>> = [];
+    for (const conn of listed) {
+      if (!isRecord(conn) || typeof conn.id !== "string") continue;
+      const binding = yield* leaders.ensureBinding(conn.id, DEFAULT_LEADER_ID);
+      const leaderPaused = leaderStatusById.get(binding.leaderId) === "paused";
+      bindingsPayload.push({
+        connectionId: conn.id,
+        leaderId: binding.leaderId,
+        bindingId: binding.bindingId,
+        bindingEpoch: binding.epoch,
+        leaderPaused,
+      });
+    }
+    yield* tryWork((signal) =>
+      callRaw(
+        "connections.syncBindings",
+        {
+          bindings: bindingsPayload,
+          defaultLeaderPaused: defaultLdr.status === "paused",
+          ...(triggerReplay ? { triggerReplay: true } : {}),
+        },
+        signal,
+      ),
+    ).pipe(Effect.ignore);
+  });
+
+  const runSync = Effect.runPromiseWith(yield* Effect.context<never>());
   const host = yield* Effect.acquireRelease(
     Effect.sync(() => {
-      const host = new XtworkImBridgeHost(options, (event, payload) => {
-        const item = { sequence: ++sequence, event, payload };
-        if (["onboarding.event", "connection.state", "access.held", "inbound.paused"].includes(event)) {
-          events.push(item);
-          if (events.length > 200) events.shift();
-        }
-        if (event === "inbound.dispatch" || event === "inbound.stop") Queue.offerUnsafe(queue, item);
-      });
+      const host = new XtworkImBridgeHost(
+        options,
+        (event, payload) => {
+          const item = { sequence: ++sequence, event, payload };
+          if (["onboarding.event", "connection.state", "access.held", "inbound.paused"].includes(event)) {
+            events.push(item);
+            if (events.length > 200) events.shift();
+          }
+          if (event === "inbound.dispatch" || event === "inbound.stop" || event === "connection.state") {
+            Queue.offerUnsafe(queue, item);
+          }
+        },
+        async (callRaw) => {
+          await runSync(syncBridgeBindings(callRaw, true));
+        },
+      );
       host.start();
       return host;
     }),
@@ -242,8 +304,51 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
   );
 
   const handle = Effect.fnUntraced(function* ({ event, payload }: BridgeEvent) {
+    if (event === "connection.state") {
+      const connId = typeof payload.connectionId === "string" ? payload.connectionId : "";
+      if (connId && host.available) {
+        const binding = yield* leaders.ensureBinding(connId, DEFAULT_LEADER_ID);
+        const ownerLeader = yield* leaders.getLeader(binding.leaderId);
+        const desiredPaused = ownerLeader?.status === "paused";
+        const needsSync =
+          payload.leaderId !== binding.leaderId ||
+          payload.bindingId !== binding.bindingId ||
+          payload.bindingEpoch !== binding.epoch ||
+          Boolean(payload.leaderPaused) !== desiredPaused;
+        if (needsSync) {
+          yield* call(host, "connections.syncBindings", {
+            bindings: [
+              {
+                connectionId: connId,
+                leaderId: binding.leaderId,
+                bindingId: binding.bindingId,
+                bindingEpoch: binding.epoch,
+                leaderPaused: desiredPaused,
+              },
+            ],
+          }).pipe(Effect.ignore);
+        }
+      }
+      return;
+    }
     if (event === "inbound.dispatch") {
-      const { threadId, turnId, inbound } = yield* dispatch.accept(payload);
+      const accepted = yield* dispatch.accept(payload).pipe(Effect.result);
+      if (accepted._tag === "Failure") {
+        // S4: If a trigger raced with Leader pause, durably defer it into `paused_pending`!
+        if (accepted.failure.message.includes(LEADER_PAUSED_ERROR)) {
+          const connId = typeof payload.connectionId === "string" ? payload.connectionId : undefined;
+          const idempotencyKey = typeof payload.idempotencyKey === "string" ? payload.idempotencyKey : undefined;
+          if (connId) {
+            yield* call(host, "connections.setLeaderPaused", { connectionIds: [connId], paused: true }).pipe(Effect.ignore);
+          }
+          if (idempotencyKey) {
+            yield* call(host, "inbound.settle", { idempotencyKey, event: "pause" }).pipe(Effect.ignore);
+          }
+          return;
+        }
+        return yield* accepted.failure;
+      }
+      const { threadId, turnId, inbound } = accepted.success;
       yield* call(host, "inbound.ack", {
         idempotencyKey: inbound.key, t3ThreadId: threadId, t3TurnId: turnId,
       });
@@ -355,24 +460,49 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
         Effect.orElseSucceed(() => []),
       )
     : [];
-  // Ensure every active bridge connection has a Leader binding (defaulting to leader-default).
+  // Ensure every active bridge connection has a Leader binding & synced pause state (S4/S6).
+  const allLeaders = yield* service.leaders.listLeaders();
+  const leaderStatusById = new Map(allLeaders.map((l) => [l.id, l.status]));
+  const toSync: Array<Record<string, unknown>> = [];
   for (const conn of rawConnections) {
     if (isRecord(conn) && typeof conn.id === "string") {
-      yield* service.leaders.ensureBinding(conn.id, DEFAULT_LEADER_ID).pipe(Effect.ignore);
+      const binding = yield* service.leaders.ensureBinding(conn.id, DEFAULT_LEADER_ID).pipe(
+        Effect.orElseSucceed(() => undefined),
+      );
+      if (binding) {
+        const desiredPaused = leaderStatusById.get(binding.leaderId) === "paused";
+        if (
+          conn.leaderId !== binding.leaderId ||
+          conn.bindingId !== binding.bindingId ||
+          conn.bindingEpoch !== binding.epoch ||
+          Boolean(conn.leaderPaused) !== desiredPaused
+        ) {
+          toSync.push({
+            connectionId: conn.id,
+            leaderId: binding.leaderId,
+            bindingId: binding.bindingId,
+            bindingEpoch: binding.epoch,
+            leaderPaused: desiredPaused,
+          });
+        }
+      }
     }
+  }
+  if (service.host?.available && toSync.length > 0) {
+    yield* call(service.host, "connections.syncBindings", { bindings: toSync }).pipe(Effect.ignore);
   }
   const refreshedBindings = yield* service.leaders.listBindings(leader.id);
   const boundConnectionIds = new Set(refreshedBindings.map((b) => b.connectionId));
   const connections = rawConnections.filter(
     (conn) => isRecord(conn) && typeof conn.id === "string" && boundConnectionIds.has(conn.id),
   );
-  const pausedPending =
-    service.host?.available && boundConnectionIds.size > 0
-      ? yield* call(service.host, "paused.list", { connectionIds: [...boundConnectionIds] }).pipe(
-          Effect.map((val) => (isRecord(val) && Array.isArray(val.items) ? val.items : [])),
-          Effect.orElseSucceed(() => []),
-        )
-      : [];
+  // S6: Query paused backlog strictly by stamped `leaderId` so rebinding preserves original Leader ownership.
+  const pausedPending = service.host?.available
+    ? yield* call(service.host, "paused.list", { leaderId: leader.id }).pipe(
+        Effect.map((val) => (isRecord(val) && Array.isArray(val.items) ? val.items : [])),
+        Effect.orElseSucceed(() => []),
+      )
+    : [];
 
   const snapshot = service.projection
     ? yield* service.projection.getAgentAwarenessSnapshot().pipe(
@@ -566,14 +696,24 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
       const updated = yield* service.leaders.updateLeader(leaderId, { status: nextPaused ? "paused" : "active" });
       if (!updated) return failure("找不到对应的 Leader。", 404);
       const bindings = yield* service.leaders.listBindings(updated.id);
-      const connectionIds = bindings.map((b) => b.connectionId);
       let pausedPending: unknown[] = [];
-      if (service.host?.available && connectionIds.length > 0) {
-        const res = yield* call(service.host, "connections.setLeaderPaused", {
-          connectionIds,
-          paused: nextPaused,
-        }).pipe(Effect.orElseSucceed(() => ({})));
-        if (isRecord(res) && Array.isArray(res.pausedPending)) pausedPending = res.pausedPending;
+      if (service.host?.available) {
+        // S4: Reconcile binding + leaderPaused for all bound connections (and default Leader fallback).
+        const bindingsPayload = bindings.map((b) => ({
+          connectionId: b.connectionId,
+          leaderId: b.leaderId,
+          bindingId: b.bindingId,
+          bindingEpoch: b.epoch,
+          leaderPaused: nextPaused,
+        }));
+        yield* call(service.host, "connections.syncBindings", {
+          bindings: bindingsPayload,
+          ...(updated.id === DEFAULT_LEADER_ID ? { defaultLeaderPaused: nextPaused } : {}),
+        }).pipe(Effect.ignore);
+        const listed = yield* call(service.host, "paused.list", { leaderId: updated.id }).pipe(
+          Effect.orElseSucceed(() => ({})),
+        );
+        if (isRecord(listed) && Array.isArray(listed.items)) pausedPending = listed.items;
       }
       return response({ leader: updated, pausedPending });
     }
@@ -582,15 +722,10 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
       if (!service.host?.available) return failure("远程连接服务暂不可用。", 503);
       const leader = yield* service.leaders.getLeader(leaderId);
       if (!leader) return failure("找不到对应的 Leader。", 404);
-      const bindings = yield* service.leaders.listBindings(leader.id);
-      const connectionIds = bindings.map((b) => b.connectionId);
-      const allowedList =
-        connectionIds.length > 0
-          ? yield* call(service.host, "paused.list", { connectionIds }).pipe(
-              Effect.map((val) => (isRecord(val) && Array.isArray(val.items) ? val.items : [])),
-              Effect.orElseSucceed(() => []),
-            )
-          : [];
+      const allowedList = yield* call(service.host, "paused.list", { leaderId: leader.id }).pipe(
+        Effect.map((val) => (isRecord(val) && Array.isArray(val.items) ? val.items : [])),
+        Effect.orElseSucceed(() => []),
+      );
       const allowedIds = new Set(
         allowedList
           .filter((item): item is Record<string, unknown> => isRecord(item) && typeof item.id === "string")
@@ -605,6 +740,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
       }
       return yield* call(service.host, "paused.decide", {
         ...params,
+        leaderId: leader.id,
         messageIds: scopedIds,
       }).pipe(
         Effect.match({ onSuccess: (val) => response(val), onFailure: (err) => failure(err.message, 400) }),
@@ -657,7 +793,9 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
   if (Option.isNone(input) || !isRecord(input.value)) return failure("需要有效的请求数据。", 400);
   const params = input.value;
   if (writing && action === "approvals.decide") {
-    const expectedRunId = typeof params.expectedRunId === "string" ? params.expectedRunId : undefined;
+    const expectedRunId = typeof params.expectedRunId === "string" && params.expectedRunId.length > 0
+      ? params.expectedRunId
+      : undefined;
     const expectedAudience =
       params.expectedAudience === "local_only" ||
       params.expectedAudience === "owner_dm" ||
@@ -665,13 +803,28 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
         ? (params.expectedAudience as ReplyAudience)
         : undefined;
     const expectedSnapshotHash = typeof params.expectedSnapshotHash === "string" ? params.expectedSnapshotHash : undefined;
-    return typeof params.id === "string" && typeof params.approved === "boolean" &&
-      service.approvals.decide(params.id, params.approved, {
-        desktopOwnerVerified: session.value.subject === "desktop-bootstrap",
-        ...(expectedRunId ? { expectedRunId } : {}),
-        ...(expectedAudience ? { expectedAudience } : {}),
-        ...(expectedSnapshotHash ? { expectedSnapshotHash } : {}),
-      })
+    if (typeof params.id !== "string" || typeof params.approved !== "boolean" || !expectedRunId || !expectedAudience) {
+      return failure("此审批缺少必需的运行标识或范围校验参数。", 409);
+    }
+    const pending = service.approvals.get(params.id);
+    if (!pending) {
+      return failure("此审批已处理、已过期或权限校验不匹配。", 409);
+    }
+    // S8: Re-verify against active execution when approving a live thread turn.
+    if (params.approved && pending.threadId && service.dispatch) {
+      const activeExec = yield* service.dispatch
+        .resolveExecution(ThreadId.make(pending.threadId), RunId.make(expectedRunId))
+        .pipe(Effect.orElseSucceed(() => undefined));
+      if (!activeExec || activeExec.context.replyAudience !== expectedAudience) {
+        return failure("目标任务已结束或上下文已变化，已拒绝本次授权。", 409);
+      }
+    }
+    return service.approvals.decide(params.id, params.approved, {
+      desktopOwnerVerified: session.value.subject === "desktop-bootstrap",
+      expectedRunId,
+      expectedAudience,
+      ...(expectedSnapshotHash !== undefined ? { expectedSnapshotHash } : {}),
+    })
       ? response({ decided: true })
       : failure("此审批已处理、已过期或权限校验不匹配。", 409);
   }

@@ -16,6 +16,7 @@ import {
   XIcon,
 } from "lucide-react";
 import type { EnvironmentId } from "@t3tools/contracts";
+import { useProjects } from "../../state/entities";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { REMOTE_IM_CHANNELS } from "../settings/remoteImThemes";
@@ -30,6 +31,7 @@ export interface LeaderSupervisoryBarProps {
   readonly threadId: string;
   readonly environmentId: EnvironmentId;
   readonly onOpenThread?: (threadId: string) => void;
+  readonly availableProjects?: readonly { readonly id: string; readonly title: string }[];
 }
 
 const AUDIENCE_LABEL: Record<"local_only" | "owner_dm" | "group", string> = {
@@ -55,9 +57,16 @@ export function LeaderSupervisoryBar({
   threadId,
   environmentId,
   onOpenThread,
+  availableProjects,
 }: LeaderSupervisoryBarProps) {
   const desktop = typeof window !== "undefined" && Boolean(window.desktopBridge);
   const navigate = useNavigate();
+  const storeProjects = useProjects();
+  const selectableProjects =
+    availableProjects ??
+    storeProjects
+      .filter((project) => project.environmentId === environmentId && project.archivedAt === null)
+      .map((project) => ({ id: project.id, title: project.title }));
   const [matchedLeaderId, setMatchedLeaderId] = useState<string | null>(null);
   const [overview, setOverview] = useState<LeaderOverview | null>(null);
   const [expanded, setExpanded] = useState(false);
@@ -66,11 +75,12 @@ export function LeaderSupervisoryBar({
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
 
-  // Editable Leader settings form state
+  // Editable Leader settings form state (S11: preserve full awarenessScope including `projects` & projectIds)
   const [draftName, setDraftName] = useState("");
   const [draftAvatar, setDraftAvatar] = useState("");
   const [draftRole, setDraftRole] = useState("");
-  const [draftAwarenessKind, setDraftAwarenessKind] = useState<"all_local" | "none">("all_local");
+  const [draftAwarenessKind, setDraftAwarenessKind] = useState<"all_local" | "projects" | "none">("all_local");
+  const [draftProjectIds, setDraftProjectIds] = useState<readonly string[]>([]);
 
   useEffect(() => {
     if (!desktop) return;
@@ -115,7 +125,8 @@ export function LeaderSupervisoryBar({
     setDraftName(overview.leader.name);
     setDraftAvatar(overview.leader.avatar);
     setDraftRole(overview.leader.role);
-    setDraftAwarenessKind(overview.leader.awarenessScope.kind === "none" ? "none" : "all_local");
+    setDraftAwarenessKind(overview.leader.awarenessScope.kind);
+    setDraftProjectIds(overview.leader.awarenessScope.projectIds);
   }, [overview, configOpen]);
 
   const nonApprovalNeedsYou =
@@ -158,11 +169,18 @@ export function LeaderSupervisoryBar({
   async function handleSaveConfig(event: FormEvent) {
     event.preventDefault();
     await runAction(async () => {
+      const normalizedProjects = draftAwarenessKind === "projects" ? [...new Set(draftProjectIds)] : [];
+      const scopeChanged =
+        draftAwarenessKind !== leader.awarenessScope.kind ||
+        normalizedProjects.length !== leader.awarenessScope.projectIds.length ||
+        normalizedProjects.some((id, idx) => leader.awarenessScope.projectIds[idx] !== id);
       await leaderRequest(`leaders/${leader.id}/update`, {
         name: draftName,
         avatar: draftAvatar,
         role: draftRole,
-        awarenessScope: { kind: draftAwarenessKind, projectIds: [] },
+        ...(scopeChanged
+          ? { awarenessScope: { kind: draftAwarenessKind, projectIds: normalizedProjects } }
+          : {}),
       });
       setConfigOpen(false);
     }, "Leader 设置已保存。");
@@ -317,66 +335,98 @@ export function LeaderSupervisoryBar({
           {overview.approvals.length > 0 ? (
             <div className="space-y-2">
               <h3 className="text-xs font-semibold text-foreground">待你批准的操作</h3>
-              {overview.approvals.map((item) => (
-                <div
-                  key={item.id}
-                  className="flex flex-col gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-2.5"
-                >
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 text-xs">
-                      <AlertCircleIcon className="size-3.5 text-amber-600" aria-hidden="true" />
-                      <span className="font-mono font-semibold text-foreground">{item.toolName}</span>
-                      <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                        {AUDIENCE_LABEL[item.replyAudience]}
-                      </span>
-                      {item.snapshotHash ? (
-                        <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-                          快照 {item.snapshotHash.slice(0, 8)}
+              {overview.approvals.map((item) => {
+                const isSnapshotShare = Boolean(item.snapshotHash);
+                const fullSnapshot = item.contentSnapshot ?? item.contentPreview;
+                const destinationLabel =
+                  item.targetChatName || item.targetChatId || item.targetScope || AUDIENCE_LABEL[item.replyAudience];
+                const canApprove =
+                  !busy &&
+                  Boolean(item.turnId) &&
+                  (!isSnapshotShare || (typeof fullSnapshot === "string" && fullSnapshot.length > 0));
+                return (
+                  <div
+                    key={item.id}
+                    className="flex flex-col gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-2.5"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <AlertCircleIcon className="size-3.5 text-amber-600" aria-hidden="true" />
+                        <span className="font-mono font-semibold text-foreground">{item.toolName}</span>
+                        <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                          {AUDIENCE_LABEL[item.replyAudience]}
                         </span>
-                      ) : null}
+                        {item.targetChatName || item.targetChatId || item.targetScope ? (
+                          <span
+                            data-testid={`approval-destination-${item.id}`}
+                            className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-800 dark:text-amber-200"
+                          >
+                            目标：{destinationLabel}
+                          </span>
+                        ) : null}
+                        {item.snapshotHash ? (
+                          <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                            快照 {item.snapshotHash.slice(0, 8)}
+                          </span>
+                        ) : null}
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <Button
+                          size="sm"
+                          disabled={!canApprove}
+                          onClick={() =>
+                            void runAction(async () => {
+                              await leaderRequest("approvals/decide", {
+                                id: item.id,
+                                approved: true,
+                                expectedRunId: item.turnId,
+                                expectedAudience: item.replyAudience,
+                                ...(item.snapshotHash ? { expectedSnapshotHash: item.snapshotHash } : {}),
+                              });
+                            }, "已单次批准该操作。")
+                          }
+                        >
+                          允许一次
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={busy || !item.turnId}
+                          onClick={() =>
+                            void runAction(async () => {
+                              await leaderRequest("approvals/decide", {
+                                id: item.id,
+                                approved: false,
+                                expectedRunId: item.turnId,
+                                expectedAudience: item.replyAudience,
+                              });
+                            }, "已拒绝该操作。")
+                          }
+                        >
+                          拒绝
+                        </Button>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-1.5">
-                      <Button
-                        size="sm"
-                        disabled={busy}
-                        onClick={() =>
-                          void runAction(async () => {
-                            await leaderRequest("approvals/decide", {
-                              id: item.id,
-                              approved: true,
-                              expectedRunId: item.turnId,
-                              expectedAudience: item.replyAudience,
-                              ...(item.snapshotHash ? { expectedSnapshotHash: item.snapshotHash } : {}),
-                            });
-                          }, "已单次批准该操作。")
-                        }
-                      >
-                        允许一次
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={busy}
-                        onClick={() =>
-                          void runAction(async () => {
-                            await leaderRequest("approvals/decide", {
-                              id: item.id,
-                              approved: false,
-                              expectedRunId: item.turnId,
-                              expectedAudience: item.replyAudience,
-                            });
-                          }, "已拒绝该操作。")
-                        }
-                      >
-                        拒绝
-                      </Button>
-                    </div>
+                    {isSnapshotShare ? (
+                      <div className="space-y-1">
+                        <div className="text-[11px] text-amber-800 dark:text-amber-200">
+                          以下完整不可变快照（共 {fullSnapshot?.length ?? 0} 字符）将在批准后一次性复制到目标群聊，不会开放私有记忆实时读取：
+                        </div>
+                        <pre
+                          data-testid={`approval-snapshot-${item.id}`}
+                          className="max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/60 p-2 font-mono text-[11px] text-foreground"
+                        >
+                          {fullSnapshot ?? ""}
+                        </pre>
+                      </div>
+                    ) : (
+                      <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/60 p-2 font-mono text-[11px] text-foreground">
+                        {item.details}
+                      </pre>
+                    )}
                   </div>
-                  <pre className="max-h-24 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/60 p-2 font-mono text-[11px] text-foreground">
-                    {item.contentPreview ?? item.details}
-                  </pre>
-                </div>
-              ))}
+                );
+              })}
             </div>
           ) : null}
 
@@ -535,22 +585,68 @@ export function LeaderSupervisoryBar({
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-xs">
-              <div>
-                <div className="font-medium text-foreground">桌面跨对话状态感知</div>
-                <p className="text-[11px] text-muted-foreground">
-                  仅授权桌面控制面主动聚合本机任务进展与 Needs You；群聊与私聊默认保持隔离
-                </p>
+            <div className="space-y-2 rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className="font-medium text-foreground">桌面跨对话状态感知</div>
+                  <p className="text-[11px] text-muted-foreground">
+                    仅授权桌面控制面主动聚合本机任务进展与 Needs You；群聊与私聊默认保持隔离
+                  </p>
+                </div>
+                <select
+                  aria-label="桌面跨对话状态感知"
+                  value={draftAwarenessKind}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setDraftAwarenessKind(
+                      value === "none" ? "none" : value === "projects" ? "projects" : "all_local",
+                    );
+                  }}
+                  className="rounded-md border border-input bg-background px-2.5 py-1 text-xs text-foreground"
+                >
+                  <option value="all_local">全部本机任务</option>
+                  <option value="projects">指定文件夹</option>
+                  <option value="none">仅此 Leader 远程任务</option>
+                </select>
               </div>
-              <select
-                aria-label="桌面跨对话状态感知"
-                value={draftAwarenessKind}
-                onChange={(e) => setDraftAwarenessKind(e.target.value === "none" ? "none" : "all_local")}
-                className="rounded-md border border-input bg-background px-2.5 py-1 text-xs text-foreground"
-              >
-                <option value="all_local">全部本机任务</option>
-                <option value="none">仅此 Leader 远程任务</option>
-              </select>
+              {draftAwarenessKind === "projects" ? (
+                <div data-testid="leader-project-scope-picker" className="space-y-1.5 border-t border-border/60 pt-2">
+                  <div className="text-[11px] text-muted-foreground">选择允许此 Leader 感知状态的文件夹：</div>
+                  {selectableProjects.length === 0 && draftProjectIds.length === 0 ? (
+                    <p className="text-[11px] text-muted-foreground">暂无可选本机文件夹。</p>
+                  ) : (
+                    <div className="flex flex-wrap gap-2">
+                      {[
+                        ...selectableProjects,
+                        ...draftProjectIds
+                          .filter((id) => !selectableProjects.some((p) => p.id === id))
+                          .map((id) => ({ id, title: id })),
+                      ].map((project) => {
+                        const checked = draftProjectIds.includes(project.id);
+                        return (
+                          <label
+                            key={project.id}
+                            className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() =>
+                                setDraftProjectIds((prev) =>
+                                  prev.includes(project.id)
+                                    ? prev.filter((id) => id !== project.id)
+                                    : [...prev, project.id],
+                                )
+                              }
+                            />
+                            <span>{project.title}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ) : null}
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-2 pt-1">

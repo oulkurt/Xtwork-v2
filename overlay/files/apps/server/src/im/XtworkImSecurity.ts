@@ -346,14 +346,18 @@ export interface ApprovalRequest {
   readonly details: string;
   readonly snapshotHash?: string;
   readonly targetScope?: CompanionScope;
+  readonly targetChatId?: string;
+  readonly targetChatName?: string;
+  /** Complete immutable snapshot content for snapshot-bound approvals (S9: never truncated). */
+  readonly contentSnapshot?: string;
   readonly contentPreview?: string;
 }
 
 export interface ApprovalDecisionVerify {
   readonly desktopOwnerVerified: boolean;
-  readonly expectedRunId?: string;
-  readonly expectedAudience?: ReplyAudience;
-  readonly expectedSnapshotHash?: string;
+  readonly expectedRunId: string | undefined;
+  readonly expectedAudience: ReplyAudience | undefined;
+  readonly expectedSnapshotHash?: string | undefined;
 }
 
 export interface ApprovalStatusSummary {
@@ -370,6 +374,10 @@ export class ImApprovals {
   /** Full approval payloads including raw tool args — strictly for verified desktop Owner views. */
   list(): ApprovalRequest[] {
     return [...this.pending.values()].map(({ request }) => request);
+  }
+
+  get(id: string): ApprovalRequest | undefined {
+    return this.pending.get(id)?.request;
   }
 
   /**
@@ -396,8 +404,9 @@ export class ImApprovals {
     if (!entry) return false;
     if (verify) {
       if (!verify.desktopOwnerVerified) return false;
-      if (verify.expectedRunId !== undefined && entry.request.turnId !== verify.expectedRunId) return false;
-      if (verify.expectedAudience !== undefined && entry.request.replyAudience !== verify.expectedAudience) return false;
+      // S8: Both runId and replyAudience MUST be explicitly supplied and match the pending request.
+      if (!verify.expectedRunId || entry.request.turnId !== verify.expectedRunId) return false;
+      if (!verify.expectedAudience || entry.request.replyAudience !== verify.expectedAudience) return false;
       if (approved && entry.request.snapshotHash !== undefined) {
         if (verify.expectedSnapshotHash !== entry.request.snapshotHash) return false;
       } else if (verify.expectedSnapshotHash !== undefined && entry.request.snapshotHash !== verify.expectedSnapshotHash) {
@@ -413,7 +422,14 @@ export class ImApprovals {
     toolName: string,
     args: unknown,
     signal?: AbortSignal,
-    meta?: { readonly snapshotHash?: string; readonly targetScope?: CompanionScope; readonly contentPreview?: string },
+    meta?: {
+      readonly snapshotHash?: string;
+      readonly targetScope?: CompanionScope;
+      readonly targetChatId?: string;
+      readonly targetChatName?: string;
+      readonly contentSnapshot?: string;
+      readonly contentPreview?: string;
+    },
   ) {
     const id = randomUUID();
     const request: ApprovalRequest = Object.freeze({
@@ -427,7 +443,14 @@ export class ImApprovals {
       details: JSON.stringify(args)?.slice(0, 4000) ?? "",
       ...(meta?.snapshotHash ? { snapshotHash: meta.snapshotHash } : {}),
       ...(meta?.targetScope ? { targetScope: meta.targetScope } : {}),
-      ...(meta?.contentPreview ? { contentPreview: meta.contentPreview.slice(0, 1200) } : {}),
+      ...(meta?.targetChatId ? { targetChatId: meta.targetChatId } : {}),
+      ...(meta?.targetChatName ? { targetChatName: meta.targetChatName } : {}),
+      ...(meta?.contentSnapshot !== undefined ? { contentSnapshot: meta.contentSnapshot } : {}),
+      ...(meta?.contentPreview !== undefined
+        ? { contentPreview: meta.contentPreview }
+        : meta?.contentSnapshot !== undefined
+          ? { contentPreview: meta.contentSnapshot }
+          : {}),
     });
     return new Promise<void>((resolve, reject) => {
       const deadline = AbortSignal.any([AbortSignal.timeout(180_000), ...(signal ? [signal] : [])]);

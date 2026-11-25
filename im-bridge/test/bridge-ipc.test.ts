@@ -563,4 +563,107 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
       // store already closed by bridge.shutdown()
     }
   });
+
+  it("defers startup replay until connections.syncBindings and validates pause + access gate before replaying paused_pending (S4/S5/S6)", async () => {
+    const store = new Store(":memory:");
+    const notifications: RpcNotification[] = [];
+    const mock = createMockChannel({ platform: "feishu", trust: "org" });
+    const bridge = new ImBridge({
+      store,
+      secrets: memorySecrets(),
+      channels: { feishu: mock.channel },
+      notify: (n) => notifications.push(n),
+      sleepCheckIntervalMs: 0,
+    });
+    try {
+      const conn = store.createConnection({
+        platform: "feishu",
+        lifecycleState: "active",
+        ownerId: "owner-1",
+        askAll: false,
+      });
+      // Unacked trigger exists before restart
+      const preRestart = store.ingestInbound(conn.id, "org", {
+        platformId: "pre-restart-1",
+        chat: { platformId: "grp-1", kind: "group", name: "Ops" },
+        sender: { id: "alice", name: "Alice", isBot: false },
+        text: "pending before restart",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_000_000,
+      });
+      assert.equal(preRestart.kind, "dispatch");
+
+      // S4: hello with deferReplay=true does NOT emit dispatch until syncBindings reconciles leaderPaused!
+      const hello = await bridge.handleRequest({
+        id: 1,
+        method: "bridge.hello",
+        params: { protocolVersion: 1, deferReplay: true },
+      });
+      assert.equal(hello.ok, true);
+      await new Promise((r) => setTimeout(r, 15));
+      assert.equal(notifications.filter((n) => n.method === "inbound.dispatch").length, 0);
+
+      // Sync leaderPaused=true + binding BEFORE triggering replay -> pre-restart message moves into paused_pending, NOT dispatched!
+      const synced = await bridge.handleRequest({
+        id: 2,
+        method: "connections.syncBindings",
+        params: {
+          bindings: [
+            {
+              connectionId: conn.id,
+              leaderId: "leader-default",
+              bindingId: "bind-1",
+              bindingEpoch: 1,
+              leaderPaused: true,
+            },
+          ],
+          triggerReplay: true,
+        },
+      });
+      assert.equal(synced.ok, true);
+      await new Promise((r) => setTimeout(r, 15));
+      assert.equal(notifications.filter((n) => n.method === "inbound.dispatch").length, 0);
+      assert.equal(store.message(preRestart.message.id)?.state, "paused_pending");
+
+      // S5 (part 1): Replay click while still paused MUST NOT strand message out of paused_pending!
+      const staleReplay = await bridge.handleRequest({
+        id: 3,
+        method: "paused.decide",
+        params: { messageIds: [preRestart.message.id], decision: "replay", leaderId: "leader-default" },
+      });
+      assert.equal(staleReplay.ok, true);
+      if (staleReplay.ok) {
+        const res = staleReplay.result as { count: number; skippedIds: string[] };
+        assert.equal(res.count, 0);
+        assert.deepEqual(res.skippedIds, [preRestart.message.id]);
+      }
+      assert.equal(store.message(preRestart.message.id)?.state, "paused_pending");
+
+      // S5 (part 2): Block the chat while paused, then unpause and attempt replay -> MUST block and NEVER dispatch!
+      store.setChatAccess(preRestart.chat.id, "blocked");
+      await bridge.handleRequest({
+        id: 4,
+        method: "connections.setLeaderPaused",
+        params: { connectionIds: [conn.id], paused: false },
+      });
+      const blockedReplay = await bridge.handleRequest({
+        id: 5,
+        method: "paused.decide",
+        params: { messageIds: [preRestart.message.id], decision: "replay", leaderId: "leader-default" },
+      });
+      assert.equal(blockedReplay.ok, true);
+      if (blockedReplay.ok) {
+        const res = blockedReplay.result as { count: number; blockedIds: string[] };
+        assert.equal(res.count, 0);
+        assert.deepEqual(res.blockedIds, [preRestart.message.id]);
+      }
+      assert.equal(store.message(preRestart.message.id)?.state, "blocked");
+      assert.equal(notifications.filter((n) => n.method === "inbound.dispatch").length, 0);
+
+      await bridge.shutdown();
+    } finally {
+      // store already closed by bridge.shutdown()
+    }
+  });
 });

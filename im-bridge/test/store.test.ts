@@ -437,4 +437,90 @@ describe("SQLite store invariants (ADR-011 S5/S6)", () => {
       store.close();
     }
   });
+
+  it("reconciles ack arriving after pause into delivered so reply settles it, and preserves stamped Leader binding identity across rebinds (S3/S6)", () => {
+    const store = new Store(":memory:");
+    try {
+      const conn = store.createConnection({
+        platform: "feishu",
+        lifecycleState: "active",
+        ownerId: "owner_1",
+      });
+      store.syncConnectionBinding({
+        connectionId: conn.id,
+        leaderId: "leader-a",
+        bindingId: "bind-a-1",
+        bindingEpoch: 1,
+        leaderPaused: false,
+      });
+
+      // S3: Dispatched (`received`, unacked) -> paused -> late `ackInbound` arrives for committed run!
+      const inFlight = store.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "m_race",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "committed before pause",
+        }),
+      );
+      assert.equal(inFlight.kind, "dispatch");
+      assert.equal(inFlight.message.leaderId, "leader-a");
+      assert.equal(inFlight.message.bindingId, "bind-a-1");
+      assert.equal(inFlight.message.bindingEpoch, 1);
+
+      store.syncConnectionBinding({
+        connectionId: conn.id,
+        leaderId: "leader-a",
+        bindingId: "bind-a-1",
+        bindingEpoch: 1,
+        leaderPaused: true,
+      });
+      assert.equal(store.message(inFlight.message.id)?.state, "paused_pending");
+
+      // Committed run ack arrives -> MUST reconcile back to `delivered` and exit paused backlog!
+      const acked = store.ackInbound(
+        { idempotencyKey: inFlight.message.idempotencyKey! },
+        { t3ThreadId: "xtwork-im-dm-1", t3TurnId: "run-committed-1" },
+      );
+      assert.equal(acked?.state, "delivered");
+      assert.equal(store.pausedPendingMessages({ leaderId: "leader-a" }).length, 0);
+      // Reply can now settle it!
+      assert.deepEqual(store.moveInbound([inFlight.message.id], "reply"), [inFlight.message.id]);
+      assert.equal(store.message(inFlight.message.id)?.state, "replied");
+
+      // S6: New message paused under Leader A keeps Leader A binding even after connection rebinds to Leader B!
+      const pausedA = store.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "m_leader_a_backlog",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "backlog for leader A",
+        }),
+      );
+      assert.equal(pausedA.kind, "paused_pending");
+      assert.equal(pausedA.message.leaderId, "leader-a");
+      assert.equal(pausedA.message.bindingId, "bind-a-1");
+
+      // Rebind connection to Leader B
+      store.syncConnectionBinding({
+        connectionId: conn.id,
+        leaderId: "leader-b",
+        bindingId: "bind-b-2",
+        bindingEpoch: 2,
+        leaderPaused: false,
+      });
+      assert.equal(store.pausedPendingMessages({ leaderId: "leader-b" }).length, 0);
+      const leaderABacklog = store.pausedPendingMessages({ leaderId: "leader-a" });
+      assert.equal(leaderABacklog.length, 1);
+      assert.equal(leaderABacklog[0]!.id, pausedA.message.id);
+      assert.equal(leaderABacklog[0]!.bindingId, "bind-a-1");
+      assert.equal(leaderABacklog[0]!.bindingEpoch, 1);
+    } finally {
+      store.close();
+    }
+  });
 });

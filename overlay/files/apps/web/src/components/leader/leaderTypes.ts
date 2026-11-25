@@ -67,6 +67,9 @@ export interface LeaderApprovalItem {
   readonly details: string;
   readonly snapshotHash?: string;
   readonly targetScope?: string;
+  readonly targetChatId?: string;
+  readonly targetChatName?: string;
+  readonly contentSnapshot?: string;
   readonly contentPreview?: string;
 }
 
@@ -79,6 +82,9 @@ export interface LeaderPausedItem {
   readonly chatName?: string | null;
   readonly senderName?: string | null;
   readonly idempotencyKey?: string | null;
+  readonly leaderId?: string | null;
+  readonly bindingId?: string | null;
+  readonly bindingEpoch?: number | null;
   readonly body: string;
   readonly createdAt: number;
 }

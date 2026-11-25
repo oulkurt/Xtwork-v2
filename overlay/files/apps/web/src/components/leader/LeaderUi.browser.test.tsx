@@ -15,6 +15,10 @@ vi.mock("../../state/environments", () => ({
   usePrimaryEnvironmentId: () => "local" as EnvironmentId,
 }));
 
+vi.mock("../../state/entities", () => ({
+  useProjects: () => [],
+}));
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -49,8 +53,13 @@ const sampleLeaderItem: LeaderListItem = {
   pausedPendingCount: 1,
 };
 
+const FULL_SNAPSHOT = `Q4 roadmap: launch Leader Slice 1.\n${"milestone-detail ".repeat(110)}SNAPSHOT_TAIL_MARKER`;
+
 const sampleOverview: LeaderOverview = {
-  leader: sampleLeaderItem.leader,
+  leader: {
+    ...sampleLeaderItem.leader,
+    awarenessScope: { kind: "projects", projectIds: ["proj-alpha"] },
+  },
   connections: sampleLeaderItem.connections,
   pausedPending: [
     {
@@ -98,7 +107,9 @@ const sampleOverview: LeaderOverview = {
       details: JSON.stringify({ note: "roadmap.md" }),
       snapshotHash: "snap1234567890",
       targetScope: "group:ops",
-      contentPreview: "Q4 roadmap: launch Leader Slice 1",
+      targetChatName: "核心研发群",
+      contentSnapshot: FULL_SNAPSHOT,
+      contentPreview: FULL_SNAPSHOT,
     },
   ],
 };
@@ -185,6 +196,10 @@ it("renders LeaderSupervisoryBar Needs You approvals with snapshot verification,
       threadId="xtwork-leader-leader-default-abc123"
       environmentId={"local" as EnvironmentId}
       onOpenThread={(id) => jumped.push(id)}
+      availableProjects={[
+        { id: "proj-alpha", title: "Alpha App" },
+        { id: "proj-beta", title: "Beta Service" },
+      ]}
     />,
     { router: "/local/xtwork-leader-leader-default-abc123" },
   );
@@ -193,10 +208,12 @@ it("renders LeaderSupervisoryBar Needs You approvals with snapshot verification,
   // 1 approval + 1 pausedPending + 0 nonApprovalNeedsYou = 2 (no double counting!)
   await expect.element(page.getByRole("button", { name: /Needs You \(2\)/ })).toBeVisible();
 
-  // Open Needs You queue and approve snapshot-bound share
+  // S9: Open Needs You queue, verify exact destination chat + FULL non-truncated snapshot tail before approving
   await page.getByRole("button", { name: /Needs You \(2\)/ }).click();
   await expect.element(page.getByTestId("leader-needs-you-panel")).toBeVisible();
-  await expect.element(page.getByText("Q4 roadmap: launch Leader Slice 1")).toBeVisible();
+  await expect.element(page.getByTestId("approval-destination-apr-1")).toHaveTextContent("目标：核心研发群");
+  await expect.element(page.getByTestId("approval-snapshot-apr-1")).toBeVisible();
+  expect(page.getByTestId("approval-snapshot-apr-1").element().textContent).toBe(FULL_SNAPSHOT);
   await page.getByRole("button", { name: "允许一次", exact: true }).click();
   await vi.waitFor(() => {
     expect(
@@ -229,13 +246,31 @@ it("renders LeaderSupervisoryBar Needs You approvals with snapshot verification,
   await page.getByRole("button", { name: /研发群发布检查/ }).click();
   expect(jumped).toEqual(["xtwork-im-group-ops"]);
 
-  // Open Mingle-inspired Leader config panel, pick a role template, and save
+  // S11: Open Mingle-inspired Leader config panel on a project-scoped Leader -> unrelated role edit MUST NOT expand awarenessScope!
   await page.getByRole("button", { name: "管理", exact: true }).click();
   await expect.element(page.getByTestId("leader-config-panel")).toBeVisible();
+  await expect.element(page.getByTestId("leader-project-scope-picker")).toBeVisible();
   await expect.element(page.getByText("所有已连接聊天都会使用这份角色介绍；私人背景请写入私有记忆")).toBeVisible();
   await page.getByRole("button", { name: "编程搭档", exact: true }).click();
   await page.getByRole("button", { name: "保存设置", exact: true }).click();
   await vi.waitFor(() => {
-    expect(calls.some((c) => c.path === "leaders/leader-default/update")).toBe(true);
+    const updateCall = calls.find((c) => c.path === "leaders/leader-default/update");
+    expect(updateCall).toBeDefined();
+    expect(updateCall?.body?.awarenessScope).toBeUndefined();
+  });
+
+  // S11: Explicitly adding Beta Service project updates awarenessScope with both projects
+  await page.getByRole("button", { name: "管理", exact: true }).click();
+  await page.getByLabelText("Beta Service").click();
+  await page.getByRole("button", { name: "保存设置", exact: true }).click();
+  await vi.waitFor(() => {
+    const scopeUpdates = calls.filter(
+      (c) => c.path === "leaders/leader-default/update" && c.body?.awarenessScope !== undefined,
+    );
+    expect(scopeUpdates).toHaveLength(1);
+    expect(scopeUpdates[0]?.body?.awarenessScope).toEqual({
+      kind: "projects",
+      projectIds: ["proj-alpha", "proj-beta"],
+    });
   });
 });
