@@ -10,6 +10,7 @@
  *   `chatgpt_account_id` required by Pi 1.5.2's pre-network `extractAccountId()` check.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   type ChannelCredentialFence,
   type CredentialFenceLease,
@@ -464,6 +465,25 @@ export interface GetValidCredentialsOptions {
   readonly expectedProvider?: OAuthSubscriptionProvider;
   /** Bind credential resolution strictly to the route snapshot's account fence generation. */
   readonly expectedGeneration?: number;
+  /** Bind credential resolution strictly to the immutable OAuth binding ID (supports staged commits). */
+  readonly expectedBindingId?: string;
+}
+
+interface OAuthBindingRecord {
+  readonly bindingId: string;
+  readonly fenceKey: string;
+  config: RegisteredOAuthChannel;
+  cache?: OAuthSubscriptionCredentials;
+  inflight?: {
+    readonly generation: number;
+    readonly promise: Promise<OAuthSubscriptionCredentials>;
+  };
+}
+
+export interface StagedOAuthUpdate {
+  readonly nextConfigs: readonly RegisteredOAuthChannel[];
+  readonly stagedBindingIds: ReadonlyMap<string, string>;
+  readonly bindingIdsByChannel: ReadonlyMap<string, string>;
 }
 
 /**
@@ -477,20 +497,18 @@ export interface GetValidCredentialsOptions {
  * - Lease/generation is acquired BEFORE reading from SecretStore and checked BEFORE caching,
  *   returning, or persisting credentials; new reads are rejected while logout/delete is pending;
  * - Metadata-only re-registrations preserve live/rotated tokens; changing `secretRef`/`provider`
- *   or unregistering fences/aborts in-flight refreshes and drops cached credentials immediately.
+ *   or unregistering fences/aborts in-flight refreshes and drops cached credentials immediately;
+ * - Non-destructive transactional staging (`stageUpdate` / `commitUpdate` / `discardUpdate`)
+ *   keeps prior accounts' live rotated caches intact until `models.json` atomic rename commits.
  */
 export class OAuthTokenManager {
   private readonly secretStore: SecretStore;
   private readonly fence: ChannelCredentialFence;
   private readonly skewMs: number;
   private readonly now: () => number;
-  private readonly configs = new Map<string, RegisteredOAuthChannel>();
-  private readonly cache = new Map<string, OAuthSubscriptionCredentials>();
+  private readonly active = new Map<string, OAuthBindingRecord>();
+  private readonly staged = new Map<string, OAuthBindingRecord>();
   private readonly pendingDeletes = new Map<string, number>();
-  private readonly inflight = new Map<
-    string,
-    { readonly generation: number; readonly promise: Promise<OAuthSubscriptionCredentials> }
-  >();
 
   constructor(options: OAuthTokenManagerOptions) {
     this.secretStore = options.secretStore;
@@ -508,71 +526,248 @@ export class OAuthTokenManager {
     }
   }
 
-  register<T extends OAuthSubscriptionCredentials>(config: RegisteredOAuthChannel<T>): void {
+  register<T extends OAuthSubscriptionCredentials>(config: RegisteredOAuthChannel<T>): string {
     const nextConfig = config as unknown as RegisteredOAuthChannel;
-    const previous = this.configs.get(config.channelId);
+    const previous = this.active.get(config.channelId);
     if (previous) {
       const accountChanged =
-        previous.secretRef !== nextConfig.secretRef || previous.provider !== nextConfig.provider;
+        previous.config.secretRef !== nextConfig.secretRef ||
+        previous.config.provider !== nextConfig.provider;
       if (accountChanged) {
         this.fence.invalidate(
           config.channelId,
-          `OAuth channel secretRef/provider changed (${previous.provider}:${previous.secretRef} -> ${nextConfig.provider}:${nextConfig.secretRef})`,
+          `OAuth channel secretRef/provider changed (${previous.config.provider}:${previous.config.secretRef} -> ${nextConfig.provider}:${nextConfig.secretRef})`,
         );
-        this.cache.delete(config.channelId);
-        this.inflight.delete(config.channelId);
-        this.configs.set(config.channelId, nextConfig);
-        if (nextConfig.initialCredentials) {
-          this.cache.set(config.channelId, nextConfig.initialCredentials);
-        }
-        return;
+        const replacement: OAuthBindingRecord = {
+          bindingId: randomUUID(),
+          fenceKey: config.channelId,
+          config: nextConfig,
+          ...(nextConfig.initialCredentials !== undefined
+            ? { cache: nextConfig.initialCredentials }
+            : {}),
+        };
+        this.active.set(config.channelId, replacement);
+        return replacement.bindingId;
       }
       // Same channelId, provider, and secretRef: preserve rotated cached credentials & inflight refresh!
-      this.configs.set(config.channelId, nextConfig);
-      return;
+      previous.config = nextConfig;
+      return previous.bindingId;
     }
-    this.configs.set(config.channelId, nextConfig);
-    if (nextConfig.initialCredentials) {
-      this.cache.set(config.channelId, nextConfig.initialCredentials);
+    const created: OAuthBindingRecord = {
+      bindingId: randomUUID(),
+      fenceKey: config.channelId,
+      config: nextConfig,
+      ...(nextConfig.initialCredentials !== undefined
+        ? { cache: nextConfig.initialCredentials }
+        : {}),
+    };
+    this.active.set(config.channelId, created);
+    return created.bindingId;
+  }
+
+  /**
+   * Non-destructively stage a candidate OAuth catalog update without evicting, invalidating,
+   * or overwriting existing live rotated caches. Call `commitUpdate(tx)` ONLY AFTER
+   * `models.json` commits, or `discardUpdate(tx)` on persistence failure!
+   */
+  stageUpdate(nextConfigs: readonly RegisteredOAuthChannel[]): StagedOAuthUpdate {
+    const stagedBindingIds = new Map<string, string>();
+    const bindingIdsByChannel = new Map<string, string>();
+
+    for (const nextConfig of nextConfigs) {
+      const existing = this.active.get(nextConfig.channelId);
+      if (
+        existing &&
+        existing.config.provider === nextConfig.provider &&
+        existing.config.secretRef === nextConfig.secretRef
+      ) {
+        // Same account: reuse active binding & rotated cache without creating a duplicate.
+        bindingIdsByChannel.set(nextConfig.channelId, existing.bindingId);
+        continue;
+      }
+      // New channel OR account swap: create an isolated staged record without touching `active`!
+      const bindingId = randomUUID();
+      const stagedRecord: OAuthBindingRecord = {
+        bindingId,
+        fenceKey: `${nextConfig.channelId}#staged:${bindingId}`,
+        config: nextConfig,
+        ...(nextConfig.initialCredentials !== undefined
+          ? { cache: nextConfig.initialCredentials }
+          : {}),
+      };
+      this.staged.set(bindingId, stagedRecord);
+      stagedBindingIds.set(nextConfig.channelId, bindingId);
+      bindingIdsByChannel.set(nextConfig.channelId, bindingId);
+    }
+
+    return {
+      nextConfigs: [...nextConfigs],
+      stagedBindingIds,
+      bindingIdsByChannel,
+    };
+  }
+
+  /**
+   * Finalize a staged OAuth catalog update AFTER `models.json` atomic rename succeeds:
+   * promotes staged records to `active` (preserving any token refreshed while staged),
+   * updates unchanged channels in place, and retires/fences removed or replaced accounts.
+   */
+  commitUpdate(tx: StagedOAuthUpdate): void {
+    const nextChannelIds = new Set<string>();
+    for (const nextConfig of tx.nextConfigs) {
+      nextChannelIds.add(nextConfig.channelId);
+      const stagedId = tx.stagedBindingIds.get(nextConfig.channelId);
+      if (stagedId !== undefined) {
+        const stagedRecord = this.staged.get(stagedId);
+        this.staged.delete(stagedId);
+        const previous = this.active.get(nextConfig.channelId);
+        if (previous) {
+          this.fence.invalidate(
+            nextConfig.channelId,
+            `OAuth channel account replaced (${previous.config.provider}:${previous.config.secretRef} -> ${nextConfig.provider}:${nextConfig.secretRef})`,
+          );
+        }
+        const promoted: OAuthBindingRecord = {
+          bindingId: stagedRecord?.bindingId ?? stagedId,
+          fenceKey: nextConfig.channelId,
+          config: nextConfig,
+          ...(stagedRecord?.cache !== undefined
+            ? { cache: stagedRecord.cache }
+            : nextConfig.initialCredentials !== undefined
+              ? { cache: nextConfig.initialCredentials }
+              : {}),
+        };
+        this.active.set(nextConfig.channelId, promoted);
+      } else {
+        const existing = this.active.get(nextConfig.channelId);
+        if (existing) {
+          existing.config = nextConfig;
+        }
+      }
+    }
+
+    for (const channelId of [...this.active.keys()]) {
+      if (!nextChannelIds.has(channelId)) {
+        this.unregister(channelId);
+      }
+    }
+  }
+
+  /**
+   * Roll back a staged OAuth catalog update after a failed `models.json` write:
+   * discards staged candidates while leaving all prior active accounts and their live
+   * rotated caches 100% untouched!
+   */
+  discardUpdate(tx: StagedOAuthUpdate): void {
+    for (const stagedId of tx.stagedBindingIds.values()) {
+      const stagedRecord = this.staged.get(stagedId);
+      if (stagedRecord) {
+        this.fence.invalidate(stagedRecord.fenceKey, "staged OAuth update discarded");
+        this.staged.delete(stagedId);
+      }
     }
   }
 
   unregister(channelId: string, reason = "OAuth channel removed"): void {
     this.fence.invalidate(channelId, reason);
-    this.configs.delete(channelId);
-    this.cache.delete(channelId);
-    this.inflight.delete(channelId);
+    this.active.delete(channelId);
+  }
+
+  getBindingId(channelId: string): string | undefined {
+    return this.active.get(channelId)?.bindingId;
   }
 
   getCached<T extends OAuthSubscriptionCredentials>(channelId: string): T | undefined {
-    return this.cache.get(channelId) as T | undefined;
+    return this.active.get(channelId)?.cache as T | undefined;
   }
 
   getAccountGeneration(channelId: string): number {
     return this.fence.generation(channelId);
   }
 
+  private resolveBinding(
+    channelId: string,
+    opts: GetValidCredentialsOptions,
+  ): OAuthBindingRecord {
+    if (opts.expectedBindingId !== undefined) {
+      const stagedRecord = this.staged.get(opts.expectedBindingId);
+      if (stagedRecord && stagedRecord.config.channelId === channelId) {
+        if (
+          (opts.expectedSecretRef !== undefined &&
+            stagedRecord.config.secretRef !== opts.expectedSecretRef) ||
+          (opts.expectedProvider !== undefined &&
+            stagedRecord.config.provider !== opts.expectedProvider)
+        ) {
+          throw new SecretStoreUnavailableError(
+            "SECRET_FENCE_STALE",
+            `Staged OAuth channel "${channelId}" binding mismatch`,
+          );
+        }
+        return stagedRecord;
+      }
+      const activeRecord = this.active.get(channelId);
+      if (!activeRecord || activeRecord.bindingId !== opts.expectedBindingId) {
+        throw new SecretStoreUnavailableError(
+          "SECRET_FENCE_STALE",
+          `OAuth channel "${channelId}" account binding is no longer active`,
+        );
+      }
+      if (
+        (opts.expectedSecretRef !== undefined &&
+          activeRecord.config.secretRef !== opts.expectedSecretRef) ||
+        (opts.expectedProvider !== undefined &&
+          activeRecord.config.provider !== opts.expectedProvider)
+      ) {
+        throw new SecretStoreUnavailableError(
+          "SECRET_FENCE_STALE",
+          `OAuth channel "${channelId}" account binding changed after request started`,
+        );
+      }
+      return activeRecord;
+    }
+
+    const activeRecord = this.active.get(channelId);
+    if (!activeRecord) {
+      throw new SecretStoreUnavailableError(
+        "SECRET_FENCE_STALE",
+        `No OAuth configuration registered for channel "${channelId}"`,
+      );
+    }
+    if (
+      (opts.expectedSecretRef !== undefined &&
+        activeRecord.config.secretRef !== opts.expectedSecretRef) ||
+      (opts.expectedProvider !== undefined &&
+        activeRecord.config.provider !== opts.expectedProvider)
+    ) {
+      throw new SecretStoreUnavailableError(
+        "SECRET_FENCE_STALE",
+        `OAuth channel "${channelId}" account binding changed after request started`,
+      );
+    }
+    return activeRecord;
+  }
+
   private async loadCredentials(
-    config: RegisteredOAuthChannel,
+    record: OAuthBindingRecord,
     lease: CredentialFenceLease,
   ): Promise<OAuthSubscriptionCredentials> {
-    this.assertNotDeleting(config.channelId);
+    const channelId = record.config.channelId;
+    this.assertNotDeleting(channelId);
     lease.assertCurrent();
-    const cached = this.cache.get(config.channelId);
-    if (cached) {
-      this.assertNotDeleting(config.channelId);
+    if (record.cache) {
+      this.assertNotDeleting(channelId);
       lease.assertCurrent();
-      return cached;
+      return record.cache;
     }
-    const raw = await this.secretStore.get(config.secretRef);
+    const raw = await this.secretStore.get(record.config.secretRef);
     // CRITICAL: Re-check fence & pending-delete state IMMEDIATELY after SecretStore read resolves,
     // BEFORE parsing, caching, returning, or starting a refresh!
-    this.assertNotDeleting(config.channelId);
+    this.assertNotDeleting(channelId);
     lease.assertCurrent();
     if (!raw) {
       throw new SecretStoreUnavailableError(
         "SECRET_STORE_UNAVAILABLE",
-        `OAuth credentials missing for channel "${config.channelId}"`,
+        `OAuth credentials missing for channel "${channelId}"`,
       );
     }
     const parsed = JSON.parse(raw) as OAuthSubscriptionCredentials;
@@ -585,12 +780,12 @@ export class OAuthTokenManager {
     ) {
       throw new SecretStoreUnavailableError(
         "SECRET_DECRYPT_FAILED",
-        `Malformed OAuth credentials stored for channel "${config.channelId}"`,
+        `Malformed OAuth credentials stored for channel "${channelId}"`,
       );
     }
-    this.assertNotDeleting(config.channelId);
+    this.assertNotDeleting(channelId);
     lease.assertCurrent();
-    this.cache.set(config.channelId, parsed);
+    record.cache = parsed;
     return parsed;
   }
 
@@ -603,25 +798,10 @@ export class OAuthTokenManager {
         ? { signal: signalOrOptions }
         : (signalOrOptions ?? {});
     this.assertNotDeleting(channelId);
-    const config = this.configs.get(channelId);
-    if (!config) {
-      throw new SecretStoreUnavailableError(
-        "SECRET_FENCE_STALE",
-        `No OAuth configuration registered for channel "${channelId}"`,
-      );
-    }
-    if (
-      (opts.expectedSecretRef !== undefined && config.secretRef !== opts.expectedSecretRef) ||
-      (opts.expectedProvider !== undefined && config.provider !== opts.expectedProvider)
-    ) {
-      throw new SecretStoreUnavailableError(
-        "SECRET_FENCE_STALE",
-        `OAuth channel "${channelId}" account binding changed after request started`,
-      );
-    }
+    const record = this.resolveBinding(channelId, opts);
     // Acquire generation lease BEFORE touching SecretStore so any concurrent logout/delete
     // or account replacement invalidates this read before it can cache, return, or refresh.
-    const readLease = this.fence.acquire(channelId, opts.signal);
+    const readLease = this.fence.acquire(record.fenceKey, opts.signal);
     try {
       if (
         opts.expectedGeneration !== undefined &&
@@ -632,31 +812,32 @@ export class OAuthTokenManager {
           `OAuth channel "${channelId}" account generation changed (${opts.expectedGeneration} !== ${readLease.generation})`,
         );
       }
-      const current = await this.loadCredentials(config, readLease);
+      const current = await this.loadCredentials(record, readLease);
       this.assertNotDeleting(channelId);
       readLease.assertCurrent();
       if (current.expires - this.now() > this.skewMs) {
         return current as T;
       }
-      return await this.refreshSerial<T>(config, current, readLease);
+      return await this.refreshSerial<T>(record, current, readLease);
     } finally {
       readLease.release();
     }
   }
 
   private async refreshSerial<T extends OAuthSubscriptionCredentials>(
-    config: RegisteredOAuthChannel,
+    record: OAuthBindingRecord,
     fallback: OAuthSubscriptionCredentials,
     readLease: CredentialFenceLease,
   ): Promise<T> {
-    this.assertNotDeleting(config.channelId);
+    const channelId = record.config.channelId;
+    this.assertNotDeleting(channelId);
     readLease.assertCurrent();
     const expectedGen = readLease.generation;
 
-    const existing = this.inflight.get(config.channelId);
+    const existing = record.inflight;
     if (existing && existing.generation === expectedGen) {
       const sharedResult = await existing.promise;
-      this.assertNotDeleting(config.channelId);
+      this.assertNotDeleting(channelId);
       readLease.assertCurrent();
       return sharedResult as T;
     }
@@ -664,13 +845,13 @@ export class OAuthTokenManager {
     // Acquire a refresh-scoped fence lease pinned strictly to `expectedGen` (NEVER jumping to
     // a post-logout generation). Not tied to a single caller's HTTP disconnect signal so
     // concurrent waiters on the same single-flight refresh are not spuriously aborted.
-    const refreshLease = this.fence.acquire(config.channelId);
+    const refreshLease = this.fence.acquire(record.fenceKey);
     if (refreshLease.generation !== expectedGen) {
       refreshLease.release();
       readLease.assertCurrent();
       throw new SecretStoreUnavailableError(
         "SECRET_FENCE_STALE",
-        `Channel "${config.channelId}" fence generation advanced before refresh started`,
+        `Channel "${channelId}" fence generation advanced before refresh started`,
       );
     }
 
@@ -679,42 +860,42 @@ export class OAuthTokenManager {
       | undefined;
     const refreshPromise = (async (): Promise<OAuthSubscriptionCredentials> => {
       try {
-        this.assertNotDeleting(config.channelId);
+        this.assertNotDeleting(channelId);
         refreshLease.assertCurrent();
-        const latest = this.cache.get(config.channelId) ?? fallback;
+        const latest = record.cache ?? fallback;
         if (latest.expires - this.now() > this.skewMs) {
           return latest;
         }
-        const refreshed = await config.refresh(latest, refreshLease.signal);
-        this.assertNotDeleting(config.channelId);
+        const refreshed = await record.config.refresh(latest, refreshLease.signal);
+        this.assertNotDeleting(channelId);
         refreshLease.assertCurrent();
         await this.fence.writeIfCurrent(
           this.secretStore,
-          config.channelId,
-          config.secretRef,
+          record.fenceKey,
+          record.config.secretRef,
           JSON.stringify(refreshed),
           refreshLease.generation,
         );
-        if (!refreshLease.isCurrent() || (this.pendingDeletes.get(config.channelId) ?? 0) > 0) {
+        if (!refreshLease.isCurrent() || (this.pendingDeletes.get(channelId) ?? 0) > 0) {
           throw new SecretStoreUnavailableError(
             "SECRET_FENCE_STALE",
-            `Channel "${config.channelId}" was invalidated during OAuth refresh`,
+            `Channel "${channelId}" was invalidated during OAuth refresh`,
           );
         }
-        this.cache.set(config.channelId, refreshed);
+        record.cache = refreshed;
         return refreshed;
       } finally {
         refreshLease.release();
-        if (inflightEntry !== undefined && this.inflight.get(config.channelId) === inflightEntry) {
-          this.inflight.delete(config.channelId);
+        if (inflightEntry !== undefined && record.inflight === inflightEntry) {
+          delete record.inflight;
         }
       }
     })();
 
     inflightEntry = { generation: expectedGen, promise: refreshPromise };
-    this.inflight.set(config.channelId, inflightEntry);
+    record.inflight = inflightEntry;
     const result = await refreshPromise;
-    this.assertNotDeleting(config.channelId);
+    this.assertNotDeleting(channelId);
     readLease.assertCurrent();
     return result as T;
   }
@@ -729,11 +910,13 @@ export class OAuthTokenManager {
     secretRefOverride?: string,
     reason = "OAuth channel logout/deleted",
   ): Promise<number> {
-    const config = this.configs.get(channelId);
-    const secretRef = secretRefOverride ?? config?.secretRef;
+    const activeRecord = this.active.get(channelId);
+    const secretRef = secretRefOverride ?? activeRecord?.config.secretRef;
     this.pendingDeletes.set(channelId, (this.pendingDeletes.get(channelId) ?? 0) + 1);
-    this.cache.delete(channelId);
-    this.inflight.delete(channelId);
+    if (activeRecord) {
+      delete activeRecord.cache;
+      delete activeRecord.inflight;
+    }
     try {
       if (!secretRef) {
         return this.fence.invalidate(channelId, reason);

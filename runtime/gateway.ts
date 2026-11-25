@@ -20,6 +20,7 @@ import {
   OAuthTokenManager,
   type OAuthSubscriptionCredentials,
   type OAuthSubscriptionProvider,
+  type RegisteredOAuthChannel,
   XAI_DEFAULT_UPSTREAM_BASE_URL,
   type XaiOAuthCredentials,
 } from "./oauthProxy.ts";
@@ -372,6 +373,13 @@ const ALLOWED_PASSTHROUGH_HEADERS: Readonly<Record<GatewayApiKind, ReadonlySet<s
   ]),
 };
 
+function hasRawDotSegment(rawPath: string): boolean {
+  for (const segment of rawPath.split("/")) {
+    if (segment === "." || segment === "..") return true;
+  }
+  return false;
+}
+
 function hasInvalidPercentEncoding(pathname: string): boolean {
   for (const segment of pathname.split("/")) {
     if (!segment.includes("%")) continue;
@@ -594,7 +602,7 @@ function effectiveUpstreamModelId(model: GatewayModelConfig): string {
 interface CompiledChannelOAuthBinding {
   readonly provider: OAuthSubscriptionProvider;
   readonly secretRef: string;
-  readonly generation: number;
+  readonly bindingId: string;
 }
 
 interface CompiledChannel {
@@ -620,7 +628,7 @@ function compileRouteSnapshot(
   revision: number,
   channels: readonly GatewayChannelConfig[],
   devFallback: DevFallbackRoute | null,
-  fence: ChannelCredentialFence,
+  bindingIdsByChannel: ReadonlyMap<string, string>,
 ): GatewayRouteSnapshot {
   const map = new Map<string, CompiledChannel>();
   for (const ch of channels) {
@@ -639,13 +647,15 @@ function compileRouteSnapshot(
         enabledModels.set(cleanId, normalizedModel);
       }
     }
-    const oauthBinding: CompiledChannelOAuthBinding | undefined = ch.oauth
-      ? {
-          provider: ch.oauth.provider,
-          secretRef: ch.oauth.secretRef,
-          generation: fence.generation(ch.id),
-        }
-      : undefined;
+    const bindingId = ch.oauth ? bindingIdsByChannel.get(ch.id) : undefined;
+    const oauthBinding: CompiledChannelOAuthBinding | undefined =
+      ch.oauth && bindingId !== undefined
+        ? {
+            provider: ch.oauth.provider,
+            secretRef: ch.oauth.secretRef,
+            bindingId,
+          }
+        : undefined;
     map.set(ch.id, {
       config: ch,
       enabledModels,
@@ -1142,9 +1152,27 @@ async function handleGatewayRequest(
 ): Promise<void> {
   // Capture immutable route snapshot at request start so mid-stream channel mutations cannot affect this request.
   const snapshot = ctx.getSnapshot();
+  // Validate raw request target BEFORE `new URL(...)` normalizes away dot segments or malformed `%` escapes.
+  const rawTarget = request.url ?? "/";
+  if (
+    !rawTarget.startsWith("/") ||
+    rawTarget.startsWith("//") ||
+    rawTarget.includes("\\") ||
+    rawTarget.includes("\0")
+  ) {
+    rejectRequest(response, 400, "Malformed model request URL.", "invalid_request");
+    return;
+  }
+  const queryOrHashIdx = rawTarget.search(/[?#]/);
+  const rawPath = queryOrHashIdx >= 0 ? rawTarget.slice(0, queryOrHashIdx) : rawTarget;
+  if (hasInvalidPercentEncoding(rawPath) || hasRawDotSegment(rawPath)) {
+    rejectRequest(response, 400, "Malformed path encoding or dot segment in request URL.", "invalid_request");
+    return;
+  }
+
   let parsedUrl: URL;
   try {
-    parsedUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+    parsedUrl = new URL(rawTarget, "http://127.0.0.1");
   } catch {
     rejectRequest(response, 400, "Malformed model request URL.", "invalid_request");
     return;
@@ -1161,7 +1189,6 @@ async function handleGatewayRequest(
     return;
   }
 
-  // Validate percent-encoding on EVERY path segment (channel AND protocol subpath) before routing.
   if (hasInvalidPercentEncoding(parsedUrl.pathname)) {
     rejectRequest(response, 400, "Malformed percent-encoding in request path.", "invalid_request");
     return;
@@ -1377,7 +1404,7 @@ async function handleGatewayRequest(
         signal: abort.signal,
         expectedProvider: binding?.provider ?? oauthProvider,
         expectedSecretRef: binding?.secretRef ?? compiled.config.oauth.secretRef,
-        ...(binding !== undefined ? { expectedGeneration: binding.generation } : {}),
+        ...(binding !== undefined ? { expectedBindingId: binding.bindingId } : {}),
       });
       injectedSecretCandidates.push(creds.access, creds.refresh);
 
@@ -1624,15 +1651,13 @@ export async function startBundledPi(
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
   const validateOAuthDestination = options.validateOAuthDestination ?? assertStrictOAuthDestination;
 
-  const syncChannelOAuth = (
+  const extractOAuthConfigs = (
     channels: readonly GatewayChannelConfig[],
-    previousIds: ReadonlySet<string>,
-  ) => {
-    const activeIds = new Set<string>();
+  ): RegisteredOAuthChannel[] => {
+    const out: RegisteredOAuthChannel[] = [];
     for (const ch of channels) {
       if (ch.oauth) {
-        activeIds.add(ch.id);
-        oauthManager.register({
+        out.push({
           channelId: ch.id,
           provider: ch.oauth.provider,
           secretRef: ch.oauth.secretRef,
@@ -1643,17 +1668,18 @@ export async function startBundledPi(
         });
       }
     }
-    for (const previousId of previousIds) {
-      if (!activeIds.has(previousId)) {
-        oauthManager.unregister(previousId);
-      }
-    }
-    return activeIds;
+    return out;
   };
 
   let currentChannels: readonly GatewayChannelConfig[] = options.channels ? [...options.channels] : [];
-  let registeredOAuthIds: ReadonlySet<string> = syncChannelOAuth(currentChannels, new Set());
-  let snapshot = compileRouteSnapshot(1, currentChannels, devFallbackRoute, fence);
+  const initialTx = oauthManager.stageUpdate(extractOAuthConfigs(currentChannels));
+  oauthManager.commitUpdate(initialTx);
+  let snapshot = compileRouteSnapshot(
+    1,
+    currentChannels,
+    devFallbackRoute,
+    initialTx.bindingIdsByChannel,
+  );
 
   const server = createServer((request, response) => {
     void handleGatewayRequest(request, response, {
@@ -1765,19 +1791,19 @@ export async function startBundledPi(
       await options.onBeforeCommitFile?.("settings.json");
       await writeRuntimeConfig(settingsPath, nextSettingsJson);
 
-      // Phase 2: publish OAuth registrations + new gateway route snapshot BEFORE models.json becomes visible.
-      const prevOAuthIds = registeredOAuthIds;
+      // Phase 2: non-destructively stage candidate OAuth bindings (NEVER evicting or clearing prior
+      // live rotated caches before models.json commits!) and publish the candidate route snapshot.
       const prevChannels = currentChannels;
       const prevSnapshot = snapshot;
       const prevDefaultModelSlug = defaultModelSlug;
       const prevZeroChannelState = zeroChannelState;
 
-      registeredOAuthIds = syncChannelOAuth(candidateChannels, prevOAuthIds);
+      const stagedOAuthTx = oauthManager.stageUpdate(extractOAuthConfigs(candidateChannels));
       const candidateSnapshot = compileRouteSnapshot(
         prevSnapshot.revision + 1,
         candidateChannels,
         devFallbackRoute,
-        fence,
+        stagedOAuthTx.bindingIdsByChannel,
       );
       currentChannels = candidateChannels;
       snapshot = candidateSnapshot;
@@ -1786,13 +1812,15 @@ export async function startBundledPi(
 
       // Phase 3 (FINAL commit point): atomically rename models.json LAST so any Pi reader observing
       // the new models.json is guaranteed to see matching settings.json and live gateway routes.
+      // Only AFTER models.json commits do we finalize OAuth promotion & retire old accounts; on
+      // failure, discard ONLY the staged candidates so prior live rotated caches stay 100% intact!
       try {
         await options.onBeforeCommitFile?.("models.json");
         await writeRuntimeConfig(modelsPath, nextModelsJson);
       } catch (error) {
-        registeredOAuthIds = syncChannelOAuth(prevChannels, registeredOAuthIds);
+        oauthManager.discardUpdate(stagedOAuthTx);
         currentChannels = prevChannels;
-        snapshot = compileRouteSnapshot(prevSnapshot.revision, prevChannels, devFallbackRoute, fence);
+        snapshot = prevSnapshot;
         defaultModelSlug = prevDefaultModelSlug;
         zeroChannelState = prevZeroChannelState;
         await writeRuntimeConfig(settingsPath, buildPiSettingsJson(prevDefaultModelSlug)).catch(
@@ -1800,6 +1828,8 @@ export async function startBundledPi(
         );
         throw error;
       }
+
+      oauthManager.commitUpdate(stagedOAuthTx);
 
       return {
         revision: snapshot.revision,

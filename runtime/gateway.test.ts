@@ -1223,21 +1223,37 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         const bombJson = (await bombRes.json()) as { error: { code: string } };
         assert.equal(bombJson.error.code, "payload_too_large");
 
-        // 2. Malformed percent-escapes in channel segment OR protocol subpath MUST return 400 (never 404 or crash!)
+        // 2. Malformed percent-escapes in channel segment OR protocol subpath — INCLUDING before
+        // `new URL` dot-segment normalization (`/%ZZ/../chat/completions`) — MUST return 400 (#5)!
         for (const badPath of [
           "/c/%E0%A4%A/openai-completions/chat/completions",
           "/c/chan-z/openai-completions/%E0%A4%A",
           "/c/chan-z/openai-completions/chat/%ZZ",
+          "/c/chan-z/openai-completions/%ZZ/../chat/completions",
+          "/c/chan-z/openai-completions/foo/../chat/completions",
         ]) {
-          const badEsc = await fetch(`http://127.0.0.1:${runtime.port}${badPath}`, {
-            method: "POST",
-            headers: {
-              authorization: `Bearer ${runtime.gatewayToken}`,
-              "content-type": "application/json",
-            },
-            body: JSON.stringify({ model: "m1" }),
+          // Use raw httpRequest so Node does NOT normalize `..` before it reaches the gateway!
+          const status = await new Promise<number>((resolveStatus, rejectReq) => {
+            const req = httpRequest(
+              {
+                host: "127.0.0.1",
+                port: runtime.port,
+                path: badPath,
+                method: "POST",
+                headers: {
+                  authorization: `Bearer ${runtime.gatewayToken}`,
+                  "content-type": "application/json",
+                },
+              },
+              (res) => {
+                res.resume();
+                res.on("end", () => resolveStatus(res.statusCode ?? 0));
+              },
+            );
+            req.on("error", rejectReq);
+            req.end(JSON.stringify({ model: "m1" }));
           });
-          assert.equal(badEsc.status, 400, `Expected 400 for malformed path ${badPath}, got ${badEsc.status}`);
+          assert.equal(status, 400, `Expected 400 for malformed raw path ${badPath}, got ${status}`);
         }
 
         // 3. Server remains completely healthy afterwards
@@ -1766,26 +1782,85 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         const modelsAfterCommit = JSON.parse(readFileSync(join(runtime.agentDir, "models.json"), "utf8"));
         assert.equal(modelsAfterCommit.providers["xai-swap-req"].models[0].id, "grok-1");
 
-        // --- Proof C (#14 rollback): If models.json commit fails, settings.json + routes + OAuth roll back! ---
-        failBeforeModels = true;
-        await assert.rejects(() => runtime.updateChannels([acct2Chan]));
-        assert.equal(runtime.getDefaultModelSlug(), "xai-swap-req/grok-1");
-        const rolledBackSettings = JSON.parse(readFileSync(join(runtime.agentDir, "settings.json"), "utf8"));
-        assert.equal(rolledBackSettings.defaultModel, "grok-1");
-        const afterRollback = await fetch(
-          `http://127.0.0.1:${runtime.port}/c/xai-swap-req/openai-responses/responses`,
+        // --- Proof C (#14 rollback): If models.json commit fails during an account swap,
+        // settings.json + routes roll back AND prior account's LIVE ROTATED token is NEVER evicted
+        // or overwritten with stale initialCredentials! ---
+        let acct1RefreshCalls = 0;
+        const acct1StaleInitial = {
+          access: "tok-stale-initial-1",
+          refresh: "r-initial-1",
+          expires: Date.now() - 10_000, // expired -> triggers live rotation
+        };
+        const acct1Rotatable: GatewayChannelConfig = {
+          ...acct1Chan,
+          id: "xai-rotated-rollback",
+          models: [{ id: "grok-1", enabled: true }],
+          oauth: {
+            provider: "xai",
+            secretRef: "oauth:acct-1-rot",
+            initialCredentials: acct1StaleInitial,
+            refresh: async () => {
+              acct1RefreshCalls++;
+              return {
+                access: `tok-rotated-live-${acct1RefreshCalls}`,
+                refresh: `r-rotated-${acct1RefreshCalls}`,
+                expires: Date.now() + 3_600_000,
+              };
+            },
+          },
+        };
+        const acct2SwapTarget: GatewayChannelConfig = {
+          ...acct1Rotatable,
+          models: [{ id: "grok-2", enabled: true }],
+          oauth: {
+            provider: "xai",
+            secretRef: "oauth:acct-2",
+            refresh: async (c) => c,
+          },
+        };
+        await runtime.updateChannels([acct1Rotatable]);
+
+        // Trigger rotation on acct-1 -> live rotated token is now `tok-rotated-live-1` (refreshCalls === 1).
+        const preFailResp = await fetch(
+          `http://127.0.0.1:${runtime.port}/c/xai-rotated-rollback/openai-responses/responses`,
           {
             method: "POST",
             headers: {
               authorization: `Bearer ${runtime.gatewayToken}`,
               "content-type": "application/json",
             },
-            body: JSON.stringify({ model: "grok-1", input: "still-works-after-rollback" }),
+            body: JSON.stringify({ model: "grok-1", input: "rotate-first" }),
+          },
+        );
+        assert.equal(preFailResp.status, 200);
+        await preFailResp.text();
+        assert.equal(acct1RefreshCalls, 1);
+        assert.equal(stub.recorded[stub.recorded.length - 1]!.headers.authorization, "Bearer tok-rotated-live-1");
+
+        // Attempt swap to acct-2 with models.json commit failing -> MUST roll back cleanly WITHOUT
+        // evicting `tok-rotated-live-1` or reloading stale `initialCredentials`!
+        failBeforeModels = true;
+        await assert.rejects(() => runtime.updateChannels([acct2SwapTarget]));
+        assert.equal(runtime.getDefaultModelSlug(), "xai-rotated-rollback/grok-1");
+        const rolledBackSettings = JSON.parse(readFileSync(join(runtime.agentDir, "settings.json"), "utf8"));
+        assert.equal(rolledBackSettings.defaultModel, "grok-1");
+        assert.equal(runtime.oauthManager.getCached("xai-rotated-rollback")?.access, "tok-rotated-live-1");
+
+        const afterRollback = await fetch(
+          `http://127.0.0.1:${runtime.port}/c/xai-rotated-rollback/openai-responses/responses`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${runtime.gatewayToken}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ model: "grok-1", input: "still-uses-rotated-cache" }),
           },
         );
         assert.equal(afterRollback.status, 200);
         await afterRollback.text();
-        assert.equal(stub.recorded[1]!.headers.authorization, "Bearer tok-account-1");
+        assert.equal(acct1RefreshCalls, 1, "Must keep live rotated cache without refreshing or reloading stale initialCredentials");
+        assert.equal(stub.recorded[stub.recorded.length - 1]!.headers.authorization, "Bearer tok-rotated-live-1");
       } finally {
         await runtime.close();
       }

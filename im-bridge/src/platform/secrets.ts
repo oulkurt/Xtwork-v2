@@ -323,13 +323,29 @@ export function keychainSecrets(
   }
 
   type ParsedKeychainManifest =
-    | { readonly kind: "b64"; readonly b64: string; readonly prev: readonly KeychainChunkSet[] }
+    | {
+        readonly kind: "b64";
+        readonly b64: string;
+        readonly prev: readonly KeychainChunkSet[];
+        readonly pending: readonly KeychainChunkSet[];
+      }
     | {
         readonly kind: "chunks";
         readonly active: KeychainChunkSet;
         readonly prev: readonly KeychainChunkSet[];
+        readonly pending: readonly KeychainChunkSet[];
       }
-    | { readonly kind: "legacy"; readonly raw: string; readonly prev: readonly KeychainChunkSet[] };
+    | {
+        readonly kind: "pending_only";
+        readonly prev: readonly KeychainChunkSet[];
+        readonly pending: readonly KeychainChunkSet[];
+      }
+    | {
+        readonly kind: "legacy";
+        readonly raw: string;
+        readonly prev: readonly KeychainChunkSet[];
+        readonly pending: readonly KeychainChunkSet[];
+      };
 
   const formatChunkSet = (spec: KeychainChunkSet): string =>
     spec.gen === null ? `legacy:${spec.count}` : `g${spec.gen}:${spec.count}`;
@@ -337,9 +353,22 @@ export function keychainSecrets(
   const chunkAccountName = (ref: string, spec: KeychainChunkSet, index: number): string =>
     spec.gen === null ? `${ref}#${index}` : `${ref}#g${spec.gen}#${index}`;
 
-  const parsePrevList = (rawPrev: string): KeychainChunkSet[] => {
+  const dedupeChunkSets = (sets: readonly KeychainChunkSet[]): KeychainChunkSet[] => {
+    const seen = new Set<string>();
     const out: KeychainChunkSet[] = [];
-    for (const token of rawPrev.split(",")) {
+    for (const spec of sets) {
+      if (spec.count <= 0) continue;
+      const key = formatChunkSet(spec);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(spec);
+    }
+    return out;
+  };
+
+  const parseChunkSetList = (rawList: string): KeychainChunkSet[] => {
+    const out: KeychainChunkSet[] = [];
+    for (const token of rawList.split(",")) {
       const trimmed = token.trim();
       if (!trimmed) continue;
       const genMatch = /^g(\d+):(\d+)$/.exec(trimmed);
@@ -358,17 +387,30 @@ export function keychainSecrets(
   };
 
   const parseManifest = (stored: string): ParsedKeychainManifest => {
-    const prevMarker = ";prev:";
-    const prevIdx = stored.indexOf(prevMarker);
-    const head = prevIdx >= 0 ? stored.slice(0, prevIdx) : stored;
-    const prev = prevIdx >= 0 ? parsePrevList(stored.slice(prevIdx + prevMarker.length)) : [];
+    const segments = stored.split(";");
+    const head = segments[0] ?? "";
+    const prev: KeychainChunkSet[] = [];
+    const pending: KeychainChunkSet[] = [];
+    for (let i = 1; i < segments.length; i++) {
+      const seg = segments[i]!;
+      if (seg.startsWith("prev:")) {
+        prev.push(...parseChunkSetList(seg.slice("prev:".length)));
+      } else if (seg.startsWith("pending:")) {
+        pending.push(...parseChunkSetList(seg.slice("pending:".length)));
+      }
+    }
 
+    if (head.startsWith("pending:")) {
+      pending.unshift(...parseChunkSetList(head.slice("pending:".length)));
+      return { kind: "pending_only", prev: dedupeChunkSets(prev), pending: dedupeChunkSets(pending) };
+    }
     const genParts = /^parts:g(\d+):(\d+)$/.exec(head);
     if (genParts) {
       return {
         kind: "chunks",
         active: { gen: Number(genParts[1]), count: Number(genParts[2]) },
-        prev,
+        prev: dedupeChunkSets(prev),
+        pending: dedupeChunkSets(pending),
       };
     }
     const legacyParts = /^parts:(\d+)$/.exec(head);
@@ -376,26 +418,40 @@ export function keychainSecrets(
       return {
         kind: "chunks",
         active: { gen: null, count: Number(legacyParts[1]) },
-        prev,
+        prev: dedupeChunkSets(prev),
+        pending: dedupeChunkSets(pending),
       };
     }
     if (head.startsWith("b64:")) {
-      return { kind: "b64", b64: head.slice(4), prev };
+      return {
+        kind: "b64",
+        b64: head.slice(4),
+        prev: dedupeChunkSets(prev),
+        pending: dedupeChunkSets(pending),
+      };
     }
-    return { kind: "legacy", raw: stored, prev: [] };
+    return { kind: "legacy", raw: stored, prev: [], pending: [] };
   };
 
-  const dedupeChunkSets = (sets: readonly KeychainChunkSet[]): KeychainChunkSet[] => {
-    const seen = new Set<string>();
-    const out: KeychainChunkSet[] = [];
-    for (const spec of sets) {
-      if (spec.count <= 0) continue;
-      const key = formatChunkSet(spec);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(spec);
+  const formatManifestString = (
+    head: string | null,
+    prev: readonly KeychainChunkSet[],
+    pending: readonly KeychainChunkSet[],
+  ): string => {
+    const cleanPrev = dedupeChunkSets(prev);
+    const cleanPending = dedupeChunkSets(pending);
+    const partsOut: string[] = [];
+    if (head !== null) {
+      partsOut.push(head);
+      if (cleanPrev.length > 0) partsOut.push(`prev:${cleanPrev.map(formatChunkSet).join(",")}`);
+      if (cleanPending.length > 0) {
+        partsOut.push(`pending:${cleanPending.map(formatChunkSet).join(",")}`);
+      }
+    } else {
+      partsOut.push(`pending:${cleanPending.map(formatChunkSet).join(",")}`);
+      if (cleanPrev.length > 0) partsOut.push(`prev:${cleanPrev.map(formatChunkSet).join(",")}`);
     }
-    return out;
+    return partsOut.join(";");
   };
 
   const maxGeneration = (manifest: ParsedKeychainManifest | null): number => {
@@ -404,8 +460,11 @@ export function keychainSecrets(
     if (manifest.kind === "chunks" && manifest.active.gen !== null) {
       max = Math.max(max, manifest.active.gen);
     }
-    for (const prev of manifest.prev) {
-      if (prev.gen !== null) max = Math.max(max, prev.gen);
+    for (const spec of manifest.prev) {
+      if (spec.gen !== null) max = Math.max(max, spec.gen);
+    }
+    for (const spec of manifest.pending) {
+      if (spec.gen !== null) max = Math.max(max, spec.gen);
     }
     return max;
   };
@@ -495,6 +554,9 @@ export function keychainSecrets(
     if (raw.status !== "found") return raw;
 
     const manifest = parseManifest(raw.value);
+    if (manifest.kind === "pending_only") {
+      return { status: "missing" };
+    }
     if (manifest.kind === "chunks") {
       const { active } = manifest;
       let joined = "";
@@ -540,8 +602,21 @@ export function keychainSecrets(
         throw existing.error;
       }
       const prevManifest = existing.status === "found" ? parseManifest(existing.value) : null;
+      const existingHead: string | null =
+        prevManifest === null || prevManifest.kind === "pending_only"
+          ? null
+          : prevManifest.kind === "chunks"
+            ? prevManifest.active.gen === null
+              ? `parts:${prevManifest.active.count}`
+              : `parts:g${prevManifest.active.gen}:${prevManifest.active.count}`
+            : prevManifest.kind === "b64"
+              ? `b64:${prevManifest.b64}`
+              : prevManifest.raw;
+      const priorPrev = prevManifest ? [...prevManifest.prev] : [];
+      const priorPending = prevManifest ? [...prevManifest.pending] : [];
       const prevToCleanup = dedupeChunkSets([
-        ...(prevManifest ? prevManifest.prev : []),
+        ...priorPrev,
+        ...priorPending,
         ...(prevManifest && prevManifest.kind === "chunks" ? [prevManifest.active] : []),
       ]);
       const nextGen = maxGeneration(prevManifest) + 1;
@@ -554,8 +629,8 @@ export function keychainSecrets(
       if (encoded.length <= CHUNK) {
         cleanHead = `b64:${encoded}`;
       } else {
-        const chunkCommands: string[] = [];
         const expectedSlices: Array<{ readonly account: string; readonly slice: string }> = [];
+        const chunkCommands: string[] = [];
         let count = 0;
         for (let at = 0; at < encoded.length; at += CHUNK) {
           count++;
@@ -564,30 +639,71 @@ export function keychainSecrets(
           chunkCommands.push(add(account, slice));
           expectedSlices.push({ account, slice });
         }
-        // Write and verify every new generation-tagged chunk BEFORE updating the root manifest.
-        await runBatchAdd(chunkCommands);
-        for (const { account, slice } of expectedSlices) {
-          const check = await readRaw(account);
-          if (check.status === "unavailable" || check.status === "denied") {
-            throw check.error;
+        const pendingSpec: KeychainChunkSet = { gen: nextGen, count };
+
+        // Phase 0 (Write-Ahead Pending Manifest): record `;pending:g<nextGen>:<count>` in the
+        // root manifest AND verify it is persisted BEFORE writing ANY new chunk. If writing or
+        // verifying chunk #2 fails, chunk #1 is still tracked by the manifest for rollback/delete!
+        const walManifest = formatManifestString(
+          existingHead,
+          priorPrev,
+          [...priorPending, pendingSpec],
+        );
+        await runBatchAdd([add(ref, walManifest)]);
+        const walVerify = await readRaw(ref);
+        if (walVerify.status === "unavailable" || walVerify.status === "denied") {
+          throw walVerify.error;
+        }
+        if (walVerify.status !== "found" || walVerify.value !== walManifest) {
+          throw new SecretStoreUnavailableError(
+            "SECRET_WRITE_VERIFY_FAILED",
+            "Could not persist write-ahead pending manifest in macOS Keychain",
+          );
+        }
+
+        // Phase 1: write and verify every new generation-tagged chunk.
+        try {
+          await runBatchAdd(chunkCommands);
+          for (const { account, slice } of expectedSlices) {
+            const check = await readRaw(account);
+            if (check.status === "unavailable" || check.status === "denied") {
+              throw check.error;
+            }
+            if (check.status !== "found" || check.value !== slice) {
+              throw new SecretStoreUnavailableError(
+                "SECRET_WRITE_VERIFY_FAILED",
+                "Could not verify new chunk written to macOS Keychain",
+              );
+            }
           }
-          if (check.status !== "found" || check.value !== slice) {
-            throw new SecretStoreUnavailableError(
-              "SECRET_WRITE_VERIFY_FAILED",
-              "Could not verify new chunk written to macOS Keychain",
-            );
+        } catch (writeErr) {
+          // Best-effort cleanup of partially written pending chunks; strip `pendingSpec` from
+          // the manifest ONLY if every chunk of `pendingSpec` is read-back confirmed `missing`.
+          // If cleanup fails, `pendingSpec` remains tracked in the manifest for retry / delete().
+          let allRolledBack = true;
+          for (const { account } of expectedSlices) {
+            try {
+              await deleteOneAccount(account);
+            } catch {
+              allRolledBack = false;
+            }
           }
+          if (allRolledBack) {
+            if (existingHead === null && priorPrev.length === 0 && priorPending.length === 0) {
+              await deleteOneAccount(ref).catch(() => undefined);
+            } else {
+              const restored = formatManifestString(existingHead, priorPrev, priorPending);
+              await runBatchAdd([add(ref, restored)]).catch(() => undefined);
+            }
+          }
+          throw writeErr;
         }
         cleanHead = `parts:g${nextGen}:${count}`;
       }
 
-      // Two-phase manifest: record all previous chunk sets alongside the new value UNTIL every
-      // old chunk is individually deleted and read-back verified `missing`. If cleanup fails,
-      // the manifest still locates every orphaned chunk for a subsequent retry or `delete()`.
-      const manifestWithPrev =
-        prevToCleanup.length > 0
-          ? `${cleanHead};prev:${prevToCleanup.map(formatChunkSet).join(",")}`
-          : cleanHead;
+      // Phase 2: commit active manifest recording all previous/pending cleanup sets UNTIL every
+      // old chunk is individually deleted and read-back verified `missing`.
+      const manifestWithPrev = formatManifestString(cleanHead, prevToCleanup, []);
       await runBatchAdd([add(ref, manifestWithPrev)]);
       if ((await store.get(ref)) !== value) {
         throw new SecretStoreUnavailableError(
@@ -602,7 +718,7 @@ export function keychainSecrets(
             await deleteOneAccount(chunkAccountName(ref, spec, i));
           }
         }
-        // Phase 3: strip `;prev:` ONLY AFTER every previous chunk has been confirmed missing.
+        // Phase 3: strip `;prev:` ONLY AFTER every previous/pending chunk is confirmed missing.
         await runBatchAdd([add(ref, cleanHead)]);
         if ((await store.get(ref)) !== value) {
           throw new SecretStoreUnavailableError(
@@ -625,9 +741,10 @@ export function keychainSecrets(
       const chunkSetsToDelete = dedupeChunkSets([
         ...(manifest.kind === "chunks" ? [manifest.active] : []),
         ...manifest.prev,
+        ...manifest.pending,
       ]);
-      // Delete and verify EACH active and pending-previous chunk individually BEFORE deleting
-      // the root manifest, so a failed chunk delete never drops the manifest and orphans secrets.
+      // Delete and verify EACH active, prev, AND pending chunk individually BEFORE deleting
+      // the root manifest, so no chunk secret can ever be orphaned.
       for (const spec of chunkSetsToDelete) {
         for (let i = 1; i <= spec.count; i++) {
           await deleteOneAccount(chunkAccountName(ref, spec, i));

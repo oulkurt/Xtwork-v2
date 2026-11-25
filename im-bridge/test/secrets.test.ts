@@ -174,6 +174,68 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
     assert.equal(db.has("bot-shrink-2#g1#2"), false);
     assert.equal(db.has("bot-shrink-2#g2#1"), false);
     assert.equal(await store.get("bot-shrink-2"), "short-final");
+
+    // Failing chunk #2 write/verify MUST already have `pending:` recorded in manifest BEFORE any
+    // chunk was written, so even if rollback delete fails, a subsequent delete() finds and removes chunk #1 (#9)!
+    let corruptAccountOnce: string | null = null;
+    const partialWriteDb = new Map<string, string>();
+    const partialDeleteOrder: string[] = [];
+    let blockDelete = false;
+    const partialRunner: CommandRunner = async (_file, args, stdin) => {
+      if (args[0] === "find-generic-password") {
+        const account = args[args.indexOf("-a") + 1]!;
+        const val = partialWriteDb.get(account);
+        return val === undefined ? { code: 44, stdout: "" } : { code: 0, stdout: `${val}\n` };
+      }
+      if (args[0] === "delete-generic-password") {
+        const account = args[args.indexOf("-a") + 1]!;
+        partialDeleteOrder.push(account);
+        if (blockDelete) {
+          return { code: 1, stdout: "", stderr: "keychain busy" };
+        }
+        const existed = partialWriteDb.delete(account);
+        return existed ? { code: 0, stdout: "" } : { code: 44, stdout: "" };
+      }
+      if (args[0] === "-i") {
+        for (const line of stdin.split("\n").filter(Boolean)) {
+          const add = /^add-generic-password -s "[^"]+" -a "([^"]+)" -U -w "([^"]+)"$/.exec(line);
+          if (add) {
+            if (corruptAccountOnce === add[1]) {
+              corruptAccountOnce = null;
+              // Simulate chunk #2 failing to persist while chunk #1 WAS written!
+              continue;
+            }
+            partialWriteDb.set(add[1]!, add[2]!);
+          }
+        }
+        return { code: 0, stdout: "" };
+      }
+      return { code: 1, stdout: "" };
+    };
+
+    const partialStore = keychainSecrets(partialRunner);
+    corruptAccountOnce = "bot-partial#g1#2";
+    blockDelete = true;
+    await assert.rejects(
+      () => partialStore.set("bot-partial", "P".repeat(5000)),
+      (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_WRITE_VERIFY_FAILED",
+    );
+    // Chunk #1 sits in Keychain AND root manifest recorded `pending:g1:3` BEFORE writing chunks!
+    assert.equal(partialWriteDb.has("bot-partial#g1#1"), true);
+    assert.equal(partialWriteDb.get("bot-partial"), "pending:g1:3");
+    assert.equal(await partialStore.get("bot-partial"), undefined);
+
+    // Subsequent delete() finds & removes pending chunk #1 before deleting root manifest!
+    blockDelete = false;
+    partialDeleteOrder.length = 0;
+    await partialStore.delete("bot-partial");
+    assert.deepEqual(partialDeleteOrder, [
+      "bot-partial#g1#1",
+      "bot-partial#g1#2",
+      "bot-partial#g1#3",
+      "bot-partial",
+    ]);
+    assert.equal(partialWriteDb.size, 0);
   });
 
   it("macOS Keychain distinguishes missing (44) vs unavailable (127 / non-zero / timedOut) vs denied (128/36/51)", async () => {
