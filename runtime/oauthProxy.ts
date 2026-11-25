@@ -259,7 +259,8 @@ export function isCopilotModelPermitted(
   availableModelIds: readonly string[] | undefined,
 ): boolean {
   if (availableModelIds === undefined) return true;
-  return availableModelIds.includes(modelId);
+  const needle = modelId.trim().toLowerCase();
+  return availableModelIds.some((id) => id.trim().toLowerCase() === needle);
 }
 
 function containsImageContent(value: unknown): boolean {
@@ -324,6 +325,38 @@ const XAI_DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
 const XAI_DEFAULT_TOKEN_URL = "https://auth.x.ai/oauth2/token";
 const XAI_DEFAULT_LIFETIME_SECONDS = 3600;
 
+const SAFE_OAUTH_ERROR_CODE_PATTERN = /^[a-z0-9_.-]{1,64}$/i;
+
+async function extractSafeOAuthErrorCode(response: Response): Promise<string | undefined> {
+  try {
+    const raw = (await response.text()).slice(0, 4096);
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof parsed.error === "string" &&
+      SAFE_OAUTH_ERROR_CODE_PATTERN.test(parsed.error.trim())
+    ) {
+      return parsed.error.trim();
+    }
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof parsed.error === "object" &&
+      parsed.error !== null &&
+      typeof (parsed.error as Record<string, unknown>).code === "string"
+    ) {
+      const nested = String((parsed.error as Record<string, unknown>).code).trim();
+      if (SAFE_OAUTH_ERROR_CODE_PATTERN.test(nested)) {
+        return nested;
+      }
+    }
+  } catch {
+    // Non-JSON or unreadable error body: never expose raw text.
+  }
+  return undefined;
+}
+
 /**
  * Perform one xAI OAuth `refresh_token` grant (matching Pi 1.5.2 `auth/oauth/xai.js`).
  * Validates the token endpoint strictly, disables HTTP redirects (`redirect: "error"`), and
@@ -356,15 +389,13 @@ export async function refreshXaiOAuthToken(
     ...(signal ? { signal } : {}),
   });
 
-  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
   if (!response.ok) {
-    const err = typeof payload.error === "string" ? payload.error : "";
-    const desc = typeof payload.error_description === "string" ? payload.error_description : "";
-    const detail = [err, desc].filter(Boolean).join(": ");
+    const safeCode = await extractSafeOAuthErrorCode(response);
     throw new Error(
-      `xAI OAuth token refresh failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`,
+      `xAI OAuth token refresh failed (HTTP ${response.status}${safeCode ? `: ${safeCode}` : ""})`,
     );
   }
+  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
   if (typeof payload.access_token !== "string" || payload.access_token.length === 0) {
     throw new Error("Invalid xAI OAuth refresh response: missing access_token");
   }
@@ -418,9 +449,9 @@ export async function refreshCodexOAuthToken(
     ...(signal ? { signal } : {}),
   });
   if (!response.ok) {
-    const text = await response.text().catch(() => "");
+    const safeCode = await extractSafeOAuthErrorCode(response);
     throw new Error(
-      `OpenAI Codex token refresh failed (${response.status}): ${text || response.statusText}`,
+      `OpenAI Codex token refresh failed (HTTP ${response.status}${safeCode ? `: ${safeCode}` : ""})`,
     );
   }
   const json = (await response.json()) as Record<string, unknown>;
@@ -1014,6 +1045,59 @@ export class OAuthTokenManager {
     }
   }
 
+  /**
+   * Resolve and, if expired, refresh OAuth credentials for a channel that may not currently
+   * have an active gateway route binding (e.g., disabled channel test or headless ChannelManager),
+   * reusing the exact same pending-delete guard, dual-fence lease (`channelId` + `secretRef`),
+   * abort propagation, single-flight refresh, and `secretRef`-serialized `writeIfCurrent` so
+   * concurrent logout/delete can NEVER be undone by a late fallback refresh write-back.
+   */
+  async getValidCredentialsDetached<T extends OAuthSubscriptionCredentials>(
+    config: RegisteredOAuthChannel<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const activeBinding = this.active.get(config.channelId);
+    if (
+      activeBinding &&
+      activeBinding.config.secretRef === config.secretRef &&
+      activeBinding.config.provider === config.provider
+    ) {
+      return await this.getValidCredentials<T>(config.channelId, {
+        ...(signal ? { signal } : {}),
+        expectedSecretRef: config.secretRef,
+        expectedProvider: config.provider,
+        expectedBindingId: activeBinding.bindingId,
+      });
+    }
+    const sanitizedConfig = stripInitialCredentials(config as unknown as RegisteredOAuthChannel);
+    const ephemeralRecord: OAuthBindingRecord = {
+      bindingId: randomUUID(),
+      fenceKey: sanitizedConfig.channelId,
+      secretRefFenceKey: secretRefFenceKeyFor(sanitizedConfig.secretRef),
+      priorFenceKeys: new Set(),
+      config: sanitizedConfig,
+    };
+    this.assertNotDeleting(sanitizedConfig.channelId, sanitizedConfig.secretRef);
+    const readLease = this.acquireDualLease(ephemeralRecord, signal);
+    try {
+      const current = await this.loadCredentials(ephemeralRecord, readLease);
+      this.assertNotDeleting(sanitizedConfig.channelId, sanitizedConfig.secretRef);
+      readLease.assertCurrent();
+      if (current.expires - this.now() > this.skewMs) {
+        return current as T;
+      }
+      return await this.refreshSerial<T>(ephemeralRecord, current, readLease);
+    } finally {
+      readLease.release();
+      if (!this.isSecretRefReferenced(sanitizedConfig.secretRef)) {
+        const state = this.secretRefStates.get(sanitizedConfig.secretRef);
+        if (state && !state.inflight) {
+          this.secretRefStates.delete(sanitizedConfig.secretRef);
+        }
+      }
+    }
+  }
+
   private async refreshSerial<T extends OAuthSubscriptionCredentials>(
     record: OAuthBindingRecord,
     fallback: OAuthSubscriptionCredentials,
@@ -1157,6 +1241,35 @@ export class OAuthTokenManager {
         (secretRef !== undefined && stagedRecord.config.secretRef === secretRef)
       ) {
         this.secretRefStates.delete(stagedRecord.config.secretRef);
+        this.fence.invalidate(stagedRecord.fenceKey, reason);
+        for (const priorKey of stagedRecord.priorFenceKeys) {
+          this.fence.invalidate(priorKey, reason);
+        }
+      }
+    }
+  }
+
+  /**
+   * Immediately evict cached credentials & invalidate in-flight refreshes for a `secretRef`
+   * (e.g. after interactive OAuth re-login writes a new account's credentials under the same ref),
+   * without deleting the SecretStore entry. Next `getValidCredentials()` immediately reloads the new token.
+   */
+  evictSecretRef(
+    secretRef: string,
+    reason = "OAuth credentials replaced via interactive re-login",
+  ): void {
+    this.secretRefStates.delete(secretRef);
+    this.fence.invalidate(secretRefFenceKeyFor(secretRef), reason);
+    for (const rec of this.active.values()) {
+      if (rec.config.secretRef === secretRef) {
+        this.fence.invalidate(rec.fenceKey, reason);
+        for (const priorKey of rec.priorFenceKeys) {
+          this.fence.invalidate(priorKey, reason);
+        }
+      }
+    }
+    for (const stagedRecord of this.staged.values()) {
+      if (stagedRecord.config.secretRef === secretRef) {
         this.fence.invalidate(stagedRecord.fenceKey, reason);
         for (const priorKey of stagedRecord.priorFenceKeys) {
           this.fence.invalidate(priorKey, reason);

@@ -2293,4 +2293,92 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("disables XTWORK_MODEL_UPSTREAM_URL dev fallback (HTTP 404, no xtwork/standard) when company or member channel is active (#10)", async () => {
+    const stub = await startStubServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    const dir = mkdtempSync(join(tmpdir(), "xtwork-gw-dev-disable-"));
+    try {
+      const runtime = await startBundledPi(
+        "/bin/true",
+        dir,
+        {
+          XTWORK_MODEL_UPSTREAM_URL: `${stub.baseUrl}/v1`,
+          XTWORK_MODEL_UPSTREAM_MODEL: "dev/fallback-model",
+        },
+        { skipBinaryAccessCheck: true },
+      );
+      try {
+        // Zero-channel state: dev fallback works
+        assert.equal(runtime.getDefaultModelSlug(), "xtwork/standard");
+        const beforeRes = await fetch(`http://127.0.0.1:${runtime.port}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${runtime.gatewayToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ model: "standard", messages: [] }),
+        });
+        assert.equal(beforeRes.status, 200);
+
+        // Configure an active member channel -> legacy /v1/chat/completions MUST return 404 and models.json MUST NOT expose xtwork/standard!
+        await runtime.updateChannels([
+          {
+            id: "openai-personal",
+            providerType: "openai",
+            enabled: true,
+            api: "openai-completions",
+            baseUrl: `${stub.baseUrl}/v1`,
+            apiKey: "sk-member-1",
+            models: [{ id: "gpt-5.4", enabled: true }],
+          },
+        ]);
+        assert.equal(runtime.getDefaultModelSlug(), "openai-personal/gpt-5.4");
+        const modelsAfterMember = JSON.parse(
+          readFileSync(join(runtime.agentDir, "models.json"), "utf8"),
+        ) as { providers: Record<string, unknown> };
+        assert.equal("xtwork" in modelsAfterMember.providers, false);
+
+        const memberLegacyRes = await fetch(`http://127.0.0.1:${runtime.port}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${runtime.gatewayToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ model: "standard", messages: [] }),
+        });
+        assert.equal(memberLegacyRes.status, 404);
+
+        // Configure company channel -> dev fallback MUST also remain disabled (HTTP 404 & no xtwork/standard)
+        await runtime.updateChannels([
+          {
+            id: COMPANY_CHANNEL_ID,
+            providerType: "company-team",
+            enabled: true,
+            api: "openai-completions",
+            baseUrl: `${stub.baseUrl}/v1`,
+            apiKey: "sk-company-1",
+            models: [{ id: COMPANY_DEFAULT_MODEL_ID, enabled: true }],
+          },
+        ]);
+        assert.equal(runtime.getDefaultModelSlug(), `${COMPANY_CHANNEL_ID}/${COMPANY_DEFAULT_MODEL_ID}`);
+        const companyLegacyRes = await fetch(`http://127.0.0.1:${runtime.port}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${runtime.gatewayToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ model: "standard", messages: [] }),
+        });
+        assert.equal(companyLegacyRes.status, 404);
+      } finally {
+        await runtime.close();
+      }
+    } finally {
+      await stub.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
