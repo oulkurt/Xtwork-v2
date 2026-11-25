@@ -33,6 +33,7 @@ Pi 执行会话与工具调用。规划通过模型别名和网关解耦运行�
 ## Related Decisions
 
 - [ADR-009 · 默认运行时](009-default-pi-runtime.md)
+- [ADR-012 · M1 重构：小瞳多渠道模型平面与编码 Agent](012-xiaotong-model-channels-and-coding-agents.md)（已生效，将本 ADR 的单路由预览网关演进为 Proxy-Only 多协议本机反向代理 + 企业微信公司渠道 + 19 类成员供应商）
 - [ADR-007 · 插件契约与权限](007-plugin-contract.md)
 - [待决策事项](../../DECISIONS.md#pending-decisions)
 - [决策索引](../../DECISIONS.md)
