@@ -818,44 +818,32 @@ export class ChannelManager {
 
     if (provider === "openai-codex") {
       return async (current, signal) =>
-        await refreshCodexOAuthToken(
-          current as CodexOAuthCredentials,
-          AbortSignal.any([signal, AbortSignal.timeout(this.requestTimeoutMs)]),
-          {
-            fetchImpl,
-            ...(validateDestination ? { validateDestination } : {}),
-            ...(this.oauthEndpoints?.codexAuthBaseUrl
-              ? { tokenEndpoint: `${this.oauthEndpoints.codexAuthBaseUrl.replace(/\/+$/, "")}/oauth/token` }
-              : {}),
-            now,
-          },
-        );
+        await refreshCodexOAuthToken(current as CodexOAuthCredentials, signal, {
+          fetchImpl,
+          ...(validateDestination ? { validateDestination } : {}),
+          ...(this.oauthEndpoints?.codexAuthBaseUrl
+            ? { tokenEndpoint: `${this.oauthEndpoints.codexAuthBaseUrl.replace(/\/+$/, "")}/oauth/token` }
+            : {}),
+          now,
+        });
     }
     if (provider === "github-copilot") {
       return async (current, signal) =>
-        await refreshGithubCopilotOAuthToken(
-          current as GithubCopilotOAuthCredentials,
-          AbortSignal.any([signal, AbortSignal.timeout(this.requestTimeoutMs)]),
-          {
-            ...this.oauthEndpoints,
-            fetchImpl,
-            now,
-          },
-        );
+        await refreshGithubCopilotOAuthToken(current as GithubCopilotOAuthCredentials, signal, {
+          ...this.oauthEndpoints,
+          fetchImpl,
+          now,
+        });
     }
     return async (current, signal) =>
-      await refreshXaiOAuthToken(
-        current as XaiOAuthCredentials,
-        AbortSignal.any([signal, AbortSignal.timeout(this.requestTimeoutMs)]),
-        {
-          fetchImpl,
-          ...(validateDestination ? { validateDestination } : {}),
-          ...(this.oauthEndpoints?.xaiAuthBaseUrl
-            ? { tokenEndpoint: `${this.oauthEndpoints.xaiAuthBaseUrl.replace(/\/+$/, "")}/oauth2/token` }
-            : {}),
-          now,
-        },
-      );
+      await refreshXaiOAuthToken(current as XaiOAuthCredentials, signal, {
+        fetchImpl,
+        ...(validateDestination ? { validateDestination } : {}),
+        ...(this.oauthEndpoints?.xaiAuthBaseUrl
+          ? { tokenEndpoint: `${this.oauthEndpoints.xaiAuthBaseUrl.replace(/\/+$/, "")}/oauth2/token` }
+          : {}),
+        now,
+      });
   }
 
   private async compileGatewayChannels(): Promise<GatewayChannelConfig[]> {
