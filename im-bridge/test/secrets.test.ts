@@ -236,6 +236,31 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
       "bot-partial",
     ]);
     assert.equal(partialWriteDb.size, 0);
+
+    // Overwriting a legacy unprefixed raw Keychain value with a chunked write that fails on chunk #2
+    // MUST wrap the legacy value as structured `b64:...;pending:...` so `read()` preserves the
+    // exact original legacy string AND `delete()` cleans up chunk #1 + manifest (#9)!
+    partialWriteDb.set("bot-legacy", "sk-raw-legacy-token-without-prefix");
+    corruptAccountOnce = "bot-legacy#g1#2";
+    blockDelete = true;
+    await assert.rejects(
+      () => partialStore.set("bot-legacy", "L".repeat(5000)),
+      (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_WRITE_VERIFY_FAILED",
+    );
+    assert.equal(await partialStore.get("bot-legacy"), "sk-raw-legacy-token-without-prefix");
+    assert.match(partialWriteDb.get("bot-legacy") ?? "", /^b64:[^;]+;pending:g1:3$/);
+    assert.equal(partialWriteDb.has("bot-legacy#g1#1"), true);
+
+    blockDelete = false;
+    partialDeleteOrder.length = 0;
+    await partialStore.delete("bot-legacy");
+    assert.deepEqual(partialDeleteOrder, [
+      "bot-legacy#g1#1",
+      "bot-legacy#g1#2",
+      "bot-legacy#g1#3",
+      "bot-legacy",
+    ]);
+    assert.equal(partialWriteDb.size, 0);
   });
 
   it("macOS Keychain distinguishes missing (44) vs unavailable (127 / non-zero / timedOut) vs denied (128/36/51)", async () => {

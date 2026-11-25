@@ -1223,14 +1223,18 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         const bombJson = (await bombRes.json()) as { error: { code: string } };
         assert.equal(bombJson.error.code, "payload_too_large");
 
-        // 2. Malformed percent-escapes in channel segment OR protocol subpath — INCLUDING before
-        // `new URL` dot-segment normalization (`/%ZZ/../chat/completions`) — MUST return 400 (#5)!
+        // 2. Malformed percent-escapes AND literal or percent-encoded dot segments (`..`, `%2e%2e`,
+        // `%2e.`, `.%2e`, `%2e`) MUST return 400 BEFORE `new URL` normalizes them away (#5)!
         for (const badPath of [
           "/c/%E0%A4%A/openai-completions/chat/completions",
           "/c/chan-z/openai-completions/%E0%A4%A",
           "/c/chan-z/openai-completions/chat/%ZZ",
           "/c/chan-z/openai-completions/%ZZ/../chat/completions",
           "/c/chan-z/openai-completions/foo/../chat/completions",
+          "/c/chan-z/openai-completions/%2e%2e/chat/completions",
+          "/c/chan-z/openai-completions/%2e./chat/completions",
+          "/c/chan-z/openai-completions/.%2e/chat/completions",
+          "/c/chan-z/openai-completions/%2e/chat/completions",
         ]) {
           // Use raw httpRequest so Node does NOT normalize `..` before it reaches the gateway!
           const status = await new Promise<number>((resolveStatus, rejectReq) => {
@@ -1470,8 +1474,8 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         );
         assert.equal(getRes.status, 405);
 
-        // 3. Disallowed subpaths (/files, /models, traversal) -> 404 endpoint_not_allowed
-        for (const badPath of ["/files", "/models", "/v1/embeddings", "/v1/%2e%2e/files"]) {
+        // 3. Disallowed subpaths (/files, /models, /v1/embeddings) -> 404 endpoint_not_allowed
+        for (const badPath of ["/files", "/models", "/v1/embeddings"]) {
           const badRes = await fetch(
             `http://127.0.0.1:${runtime.port}/c/strict-openai/openai-completions${badPath}`,
             {
@@ -1861,6 +1865,64 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         await afterRollback.text();
         assert.equal(acct1RefreshCalls, 1, "Must keep live rotated cache without refreshing or reloading stale initialCredentials");
         assert.equal(stub.recorded[stub.recorded.length - 1]!.headers.authorization, "Bearer tok-rotated-live-1");
+
+        // --- Proof D (staged refresh + commitUpdate + immediate revokeAndDelete race) ---
+        // A refresh started during the staged window BEFORE commitUpdate MUST be aborted and
+        // blocked from writing back if revokeAndDelete runs right after commitUpdate!
+        const raceStore = memorySecrets();
+        const raceFence = new ChannelCredentialFence();
+        const raceMgr = new OAuthTokenManager({ secretStore: raceStore, fence: raceFence });
+        await raceStore.set(
+          "oauth:staged-race",
+          JSON.stringify({ access: "exp", refresh: "r0", expires: Date.now() - 10_000 }),
+        );
+        let enteredStagedRefresh!: () => void;
+        const enteredStagedRefreshP = new Promise<void>((r) => {
+          enteredStagedRefresh = r;
+        });
+        let releaseStagedRefresh!: () => void;
+        const releaseStagedRefreshP = new Promise<void>((r) => {
+          releaseStagedRefresh = r;
+        });
+        let stagedSignalAborted = false;
+
+        const tx = raceMgr.stageUpdate([
+          {
+            channelId: "staged-logout-ch",
+            provider: "xai",
+            secretRef: "oauth:staged-race",
+            refresh: async (_cur, sig) => {
+              sig.addEventListener("abort", () => {
+                stagedSignalAborted = true;
+              });
+              enteredStagedRefresh();
+              await releaseStagedRefreshP;
+              return { access: "resurrected-after-logout", refresh: "r1", expires: Date.now() + 3_600_000 };
+            },
+          },
+        ]);
+        const stagedBindingId = tx.bindingIdsByChannel.get("staged-logout-ch")!;
+        const preCommitRefresh = raceMgr.getValidCredentials("staged-logout-ch", {
+          expectedProvider: "xai",
+          expectedSecretRef: "oauth:staged-race",
+          expectedBindingId: stagedBindingId,
+        });
+        await enteredStagedRefreshP;
+
+        // Commit the staged channel, then immediately log out (revokeAndDelete) while pre-commit refresh is still in flight!
+        raceMgr.commitUpdate(tx);
+        await raceMgr.revokeAndDelete("staged-logout-ch", undefined, "immediate post-commit logout");
+        assert.equal(stagedSignalAborted, true);
+        assert.equal(await raceStore.get("oauth:staged-race"), undefined);
+
+        // Release the pre-commit staged refresh -> MUST reject SECRET_FENCE_STALE and NEVER resurrect credentials!
+        releaseStagedRefresh();
+        await assert.rejects(
+          () => preCommitRefresh,
+          (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_FENCE_STALE",
+        );
+        assert.equal(await raceStore.get("oauth:staged-race"), undefined);
+        assert.equal(raceMgr.getCached("staged-logout-ch"), undefined);
       } finally {
         await runtime.close();
       }

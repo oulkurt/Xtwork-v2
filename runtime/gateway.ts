@@ -373,20 +373,21 @@ const ALLOWED_PASSTHROUGH_HEADERS: Readonly<Record<GatewayApiKind, ReadonlySet<s
   ]),
 };
 
-function hasRawDotSegment(rawPath: string): boolean {
+function hasUnsafeRawPath(rawPath: string): boolean {
   for (const segment of rawPath.split("/")) {
-    if (segment === "." || segment === "..") return true;
-  }
-  return false;
-}
-
-function hasInvalidPercentEncoding(pathname: string): boolean {
-  for (const segment of pathname.split("/")) {
-    if (!segment.includes("%")) continue;
+    let decoded: string;
     try {
-      const decoded = decodeURIComponent(segment);
-      if (decoded.includes("\0")) return true;
+      decoded = decodeURIComponent(segment);
     } catch {
+      return true;
+    }
+    if (
+      decoded === "." ||
+      decoded === ".." ||
+      decoded.includes("/") ||
+      decoded.includes("\\") ||
+      decoded.includes("\0")
+    ) {
       return true;
     }
   }
@@ -1152,7 +1153,8 @@ async function handleGatewayRequest(
 ): Promise<void> {
   // Capture immutable route snapshot at request start so mid-stream channel mutations cannot affect this request.
   const snapshot = ctx.getSnapshot();
-  // Validate raw request target BEFORE `new URL(...)` normalizes away dot segments or malformed `%` escapes.
+  // Validate raw request target BEFORE `new URL(...)` can normalize away literal OR percent-encoded
+  // dot segments (`..`, `%2e%2e`, `%2e.`, `.%2e`, `%2e`) or malformed `%` escapes.
   const rawTarget = request.url ?? "/";
   if (
     !rawTarget.startsWith("/") ||
@@ -1165,8 +1167,13 @@ async function handleGatewayRequest(
   }
   const queryOrHashIdx = rawTarget.search(/[?#]/);
   const rawPath = queryOrHashIdx >= 0 ? rawTarget.slice(0, queryOrHashIdx) : rawTarget;
-  if (hasInvalidPercentEncoding(rawPath) || hasRawDotSegment(rawPath)) {
-    rejectRequest(response, 400, "Malformed path encoding or dot segment in request URL.", "invalid_request");
+  if (hasUnsafeRawPath(rawPath)) {
+    rejectRequest(
+      response,
+      400,
+      "Malformed path encoding or disallowed path segment in request URL.",
+      "invalid_request",
+    );
     return;
   }
 
@@ -1189,8 +1196,8 @@ async function handleGatewayRequest(
     return;
   }
 
-  if (hasInvalidPercentEncoding(parsedUrl.pathname)) {
-    rejectRequest(response, 400, "Malformed percent-encoding in request path.", "invalid_request");
+  if (hasUnsafeRawPath(parsedUrl.pathname)) {
+    rejectRequest(response, 400, "Malformed path encoding in request path.", "invalid_request");
     return;
   }
 

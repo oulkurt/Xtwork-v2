@@ -602,6 +602,8 @@ export function keychainSecrets(
         throw existing.error;
       }
       const prevManifest = existing.status === "found" ? parseManifest(existing.value) : null;
+      const decodeLegacyRaw = (raw: string): string =>
+        /^(?:[0-9a-f]{2})+$/i.test(raw) ? Buffer.from(raw, "hex").toString("utf8") : raw;
       const existingHead: string | null =
         prevManifest === null || prevManifest.kind === "pending_only"
           ? null
@@ -611,7 +613,9 @@ export function keychainSecrets(
               : `parts:g${prevManifest.active.gen}:${prevManifest.active.count}`
             : prevManifest.kind === "b64"
               ? `b64:${prevManifest.b64}`
-              : prevManifest.raw;
+              : // Wrap unprefixed legacy values in structured `b64:` so attaching `;pending:`
+                // is always parsed as a structured manifest while preserving exact read-back!
+                `b64:${Buffer.from(decodeLegacyRaw(prevManifest.raw), "utf8").toString("base64")}`;
       const priorPrev = prevManifest ? [...prevManifest.prev] : [];
       const priorPending = prevManifest ? [...prevManifest.pending] : [];
       const prevToCleanup = dedupeChunkSets([
