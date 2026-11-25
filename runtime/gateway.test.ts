@@ -1973,6 +1973,74 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         );
         assert.equal(siblingRefreshCalls, 0);
         assert.equal(await sharedStore.get("oauth:shared-acct"), undefined);
+
+        // --- Proof F (stageUpdate/register during paused revokeAndDelete must NOT resurrect initialCredentials) ---
+        const basePausedStore = memorySecrets();
+        await basePausedStore.set(
+          "oauth:paused-del",
+          JSON.stringify({ access: "old-tok", refresh: "old-r", expires: 100 }),
+        );
+        let enteredDelete!: () => void;
+        const enteredDeleteP = new Promise<void>((r) => {
+          enteredDelete = r;
+        });
+        let releaseDelete!: () => void;
+        const releaseDeleteP = new Promise<void>((r) => {
+          releaseDelete = r;
+        });
+        const pausedStore: SecretStore = {
+          backend: basePausedStore.backend,
+          get: (k) => basePausedStore.get(k),
+          set: (k, v) => basePausedStore.set(k, v),
+          delete: async (k) => {
+            enteredDelete();
+            await releaseDeleteP;
+            await basePausedStore.delete(k);
+          },
+        };
+        let pausedRefreshCalls = 0;
+        const pausedMgr = new OAuthTokenManager({
+          secretStore: pausedStore,
+          fence: new ChannelCredentialFence(),
+          now: () => 500_000,
+        });
+        const pausedRefresh = async () => {
+          pausedRefreshCalls += 1;
+          return { access: "resurrected-from-paused-stage", refresh: "r-new", expires: 9_999_999 };
+        };
+        pausedMgr.register({
+          channelId: "paused-ch-a",
+          provider: "xai",
+          secretRef: "oauth:paused-del",
+          refresh: pausedRefresh,
+        });
+
+        const deletePromise = pausedMgr.revokeAndDelete("paused-ch-a", undefined, "paused logout");
+        await enteredDeleteP;
+
+        // While delete is paused in SecretStore, stageUpdate introduces a channel with stale initialCredentials!
+        const pausedTx = pausedMgr.stageUpdate([
+          {
+            channelId: "paused-ch-b",
+            provider: "xai",
+            secretRef: "oauth:paused-del",
+            initialCredentials: { access: "stale-init", refresh: "stale-r", expires: 100 },
+            refresh: pausedRefresh,
+          },
+        ]);
+
+        releaseDelete();
+        await deletePromise;
+
+        // Committing the staged update after delete finishes MUST NOT carry over stale initialCredentials!
+        pausedMgr.commitUpdate(pausedTx);
+        assert.equal(pausedMgr.getCached("paused-ch-b"), undefined);
+        await assert.rejects(
+          () => pausedMgr.getValidCredentials("paused-ch-b"),
+          (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_STORE_UNAVAILABLE",
+        );
+        assert.equal(pausedRefreshCalls, 0);
+        assert.equal(await basePausedStore.get("oauth:paused-del"), undefined);
       } finally {
         await runtime.close();
       }

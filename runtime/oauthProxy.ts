@@ -621,7 +621,8 @@ export class OAuthTokenManager {
           secretRefFenceKey: secretRefFenceKeyFor(nextConfig.secretRef),
           priorFenceKeys: new Set(),
           config: nextConfig,
-          ...(nextConfig.initialCredentials !== undefined
+          ...(nextConfig.initialCredentials !== undefined &&
+          !this.isDeleting(nextConfig.channelId, nextConfig.secretRef)
             ? { cache: nextConfig.initialCredentials }
             : {}),
         };
@@ -638,7 +639,8 @@ export class OAuthTokenManager {
       secretRefFenceKey: secretRefFenceKeyFor(nextConfig.secretRef),
       priorFenceKeys: new Set(),
       config: nextConfig,
-      ...(nextConfig.initialCredentials !== undefined
+      ...(nextConfig.initialCredentials !== undefined &&
+      !this.isDeleting(nextConfig.channelId, nextConfig.secretRef)
         ? { cache: nextConfig.initialCredentials }
         : {}),
     };
@@ -674,7 +676,8 @@ export class OAuthTokenManager {
         secretRefFenceKey: secretRefFenceKeyFor(nextConfig.secretRef),
         priorFenceKeys: new Set(),
         config: nextConfig,
-        ...(nextConfig.initialCredentials !== undefined
+        ...(nextConfig.initialCredentials !== undefined &&
+        !this.isDeleting(nextConfig.channelId, nextConfig.secretRef)
           ? { cache: nextConfig.initialCredentials }
           : {}),
       };
@@ -715,19 +718,22 @@ export class OAuthTokenManager {
         if (stagedRecord) {
           promotedPriorKeys.add(stagedRecord.fenceKey);
         }
+        const deleting = this.isDeleting(nextConfig.channelId, nextConfig.secretRef);
         const promoted: OAuthBindingRecord = {
           bindingId: stagedRecord?.bindingId ?? stagedId,
           fenceKey: nextConfig.channelId,
           secretRefFenceKey: secretRefFenceKeyFor(nextConfig.secretRef),
           priorFenceKeys: promotedPriorKeys,
           config: nextConfig,
-          ...(stagedRecord !== undefined
-            ? stagedRecord.cache !== undefined
-              ? { cache: stagedRecord.cache }
-              : {}
-            : nextConfig.initialCredentials !== undefined
-              ? { cache: nextConfig.initialCredentials }
-              : {}),
+          ...(!deleting
+            ? stagedRecord !== undefined
+              ? stagedRecord.cache !== undefined
+                ? { cache: stagedRecord.cache }
+                : {}
+              : nextConfig.initialCredentials !== undefined
+                ? { cache: nextConfig.initialCredentials }
+                : {}
+            : {}),
         };
         this.active.set(nextConfig.channelId, promoted);
       } else {
@@ -1020,34 +1026,11 @@ export class OAuthTokenManager {
     return result as T;
   }
 
-  /**
-   * Logout / delete a channel's OAuth credentials safely under the fencing token:
-   * blocks new reads while deletion is pending, aborts ANY in-flight active OR pre-commit staged
-   * refresh for that channel or `secretRef`, clears in-memory caches across all channels sharing
-   * the `secretRef`, and performs serialized verified deletion from the OS SecretStore.
-   */
-  async revokeAndDelete(
+  private purgeMatchingRecords(
     channelId: string,
-    secretRefOverride?: string,
-    reason = "OAuth channel logout/deleted",
-  ): Promise<number> {
-    const activeRecord = this.active.get(channelId);
-    let secretRef = secretRefOverride ?? activeRecord?.config.secretRef;
-    if (!secretRef) {
-      for (const stagedRecord of this.staged.values()) {
-        if (stagedRecord.config.channelId === channelId) {
-          secretRef = stagedRecord.config.secretRef;
-          break;
-        }
-      }
-    }
-    this.pendingDeletes.set(channelId, (this.pendingDeletes.get(channelId) ?? 0) + 1);
-    if (secretRef !== undefined) {
-      this.pendingDeletesBySecretRef.set(
-        secretRef,
-        (this.pendingDeletesBySecretRef.get(secretRef) ?? 0) + 1,
-      );
-    }
+    secretRef: string | undefined,
+    reason: string,
+  ): void {
     for (const rec of this.active.values()) {
       if (
         rec.config.channelId === channelId ||
@@ -1076,6 +1059,37 @@ export class OAuthTokenManager {
         }
       }
     }
+  }
+
+  /**
+   * Logout / delete a channel's OAuth credentials safely under the fencing token:
+   * blocks new reads while deletion is pending, aborts ANY in-flight active OR pre-commit staged
+   * refresh for that channel or `secretRef`, clears in-memory caches across all channels sharing
+   * the `secretRef`, and performs serialized verified deletion from the OS SecretStore.
+   */
+  async revokeAndDelete(
+    channelId: string,
+    secretRefOverride?: string,
+    reason = "OAuth channel logout/deleted",
+  ): Promise<number> {
+    const activeRecord = this.active.get(channelId);
+    let secretRef = secretRefOverride ?? activeRecord?.config.secretRef;
+    if (!secretRef) {
+      for (const stagedRecord of this.staged.values()) {
+        if (stagedRecord.config.channelId === channelId) {
+          secretRef = stagedRecord.config.secretRef;
+          break;
+        }
+      }
+    }
+    this.pendingDeletes.set(channelId, (this.pendingDeletes.get(channelId) ?? 0) + 1);
+    if (secretRef !== undefined) {
+      this.pendingDeletesBySecretRef.set(
+        secretRef,
+        (this.pendingDeletesBySecretRef.get(secretRef) ?? 0) + 1,
+      );
+    }
+    this.purgeMatchingRecords(channelId, secretRef, reason);
     try {
       const nextChannelGen = this.fence.invalidate(channelId, reason);
       if (secretRef) {
@@ -1086,6 +1100,8 @@ export class OAuthTokenManager {
           reason,
         );
       }
+      // Post-delete sweep: clear any active/staged records introduced while delete was awaiting.
+      this.purgeMatchingRecords(channelId, secretRef, reason);
       return nextChannelGen;
     } finally {
       const remaining = (this.pendingDeletes.get(channelId) ?? 1) - 1;
