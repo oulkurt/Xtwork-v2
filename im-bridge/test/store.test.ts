@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import type { InboundMessage } from "../src/channels/channel.ts";
 import { CLAIM_TTL_MS } from "../src/core/access.ts";
@@ -374,6 +378,7 @@ describe("SQLite store invariants (ADR-011 S5/S6)", () => {
     try {
       const conn = store.createConnection({
         platform: "feishu",
+        secretRef: null,
         lifecycleState: "active",
         ownerId: "owner_1",
       });
@@ -443,6 +448,7 @@ describe("SQLite store invariants (ADR-011 S5/S6)", () => {
     try {
       const conn = store.createConnection({
         platform: "feishu",
+        secretRef: null,
         lifecycleState: "active",
         ownerId: "owner_1",
       });
@@ -521,6 +527,65 @@ describe("SQLite store invariants (ADR-011 S5/S6)", () => {
       assert.equal(leaderABacklog[0]!.bindingEpoch, 1);
     } finally {
       store.close();
+    }
+  });
+
+  it("backfills legacy pre-Leader inbound rows to leader-default epoch 1 on migration (S6)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "xtwork-im-migrate-"));
+    const dbPath = join(dir, "im.sqlite");
+    try {
+      // Seed an older v3 database with NULL leader_id / binding_id / binding_epoch on legacy inbound rows
+      const initial = new Store(dbPath);
+      const conn = initial.createConnection({
+        platform: "feishu",
+        secretRef: null,
+        lifecycleState: "active",
+        ownerId: "owner_1",
+        askAll: true,
+      });
+      const held = initial.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "legacy_held_1",
+          chat: { platformId: "dm_stranger", kind: "dm" },
+          sender: { id: "stranger_1", name: "Stranger", isBot: false },
+          text: "hello before upgrade",
+        }),
+      );
+      assert.equal(held.kind, "held");
+      initial.close();
+
+      const raw = new DatabaseSync(dbPath);
+      raw.exec("UPDATE messages SET leader_id = NULL, binding_id = NULL, binding_epoch = NULL");
+      raw.exec("PRAGMA user_version = 3");
+      raw.close();
+
+      // Reopen via Store -> runs v4 backfill
+      const upgraded = new Store(dbPath);
+      try {
+        const backfilled = upgraded.message(held.message.id);
+        assert.equal(backfilled?.leaderId, "leader-default");
+        assert.equal(backfilled?.bindingId, null);
+        assert.equal(backfilled?.bindingEpoch, 1);
+
+        // Even after rebinding to Leader B, backlog queries use historical message identity
+        upgraded.syncConnectionBinding({
+          connectionId: conn.id,
+          leaderId: "leader-b",
+          bindingId: "bind-b-2",
+          bindingEpoch: 2,
+          leaderPaused: false,
+        });
+        upgraded.moveInbound([held.message.id], "admit");
+        upgraded.moveInbound([held.message.id], "pause");
+        assert.equal(upgraded.pausedPendingMessages({ leaderId: "leader-b" }).length, 0);
+        assert.equal(upgraded.pausedPendingMessages({ leaderId: "leader-default" }).length, 1);
+      } finally {
+        upgraded.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

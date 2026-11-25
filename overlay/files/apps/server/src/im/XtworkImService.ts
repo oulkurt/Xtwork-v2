@@ -141,10 +141,53 @@ const call = (host: XtworkImBridgeHost, method: string, params: BridgePayload) =
   tryWork((signal) => host.request(method, params, signal));
 
 const TERMINAL_BRIDGE_STATES = new Set(["replied", "ignored", "blocked", "unanswered", "failed"]);
+const TEMPORARY_BRIDGE_ERROR_CODES = new Set(["CONNECTION_OFFLINE", "CONNECTION_INACTIVE"]);
+const PERMANENT_BRIDGE_ERROR_CODES = new Set([
+  "CHAT_BLOCKED",
+  "CHAT_NOT_FOUND",
+  "MESSAGE_NOT_FOUND",
+  "CONNECTION_NOT_FOUND",
+  "INVALID_PARAMS",
+]);
 
-const makeDeliveryWorker = (host: XtworkImBridgeHost, dispatch: ImDispatcher, hasReplySucceeded: (turnId: string) => boolean) => {
+export type DeliverySendOutcome = "sent" | "temporary_failure" | "permanent_failure";
+
+export function classifyDeliverySendOutcome(
+  response: unknown,
+  error?: { readonly code?: string | undefined; readonly message?: string | undefined },
+): DeliverySendOutcome {
+  if (error !== undefined) {
+    if (error.code && PERMANENT_BRIDGE_ERROR_CODES.has(error.code)) return "permanent_failure";
+    if (error.code && TEMPORARY_BRIDGE_ERROR_CODES.has(error.code)) return "temporary_failure";
+    // Disconnected bridge, abort, timeout, or unknown transient RPC error -> retry rather than falsely settling!
+    return "temporary_failure";
+  }
+  if (isRecord(response) && isRecord(response.result)) {
+    const kind = String(response.result.kind ?? "");
+    if (kind === "sent" || kind === "uncertain") return "sent";
+    if (kind === "failed") {
+      return response.result.retryable === true ? "temporary_failure" : "permanent_failure";
+    }
+  }
+  return "temporary_failure";
+}
+
+export interface DeliveryWorkerHost {
+  readonly available: boolean;
+  request(method: string, params?: BridgePayload, signal?: AbortSignal): Promise<unknown>;
+}
+
+export const makeDeliverySync = (
+  host: DeliveryWorkerHost,
+  dispatch: Pick<ImDispatcher, "orchestrator" | "settle">,
+  hasReplySucceeded: (turnId: string) => boolean,
+) => {
   const live = new Map<string, { text: string; liveId: string | null }>();
   const ackedInBridge = new Set<string>();
+  const clearCaches = () => {
+    live.clear();
+    ackedInBridge.clear();
+  };
   const sync = Effect.fnUntraced(function* (row: Effect.Success<ImDispatcher["unsettled"]>[number]) {
     const inbound = decodeInbound(row.payloadJson);
     const threadId = ThreadId.make(row.threadId);
@@ -155,11 +198,17 @@ const makeDeliveryWorker = (host: XtworkImBridgeHost, dispatch: ImDispatcher, ha
     // S3: Reconcile any lost `inbound.ack` FIRST so a committed run stranded in `paused_pending`
     // or `received` transitions to `delivered` before sending or settling its reply!
     if (!ackedInBridge.has(inbound.key)) {
-      const ackRes = yield* call(host, "inbound.ack", {
-        idempotencyKey: inbound.key,
-        t3ThreadId: threadId,
-        t3TurnId: run.id,
-      }).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value }));
+      const ackRes = yield* tryWork((signal) =>
+        host.request(
+          "inbound.ack",
+          {
+            idempotencyKey: inbound.key,
+            t3ThreadId: threadId,
+            t3TurnId: run.id,
+          },
+          signal,
+        ),
+      ).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value }));
       if (ackRes === undefined) return;
       const ackedState =
         isRecord(ackRes) && isRecord(ackRes.message) && typeof ackRes.message.state === "string"
@@ -178,34 +227,84 @@ const makeDeliveryWorker = (host: XtworkImBridgeHost, dispatch: ImDispatcher, ha
     const current = live.get(inbound.key);
     const alreadyReplied = hasReplySucceeded(run.id);
     if (isTerminal(run.status)) {
-      let replied = alreadyReplied;
       const finalText = text || current?.text || "";
+      let replied = alreadyReplied;
+      let sendOutcome: "not_needed" | DeliverySendOutcome = alreadyReplied ? "sent" : "not_needed";
       if (!alreadyReplied && current?.liveId) {
-        const finished = yield* call(host, "messages.liveFinish", {
-          liveId: current.liveId,
-          markdown: finalText,
-          operationKey: `${inbound.key}:finish`,
-        }).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value }));
-        replied = isRecord(finished) && isRecord(finished.result) && finished.result.kind !== "failed";
-        if (!replied && finalText && inbound.messageId) {
-          const fallback = yield* call(host, "messages.reply", {
-            messageId: inbound.messageId,
-            text: finalText,
-            operationKey: `${inbound.key}:reply`,
-          }).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value }));
-          replied = isRecord(fallback) && isRecord(fallback.result) && ["sent", "uncertain"].includes(String(fallback.result.kind));
+        const finished = yield* tryWork((signal) =>
+          host.request(
+            "messages.liveFinish",
+            {
+              liveId: current.liveId,
+              markdown: finalText,
+              operationKey: `${inbound.key}:finish`,
+            },
+            signal,
+          ),
+        ).pipe(Effect.result);
+        const finishOutcome =
+          finished._tag === "Success"
+            ? classifyDeliverySendOutcome(finished.success)
+            : classifyDeliverySendOutcome(undefined, finished.failure);
+        if (finishOutcome === "sent") {
+          replied = true;
+          sendOutcome = "sent";
+        } else if (finalText && inbound.messageId) {
+          const fallback = yield* tryWork((signal) =>
+            host.request(
+              "messages.reply",
+              {
+                messageId: inbound.messageId,
+                text: finalText,
+                operationKey: `${inbound.key}:reply`,
+              },
+              signal,
+            ),
+          ).pipe(Effect.result);
+          sendOutcome =
+            fallback._tag === "Success"
+              ? classifyDeliverySendOutcome(fallback.success)
+              : classifyDeliverySendOutcome(undefined, fallback.failure);
+          replied = sendOutcome === "sent";
+        } else {
+          sendOutcome = finishOutcome;
         }
       } else if (!alreadyReplied && finalText && inbound.messageId) {
-        const result = yield* call(host, "messages.reply", {
-          messageId: inbound.messageId,
-          text: finalText,
-          operationKey: `${inbound.key}:reply`,
-        }).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value }));
-        replied = isRecord(result) && isRecord(result.result) && ["sent", "uncertain"].includes(String(result.result.kind));
+        const replyRes = yield* tryWork((signal) =>
+          host.request(
+            "messages.reply",
+            {
+              messageId: inbound.messageId,
+              text: finalText,
+              operationKey: `${inbound.key}:reply`,
+            },
+            signal,
+          ),
+        ).pipe(Effect.result);
+        sendOutcome =
+          replyRes._tag === "Success"
+            ? classifyDeliverySendOutcome(replyRes.success)
+            : classifyDeliverySendOutcome(undefined, replyRes.failure);
+        replied = sendOutcome === "sent";
+      }
+      // S3: Keep temporary send failures (e.g. CONNECTION_OFFLINE, rate_limited, network) pending
+      // for retry — NEVER falsely mark them replied or settle them locally!
+      if (sendOutcome === "temporary_failure") {
+        if (!replied && current?.liveId) {
+          live.delete(inbound.key);
+        }
+        return;
       }
       live.delete(inbound.key);
-      const event = replied ? "reply" : run.status === "failed" ? "fail" : run.status === "completed" && finalText ? "reply" : "give_up";
-      const settled = yield* call(host, "inbound.settle", { idempotencyKey: inbound.key, event });
+      // S3: NEVER settle as "reply" unless a send actually succeeded (sent/uncertain) or alreadyReplied!
+      const event = replied
+        ? "reply"
+        : sendOutcome === "permanent_failure" || run.status === "failed"
+          ? "fail"
+          : "give_up";
+      const settled = yield* tryWork((signal) =>
+        host.request("inbound.settle", { idempotencyKey: inbound.key, event }, signal),
+      );
       const bridgeMoved = isRecord(settled) && settled.moved === true;
       const bridgeState =
         isRecord(settled) && isRecord(settled.message) && typeof settled.message.state === "string"
@@ -222,28 +321,40 @@ const makeDeliveryWorker = (host: XtworkImBridgeHost, dispatch: ImDispatcher, ha
     }
     if (alreadyReplied || run.status !== "running" || !text || text === current?.text) return;
     if (current === undefined) {
-      const result = yield* call(host, "messages.liveStart", {
-        chatId: inbound.chatId,
-        replyTo: inbound.messageId ?? inbound.platformMsgId,
-        initial: text,
-        operationKey: `${inbound.key}:live`,
-      }).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value }));
+      const result = yield* tryWork((signal) =>
+        host.request(
+          "messages.liveStart",
+          {
+            chatId: inbound.chatId,
+            replyTo: inbound.messageId ?? inbound.platformMsgId,
+            initial: text,
+            operationKey: `${inbound.key}:live`,
+          },
+          signal,
+        ),
+      ).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value }));
       if (isRecord(result) && result.supported === true && typeof result.liveId === "string") {
         live.set(inbound.key, { text, liveId: result.liveId });
       } else if (isRecord(result) && result.supported === false) {
         live.set(inbound.key, { text, liveId: null });
       }
     } else if (current.liveId !== null) {
-      yield* call(host, "messages.liveUpdate", { liveId: current.liveId, markdown: text });
+      yield* tryWork((signal) =>
+        host.request("messages.liveUpdate", { liveId: current.liveId, markdown: text }, signal),
+      );
       current.text = text;
     } else {
       current.text = text;
     }
   });
+  return { sync, clearCaches };
+};
+
+const makeDeliveryWorker = (host: XtworkImBridgeHost, dispatch: ImDispatcher, hasReplySucceeded: (turnId: string) => boolean) => {
+  const { sync, clearCaches } = makeDeliverySync(host, dispatch, hasReplySucceeded);
   return Effect.gen(function* () {
     if (!host.available) {
-      live.clear();
-      ackedInBridge.clear();
+      clearCaches();
       return;
     }
     const rows = yield* dispatch.unsettled;
@@ -404,15 +515,34 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
     if (event === "inbound.dispatch") {
       const accepted = yield* dispatch.accept(payload).pipe(Effect.result);
       if (accepted._tag === "Failure") {
-        // S4: If a trigger raced with Leader pause, durably defer it into `paused_pending`!
+        // S4/S14: If a trigger raced with Leader pause, defer ONLY the stamped inbound message!
+        // Derive any connection-wide pause flag strictly from the connection's CURRENT active
+        // binding so a historical dispatch from paused Leader A NEVER pauses active Leader B.
         if (accepted.failure.message.includes(LEADER_PAUSED_ERROR)) {
           const connId = typeof payload.connectionId === "string" ? payload.connectionId : undefined;
           const idempotencyKey = typeof payload.idempotencyKey === "string" ? payload.idempotencyKey : undefined;
-          if (connId) {
-            yield* call(host, "connections.setLeaderPaused", { connectionIds: [connId], paused: true }).pipe(Effect.ignore);
-          }
           if (idempotencyKey) {
             yield* call(host, "inbound.settle", { idempotencyKey, event: "pause" }).pipe(Effect.ignore);
+          }
+          if (connId) {
+            const activeBinding = yield* leaders.activeBindingForConnection(connId).pipe(Effect.orElseSucceed(() => undefined));
+            const currentBinding =
+              activeBinding ?? (yield* leaders.ensureBinding(connId, DEFAULT_LEADER_ID).pipe(Effect.orElseSucceed(() => undefined)));
+            if (currentBinding) {
+              const currentLeader = yield* leaders.getLeader(currentBinding.leaderId).pipe(Effect.orElseSucceed(() => undefined));
+              const currentPaused = currentLeader?.status === "paused";
+              yield* call(host, "connections.syncBindings", {
+                bindings: [
+                  {
+                    connectionId: connId,
+                    leaderId: currentBinding.leaderId,
+                    bindingId: currentBinding.bindingId,
+                    bindingEpoch: currentBinding.epoch,
+                    leaderPaused: currentPaused,
+                  },
+                ],
+              }).pipe(Effect.ignore);
+            }
           }
           return;
         }

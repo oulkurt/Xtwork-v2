@@ -578,6 +578,7 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
     try {
       const conn = store.createConnection({
         platform: "feishu",
+        secretRef: null,
         lifecycleState: "active",
         ownerId: "owner-1",
         askAll: false,
@@ -664,6 +665,7 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
       // S4: Pausing default Leader MUST NOT overwrite pause flag on a connection bound to another Leader!
       const connB = store.createConnection({
         platform: "feishu",
+        secretRef: null,
         lifecycleState: "active",
         ownerId: "owner-1",
       });
@@ -685,6 +687,7 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
       // S6: Pre-sync message (`leader-default / null / epoch 1`) replayed after rebind MUST NOT mix in Leader B's bindingId!
       const connC = store.createConnection({
         platform: "feishu",
+        secretRef: null,
         lifecycleState: "active",
         ownerId: "owner-1",
         askAll: false,
@@ -724,6 +727,86 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
       assert.equal(dispatches[0]!.params.leaderId, "leader-default");
       assert.equal(dispatches[0]!.params.bindingId, null);
       assert.equal(dispatches[0]!.params.bindingEpoch, 1);
+
+      // S14: Deferring ONLY a historical paused Leader A message via inbound.settle + syncing Leader B's active binding
+      // MUST leave Leader B's queued message on connC completely untouched (in `received`, NOT `paused_pending`).
+      const leaderBMsg = store.ingestInbound(connC.id, "org", {
+        platformId: "leader-b-msg",
+        chat: { platformId: "grp-c", kind: "group", name: "Group C" },
+        sender: { id: "bob", name: "Bob", isBot: false },
+        text: "for active leader B",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_020_000,
+      });
+      assert.equal(leaderBMsg.kind, "dispatch");
+      const deferOnlyA = await bridge.handleRequest({
+        id: 8,
+        method: "inbound.settle",
+        params: { idempotencyKey: preSyncMsg.message.idempotencyKey, event: "pause" },
+      });
+      assert.equal(deferOnlyA.ok, true);
+      await bridge.handleRequest({
+        id: 9,
+        method: "connections.syncBindings",
+        params: {
+          bindings: [
+            {
+              connectionId: connC.id,
+              leaderId: "leader-b",
+              bindingId: "bind-c-2",
+              bindingEpoch: 2,
+              leaderPaused: false,
+            },
+          ],
+        },
+      });
+      assert.equal(store.message(preSyncMsg.message.id)?.state, "paused_pending");
+      assert.equal(store.message(leaderBMsg.message.id)?.state, "received");
+      assert.equal(store.connection(connC.id)?.leaderPaused, false);
+
+      // S6: Legacy held row (with null leader/binding/epoch before backfill or from v2 upgrade) approved
+      // AFTER rebinding connC to Leader B MUST still dispatch under ('leader-default', null, 1), NEVER Leader B!
+      const connLegacy = store.createConnection({
+        platform: "wechat",
+        secretRef: null,
+        lifecycleState: "active",
+        ownerId: "owner-1",
+        askAll: true,
+      });
+      const legacyHeld = store.ingestInbound(connLegacy.id, "public", {
+        platformId: "legacy-held-1",
+        chat: { platformId: "dm-stranger", kind: "dm" },
+        sender: { id: "stranger-1", name: "Stranger", isBot: false },
+        text: "held before upgrade",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_030_000,
+      });
+      assert.equal(legacyHeld.kind, "held");
+      // Simulate pre-v3 schema where message tuple columns were NULL
+      (store as unknown as { db: { prepare: (s: string) => { run: (...a: unknown[]) => void } } }).db
+        .prepare("UPDATE messages SET leader_id = NULL, binding_id = NULL, binding_epoch = NULL WHERE id = ?")
+        .run(legacyHeld.message.id);
+      store.syncConnectionBinding({
+        connectionId: connLegacy.id,
+        leaderId: "leader-b",
+        bindingId: "bind-legacy-2",
+        bindingEpoch: 2,
+        leaderPaused: false,
+      });
+      notifications.length = 0;
+      const admitted = await bridge.handleRequest({
+        id: 10,
+        method: "access.decide",
+        params: { targetKind: "contact", targetId: legacyHeld.contact.id, decision: "allowed" },
+      });
+      assert.equal(admitted.ok, true);
+      const legacyDispatches = notifications.filter((n) => n.method === "inbound.dispatch");
+      assert.equal(legacyDispatches.length, 1);
+      assert.equal(legacyDispatches[0]!.params.leaderId, "leader-default");
+      assert.equal(legacyDispatches[0]!.params.bindingId, null);
+      assert.equal(legacyDispatches[0]!.params.bindingEpoch, 1);
 
       await bridge.shutdown();
     } finally {

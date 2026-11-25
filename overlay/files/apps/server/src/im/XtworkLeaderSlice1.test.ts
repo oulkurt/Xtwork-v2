@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import type { AgentAwarenessThread } from "../orchestration-v2/ProjectionStore.ts";
+import { bridgeRpcError } from "./XtworkImBridgeHost.ts";
 import { dispatchIdentity, inboundMessage, sameAudience } from "./XtworkImDispatch.ts";
 import { imToolAllowed, runImTool } from "./XtworkImMcp.ts";
 import { XtworkImMemory } from "./XtworkImMemory.ts";
@@ -18,11 +19,13 @@ import {
   canReuseProviderSession,
   desktopContext,
   evaluateThreadAccess,
+  hashArgs,
   narrowDelegatedPolicy,
   normalizeExecutionContext,
   type Execution,
   type TurnExecutionContext,
 } from "./XtworkImSecurity.ts";
+import { classifyDeliverySendOutcome, makeDeliverySync } from "./XtworkImService.ts";
 import { buildOwnerNeedsYou, buildScopedAwareness, redactDiagnosticText } from "./XtworkLeaderAwareness.ts";
 import { makeLeaderStore } from "./XtworkLeaderStore.ts";
 
@@ -747,6 +750,160 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         expect(tuple?.leaderId).toBe(DEFAULT_LEADER_ID);
         expect(yield* reopened.findBindingByTuple("conn-wechat", "leader-other", 1)).toBeUndefined();
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath }))),
+    );
+  });
+
+  it("keeps lost-ACK runs pending across temporary CONNECTION_OFFLINE errors and never settles unsent replies as replied (S3)", async () => {
+    const inbound = inboundMessage({
+      connectionId: "conn-feishu",
+      platformMsgId: "pm-offline-1",
+      messageId: "m-offline-1",
+      chatId: "chat-1",
+      chatKind: "dm",
+      senderRole: "owner",
+    });
+    const threadId = "xtwork-im-dm-offline";
+    const userMessageId = `xtwork-im:${hashArgs(inbound.key)}`;
+    const settledKeys: string[] = [];
+    const bridgeCalls: Array<{ method: string; params: Record<string, unknown> | undefined }> = [];
+    let bridgeOnline = false;
+    let bridgeMsgState = "paused_pending";
+
+    const fakeHost = {
+      available: true,
+      async request(method: string, params?: Record<string, unknown>) {
+        bridgeCalls.push({ method, params });
+        if (method === "inbound.ack") {
+          if (bridgeMsgState === "paused_pending") bridgeMsgState = "delivered";
+          return { message: { state: bridgeMsgState } };
+        }
+        if (method === "messages.reply") {
+          if (!bridgeOnline) {
+            throw bridgeRpcError('Connection "conn-feishu" is not currently connected', "CONNECTION_OFFLINE");
+          }
+          bridgeMsgState = "replied";
+          return { result: { kind: "sent", platformId: "out-1" } };
+        }
+        if (method === "inbound.settle") {
+          const event = String(params?.event ?? "");
+          if (event === "reply" && bridgeMsgState === "replied") {
+            return { moved: false, message: { state: "replied" } };
+          }
+          if (event === "fail" && bridgeMsgState === "delivered") {
+            bridgeMsgState = "failed";
+            return { moved: true, message: { state: "failed" } };
+          }
+          return { moved: false, message: { state: bridgeMsgState } };
+        }
+        return {};
+      },
+    };
+
+    const fakeDispatch = {
+      orchestrator: {
+        getThreadRecords: () =>
+          Effect.succeed({
+            runs: [{ id: "run-s3-1", userMessageId, status: "completed" }],
+            messages: [{ runId: "run-s3-1", role: "assistant", text: "Task finished!" }],
+          }),
+      },
+      settle: (key: string) =>
+        Effect.sync(() => {
+          settledKeys.push(key);
+        }),
+    } as never;
+
+    const { sync } = makeDeliverySync(fakeHost, fakeDispatch, () => false);
+    const row = {
+      key: inbound.key,
+      threadId,
+      contextJson: "{}",
+      payloadJson: JSON.stringify(inbound),
+    };
+
+    // Tick 1: Lost ACK reconciled (`paused_pending` -> `delivered`), reply hits CONNECTION_OFFLINE -> MUST NOT settle!
+    await Effect.runPromise(sync(row));
+    expect(bridgeMsgState).toBe("delivered");
+    expect(settledKeys).toEqual([]);
+    expect(bridgeCalls.filter((c) => c.method === "inbound.settle")).toHaveLength(0);
+
+    // Tick 2: Connection comes back online -> reply succeeds -> settles locally cleanly!
+    bridgeOnline = true;
+    await Effect.runPromise(sync(row));
+    expect(bridgeMsgState).toBe("replied");
+    expect(settledKeys).toEqual([inbound.key]);
+
+    // Permanent failure classification settles as "fail", never "reply"
+    expect(classifyDeliverySendOutcome(undefined, { code: "CONNECTION_OFFLINE" })).toBe("temporary_failure");
+    expect(classifyDeliverySendOutcome({ result: { kind: "failed", code: "rate_limited", retryable: true } })).toBe(
+      "temporary_failure",
+    );
+    expect(classifyDeliverySendOutcome(undefined, { code: "CHAT_BLOCKED" })).toBe("permanent_failure");
+    expect(classifyDeliverySendOutcome({ result: { kind: "failed", code: "forbidden", retryable: false } })).toBe(
+      "permanent_failure",
+    );
+    expect(classifyDeliverySendOutcome({ result: { kind: "uncertain" } })).toBe("sent");
+  });
+
+  it("preserves same-policy reuse across mid-turn Pi native session switches while still failing closed on policy change (S16)", async () => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const store = yield* makeLeaderStore();
+        yield* store.ensureDefaultLeader();
+
+        const policyX = normalizeExecutionContext({
+          source: "im",
+          leaderId: DEFAULT_LEADER_ID,
+          connectionId: "conn-feishu",
+          chatId: "chat-handoff",
+          chatKind: "group",
+          senderRole: "member",
+          replyAudience: "group",
+          isolatedWorkspaceRoot: "/tmp/ws/handoff",
+          companionScope: "group:handoff",
+        });
+        const policyY = normalizeExecutionContext({
+          ...policyX,
+          isolatedWorkspaceRoot: "/tmp/ws/handoff-v2",
+        });
+
+        // Turn 1 starts on native-pi-1 under policy X
+        const run1 = yield* store.persistPolicyBeforeLaunch({
+          commandId: "cmd-s16-1",
+          threadId: "thread-s16",
+          runId: "run-s16-1",
+          context: policyX,
+        });
+        yield* store.recordNativeThreadPolicy("thread-s16", "native-pi-1", run1.policyDigest);
+
+        // Mid-turn Pi extension calls ctx.newSession() -> replacement native-pi-child recorded with active run's digest
+        const activePolicy = store.resolveProviderPolicySync("thread-s16", "run-s16-1");
+        expect(activePolicy.failClosed).toBe(false);
+        expect(activePolicy.policyDigest).toBe(run1.policyDigest);
+        yield* store.recordNativeThreadPolicy("thread-s16", "native-pi-child", activePolicy.policyDigest!);
+
+        // Turn 2 with SAME policy X resumes native-pi-child WITHOUT forcing a fresh conversation!
+        yield* store.persistPolicyBeforeLaunch({
+          commandId: "cmd-s16-2",
+          threadId: "thread-s16",
+          runId: "run-s16-2",
+          context: policyX,
+        });
+        const turn2Check = store.resolveProviderPolicySync("thread-s16", "run-s16-2", "native-pi-child");
+        expect(turn2Check.failClosed).toBe(false);
+        expect(turn2Check.policyChanged).toBe(false);
+
+        // Turn 3 with DIFFERENT policy Y MUST still see policyChanged: true on native-pi-child!
+        yield* store.persistPolicyBeforeLaunch({
+          commandId: "cmd-s16-3",
+          threadId: "thread-s16",
+          runId: "run-s16-3",
+          context: policyY,
+        });
+        const turn3Check = store.resolveProviderPolicySync("thread-s16", "run-s16-3", "native-pi-child");
+        expect(turn3Check.failClosed).toBe(false);
+        expect(turn3Check.policyChanged).toBe(true);
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
     );
   });
 });

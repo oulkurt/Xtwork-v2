@@ -305,7 +305,7 @@ export class Store {
   private migrate(): void {
     const row = this.db.prepare("PRAGMA user_version").get() as Row;
     const version = Number(row.user_version ?? 0);
-    if (version >= 3) return;
+    if (version >= 4) return;
     this.db.exec("BEGIN");
     try {
       if (version < 1) {
@@ -334,8 +334,16 @@ export class Store {
         if (!msgCols.includes("binding_epoch")) {
           this.db.exec("ALTER TABLE messages ADD COLUMN binding_epoch INTEGER");
         }
+        // S6: Backfill pre-Leader legacy inbound rows so they retain their historical
+        // default-Leader epoch-1 identity even after the connection is rebound.
+        this.db.exec(
+          `UPDATE messages
+           SET leader_id = COALESCE(leader_id, 'leader-default'),
+               binding_epoch = COALESCE(binding_epoch, 1)
+           WHERE direction = 'in' AND (leader_id IS NULL OR binding_epoch IS NULL)`,
+        );
       }
-      this.db.exec("PRAGMA user_version = 3");
+      this.db.exec("PRAGMA user_version = 4");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1502,13 +1510,23 @@ export class Store {
   }
 
   /** Defer unacked queued/waiting inbound messages for a paused connection/leader into `paused_pending` without touching committed runs. */
-  pauseConnectionMessages(connectionId: string): string[] {
-    const rows = this.stmt(
-      `SELECT id FROM messages
-       WHERE connection_id = ? AND direction = 'in'
-         AND acked_at IS NULL AND t3_turn_id IS NULL
-         AND state IN ('received', 'waiting')`,
-    ).all(connectionId) as Row[];
+  pauseConnectionMessages(connectionId: string, leaderId?: string): string[] {
+    const rows = (
+      leaderId
+        ? this.stmt(
+            `SELECT id FROM messages
+             WHERE connection_id = ? AND direction = 'in'
+               AND acked_at IS NULL AND t3_turn_id IS NULL
+               AND state IN ('received', 'waiting')
+               AND COALESCE(leader_id, 'leader-default') = ?`,
+          ).all(connectionId, leaderId)
+        : this.stmt(
+            `SELECT id FROM messages
+             WHERE connection_id = ? AND direction = 'in'
+               AND acked_at IS NULL AND t3_turn_id IS NULL
+               AND state IN ('received', 'waiting')`,
+          ).all(connectionId)
+    ) as Row[];
     if (!rows.length) return [];
     return this.moveInbound(
       rows.map((r) => String(r.id)),
@@ -1531,7 +1549,7 @@ export class Store {
       leaderPaused: input.leaderPaused,
     });
     if (updated && input.leaderPaused) {
-      this.pauseConnectionMessages(updated.id);
+      this.pauseConnectionMessages(updated.id, input.leaderId);
     }
     return updated;
   }
@@ -1575,7 +1593,8 @@ export class Store {
       args.push(...connectionIds);
     }
     if (leaderId) {
-      clauses.push("COALESCE(m.leader_id, n.leader_id) = ?");
+      // S6: Always filter by historical message identity (never the connection's current Leader after rebind).
+      clauses.push("COALESCE(m.leader_id, 'leader-default') = ?");
       args.push(leaderId);
     }
     const sql = `

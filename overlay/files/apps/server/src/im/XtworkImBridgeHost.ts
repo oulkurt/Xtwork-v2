@@ -10,6 +10,14 @@ export interface BridgeOptions {
   readonly companionDir: string;
 }
 
+export function bridgeRpcError(message: string, code?: string): Error {
+  const err = new Error(message);
+  if (code !== undefined) {
+    Object.defineProperty(err, "code", { value: code, enumerable: true, configurable: true });
+  }
+  return err;
+}
+
 export type BridgePayload = Record<string, unknown>;
 export const isRecord = (value: unknown): value is BridgePayload =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -103,7 +111,8 @@ export class XtworkImBridgeHost {
         if (typeof frame.id === "number") {
           const pending = connection.pending.get(frame.id);
           if (isRecord(frame.error) && typeof frame.error.message === "string") {
-            pending?.reject(new Error(frame.error.message));
+            const code = typeof frame.error.code === "string" ? frame.error.code : undefined;
+            pending?.reject(bridgeRpcError(frame.error.message, code));
           } else {
             pending?.resolve(frame.result);
           }

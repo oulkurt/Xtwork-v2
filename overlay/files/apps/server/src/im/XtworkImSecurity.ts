@@ -265,10 +265,17 @@ export class ImDispatchAuthority extends Context.Reference<boolean>("t3/im/Xtwor
 
 export class ImError extends Schema.TaggedError<ImError, { readonly brand: unique symbol }>()("ImError", {
   message: Schema.String,
+  code: Schema.optional(Schema.String),
 }) {}
 
-export const imError = (cause: unknown) =>
-  new ImError({ message: cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "IM operation failed." });
+export const imError = (cause: unknown) => {
+  const rawCode = cause instanceof Error ? Reflect.get(cause, "code") : undefined;
+  const code = typeof rawCode === "string" ? rawCode : undefined;
+  return new ImError({
+    message: cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "IM operation failed.",
+    ...(code !== undefined ? { code } : {}),
+  });
+};
 
 export const localForkThreadId = (commandId: string) => "xtwork-local-" + hashArgs(commandId).slice(0, 32);
 export const isImThread = (threadId: string) => threadId.startsWith("xtwork-im-");

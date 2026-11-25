@@ -225,8 +225,10 @@ export const makeDispatcher = Effect.fnUntraced(function* (
         if (
           !stamped ||
           stamped.connectionId !== inbound.connectionId ||
-          (inbound.leaderId !== undefined && stamped.leaderId !== inbound.leaderId) ||
-          (inbound.bindingEpoch !== undefined && stamped.epoch !== inbound.bindingEpoch)
+          inbound.leaderId === undefined ||
+          stamped.leaderId !== inbound.leaderId ||
+          inbound.bindingEpoch === undefined ||
+          stamped.epoch !== inbound.bindingEpoch
         ) {
           return yield* imError("Rejected IM dispatch with mismatched Leader binding tuple.");
         }

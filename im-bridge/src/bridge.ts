@@ -680,6 +680,7 @@ export class ImBridge {
 
   private handleSetLeaderPaused(params: Record<string, unknown>) {
     const paused = Boolean(params.paused);
+    const filterLeaderId = optStr(params, "leaderId");
     const connectionIds = Array.isArray(params.connectionIds)
       ? params.connectionIds.filter((id): id is string => typeof id === "string" && id.length > 0)
       : this.store.connections().map((c) => c.id);
@@ -687,9 +688,11 @@ export class ImBridge {
     for (const connectionId of connectionIds) {
       const conn = this.store.connection(connectionId);
       if (!conn) continue;
+      // S14: Never overwrite pause state for a connection currently bound to a different Leader.
+      if (filterLeaderId && conn.leaderId !== filterLeaderId) continue;
       const next = this.store.updateConnection(conn.id, { leaderPaused: paused })!;
       if (paused) {
-        this.store.pauseConnectionMessages(conn.id);
+        this.store.pauseConnectionMessages(conn.id, next.leaderId);
       }
       this.emitConnectionState(next);
       updated.push(sanitizeConnection(next));
@@ -803,8 +806,7 @@ export class ImBridge {
       const eligible = messageIds.filter((id) => {
         const msg = this.store.message(id);
         if (!msg || msg.state !== "paused_pending") return false;
-        const conn = this.store.connection(msg.connectionId);
-        if (leaderId && (msg.leaderId ?? conn?.leaderId ?? "leader-default") !== leaderId) return false;
+        if (leaderId && (msg.leaderId ?? "leader-default") !== leaderId) return false;
         return true;
       });
       const changed = this.store.decidePausedPending(eligible, "dismiss");
@@ -825,7 +827,7 @@ export class ImBridge {
         skippedIds.push(id);
         continue;
       }
-      if (leaderId && (msg.leaderId ?? conn.leaderId) !== leaderId) {
+      if (leaderId && (msg.leaderId ?? "leader-default") !== leaderId) {
         skippedIds.push(id);
         continue;
       }
@@ -1556,12 +1558,12 @@ export class ImBridge {
       senderName: senderDisplayName,
     });
 
-    // S6: Resolve historical binding identity as ONE atomic tuple so a pre-sync row
-    // (`leader-default / null / epoch 1`) never inherits a later Leader's `bindingId`!
-    const hasStampedBinding = msg.leaderId !== null || msg.bindingId !== null || msg.bindingEpoch !== null;
-    const dispatchLeaderId = hasStampedBinding ? (msg.leaderId ?? "leader-default") : conn.leaderId;
-    const dispatchBindingId = hasStampedBinding ? msg.bindingId : conn.bindingId;
-    const dispatchBindingEpoch = hasStampedBinding ? (msg.bindingEpoch ?? 1) : conn.bindingEpoch;
+    // S6: Always emit the message's stamped historical binding identity as one atomic tuple
+    // (never borrow the connection's current binding after rebind!). Legacy unbackfilled rows
+    // default to ('leader-default', null, 1).
+    const dispatchLeaderId = msg.leaderId ?? "leader-default";
+    const dispatchBindingId = msg.bindingId;
+    const dispatchBindingEpoch = msg.bindingEpoch ?? 1;
 
     this.emit({
       method: "inbound.dispatch",

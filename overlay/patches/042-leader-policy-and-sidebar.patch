@@ -256,6 +256,56 @@ index 060b199d..c5369faf 100644
        return yield* dispatchWithReceipt(command);
      }
      if (command.type === "message.dispatch" && command.guestMessageId === undefined &&
+diff --git a/apps/server/src/orchestration-v2/ProviderEventIngestor.ts b/apps/server/src/orchestration-v2/ProviderEventIngestor.ts
+index 45ed0d1c..081851e7 100644
+--- a/apps/server/src/orchestration-v2/ProviderEventIngestor.ts
++++ b/apps/server/src/orchestration-v2/ProviderEventIngestor.ts
+@@ -42,6 +42,7 @@ import { makeProviderFailureTurnItem } from "@t3tools/provider-core/server/failu
+ import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+ import { stripUnservedToolOutputImageBytes } from "./toolOutputImageBytes.ts";
+ import { boundFileChangeForStorage } from "./WireProjection.ts";
++import { recordXtworkNativeThreadPolicy, resolveXtworkProviderPolicy } from "../im/XtworkImService.ts";
+ 
+ export class ProviderEventNormalizeError extends Schema.TaggedError<ProviderEventNormalizeError>()(
+   "ProviderEventNormalizeError",
+@@ -790,6 +791,37 @@ export const layer: Layer.Layer<
+           },
+           (effect, input) =>
+             effect.pipe(
++              Effect.tap((storedEvents) =>
++                Effect.gen(function* () {
++                  if (storedEvents.length === 0) return;
++                  const activeRunId =
++                    input.runId ??
++                    input.writeIfProviderThreadOwner?.runId ??
++                    input.writeIfRunCurrent?.runId;
++                  if (activeRunId === undefined) return;
++                  for (const stored of storedEvents) {
++                    if (stored.event.type !== "provider-thread.updated") continue;
++                    const nativeId = stored.event.payload.nativeThreadRef?.nativeId;
++                    if (!nativeId) continue;
++                    const policy = resolveXtworkProviderPolicy(stored.event.threadId, activeRunId);
++                    if (!policy.protected || policy.failClosed || policy.policyDigest === null) continue;
++                    yield* recordXtworkNativeThreadPolicy(
++                      stored.event.threadId,
++                      nativeId,
++                      policy.policyDigest,
++                    ).pipe(
++                      Effect.mapError(
++                        (cause) =>
++                          new ProviderEventPublishError({
++                            providerSessionId: input.providerSessionId,
++                            eventCount: storedEvents.length,
++                            cause,
++                          }),
++                      ),
++                    );
++                  }
++                }),
++              ),
+               Effect.tap((storedEvents) =>
+                 Effect.gen(function* () {
+                   if (
 diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
 index 113821ea..dc7db499 100644
 --- a/apps/server/src/orchestration-v2/ProviderSessionManager.ts
@@ -471,7 +521,7 @@ index 113821ea..dc7db499 100644
                    runtime.providerSession.capabilities.sessions
                      .supportsMultipleProviderThreadsPerSession,
 diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
-index 8208ee0a..5094a5ae 100644
+index 8208ee0a..605f56f0 100644
 --- a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 +++ b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 @@ -1,4 +1,5 @@
@@ -558,6 +608,27 @@ index 8208ee0a..5094a5ae 100644
        if (!(yield* isCurrentAttemptInStatus("starting"))) {
          return;
        }
+@@ -1718,6 +1743,20 @@ export const layer: Layer.Layer<
+         createdAt: providerThread.createdAt,
+         updatedAt: now,
+       };
++      if (
++        xtworkPolicy.protected &&
++        xtworkPolicy.policyDigest !== null &&
++        runningProviderThread.nativeThreadRef?.nativeId &&
++        runningProviderThread.nativeThreadRef.nativeId !== loadedProviderThread.nativeThreadRef?.nativeId
++      ) {
++        yield* recordXtworkNativeThreadPolicy(
++          projection.thread.id,
++          runningProviderThread.nativeThreadRef.nativeId,
++          xtworkPolicy.policyDigest,
++        ).pipe(
++          Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })),
++        );
++      }
+       const runningRun: OrchestrationV2Run = {
+         ...run,
+         status: "running",
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
 index a15da677..b984a694 100644
 --- a/apps/web/src/components/ChatView.tsx
