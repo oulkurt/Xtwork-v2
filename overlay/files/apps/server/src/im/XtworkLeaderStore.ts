@@ -406,39 +406,57 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
       readonly ownerDmDesktopGrants: readonly string[];
     }>,
   ) {
-    const current = yield* getLeader(id);
-    if (!current) return undefined;
-    const nextName = patch.name !== undefined ? patch.name.trim() || current.name : current.name;
-    const nextAvatar =
-      patch.avatar !== undefined ? (patch.avatar.trim() || Array.from(nextName)[0] || current.avatar).slice(0, 8) : current.avatar;
-    const nextRole = patch.role !== undefined ? patch.role : current.role;
-    const nextStatus = patch.status !== undefined ? patch.status : current.status;
+    // S29: Perform a single atomic `UPDATE ... RETURNING` statement so:
+    // 1. Omitted columns (especially `status`, `pause_generation`, `pause_version`) are preserved
+    //    in SQL and can never be clobbered by concurrent metadata edits.
+    // 2. Concurrent Pause/Resume writers each receive the exact tuple committed by their own
+    //    SQLite write (never a later writer's status/version read back by a separate SELECT).
+    const trimmedName = patch.name !== undefined ? patch.name.trim() : "";
+    const updateName = trimmedName.length > 0 ? 1 : 0;
+    const trimmedAvatar = patch.avatar !== undefined ? patch.avatar.trim() : "";
+    const derivedAvatar = trimmedAvatar
+      ? trimmedAvatar.slice(0, 8)
+      : updateName === 1
+        ? (Array.from(trimmedName)[0] || "L").slice(0, 8)
+        : "";
+    const updateAvatar = patch.avatar !== undefined && derivedAvatar.length > 0 ? 1 : 0;
+    const updateRole = patch.role !== undefined ? 1 : 0;
+    const updateStatus = patch.status !== undefined ? 1 : 0;
     // S23: Advance pause_generation whenever a Leader pauses so in-flight dispatches started
     // before the pause cannot bypass the paused backlog even if the Leader is resumed later.
     const advancePauseGeneration = patch.status === "paused" ? 1 : 0;
     // S29: Advance pause_version on EVERY Pause and Resume transition so out-of-order bridge
     // syncs are strictly totally ordered and stale syncs can never overwrite newer state.
     const advancePauseVersion = patch.status === "paused" || patch.status === "active" ? 1 : 0;
-    const nextPinned = patch.pinnedThreadId !== undefined ? patch.pinnedThreadId : current.pinnedThreadId;
-    const nextScope = patch.awarenessScope !== undefined ? patch.awarenessScope : current.awarenessScope;
-    const nextGrants =
-      patch.ownerDmDesktopGrants !== undefined ? patch.ownerDmDesktopGrants : current.ownerDmDesktopGrants;
+    const updatePinned = patch.pinnedThreadId !== undefined ? 1 : 0;
+    const updateScope = patch.awarenessScope !== undefined ? 1 : 0;
+    const updateGrants = patch.ownerDmDesktopGrants !== undefined ? 1 : 0;
     const now = Date.now();
-    yield* sql`UPDATE xtwork_leaders SET
-      name = ${nextName},
-      avatar = ${nextAvatar},
-      role = ${nextRole},
-      status = ${nextStatus},
-      pause_generation = pause_generation + ${advancePauseGeneration},
-      pause_version = pause_version + ${advancePauseVersion},
-      pinned_thread_id = ${nextPinned},
-      awareness_scope_json = ${JSON.stringify(nextScope)},
-      owner_dm_grants_json = ${JSON.stringify(nextGrants)},
-      updated_at = ${now}
-      WHERE id = ${id}`;
-    const updated = yield* getLeader(id);
+    const [row] = yield* sql<LeaderRow>`
+      UPDATE xtwork_leaders SET
+        name = CASE WHEN ${updateName} = 1 THEN ${trimmedName} ELSE name END,
+        avatar = CASE WHEN ${updateAvatar} = 1 THEN ${derivedAvatar} ELSE avatar END,
+        role = CASE WHEN ${updateRole} = 1 THEN ${patch.role ?? ""} ELSE role END,
+        status = CASE WHEN ${updateStatus} = 1 THEN ${patch.status ?? "active"} ELSE status END,
+        pause_generation = pause_generation + ${advancePauseGeneration},
+        pause_version = pause_version + ${advancePauseVersion},
+        pinned_thread_id = CASE WHEN ${updatePinned} = 1 THEN ${patch.pinnedThreadId ?? null} ELSE pinned_thread_id END,
+        awareness_scope_json = CASE WHEN ${updateScope} = 1 THEN ${JSON.stringify(patch.awarenessScope ?? DEFAULT_AWARENESS_SCOPE)} ELSE awareness_scope_json END,
+        owner_dm_grants_json = CASE WHEN ${updateGrants} = 1 THEN ${JSON.stringify(patch.ownerDmDesktopGrants ?? [])} ELSE owner_dm_grants_json END,
+        updated_at = ${now}
+      WHERE id = ${id}
+      RETURNING id, name, avatar, role, status, pause_generation AS "pauseGeneration",
+        pause_version AS "pauseVersion",
+        pinned_thread_id AS "pinnedThreadId",
+        awareness_scope_json AS "awarenessScopeJson", owner_dm_grants_json AS "ownerDmGrantsJson",
+        created_at AS "createdAt", updated_at AS "updatedAt"
+    `;
+    const updated = row ? rowToLeader(row) : undefined;
     if (updated) {
-      pauseGenerationByLeader.set(updated.id, updated.pauseGeneration);
+      pauseGenerationByLeader.set(
+        updated.id,
+        Math.max(pauseGenerationByLeader.get(updated.id) ?? 0, updated.pauseGeneration),
+      );
     }
     return updated;
   });

@@ -793,7 +793,8 @@ export class ImBridge {
       const leaderId = typeof item.leaderId === "string" && item.leaderId ? item.leaderId : "leader-default";
       const bindingId = typeof item.bindingId === "string" && item.bindingId ? item.bindingId : null;
       const bindingEpoch = typeof item.bindingEpoch === "number" && Number.isInteger(item.bindingEpoch) ? item.bindingEpoch : 1;
-      const leaderPaused = Boolean(item.leaderPaused);
+      // S29: Preserve omitted `leaderPaused` (never coerce `undefined` to `false`!).
+      const leaderPaused = typeof item.leaderPaused === "boolean" ? item.leaderPaused : undefined;
       const pauseGeneration = validNonNegInt(item.pauseGeneration);
       const pauseVersion = validNonNegInt(item.pauseVersion);
       if (!connectionId) continue;
@@ -804,7 +805,7 @@ export class ImBridge {
         leaderId,
         bindingId,
         bindingEpoch,
-        leaderPaused,
+        ...(leaderPaused !== undefined ? { leaderPaused } : {}),
         ...(pauseGeneration !== undefined ? { pauseGeneration } : {}),
         ...(pauseVersion !== undefined ? { pauseVersion } : {}),
       });
@@ -822,8 +823,8 @@ export class ImBridge {
       }
     }
     if (typeof params.defaultLeaderPaused === "boolean") {
-      // S29: Always apply the authoritative monotonic state for `leader-default` (never a stale param!).
-      const effectiveDefaultPaused = this.store.getLeaderPaused("leader-default");
+      // S29: Mirror the authoritative monotonic state for `leader-default` onto unbound connections
+      // without passing an unversioned override.
       for (const conn of this.store.connections()) {
         if (seen.has(conn.id)) continue;
         // S4: Apply default Leader pause fallback ONLY to unbound connections;
@@ -834,7 +835,6 @@ export class ImBridge {
           leaderId: conn.leaderId,
           bindingId: conn.bindingId,
           bindingEpoch: conn.bindingEpoch,
-          leaderPaused: effectiveDefaultPaused,
         });
         if (next) {
           const changed = conn.leaderPaused !== next.leaderPaused || emittedConnIds.has(next.id);
@@ -947,12 +947,24 @@ export class ImBridge {
         skippedIds.push(id);
         continue;
       }
-      // S5/S18/S26: Validate active/unpaused connection and target Leader state BEFORE transitioning
-      // out of `paused_pending`. Checks the message's stamped Leader's pause state rather than another
-      // Leader's pause state on a rebound connection so paused Leader B never blocks active Leader A,
-      // while paused Leader A still blocks its own backlog even after rebind to active Leader B.
+      // S5/S18/S26/S29: Validate active/unpaused connection, target Leader state, and monotonic
+      // pauseVersion/pauseGeneration BEFORE transitioning any row out of `paused_pending`!
+      // Stale Replay requests (carrying an older pauseVersion or pauseGeneration than what the
+      // bridge already knows for this Leader) are skipped cleanly without moving rows.
       const msgLeaderId = msg.leaderId ?? "leader-default";
-      if (conn.lifecycleState !== "active" || this.store.isLeaderPausedForConnection(msgLeaderId, conn)) {
+      const leaderPauseState = this.store.getLeaderPauseState(msgLeaderId);
+      const staleReplayVersion =
+        replayPauseVersion !== undefined &&
+        leaderPauseState.exists &&
+        replayPauseVersion < leaderPauseState.pauseVersion;
+      const staleReplayGeneration =
+        replayPauseGeneration !== undefined && replayPauseGeneration < leaderPauseState.pauseGeneration;
+      if (
+        conn.lifecycleState !== "active" ||
+        this.store.isLeaderPausedForConnection(msgLeaderId, conn) ||
+        staleReplayVersion ||
+        staleReplayGeneration
+      ) {
         skippedIds.push(id);
         continue;
       }

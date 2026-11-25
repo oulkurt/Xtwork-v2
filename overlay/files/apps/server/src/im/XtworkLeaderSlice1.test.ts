@@ -1464,4 +1464,54 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
       { method: "messages.reply", operationKey: `${inbound.key}:final` },
     ]);
   });
+
+  it("returns exact atomic tuples on concurrent Pause/Resume and preserves status during concurrent metadata edits (S29)", async () => {
+    const sqlLayer = NodeSqliteClient.layer({ filename: ":memory:" });
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const leaders = yield* makeLeaderStore();
+        const leaderA = yield* leaders.createLeader({ name: "Leader Concurrent A" });
+        expect(leaderA.pauseVersion).toBe(0);
+        expect(leaderA.pauseGeneration).toBe(0);
+
+        // S29a: Concurrent Pause & Resume MUST each return the exact status+version committed by its own write!
+        const [pauseTuple, resumeTuple] = yield* Effect.all(
+          [
+            leaders.updateLeader(leaderA.id, { status: "paused" }),
+            leaders.updateLeader(leaderA.id, { status: "active" }),
+          ],
+          { concurrency: "unbounded" },
+        );
+        expect(pauseTuple).toBeDefined();
+        expect(resumeTuple).toBeDefined();
+        expect(pauseTuple!.status).toBe("paused");
+        expect(resumeTuple!.status).toBe("active");
+        expect(pauseTuple!.pauseVersion).not.toBe(resumeTuple!.pauseVersion);
+        expect(new Set([pauseTuple!.pauseVersion, resumeTuple!.pauseVersion])).toEqual(new Set([1, 2]));
+        const latestA = yield* leaders.getLeader(leaderA.id);
+        const winner = pauseTuple!.pauseVersion > resumeTuple!.pauseVersion ? pauseTuple! : resumeTuple!;
+        expect(latestA?.status).toBe(winner.status);
+        expect(latestA?.pauseVersion).toBe(winner.pauseVersion);
+        expect(latestA?.pauseGeneration).toBe(winner.pauseGeneration);
+
+        // S29b: Concurrent Pause & name-only edit MUST preserve BOTH the Pause status and the new name!
+        const leaderB = yield* leaders.createLeader({ name: "Leader Concurrent B" });
+        const [pausedB, renamedB] = yield* Effect.all(
+          [
+            leaders.updateLeader(leaderB.id, { status: "paused" }),
+            leaders.updateLeader(leaderB.id, { name: "Renamed Leader B" }),
+          ],
+          { concurrency: "unbounded" },
+        );
+        expect(pausedB?.status).toBe("paused");
+        expect(pausedB?.pauseVersion).toBe(1);
+        expect(renamedB?.name).toBe("Renamed Leader B");
+        const latestB = yield* leaders.getLeader(leaderB.id);
+        expect(latestB?.name).toBe("Renamed Leader B");
+        expect(latestB?.status).toBe("paused");
+        expect(latestB?.pauseGeneration).toBe(1);
+        expect(latestB?.pauseVersion).toBe(1);
+      }).pipe(Effect.provide(sqlLayer)),
+    );
+  });
 });

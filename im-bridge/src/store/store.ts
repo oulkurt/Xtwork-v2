@@ -1895,17 +1895,14 @@ export class Store {
           }
         }
       } else {
-        // Unversioned fallback: never allow a lower pauseGeneration (or a same/lower generation
-        // against an already-versioned Leader) to overwrite newer state!
+        // Unversioned fallback (S29):
+        // 1. Never allow a lower pauseGeneration to overwrite newer state.
+        // 2. Once a Leader has a known positive pauseVersion, reject ANY unversioned `paused`
+        //    mutation (whether or not pauseGeneration was supplied) so partial or unversioned
+        //    binding syncs can never clear or toggle a versioned Pause/Resume!
         if (incomingGen !== undefined && incomingGen < current.pauseGeneration) {
           stale = true;
-        } else if (
-          current.exists &&
-          current.pauseVersion > 0 &&
-          incomingPaused !== undefined &&
-          incomingGen !== undefined &&
-          incomingGen <= current.pauseGeneration
-        ) {
+        } else if (current.exists && current.pauseVersion > 0 && incomingPaused !== undefined) {
           stale = true;
         }
       }
@@ -1997,20 +1994,26 @@ export class Store {
     readonly leaderId: string;
     readonly bindingId: string | null;
     readonly bindingEpoch: number;
-    readonly leaderPaused: boolean;
+    readonly leaderPaused?: boolean;
     readonly pauseGeneration?: number;
     readonly pauseVersion?: number;
   }): Connection | undefined {
     this.db.exec("SAVEPOINT sync_conn_binding");
     try {
-      const leaderState = this.setLeaderPauseState(input.leaderId, {
-        paused: input.leaderPaused,
-        ...(typeof input.pauseGeneration === "number" ? { pauseGeneration: input.pauseGeneration } : {}),
-        ...(typeof input.pauseVersion === "number" ? { pauseVersion: input.pauseVersion } : {}),
-      });
+      const hasPauseFields =
+        typeof input.leaderPaused === "boolean" ||
+        typeof input.pauseGeneration === "number" ||
+        typeof input.pauseVersion === "number";
+      const leaderState = hasPauseFields
+        ? this.setLeaderPauseState(input.leaderId, {
+            ...(typeof input.leaderPaused === "boolean" ? { paused: input.leaderPaused } : {}),
+            ...(typeof input.pauseGeneration === "number" ? { pauseGeneration: input.pauseGeneration } : {}),
+            ...(typeof input.pauseVersion === "number" ? { pauseVersion: input.pauseVersion } : {}),
+          })
+        : this.getLeaderPauseState(input.leaderId);
       const prev = this.connection(input.connectionId);
       const bindingStale = prev !== undefined && input.bindingEpoch < prev.bindingEpoch;
-      // S29: Always apply the authoritative monotonic `leaderState.paused` (never a stale input flag!),
+      // S29: Always apply the authoritative monotonic `leaderState.paused` (never a stale or omitted input flag!),
       // and never roll back a connection to an older binding epoch.
       const updated = bindingStale
         ? this.updateConnection(input.connectionId, {

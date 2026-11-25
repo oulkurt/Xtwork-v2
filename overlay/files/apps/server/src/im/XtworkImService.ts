@@ -1003,6 +1003,9 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
       const nextPaused = subAction === "pause";
       const updated = yield* service.leaders.updateLeader(leaderId, { status: nextPaused ? "paused" : "active" });
       if (!updated) return failure("找不到对应的 Leader。", 404);
+      // S29: Always derive `paused` from the exact atomic row tuple returned by `updateLeader`
+      // so concurrent Pause/Resume calls can never pair a local boolean with another writer's version!
+      const updatedPaused = updated.status === "paused";
       const bindings = yield* service.leaders.listBindings(updated.id);
       let pausedPending: unknown[] = [];
       if (service.host?.available) {
@@ -1012,7 +1015,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
           leaderId: b.leaderId,
           bindingId: b.bindingId,
           bindingEpoch: b.epoch,
-          leaderPaused: nextPaused,
+          leaderPaused: updatedPaused,
           pauseGeneration: updated.pauseGeneration,
           pauseVersion: updated.pauseVersion,
         }));
@@ -1020,17 +1023,17 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
           bindings: bindingsPayload,
           leaderStates: {
             [updated.id]: {
-              paused: nextPaused,
+              paused: updatedPaused,
               pauseGeneration: updated.pauseGeneration,
               pauseVersion: updated.pauseVersion,
             },
           },
           leaderPauseGenerations: { [updated.id]: updated.pauseGeneration },
-          leaderPausedById: { [updated.id]: nextPaused },
+          leaderPausedById: { [updated.id]: updatedPaused },
           leaderPauseVersions: { [updated.id]: updated.pauseVersion },
           ...(updated.id === DEFAULT_LEADER_ID
             ? {
-                defaultLeaderPaused: nextPaused,
+                defaultLeaderPaused: updatedPaused,
                 defaultLeaderPauseGeneration: updated.pauseGeneration,
                 defaultLeaderPauseVersion: updated.pauseVersion,
               }

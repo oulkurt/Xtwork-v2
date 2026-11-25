@@ -1662,6 +1662,143 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
         assert.ok(nullGenDispatch);
         assert.equal(nullGenDispatch.params.pauseGeneration, 0);
 
+        // S29c: Pause to (gen=2, ver=3), then verify BOTH:
+        // (1) a binding update omitting `leaderPaused`/`pauseGeneration`/`pauseVersion`, AND
+        // (2) an unversioned binding update explicitly passing `leaderPaused: false` (no version/gen)
+        // NEVER clear the versioned Pause on either the Leader or connection!
+        await bridgeB.handleRequest({
+          id: 9,
+          method: "connections.syncBindings",
+          params: {
+            bindings: [
+              {
+                connectionId: connA.id,
+                leaderId: "leader-default",
+                bindingId: "bind-default-1",
+                bindingEpoch: 1,
+                leaderPaused: true,
+                pauseGeneration: 2,
+                pauseVersion: 3,
+              },
+            ],
+            leaderStates: { "leader-default": { paused: true, pauseGeneration: 2, pauseVersion: 3 } },
+            defaultLeaderPaused: true,
+            defaultLeaderPauseGeneration: 2,
+            defaultLeaderPauseVersion: 3,
+          },
+        });
+        assert.equal(storeB.getLeaderPaused("leader-default"), true);
+        assert.equal(storeB.getLeaderPauseState("leader-default").pauseVersion, 3);
+        assert.equal(storeB.connection(connA.id)?.leaderPaused, true);
+
+        // (1) Partial binding update omitting pause fields -> MUST preserve paused=true, ver=3!
+        await bridgeB.handleRequest({
+          id: 10,
+          method: "connections.syncBindings",
+          params: {
+            bindings: [
+              {
+                connectionId: connA.id,
+                leaderId: "leader-default",
+                bindingId: "bind-default-1",
+                bindingEpoch: 1,
+              },
+            ],
+          },
+        });
+        assert.equal(storeB.getLeaderPaused("leader-default"), true);
+        assert.equal(storeB.getLeaderPauseState("leader-default").pauseVersion, 3);
+        assert.equal(storeB.connection(connA.id)?.leaderPaused, true);
+
+        // (2) Unversioned `leaderPaused: false` without version/gen -> MUST be rejected!
+        await bridgeB.handleRequest({
+          id: 11,
+          method: "connections.syncBindings",
+          params: {
+            bindings: [
+              {
+                connectionId: connA.id,
+                leaderId: "leader-default",
+                bindingId: "bind-default-1",
+                bindingEpoch: 1,
+                leaderPaused: false,
+              },
+            ],
+            leaderPausedById: { "leader-default": false },
+            defaultLeaderPaused: false,
+          },
+        });
+        assert.equal(storeB.getLeaderPaused("leader-default"), true);
+        assert.equal(storeB.getLeaderPauseState("leader-default").pauseVersion, 3);
+        assert.equal(storeB.connection(connA.id)?.leaderPaused, true);
+
+        // S29d: Resume to (gen=2, ver=4); ingest/pause a row, then send a STALE Replay carrying
+        // `pauseVersion: 2, pauseGeneration: 1` -> MUST skip cleanly (`count: 0`, row stays in `paused_pending`)!
+        assert.equal(storeB.message(nullGenMsg.message.id)?.state, "paused_pending");
+        await bridgeB.handleRequest({
+          id: 12,
+          method: "connections.syncBindings",
+          params: {
+            bindings: [
+              {
+                connectionId: connA.id,
+                leaderId: "leader-default",
+                bindingId: "bind-default-1",
+                bindingEpoch: 1,
+                leaderPaused: false,
+                pauseGeneration: 2,
+                pauseVersion: 4,
+              },
+            ],
+            leaderStates: { "leader-default": { paused: false, pauseGeneration: 2, pauseVersion: 4 } },
+            defaultLeaderPaused: false,
+            defaultLeaderPauseGeneration: 2,
+            defaultLeaderPauseVersion: 4,
+          },
+        });
+        notificationsB.length = 0;
+        const staleReplayResp = await bridgeB.handleRequest({
+          id: 13,
+          method: "paused.decide",
+          params: {
+            messageIds: [nullGenMsg.message.id],
+            decision: "replay",
+            leaderId: "leader-default",
+            pauseGeneration: 1,
+            pauseVersion: 2,
+          },
+        });
+        assert.equal(staleReplayResp.ok, true);
+        if (staleReplayResp.ok) {
+          const r = staleReplayResp.result as { count: number; skippedIds: string[] };
+          assert.equal(r.count, 0);
+          assert.deepEqual(r.skippedIds, [nullGenMsg.message.id]);
+        }
+        assert.equal(notificationsB.filter((n) => n.method === "inbound.dispatch").length, 0);
+        assert.equal(storeB.message(nullGenMsg.message.id)?.state, "paused_pending");
+
+        // Fresh Replay carrying current `(gen=2, ver=4)` succeeds!
+        const freshReplayResp = await bridgeB.handleRequest({
+          id: 14,
+          method: "paused.decide",
+          params: {
+            messageIds: [nullGenMsg.message.id],
+            decision: "replay",
+            leaderId: "leader-default",
+            pauseGeneration: 2,
+            pauseVersion: 4,
+          },
+        });
+        assert.equal(freshReplayResp.ok, true);
+        if (freshReplayResp.ok) {
+          const r = freshReplayResp.result as { count: number; messageIds: string[] };
+          assert.equal(r.count, 1);
+          assert.deepEqual(r.messageIds, [nullGenMsg.message.id]);
+        }
+        const freshDispatches = notificationsB.filter((n) => n.method === "inbound.dispatch");
+        assert.equal(freshDispatches.length, 1);
+        assert.equal(freshDispatches[0]!.params.pauseGeneration, 2);
+
         await bridgeB.shutdown();
       }
     } finally {
