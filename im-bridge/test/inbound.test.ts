@@ -31,7 +31,11 @@ describe("inbound message state machine", () => {
     assert.equal(nextInbound("failed", "reply"), "replied");
     assert.equal(nextInbound("delivered", "send"), "replied");
     assert.equal(nextInbound("failed", "send"), undefined);
-    assert.equal(nextInbound("received", "pause"), "ignored");
+    assert.equal(nextInbound("received", "pause"), "paused_pending");
+    assert.equal(nextInbound("waiting", "pause"), "paused_pending");
+    assert.equal(nextInbound("delivered", "pause"), undefined);
+    assert.equal(nextInbound("paused_pending", "replay_paused"), "received");
+    assert.equal(nextInbound("paused_pending", "dismiss_paused"), "ignored");
     assert.equal(nextInbound("failed", "ignore"), "ignored");
   });
 
@@ -49,6 +53,7 @@ describe("inbound message state machine", () => {
   it("marks ONLY received and delivered as deliverable for crash-recovery replay", () => {
     const allStates: InboundState[] = [
       "held",
+      "paused_pending",
       "received",
       "delivered",
       "waiting",

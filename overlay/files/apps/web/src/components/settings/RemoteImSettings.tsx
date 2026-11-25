@@ -818,7 +818,12 @@ export function RemoteImSettings() {
     <SettingsPageContainer width="wide">
       <section id="remote-im" className="space-y-4">
         <div className="flex flex-wrap items-baseline justify-between gap-2 px-1">
-          <h2 className="text-base font-semibold text-foreground">远程连接</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-base font-semibold text-foreground">远程连接</h2>
+            <span className="rounded-full border border-border/70 bg-muted/50 px-2 py-0.5 text-[11px] text-muted-foreground">
+              绑定至默认 Leader（小瞳）
+            </span>
+          </div>
           <p className="text-xs text-muted-foreground" role="status">
             {!desktop
               ? "请在桌面端使用远程连接"

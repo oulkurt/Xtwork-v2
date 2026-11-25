@@ -341,6 +341,12 @@ export class ImBridge {
         return this.handleConnectionPause(reqStr(params, "connectionId"));
       case "connections.resume":
         return this.handleConnectionResume(reqStr(params, "connectionId"));
+      case "connections.setLeaderPaused":
+        return this.handleSetLeaderPaused(params);
+      case "paused.list":
+        return this.handlePausedList(params);
+      case "paused.decide":
+        return this.handlePausedDecide(params);
       case "connections.disconnect":
         return this.handleConnectionDisconnect(reqStr(params, "connectionId"));
       case "connections.claimRefresh":
@@ -667,6 +673,71 @@ export class ImBridge {
     this.store.updateConnection(conn.id, { paused: false });
     this.dispatchLinkEvent(conn.id, { kind: "resume" });
     return { connection: sanitizeConnection(this.store.connection(conn.id)!) };
+  }
+
+  private handleSetLeaderPaused(params: Record<string, unknown>) {
+    const paused = Boolean(params.paused);
+    const connectionIds = Array.isArray(params.connectionIds)
+      ? params.connectionIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+      : this.store.connections().map((c) => c.id);
+    const updated: Record<string, unknown>[] = [];
+    for (const connectionId of connectionIds) {
+      const conn = this.store.connection(connectionId);
+      if (!conn) continue;
+      const next = this.store.updateConnection(conn.id, { leaderPaused: paused })!;
+      if (paused) {
+        this.store.pauseConnectionMessages(conn.id);
+      }
+      this.emitConnectionState(next);
+      updated.push(sanitizeConnection(next));
+    }
+    return { paused, connections: updated, pausedPending: this.handlePausedList({ connectionIds }).items };
+  }
+
+  private handlePausedList(params: Record<string, unknown>) {
+    const connectionIds = Array.isArray(params.connectionIds)
+      ? params.connectionIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+      : optStr(params, "connectionId")
+        ? [reqStr(params, "connectionId")]
+        : undefined;
+    const items = this.store.pausedPendingMessages(connectionIds).map((item) => ({
+      id: item.id,
+      connectionId: item.connectionId,
+      platform: item.platform,
+      chatId: item.chatId,
+      chatKind: item.chat.kind,
+      chatName: item.chat.name,
+      senderId: item.senderId,
+      senderName: contactName(item.contact) ?? item.senderName,
+      platformMsgId: item.platformMsgId,
+      idempotencyKey: item.idempotencyKey,
+      body: item.body,
+      createdAt: item.createdAt,
+    }));
+    return { items };
+  }
+
+  private handlePausedDecide(params: Record<string, unknown>) {
+    const decision = reqStr(params, "decision");
+    if (decision !== "replay" && decision !== "dismiss") {
+      throw new BridgeError("INVALID_PARAMS", 'decision must be "replay" or "dismiss"');
+    }
+    const messageIds = Array.isArray(params.messageIds)
+      ? params.messageIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+      : optStr(params, "messageId")
+        ? [reqStr(params, "messageId")]
+        : [];
+    const changed = this.store.decidePausedPending(messageIds, decision);
+    if (decision === "replay") {
+      for (const msg of changed) {
+        const conn = this.store.connection(msg.connectionId);
+        const chat = this.store.chat(msg.chatId);
+        if (!conn || !chat || conn.paused || conn.leaderPaused) continue;
+        const contact = msg.senderId ? this.store.contactByPlatformId(conn.id, msg.senderId) : undefined;
+        this.emitDispatch(conn, chat, msg, contact);
+      }
+    }
+    return { decision, count: changed.length, messageIds: changed.map((m) => m.id) };
   }
 
   private async handleConnectionDisconnect(connectionId: string) {
@@ -1277,6 +1348,24 @@ export class ImBridge {
         });
         return;
       }
+      case "paused_pending": {
+        this.emit({
+          method: "inbound.paused",
+          params: {
+            connectionId: conn.id,
+            platform: conn.platform,
+            chatId: outcome.chat.id,
+            chatKind: outcome.chat.kind,
+            chatName: outcome.chat.name,
+            messageId: outcome.message.id,
+            idempotencyKey: outcome.message.idempotencyKey,
+            senderName: contactName(outcome.contact) ?? outcome.message.senderName,
+            body: outcome.message.body,
+            createdAt: outcome.message.createdAt,
+          },
+        });
+        return;
+      }
       case "dispatch": {
         this.emitDispatch(conn, outcome.chat, outcome.message, outcome.contact);
         return;
@@ -1296,6 +1385,7 @@ export class ImBridge {
         state: conn.state,
         stateDetail: conn.stateDetail,
         paused: conn.paused,
+        leaderPaused: conn.leaderPaused,
         ownerId: conn.ownerId,
         claimCode: conn.claimCode,
         claimExpiresAt: conn.claimExpiresAt,
@@ -1441,6 +1531,7 @@ function sanitizeConnection(conn: Connection) {
     state: conn.state,
     stateDetail: conn.stateDetail,
     paused: conn.paused,
+    leaderPaused: conn.leaderPaused,
     ownerId: conn.ownerId,
     claimCode: conn.claimCode,
     claimExpiresAt: conn.claimExpiresAt,

@@ -6,12 +6,34 @@ import { lstat, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { isRecord } from "./XtworkImBridgeHost.ts";
 
+export const DEFAULT_LEADER_ID = "leader-default";
+
 export type CompanionScope = "private" | `group:${string}`;
 export type MemoryScope = CompanionScope | "role";
 export type ReplyAudience = "local_only" | "owner_dm" | "group";
 
+export interface AwarenessScope {
+  readonly kind: "none" | "all_local" | "projects";
+  readonly projectIds: readonly string[];
+}
+
+export type ThreadAccessAction = "status_read" | "history_read" | "send" | "share";
+
+export interface ThreadAccessTarget {
+  readonly threadId: string;
+  readonly projectId?: string | null;
+  readonly isProtected: boolean;
+  readonly replyAudience: ReplyAudience;
+  readonly leaderId?: string | null;
+  readonly connectionId?: string | null;
+  readonly chatId?: string | null;
+}
+
 export interface TurnExecutionContext {
   readonly source: "desktop" | "im";
+  readonly leaderId?: string;
+  readonly bindingId?: string | null;
+  readonly bindingEpoch?: number | null;
   readonly connectionId: string | null;
   readonly chatId: string | null;
   readonly chatKind: "dm" | "group" | "thread";
@@ -19,15 +41,67 @@ export interface TurnExecutionContext {
   readonly replyAudience: ReplyAudience;
   readonly isolatedWorkspaceRoot: string | null;
   readonly companionScope: CompanionScope;
+  readonly policyDigest?: string;
 }
 
 export interface Execution {
   readonly turnId: string;
+  readonly threadId?: string;
   readonly context: TurnExecutionContext;
 }
 
-export const desktopContext: TurnExecutionContext = Object.freeze({
+export const hashArgs = (value: unknown): string => {
+  function sort(input: unknown): unknown {
+    if (Array.isArray(input)) return input.map(sort);
+    if (!isRecord(input)) return input;
+    return Object.fromEntries(Object.keys(input).sort().map((key) => [key, sort(input[key])]));
+  }
+  return createHash("sha256").update(JSON.stringify(sort(value)) ?? "null").digest("hex");
+};
+
+export function computePolicyDigest(context: Omit<TurnExecutionContext, "policyDigest">): string {
+  return hashArgs({
+    source: context.source,
+    leaderId: context.leaderId ?? DEFAULT_LEADER_ID,
+    bindingId: context.bindingId ?? null,
+    bindingEpoch: context.bindingEpoch ?? null,
+    connectionId: context.connectionId,
+    chatId: context.chatId,
+    chatKind: context.chatKind,
+    senderRole: context.senderRole,
+    replyAudience: context.replyAudience,
+    isolatedWorkspaceRoot: context.isolatedWorkspaceRoot,
+    companionScope: context.companionScope,
+  });
+}
+
+export function normalizeExecutionContext(
+  context: Omit<TurnExecutionContext, "policyDigest"> & { readonly policyDigest?: string },
+): TurnExecutionContext {
+  const base = {
+    source: context.source,
+    leaderId: context.leaderId ?? DEFAULT_LEADER_ID,
+    bindingId: context.bindingId ?? null,
+    bindingEpoch: context.bindingEpoch ?? null,
+    connectionId: context.connectionId,
+    chatId: context.chatId,
+    chatKind: context.chatKind,
+    senderRole: context.senderRole,
+    replyAudience: context.replyAudience,
+    isolatedWorkspaceRoot: context.isolatedWorkspaceRoot,
+    companionScope: context.companionScope,
+  };
+  return Object.freeze({
+    ...base,
+    policyDigest: computePolicyDigest(base),
+  });
+}
+
+export const desktopContext: TurnExecutionContext = normalizeExecutionContext({
   source: "desktop",
+  leaderId: DEFAULT_LEADER_ID,
+  bindingId: null,
+  bindingEpoch: null,
   connectionId: null,
   chatId: null,
   chatKind: "dm",
@@ -39,6 +113,152 @@ export const desktopContext: TurnExecutionContext = Object.freeze({
 
 export const protectedExecution = (context: TurnExecutionContext) =>
   context.source === "im" || context.replyAudience === "group";
+
+const AUDIENCE_RANK: Readonly<Record<ReplyAudience, number>> = {
+  group: 0,
+  owner_dm: 1,
+  local_only: 2,
+};
+
+/**
+ * Delegated tasks and scheduled triggers may only inherit or narrow parent policy
+ * (ADR-013 §2). They can never widen audience, source, workspace, or companion scope.
+ */
+export function narrowDelegatedPolicy(
+  parent: TurnExecutionContext,
+  requested?: Partial<TurnExecutionContext>,
+): TurnExecutionContext {
+  const normalizedParent = normalizeExecutionContext(parent);
+  const reqAudience = requested?.replyAudience ?? normalizedParent.replyAudience;
+  const replyAudience =
+    AUDIENCE_RANK[reqAudience] <= AUDIENCE_RANK[normalizedParent.replyAudience]
+      ? reqAudience
+      : normalizedParent.replyAudience;
+  const source = normalizedParent.source === "im" ? "im" : (requested?.source ?? normalizedParent.source);
+  const senderRole =
+    normalizedParent.senderRole !== "owner"
+      ? normalizedParent.senderRole
+      : (requested?.senderRole ?? normalizedParent.senderRole);
+  const lockedToParentScope = protectedExecution(normalizedParent);
+  const requestedWorkspace = requested?.isolatedWorkspaceRoot;
+  const resolvedNarrowWorkspace =
+    lockedToParentScope && normalizedParent.isolatedWorkspaceRoot && requestedWorkspace
+      ? resolve(normalizedParent.isolatedWorkspaceRoot, requestedWorkspace)
+      : null;
+  const isolatedWorkspaceRoot = lockedToParentScope
+    ? resolvedNarrowWorkspace &&
+      normalizedParent.isolatedWorkspaceRoot &&
+      inside(normalizedParent.isolatedWorkspaceRoot, resolvedNarrowWorkspace)
+      ? resolvedNarrowWorkspace
+      : normalizedParent.isolatedWorkspaceRoot
+    : (requestedWorkspace ?? normalizedParent.isolatedWorkspaceRoot);
+  return normalizeExecutionContext({
+    source,
+    leaderId: normalizedParent.leaderId ?? DEFAULT_LEADER_ID,
+    bindingId: normalizedParent.bindingId ?? null,
+    bindingEpoch: normalizedParent.bindingEpoch ?? null,
+    connectionId: lockedToParentScope ? normalizedParent.connectionId : (requested?.connectionId ?? normalizedParent.connectionId),
+    chatId: lockedToParentScope ? normalizedParent.chatId : (requested?.chatId ?? normalizedParent.chatId),
+    chatKind: lockedToParentScope ? normalizedParent.chatKind : (requested?.chatKind ?? normalizedParent.chatKind),
+    senderRole,
+    replyAudience,
+    isolatedWorkspaceRoot,
+    companionScope:
+      replyAudience === "group" || lockedToParentScope
+        ? normalizedParent.companionScope
+        : (requested?.companionScope ?? normalizedParent.companionScope),
+  });
+}
+
+/**
+ * Forces a fresh Pi session whenever policy digests differ across runs on the same thread.
+ */
+export function canReuseProviderSession(
+  sessionPolicyDigest: string | null | undefined,
+  nextPolicyDigest: string | null | undefined,
+): boolean {
+  const a = sessionPolicyDigest ?? null;
+  const b = nextPolicyDigest ?? null;
+  return a === b;
+}
+
+/**
+ * Unified server access policy (ADR-013 §3): runs BEFORE querying, counting, paging,
+ * or returning titles/blockers/snippets. Prevents guessed-ID and cross-group leaks.
+ */
+export function evaluateThreadAccess(input: {
+  readonly caller: TurnExecutionContext;
+  readonly callerLeaderId?: string;
+  readonly awarenessScope: AwarenessScope;
+  readonly ownerDmDesktopGrants?: ReadonlySet<string>;
+  readonly target: ThreadAccessTarget;
+  readonly action: ThreadAccessAction;
+}): { readonly allowed: boolean; readonly reason?: string } {
+  const { caller, awarenessScope, ownerDmDesktopGrants, target, action } = input;
+  const callerLeaderId = input.callerLeaderId ?? caller.leaderId ?? DEFAULT_LEADER_ID;
+  const targetLeaderId = target.leaderId ?? DEFAULT_LEADER_ID;
+
+  // 1. Group callers: strictly confined to their own (leaderId, connectionId, chatId) group.
+  if (caller.replyAudience === "group") {
+    const sameGroup =
+      target.isProtected &&
+      target.replyAudience === "group" &&
+      targetLeaderId === callerLeaderId &&
+      Boolean(caller.connectionId) &&
+      Boolean(caller.chatId) &&
+      target.connectionId === caller.connectionId &&
+      target.chatId === caller.chatId;
+    if (!sameGroup) {
+      return { allowed: false, reason: "Group audience cannot access threads outside its own chat." };
+    }
+    if (action === "share") {
+      return { allowed: false, reason: "Group turns require explicit Owner snapshot approval to share." };
+    }
+    return { allowed: true };
+  }
+
+  // 2. Owner DM callers: own Leader remote threads only; desktop local_only requires explicit grant.
+  if (caller.replyAudience === "owner_dm") {
+    if (target.isProtected) {
+      if (targetLeaderId !== callerLeaderId) {
+        return { allowed: false, reason: "Owner DM cannot access another Leader's remote threads." };
+      }
+      if (target.replyAudience === "group" && action !== "status_read") {
+        return { allowed: false, reason: "Owner DM can inspect group status only; cross-chat actions require approval." };
+      }
+      return { allowed: true };
+    }
+    const granted =
+      ownerDmDesktopGrants?.has(target.threadId) === true ||
+      (Boolean(target.projectId) && ownerDmDesktopGrants?.has(`project:${target.projectId}`) === true);
+    if (!granted) {
+      return { allowed: false, reason: "Owner DM access to local desktop sessions is disabled by default." };
+    }
+    return { allowed: true };
+  }
+
+  // 3. Desktop local_only Owner: own Leader remote threads + authorized local awareness scope.
+  if (caller.source === "desktop" && caller.senderRole === "owner") {
+    if (target.isProtected) {
+      if (targetLeaderId !== callerLeaderId) {
+        return { allowed: false, reason: "Thread belongs to a different Leader." };
+      }
+      return { allowed: true };
+    }
+    if (awarenessScope.kind === "all_local") return { allowed: true };
+    if (
+      awarenessScope.kind === "projects" &&
+      target.projectId &&
+      awarenessScope.projectIds.includes(target.projectId)
+    ) {
+      return { allowed: true };
+    }
+    return { allowed: false, reason: "Local thread is outside this Leader's authorized awareness scope." };
+  }
+
+  return { allowed: false, reason: "Unauthorized caller execution context." };
+}
+
 export class ImDispatchAuthority extends Context.Reference<boolean>("t3/im/XtworkImSecurity/ImDispatchAuthority", {
   defaultValue: () => false,
 }) {}
@@ -52,15 +272,6 @@ export const imError = (cause: unknown) =>
 
 export const localForkThreadId = (commandId: string) => "xtwork-local-" + hashArgs(commandId).slice(0, 32);
 export const isImThread = (threadId: string) => threadId.startsWith("xtwork-im-");
-
-export const hashArgs = (value: unknown): string => {
-  function sort(input: unknown): unknown {
-    if (Array.isArray(input)) return input.map(sort);
-    if (!isRecord(input)) return input;
-    return Object.fromEntries(Object.keys(input).sort().map((key) => [key, sort(input[key])]));
-  }
-  return createHash("sha256").update(JSON.stringify(sort(value)) ?? "null").digest("hex");
-};
 
 export function untrustedEnvelope(value: unknown, context: TurnExecutionContext) {
   const data = JSON.stringify(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -124,13 +335,30 @@ export const memoryNeedsApproval = (context: TurnExecutionContext, target: Memor
 export const isolateDesktopReply = (source: ReplyAudience, requested: ReplyAudience): boolean =>
   source !== requested;
 
-interface ApprovalRequest {
+export interface ApprovalRequest {
   readonly id: string;
   readonly turnId: string;
+  readonly threadId?: string;
+  readonly leaderId: string;
   readonly toolName: string;
   readonly normalizedArgsHash: string;
   readonly replyAudience: ReplyAudience;
   readonly details: string;
+  readonly snapshotHash?: string;
+  readonly targetScope?: CompanionScope;
+  readonly contentPreview?: string;
+}
+
+export interface ApprovalDecisionVerify {
+  readonly desktopOwnerVerified: boolean;
+  readonly expectedRunId?: string;
+  readonly expectedAudience?: ReplyAudience;
+  readonly expectedSnapshotHash?: string;
+}
+
+export interface ApprovalStatusSummary {
+  readonly totalCount: number;
+  readonly countByThreadId: Readonly<Record<string, number>>;
 }
 
 export class ImApprovals {
@@ -139,26 +367,67 @@ export class ImApprovals {
     readonly finish: (approved: boolean) => void;
   }>();
 
-  list() {
+  /** Full approval payloads including raw tool args — strictly for verified desktop Owner views. */
+  list(): ApprovalRequest[] {
     return [...this.pending.values()].map(({ request }) => request);
   }
 
-  decide(id: string, approved: boolean): boolean {
+  /**
+   * Scoped status-only summary for `status_read` callers (ADR-013 §3):
+   * exposes ONLY counts per authorized thread — NEVER raw tool `details` or previews.
+   */
+  listStatusSummary(allowedThreadIds?: ReadonlySet<string>): ApprovalStatusSummary {
+    const counts: Record<string, number> = {};
+    let totalCount = 0;
+    for (const { request } of this.pending.values()) {
+      if (allowedThreadIds !== undefined) {
+        if (!request.threadId || !allowedThreadIds.has(request.threadId)) continue;
+      }
+      totalCount += 1;
+      if (request.threadId) {
+        counts[request.threadId] = (counts[request.threadId] ?? 0) + 1;
+      }
+    }
+    return { totalCount, countByThreadId: counts };
+  }
+
+  decide(id: string, approved: boolean, verify?: ApprovalDecisionVerify): boolean {
     const entry = this.pending.get(id);
     if (!entry) return false;
+    if (verify) {
+      if (!verify.desktopOwnerVerified) return false;
+      if (verify.expectedRunId !== undefined && entry.request.turnId !== verify.expectedRunId) return false;
+      if (verify.expectedAudience !== undefined && entry.request.replyAudience !== verify.expectedAudience) return false;
+      if (approved && entry.request.snapshotHash !== undefined) {
+        if (verify.expectedSnapshotHash !== entry.request.snapshotHash) return false;
+      } else if (verify.expectedSnapshotHash !== undefined && entry.request.snapshotHash !== verify.expectedSnapshotHash) {
+        return false;
+      }
+    }
     entry.finish(approved);
     return true;
   }
 
-  require(execution: Execution, toolName: string, args: unknown, signal?: AbortSignal) {
+  require(
+    execution: Execution,
+    toolName: string,
+    args: unknown,
+    signal?: AbortSignal,
+    meta?: { readonly snapshotHash?: string; readonly targetScope?: CompanionScope; readonly contentPreview?: string },
+  ) {
     const id = randomUUID();
-    const request = Object.freeze({
+    const request: ApprovalRequest = Object.freeze({
       id,
       turnId: execution.turnId,
+      ...(execution.threadId ? { threadId: execution.threadId } : {}),
+      leaderId: execution.context.leaderId ?? DEFAULT_LEADER_ID,
       toolName,
       normalizedArgsHash: hashArgs(args),
       replyAudience: execution.context.replyAudience,
       details: JSON.stringify(args)?.slice(0, 4000) ?? "",
+      ...(meta?.snapshotHash ? { snapshotHash: meta.snapshotHash } : {}),
+      ...(meta?.targetScope ? { targetScope: meta.targetScope } : {}),
+      ...(meta?.contentPreview ? { contentPreview: meta.contentPreview.slice(0, 1200) } : {}),
     });
     return new Promise<void>((resolve, reject) => {
       const deadline = AbortSignal.any([AbortSignal.timeout(180_000), ...(signal ? [signal] : [])]);

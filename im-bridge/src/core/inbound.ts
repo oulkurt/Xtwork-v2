@@ -15,17 +15,21 @@
  *   send:    delivered, unanswered ──▶ replied
  *   retry:   waiting, failed, unanswered ──▶ received
  *   ignore:  waiting, failed, unanswered ──▶ ignored
- *   pause:   received, delivered, waiting ──▶ ignored
- *   admit:   held ──▶ received
- *   refuse:  held ──▶ blocked
+ *   pause:          received, waiting ──▶ paused_pending
+ *   replay_paused:  paused_pending ──▶ received
+ *   dismiss_paused: paused_pending ──▶ ignored
+ *   admit:          held ──▶ received
+ *   refuse:         held ──▶ blocked
  *
  * `replied`, `ignored`, and `blocked` are terminal.
+ * `paused_pending` is a dedicated Leader-pause review backlog state (neither terminal nor `held`).
  * Only gate-approved trigger messages in `received` or `delivered` are ever eligible
  * for T3 dispatch / crash-recovery redelivery (`listUnackedTriggers`).
  */
 
 export type InboundState =
   | "held"
+  | "paused_pending"
   | "received"
   | "delivered"
   | "waiting"
@@ -56,8 +60,12 @@ export type InboundEvent =
   | "retry"
   /** Owner dismisses it. */
   | "ignore"
-  /** Owner paused the connection. */
+  /** Owner paused the Leader/connection: defer queued triggers without aborting delivered runs. */
   | "pause"
+  /** Owner selectively replays a paused backlog item under its original idempotency key. */
+  | "replay_paused"
+  /** Owner dismisses a paused backlog item. */
+  | "dismiss_paused"
   /** Owner approved the held sender or group: enters delivery queue. */
   | "admit"
   /** Owner rejected the held sender or group: permanently blocked. */
@@ -76,7 +84,9 @@ export const INBOUND: Readonly<
   send: { from: ["delivered", "unanswered"], to: "replied" },
   retry: { from: ["waiting", "failed", "unanswered"], to: "received" },
   ignore: { from: ["waiting", "failed", "unanswered"], to: "ignored" },
-  pause: { from: ["received", "delivered", "waiting"], to: "ignored" },
+  pause: { from: ["received", "waiting"], to: "paused_pending" },
+  replay_paused: { from: ["paused_pending"], to: "received" },
+  dismiss_paused: { from: ["paused_pending"], to: "ignored" },
   admit: { from: ["held"], to: "received" },
   refuse: { from: ["held"], to: "blocked" },
 };

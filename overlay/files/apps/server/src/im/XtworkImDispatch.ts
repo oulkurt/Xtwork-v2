@@ -11,8 +11,18 @@ import { ServerSettingsService } from "../serverSettings.ts";
 import { PI_DRIVER, PI_INSTANCE_ID } from "../xtwork/bundledPiSettings.ts";
 import { MODEL_PROVIDER, STANDARD_MODEL } from "../xtwork/gateway.ts";
 import { type BridgePayload, isRecord } from "./XtworkImBridgeHost.ts";
-import { ImDispatchAuthority, hashArgs, imError, untrustedEnvelope, type Execution, type TurnExecutionContext } from "./XtworkImSecurity.ts";
+import {
+  DEFAULT_LEADER_ID,
+  ImDispatchAuthority,
+  hashArgs,
+  imError,
+  normalizeExecutionContext,
+  untrustedEnvelope,
+  type Execution,
+  type TurnExecutionContext,
+} from "./XtworkImSecurity.ts";
 import type { XtworkImMemory } from "./XtworkImMemory.ts";
+import type { LeaderBindingRecord, LeaderStore } from "./XtworkLeaderStore.ts";
 
 const serializeDelivery = (context: TurnExecutionContext, payload: BridgePayload) =>
   [JSON.stringify(context), JSON.stringify(payload)] as const;
@@ -65,7 +75,15 @@ type StoredDelivery = {
   readonly payloadJson: string;
 };
 
-export const dispatchIdentity = (route: Route, dataDir: string, linkedThreadId?: string) => {
+export const dispatchIdentity = (
+  route: Route,
+  dataDir: string,
+  linkedThreadId?: string,
+  binding?: Pick<LeaderBindingRecord, "leaderId" | "bindingId" | "epoch">,
+) => {
+  const leaderId = binding?.leaderId ?? DEFAULT_LEADER_ID;
+  const bindingId = binding?.bindingId ?? null;
+  const bindingEpoch = binding?.epoch ?? null;
   const isGroup = route.chatKind !== "dm";
   const isOwnerPrivate = route.chatKind === "dm" && route.replyAudience === "owner_dm";
   const groupKey = hashArgs([route.connectionId, route.chatId]).slice(0, 32);
@@ -74,9 +92,19 @@ export const dispatchIdentity = (route: Route, dataDir: string, linkedThreadId?:
     : isGroup
       ? route.message.topicId ?? route.message.rootId ?? route.message.threadRootId ?? route.platformMsgId
       : route.chatId;
-  const threadId = ThreadId.make(linkedThreadId ?? `xtwork-im-${isGroup ? "group" : "dm"}-${hashArgs([route.connectionId, route.chatId, subkey]).slice(0, 32)}`);
-  const context: TurnExecutionContext = Object.freeze({
+  // Include bindingId + bindingEpoch when present so rebinding a connection to a new Leader
+  // NEVER collides with or resumes an old binding's thread or Provider session (ADR-013 §1).
+  const threadKeyParts = bindingId
+    ? [leaderId, bindingId, bindingEpoch, route.connectionId, route.chatId, subkey]
+    : [route.connectionId, route.chatId, subkey];
+  const threadId = ThreadId.make(
+    linkedThreadId ?? `xtwork-im-${isGroup ? "group" : "dm"}-${hashArgs(threadKeyParts).slice(0, 32)}`,
+  );
+  const context: TurnExecutionContext = normalizeExecutionContext({
     source: "im",
+    leaderId,
+    bindingId,
+    bindingEpoch,
     connectionId: route.connectionId,
     chatId: route.chatId,
     chatKind: route.chatKind,
@@ -89,9 +117,18 @@ export const dispatchIdentity = (route: Route, dataDir: string, linkedThreadId?:
 };
 
 export const sameAudience = (a: TurnExecutionContext, b: TurnExecutionContext) =>
-  a.replyAudience === b.replyAudience && a.connectionId === b.connectionId && a.chatId === b.chatId;
+  a.replyAudience === b.replyAudience &&
+  a.connectionId === b.connectionId &&
+  a.chatId === b.chatId &&
+  (a.leaderId ?? DEFAULT_LEADER_ID) === (b.leaderId ?? DEFAULT_LEADER_ID) &&
+  (a.bindingId ?? null) === (b.bindingId ?? null) &&
+  (a.bindingEpoch ?? null) === (b.bindingEpoch ?? null);
 
-export const makeDispatcher = Effect.fnUntraced(function* (dataDir: string, memory: XtworkImMemory) {
+export const makeDispatcher = Effect.fnUntraced(function* (
+  dataDir: string,
+  memory: XtworkImMemory,
+  leaders: LeaderStore,
+) {
   const sql = yield* SqlClient.SqlClient;
   const fs = yield* FileSystem.FileSystem;
   const orchestrator = yield* OrchestratorV2;
@@ -107,22 +144,40 @@ export const makeDispatcher = Effect.fnUntraced(function* (dataDir: string, memo
   const stored = (key: string) => sql<StoredDelivery>`
     SELECT key, thread_id AS "threadId", context_json AS "contextJson", payload_json AS "payloadJson"
     FROM xtwork_im_delivery WHERE key = ${key}`;
-  const contextOf = (row: StoredDelivery): TurnExecutionContext => Object.freeze(JSON.parse(row.contextJson));
+  const contextOf = (row: StoredDelivery): TurnExecutionContext =>
+    normalizeExecutionContext(JSON.parse(row.contextJson) as TurnExecutionContext);
   const firstContext = (threadId: ThreadId) => sql<StoredDelivery>`
     SELECT context_json AS "contextJson" FROM xtwork_im_delivery WHERE thread_id = ${threadId} LIMIT 1
-  `.pipe(Effect.map(([row]) => row === undefined ? undefined : contextOf(row)));
+  `.pipe(Effect.map(([row]) => (row === undefined ? undefined : contextOf(row))));
 
   const accept = (payload: BridgePayload) => permits.withPermit(Effect.gen(function* () {
     const inbound = yield* Effect.try({ try: () => inboundMessage(payload), catch: imError });
     const commandId = CommandId.make(inbound.key);
     const [previous] = yield* stored(inbound.key);
-    const requestedThread = typeof payload.threadId === "string" && payload.threadId.startsWith("xtwork-im-")
+    const binding = previous
+      ? undefined
+      : yield* leaders.ensureBinding(inbound.connectionId);
+    const activeLeaderId = previous
+      ? (contextOf(previous).leaderId ?? DEFAULT_LEADER_ID)
+      : (binding?.leaderId ?? DEFAULT_LEADER_ID);
+
+    // If this is a brand-new trigger (not an already-accepted replay) and its Leader is paused,
+    // refuse starting a new turn so it remains deferred in `paused_pending`.
+    if (!previous) {
+      const leader = yield* leaders.getLeader(activeLeaderId);
+      if (leader?.status === "paused") {
+        return yield* imError("Leader is currently paused; new IM tasks are deferred.");
+      }
+    }
+
+    const requestedThread = typeof payload.threadId === "string" && payload.threadId.length > 0
       ? ThreadId.make(payload.threadId)
       : undefined;
-    const desired = dispatchIdentity(inbound, dataDir);
+    const desired = dispatchIdentity(inbound, dataDir, undefined, binding);
     const existingContext = requestedThread === undefined ? undefined : yield* firstContext(requestedThread);
+    // Only reuse requestedThread if audience AND Leader binding + epoch match exactly!
     const identity = existingContext !== undefined && sameAudience(desired.context, existingContext)
-      ? dispatchIdentity(inbound, dataDir, requestedThread)
+      ? dispatchIdentity(inbound, dataDir, requestedThread, binding)
       : desired;
     const threadId = previous ? ThreadId.make(previous.threadId) : identity.threadId;
     const context = previous ? contextOf(previous) : identity.context;
@@ -131,6 +186,9 @@ export const makeDispatcher = Effect.fnUntraced(function* (dataDir: string, memo
     if (previous) {
       const records = yield* orchestrator.getThreadRecords(threadId, ["messages"], { messageIds: [messageId] });
       turnId = records.messages.find((message) => message.id === messageId)?.runId ?? undefined;
+      if (turnId) {
+        yield* leaders.attachRunId(commandId, turnId);
+      }
     }
     if (!turnId) {
       const current = yield* settings.getSettings;
@@ -139,12 +197,20 @@ export const makeDispatcher = Effect.fnUntraced(function* (dataDir: string, memo
         return yield* imError("Remote conversations require the bundled Pi assistant.");
       }
       yield* fs.makeDirectory(context.isolatedWorkspaceRoot!, { recursive: true, mode: 0o700 });
+
+      // ADR-013 §2: Persist the run's execution policy BEFORE Orchestrator dispatches / Pi launches!
+      yield* leaders.persistPolicyBeforeLaunch({ commandId, threadId, context });
+
       const [contextJson, payloadJson] = serializeDelivery(context, payload);
       yield* sql`INSERT INTO xtwork_im_delivery (key, thread_id, message_id, context_json, payload_json)
         VALUES (${inbound.key}, ${threadId}, ${messageId}, ${contextJson}, ${payloadJson})
         ON CONFLICT(key) DO NOTHING`;
-      const role = yield* Effect.tryPromise({ try: () => memory.read("role"), catch: imError });
-      const memories = yield* Effect.tryPromise({ try: () => memory.read(context.companionScope), catch: imError });
+      const leaderId = context.leaderId ?? DEFAULT_LEADER_ID;
+      const role = yield* Effect.tryPromise({ try: () => memory.read("role", undefined, leaderId), catch: imError });
+      const memories = yield* Effect.tryPromise({
+        try: () => memory.read(context.companionScope, undefined, leaderId),
+        catch: imError,
+      });
       const modelSelection = { instanceId: PI_INSTANCE_ID, model: `${MODEL_PROVIDER}/${STANDARD_MODEL}` };
       const content = typeof payload.formatted === "string"
         ? payload.formatted
@@ -174,20 +240,49 @@ export const makeDispatcher = Effect.fnUntraced(function* (dataDir: string, memo
           })).pipe(Effect.provideService(ImDispatchAuthority, true));
       const created = result.storedEvents.find(({ event }) => event.type === "run.created")?.event;
       turnId = created?.type === "run.created" ? created.payload.id : undefined;
+      if (turnId) {
+        yield* leaders.attachRunId(commandId, turnId);
+      }
     }
     if (!turnId) return yield* imError("No committed IM turn was found.");
     return { threadId, turnId, inbound };
   }));
 
-  const resolveExecution = Effect.fnUntraced(function* (threadId: ThreadId) {
+  /**
+   * Resolve persisted per-run execution policy for MCP tool enforcement.
+   * Checks persisted `xtwork_run_policies` by exact `runId` FIRST (never guessing across runs
+   * or relying on `xtwork-im-` prefix alone), and returns `undefined` (fail-closed) when missing.
+   */
+  const resolveExecution = Effect.fnUntraced(function* (threadId: ThreadId, explicitRunId?: RunId) {
     const records = yield* orchestrator.getThreadRecords(threadId, ["runs"], { runStatuses: activeStatuses });
-    const run = records.runs.at(-1);
+    const run = explicitRunId
+      ? records.runs.find((candidate) => candidate.id === explicitRunId)
+      : records.runs.at(-1);
     if (run === undefined) return undefined;
+
     const [row] = yield* sql<StoredDelivery>`
       SELECT context_json AS "contextJson", key, payload_json AS "payloadJson" FROM xtwork_im_delivery
       WHERE thread_id = ${threadId} AND message_id = ${run.userMessageId}`;
+    const persisted =
+      (yield* leaders.resolvePolicy({ runId: run.id })) ??
+      (row ? yield* leaders.resolvePolicy({ commandId: row.key }) : undefined);
+
+    if (persisted !== undefined) {
+      const inbound = row ? decodeInbound(row.payloadJson) : undefined;
+      return {
+        turnId: run.id,
+        threadId,
+        context: persisted.context,
+        ...(inbound ? { inbound } : {}),
+      } as Execution & { readonly inbound?: Route };
+    }
     if (row === undefined) return undefined;
-    return { turnId: run.id, context: contextOf(row), inbound: decodeInbound(row.payloadJson) } as Execution & { inbound: Route };
+    return {
+      turnId: run.id,
+      threadId,
+      context: contextOf(row),
+      inbound: decodeInbound(row.payloadJson),
+    } as Execution & { readonly inbound?: Route };
   });
 
   const settle = (key: string) => sql`UPDATE xtwork_im_delivery SET settled = 1 WHERE key = ${key}`.pipe(Effect.asVoid);
@@ -207,7 +302,18 @@ export const makeDispatcher = Effect.fnUntraced(function* (dataDir: string, memo
     }
   })));
 
-  return { accept, firstContext, orchestrator, resolveExecution, settle, stored, unsettled, unsettledForChat };
+  return {
+    accept,
+    firstContext,
+    orchestrator,
+    projects,
+    leaders,
+    resolveExecution,
+    settle,
+    stored,
+    unsettled,
+    unsettledForChat,
+  };
 });
 
 export type ImDispatcher = Effect.Success<ReturnType<typeof makeDispatcher>>;

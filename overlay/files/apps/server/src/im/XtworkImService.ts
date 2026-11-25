@@ -9,17 +9,72 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
 import { Headers, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { randomUUID } from "node:crypto";
 import { EnvironmentAuth, parseBearerToken } from "../auth/EnvironmentAuth.ts";
+import { OrchestratorV2 } from "../orchestration-v2/Orchestrator.ts";
+import { ProjectionStoreV2 } from "../orchestration-v2/ProjectionStore.ts";
+import { ManagedProjectFolders } from "../project/ManagedProjectFolders.ts";
 import { forkParked } from "../serverActivation.ts";
+import { PI_INSTANCE_ID } from "../xtwork/bundledPiSettings.ts";
+import { MODEL_PROVIDER, STANDARD_MODEL } from "../xtwork/gateway.ts";
 import { bridgeOptions, type BridgePayload, isRecord, XtworkImBridgeHost } from "./XtworkImBridgeHost.ts";
 import { activeStatuses, decodeInbound, isTerminal, makeDispatcher, type ImDispatcher } from "./XtworkImDispatch.ts";
-import { XtworkImMemory } from "./XtworkImMemory.ts";
-import { hashArgs, imError, ImApprovals } from "./XtworkImSecurity.ts";
+import { XtworkImMemory, memoryScope } from "./XtworkImMemory.ts";
+import {
+  DEFAULT_LEADER_ID,
+  desktopContext,
+  hashArgs,
+  imError,
+  ImApprovals,
+  isImThread,
+  untrustedEnvelope,
+  type AwarenessScope,
+  type ReplyAudience,
+  type TurnExecutionContext,
+} from "./XtworkImSecurity.ts";
+import { makeLeaderStore, type LeaderStore, type ProviderPolicyState } from "./XtworkLeaderStore.ts";
+import { buildOwnerNeedsYou, redactDiagnosticText } from "./XtworkLeaderAwareness.ts";
+
+export interface XtworkPolicyHook {
+  readonly isProtectedThread: (threadId: string | undefined) => boolean;
+  readonly resolveProviderPolicy: (threadId: string, runId?: string | null) => ProviderPolicyState;
+  readonly hasPersistedRunPolicy: (query: { readonly runId?: string | null; readonly commandId?: string | null; readonly threadId?: string | null }) => boolean;
+  readonly getProtectedContext: (threadId: string | undefined) => TurnExecutionContext | undefined;
+}
+
+let activePolicyHook: XtworkPolicyHook | undefined;
+
+export function setActiveXtworkPolicyHook(hook: XtworkPolicyHook | undefined): void {
+  activePolicyHook = hook;
+}
+
+export function isProtectedXtworkThread(threadId: string | undefined): boolean {
+  if (!threadId) return false;
+  if (activePolicyHook) return activePolicyHook.isProtectedThread(threadId);
+  return isImThread(threadId);
+}
+
+export function resolveXtworkProviderPolicy(threadId: string, runId?: string | null): ProviderPolicyState {
+  if (activePolicyHook) return activePolicyHook.resolveProviderPolicy(threadId, runId);
+  if (isImThread(threadId)) {
+    return { protected: true, policyDigest: null, failClosed: true };
+  }
+  return { protected: false, policyDigest: null, failClosed: false };
+}
+
+export function hasPersistedXtworkRunPolicy(query: { readonly runId?: string | null; readonly commandId?: string | null; readonly threadId?: string | null }): boolean {
+  if (activePolicyHook) return activePolicyHook.hasPersistedRunPolicy(query);
+  return false;
+}
 
 interface ImService {
   readonly host?: XtworkImBridgeHost;
   readonly memory?: XtworkImMemory;
   readonly dispatch?: ImDispatcher;
+  readonly leaders?: LeaderStore;
+  readonly projection?: ProjectionStoreV2["Service"];
+  readonly orchestrator?: OrchestratorV2["Service"];
+  readonly projects?: ManagedProjectFolders["Service"];
   readonly approvals: ImApprovals;
   readonly markReplySucceeded: (turnId: string) => void;
   readonly hasReplySucceeded: (turnId: string) => boolean;
@@ -119,16 +174,54 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
   const approvals = new ImApprovals();
   const events: BridgeEvent[] = [];
   const repliedTurns = new Set<string>();
-  const defaultService = {
+  const projection = Option.getOrUndefined(yield* Effect.serviceOption(ProjectionStoreV2));
+  const orchestrator = Option.getOrUndefined(yield* Effect.serviceOption(OrchestratorV2));
+  const projects = Option.getOrUndefined(yield* Effect.serviceOption(ManagedProjectFolders));
+  const leaders = yield* makeLeaderStore().pipe(Effect.orElseSucceed(() => undefined));
+
+  if (leaders) {
+    const hook: XtworkPolicyHook = {
+      isProtectedThread: leaders.isProtectedThreadSync,
+      resolveProviderPolicy: leaders.resolveProviderPolicySync,
+      hasPersistedRunPolicy: leaders.hasRunPolicySync,
+      getProtectedContext: leaders.getProtectedContextSync,
+    };
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        setActiveXtworkPolicyHook(hook);
+        return hook;
+      }),
+      (registered) =>
+        Effect.sync(() => {
+          if (activePolicyHook === registered) setActiveXtworkPolicyHook(undefined);
+        }),
+    );
+  }
+
+  const defaultService: ImService = {
     approvals,
+    ...(leaders ? { leaders } : {}),
+    ...(projection ? { projection } : {}),
+    ...(orchestrator ? { orchestrator } : {}),
+    ...(projects ? { projects } : {}),
     markReplySucceeded: (turnId: string) => { repliedTurns.add(turnId); },
     hasReplySucceeded: (turnId: string) => repliedTurns.has(turnId),
     eventsSince: (after: number) => events.filter((item) => item.sequence > after),
   };
   const options = yield* Effect.try({ try: bridgeOptions, catch: imError }).pipe(Effect.orElseSucceed(() => undefined));
-  if (options === undefined) return defaultService;
+  if (options === undefined || leaders === undefined) return defaultService;
   const memory = new XtworkImMemory(options.companionDir);
-  const dispatch = yield* makeDispatcher(options.dataDir, memory);
+  yield* tryWork(() => memory.ensureMigrated(DEFAULT_LEADER_ID)).pipe(Effect.ignore);
+  // Sync default Leader's role from migrated ROLE.md if database role is empty.
+  const migratedRole = yield* tryWork(() => memory.read("role", undefined, DEFAULT_LEADER_ID)).pipe(
+    Effect.orElseSucceed(() => ""),
+  );
+  const defaultLeader = yield* leaders.ensureDefaultLeader();
+  if (migratedRole && !defaultLeader.role) {
+    yield* leaders.updateLeader(DEFAULT_LEADER_ID, { role: migratedRole });
+  }
+
+  const dispatch = yield* makeDispatcher(options.dataDir, memory, leaders);
   const queue = yield* Queue.unbounded<BridgeEvent>();
   const epoch = (yield* Clock.currentTimeMillis) * 1000;
   let sequence = epoch;
@@ -136,7 +229,7 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
     Effect.sync(() => {
       const host = new XtworkImBridgeHost(options, (event, payload) => {
         const item = { sequence: ++sequence, event, payload };
-        if (["onboarding.event", "connection.state", "access.held"].includes(event)) {
+        if (["onboarding.event", "connection.state", "access.held", "inbound.paused"].includes(event)) {
           events.push(item);
           if (events.length > 200) events.shift();
         }
@@ -158,7 +251,7 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
     }
     if (payload.senderRole !== "owner" && payload.verifiedOwner !== true) return;
     if (typeof payload.connectionId !== "string" || typeof payload.chatId !== "string") return;
-    const explicitThread = typeof payload.threadId === "string" && payload.threadId.startsWith("xtwork-im-")
+    const explicitThread = typeof payload.threadId === "string" && leaders.isProtectedThreadSync(payload.threadId)
       ? payload.threadId
       : undefined;
     const candidates = explicitThread
@@ -197,16 +290,114 @@ const readMethods = new Map([
   ["access", "access.list"],
   ["contacts", "contacts.list"],
   ["people", "contacts.list"],
+  ["paused", "paused.list"],
 ]);
 const writeMethods = new Set([
   "onboarding.start", "onboarding.submitCode", "onboarding.cancel",
   "connections.pause", "connections.resume", "connections.disconnect", "connections.claimRefresh",
   "connections.permissions", "access.decide", "access.setAskAll",
   "contacts.rename", "contacts.note", "people.link", "people.unlink",
+  "paused.decide",
 ]);
 const response = (value: unknown, status = 200) =>
   HttpServerResponse.jsonUnsafe(value ?? {}, { status, headers: { "cache-control": "no-store" } });
 const failure = (error: string, status: number) => response({ error }, status);
+
+const ensureLeaderDesktopThread = Effect.fnUntraced(function* (
+  service: ImService,
+  leaderId: string,
+  forceNew: boolean,
+) {
+  if (!service.leaders || !service.orchestrator || !service.projects) {
+    return yield* imError("Leader workspace service is unavailable.");
+  }
+  const leader = yield* service.leaders.getLeader(leaderId);
+  if (!leader) return yield* imError("Leader not found.");
+  if (!forceNew && leader.pinnedThreadId) {
+    const existing = yield* service.orchestrator.getThreadShell(ThreadId.make(leader.pinnedThreadId)).pipe(
+      Effect.orElseSucceed(() => null),
+    );
+    if (existing !== null && existing.deletedAt === null && existing.archivedAt === null) {
+      return { leader, threadId: leader.pinnedThreadId };
+    }
+  }
+  const { projectId } = yield* service.projects.ensureScratchProject;
+  const threadId = ThreadId.make(`xtwork-leader-${leader.id}-${randomUUID().slice(0, 8)}`);
+  const commandId = CommandId.make(`leader-thread:${leader.id}:${Date.now()}:${randomUUID().slice(0, 6)}`);
+  yield* service.orchestrator.dispatch({
+    type: "thread.create",
+    commandId,
+    threadId,
+    projectId,
+    title: leader.name,
+    modelSelection: { instanceId: PI_INSTANCE_ID, model: `${MODEL_PROVIDER}/${STANDARD_MODEL}` },
+    worktreePath: null,
+    branch: null,
+    runtimeMode: "approval-required",
+    interactionMode: "default",
+    createdBy: "user",
+    creationSource: "server",
+  });
+  const updated = (yield* service.leaders.updateLeader(leader.id, { pinnedThreadId: threadId })) ?? leader;
+  return { leader: updated, threadId };
+});
+
+const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, leaderId: string) {
+  if (!service.leaders) return yield* imError("Leader service is unavailable.");
+  const leader =
+    (yield* service.leaders.getLeader(leaderId)) ??
+    (leaderId === DEFAULT_LEADER_ID ? yield* service.leaders.ensureDefaultLeader() : undefined);
+  if (!leader) return yield* imError("Leader not found.");
+  const bindings = yield* service.leaders.listBindings(leader.id);
+  const rawConnections = service.host?.available
+    ? yield* call(service.host, "connections.list", {}).pipe(
+        Effect.map((val) => (isRecord(val) && Array.isArray(val.connections) ? val.connections : [])),
+        Effect.orElseSucceed(() => []),
+      )
+    : [];
+  // Ensure every active bridge connection has a Leader binding (defaulting to leader-default).
+  for (const conn of rawConnections) {
+    if (isRecord(conn) && typeof conn.id === "string") {
+      yield* service.leaders.ensureBinding(conn.id, DEFAULT_LEADER_ID).pipe(Effect.ignore);
+    }
+  }
+  const refreshedBindings = yield* service.leaders.listBindings(leader.id);
+  const boundConnectionIds = new Set(refreshedBindings.map((b) => b.connectionId));
+  const connections = rawConnections.filter(
+    (conn) => isRecord(conn) && typeof conn.id === "string" && boundConnectionIds.has(conn.id),
+  );
+  const pausedPending =
+    service.host?.available && boundConnectionIds.size > 0
+      ? yield* call(service.host, "paused.list", { connectionIds: [...boundConnectionIds] }).pipe(
+          Effect.map((val) => (isRecord(val) && Array.isArray(val.items) ? val.items : [])),
+          Effect.orElseSucceed(() => []),
+        )
+      : [];
+
+  const snapshot = service.projection
+    ? yield* service.projection.getAgentAwarenessSnapshot().pipe(
+        Effect.orElseSucceed(() => ({ snapshotSequence: 0, threads: [] })),
+      )
+    : { snapshotSequence: 0, threads: [] };
+
+  const ownerNeedsYou = buildOwnerNeedsYou({
+    caller: { ...desktopContext, leaderId: leader.id },
+    leader,
+    snapshotSequence: snapshot.snapshotSequence,
+    snapshotThreads: snapshot.threads,
+    leaderStore: service.leaders,
+    approvals: service.approvals,
+  });
+
+  return {
+    leader,
+    bindings: refreshedBindings,
+    connections,
+    pausedPending,
+    needsYou: ownerNeedsYou.awareness,
+    approvals: ownerNeedsYou.approvals,
+  };
+});
 
 const serve = Effect.fnUntraced(function* (service: ImService) {
   const request = yield* HttpServerRequest.HttpServerRequest;
@@ -221,11 +412,233 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
     return failure("当前会话没有远程连接管理权限。", 403);
   }
   const url = new URL(request.url, "http://localhost");
-  const action = url.pathname.slice("/api/xtwork/im/".length).replaceAll("/", ".");
-  if (["approvals", "onboarding.events", "companion.role", "contacts", "people", "access"].includes(action) &&
+  const rawPath = url.pathname.slice("/api/xtwork/im/".length);
+  const action = rawPath.replaceAll("/", ".");
+  const isLeaderPath = rawPath === "leaders" || rawPath.startsWith("leaders/");
+  if ((isLeaderPath || ["approvals", "onboarding.events", "companion.role", "contacts", "people", "access", "paused"].includes(action)) &&
       session.value.subject !== "desktop-bootstrap") {
     return failure("请从本机桌面查看此数据。", 403);
   }
+
+  // Leader Control Plane HTTP endpoints (desktop-bootstrap Owner only).
+  if (isLeaderPath) {
+    if (!service.leaders) return failure("Leader 服务暂不可用。", 503);
+    const segments = rawPath.split("/").filter(Boolean);
+    const body = writing
+      ? yield* request.json.pipe(
+          Effect.provideService(HttpServerRequest.MaxBodySize, ByteSize.kibibytes(80)),
+          Effect.option,
+        )
+      : Option.some({} as unknown);
+    const params = Option.isSome(body) && isRecord(body.value) ? body.value : {};
+
+    if (!writing && segments.length === 1) {
+      yield* service.leaders.ensureDefaultLeader();
+      const leaders = yield* service.leaders.listLeaders();
+      const items = yield* Effect.forEach(leaders, (leader) =>
+        fetchLeaderOverview(service, leader.id).pipe(
+          Effect.map((overview) => {
+            const nonApprovalNeedsYou = overview.needsYou.threads.filter(
+              (t) =>
+                t.pendingApprovalCount === 0 &&
+                (t.phase === "waiting_for_approval" || t.phase === "waiting_for_input" || t.phase === "failed"),
+            ).length;
+            return {
+              leader: overview.leader,
+              bindings: overview.bindings,
+              connections: overview.connections,
+              needsYouCount: overview.approvals.length + overview.pausedPending.length + nonApprovalNeedsYou,
+              runningCount: overview.needsYou.runningCount,
+              pendingApprovalCount: overview.approvals.length,
+              pausedPendingCount: overview.pausedPending.length,
+            };
+          }),
+        ),
+      );
+      return response({ leaders: items });
+    }
+
+    if (writing && segments.length === 1) {
+      const name = typeof params.name === "string" ? params.name : "";
+      if (!name.trim()) return failure("请填写 Leader 名字。", 400);
+      const created = yield* service.leaders
+        .createLeader({
+          name,
+          ...(typeof params.avatar === "string" ? { avatar: params.avatar } : {}),
+          ...(typeof params.role === "string" ? { role: params.role } : {}),
+        })
+        .pipe(Effect.mapError((cause) => imError(cause)));
+      if (service.memory && created.role) {
+        yield* tryWork(() => service.memory!.write("role", created.role, undefined, created.id)).pipe(Effect.ignore);
+      }
+      return response({ leader: created });
+    }
+
+    const leaderId = segments[1] ?? DEFAULT_LEADER_ID;
+    const subAction = segments[2] ?? "overview";
+
+    if (!writing && subAction === "overview") {
+      return yield* fetchLeaderOverview(service, leaderId).pipe(
+        Effect.match({ onSuccess: (val) => response(val), onFailure: (err) => failure(err.message, 400) }),
+      );
+    }
+
+    if (!writing && subAction === "diagnostics") {
+      return yield* fetchLeaderOverview(service, leaderId).pipe(
+        Effect.map((overview) => {
+          const payload = {
+            generatedAt: new Date().toISOString(),
+            leader: {
+              id: overview.leader.id,
+              name: overview.leader.name,
+              status: overview.leader.status,
+              awarenessScope: overview.leader.awarenessScope,
+            },
+            connections: overview.connections.map((conn) =>
+              isRecord(conn)
+                ? {
+                    id: conn.id,
+                    platform: conn.platform,
+                    lifecycleState: conn.lifecycleState,
+                    state: conn.state,
+                    stateDetail: conn.stateDetail,
+                    paused: conn.paused,
+                    leaderPaused: conn.leaderPaused,
+                  }
+                : conn,
+            ),
+            needsYou: {
+              needsYouCount: overview.needsYou.needsYouCount,
+              runningCount: overview.needsYou.runningCount,
+              pendingApprovalCount: overview.needsYou.pendingApprovalCount,
+              pausedPendingCount: overview.pausedPending.length,
+            },
+          };
+          return response({ text: redactDiagnosticText(JSON.stringify(payload, null, 2)) });
+        }),
+        Effect.catch((err) => Effect.succeed(failure(err.message, 400))),
+      );
+    }
+
+    if (writing && subAction === "open-thread") {
+      return yield* ensureLeaderDesktopThread(service, leaderId, false).pipe(
+        Effect.match({ onSuccess: (val) => response(val), onFailure: (err) => failure(err.message, 400) }),
+      );
+    }
+
+    if (writing && subAction === "reset-session") {
+      return yield* ensureLeaderDesktopThread(service, leaderId, true).pipe(
+        Effect.match({ onSuccess: (val) => response(val), onFailure: (err) => failure(err.message, 400) }),
+      );
+    }
+
+    if (writing && subAction === "update") {
+      const awarenessScope = isRecord(params.awarenessScope)
+        ? ({
+            kind:
+              params.awarenessScope.kind === "none" ||
+              params.awarenessScope.kind === "projects" ||
+              params.awarenessScope.kind === "all_local"
+                ? params.awarenessScope.kind
+                : "all_local",
+            projectIds: Array.isArray(params.awarenessScope.projectIds)
+              ? params.awarenessScope.projectIds.filter((id): id is string => typeof id === "string")
+              : [],
+          } satisfies AwarenessScope)
+        : undefined;
+      const updated = yield* service.leaders.updateLeader(leaderId, {
+        ...(typeof params.name === "string" ? { name: params.name } : {}),
+        ...(typeof params.avatar === "string" ? { avatar: params.avatar } : {}),
+        ...(typeof params.role === "string" ? { role: params.role } : {}),
+        ...(awarenessScope ? { awarenessScope } : {}),
+      });
+      if (!updated) return failure("找不到对应的 Leader。", 404);
+      if (typeof params.role === "string" && service.memory) {
+        yield* tryWork(() => service.memory!.write("role", params.role as string, undefined, updated.id)).pipe(
+          Effect.ignore,
+        );
+      }
+      return response({ leader: updated });
+    }
+
+    if (writing && (subAction === "pause" || subAction === "resume")) {
+      const nextPaused = subAction === "pause";
+      const updated = yield* service.leaders.updateLeader(leaderId, { status: nextPaused ? "paused" : "active" });
+      if (!updated) return failure("找不到对应的 Leader。", 404);
+      const bindings = yield* service.leaders.listBindings(updated.id);
+      const connectionIds = bindings.map((b) => b.connectionId);
+      let pausedPending: unknown[] = [];
+      if (service.host?.available && connectionIds.length > 0) {
+        const res = yield* call(service.host, "connections.setLeaderPaused", {
+          connectionIds,
+          paused: nextPaused,
+        }).pipe(Effect.orElseSucceed(() => ({})));
+        if (isRecord(res) && Array.isArray(res.pausedPending)) pausedPending = res.pausedPending;
+      }
+      return response({ leader: updated, pausedPending });
+    }
+
+    if (writing && subAction === "paused-decide") {
+      if (!service.host?.available) return failure("远程连接服务暂不可用。", 503);
+      const leader = yield* service.leaders.getLeader(leaderId);
+      if (!leader) return failure("找不到对应的 Leader。", 404);
+      const bindings = yield* service.leaders.listBindings(leader.id);
+      const connectionIds = bindings.map((b) => b.connectionId);
+      const allowedList =
+        connectionIds.length > 0
+          ? yield* call(service.host, "paused.list", { connectionIds }).pipe(
+              Effect.map((val) => (isRecord(val) && Array.isArray(val.items) ? val.items : [])),
+              Effect.orElseSucceed(() => []),
+            )
+          : [];
+      const allowedIds = new Set(
+        allowedList
+          .filter((item): item is Record<string, unknown> => isRecord(item) && typeof item.id === "string")
+          .map((item) => item.id as string),
+      );
+      const requestedIds = Array.isArray(params.messageIds)
+        ? params.messageIds.filter((id): id is string => typeof id === "string")
+        : [];
+      const scopedIds = requestedIds.filter((id) => allowedIds.has(id));
+      if (requestedIds.length > 0 && scopedIds.length === 0) {
+        return failure("所选积压消息不属于该 Leader。", 403);
+      }
+      return yield* call(service.host, "paused.decide", {
+        ...params,
+        messageIds: scopedIds,
+      }).pipe(
+        Effect.match({ onSuccess: (val) => response(val), onFailure: (err) => failure(err.message, 400) }),
+      );
+    }
+
+    if (writing && subAction === "handoff") {
+      if (!service.memory) return failure("伴侣记忆服务暂不可用。", 503);
+      const summary = typeof params.summary === "string" ? params.summary.trim() : "";
+      if (!summary) return failure("请提供交接摘要内容。", 400);
+      const targetScope = yield* Effect.try({
+        try: () => memoryScope(params.targetScope ?? "private"),
+        catch: imError,
+      }).pipe(Effect.match({ onSuccess: (s) => s, onFailure: () => undefined }));
+      if (!targetScope || targetScope === "role") return failure("无效的交接目标记忆范围。", 400);
+      const sourceLabel = typeof params.sourceLabel === "string" ? params.sourceLabel.trim() : "manual-handoff";
+      const digest = hashArgs({ leaderId, targetScope, sourceLabel, summary }).slice(0, 10);
+      const note = `handoff-${digest}.md`;
+      const bodyText = [
+        `# Handoff (${sourceLabel})`,
+        "",
+        untrustedEnvelope({ sourceLabel, summary, digest }, { ...desktopContext, leaderId }),
+      ].join("\n");
+      return yield* tryWork(() => service.memory!.write(targetScope, bodyText, note, leaderId)).pipe(
+        Effect.match({
+          onSuccess: () => response({ saved: true, note, targetScope, digest }),
+          onFailure: (err) => failure(err.message, 400),
+        }),
+      );
+    }
+
+    return failure("找不到对应的 Leader 操作。", 404);
+  }
+
   if (!writing && action === "status" && !service.host?.available) {
     return response({ state: service.host ? "starting" : "unavailable", installed: service.host !== undefined });
   }
@@ -244,17 +657,31 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
   if (Option.isNone(input) || !isRecord(input.value)) return failure("需要有效的请求数据。", 400);
   const params = input.value;
   if (writing && action === "approvals.decide") {
+    const expectedRunId = typeof params.expectedRunId === "string" ? params.expectedRunId : undefined;
+    const expectedAudience =
+      params.expectedAudience === "local_only" ||
+      params.expectedAudience === "owner_dm" ||
+      params.expectedAudience === "group"
+        ? (params.expectedAudience as ReplyAudience)
+        : undefined;
+    const expectedSnapshotHash = typeof params.expectedSnapshotHash === "string" ? params.expectedSnapshotHash : undefined;
     return typeof params.id === "string" && typeof params.approved === "boolean" &&
-      service.approvals.decide(params.id, params.approved)
+      service.approvals.decide(params.id, params.approved, {
+        desktopOwnerVerified: session.value.subject === "desktop-bootstrap",
+        ...(expectedRunId ? { expectedRunId } : {}),
+        ...(expectedAudience ? { expectedAudience } : {}),
+        ...(expectedSnapshotHash ? { expectedSnapshotHash } : {}),
+      })
       ? response({ decided: true })
-      : failure("此审批已处理或过期。", 409);
+      : failure("此审批已处理、已过期或权限校验不匹配。", 409);
   }
   if (action === "companion.role" && service.memory) {
     const memory = service.memory;
+    const leaderId = typeof params.leaderId === "string" ? params.leaderId : DEFAULT_LEADER_ID;
     if (writing && typeof params.text !== "string") return failure("需要角色说明文本。", 400);
     return yield* tryWork(async () => {
-      if (typeof params.text === "string" && writing) await memory.write("role", params.text);
-      return { text: await memory.read("role") };
+      if (typeof params.text === "string" && writing) await memory.write("role", params.text, undefined, leaderId);
+      return { text: await memory.read("role", undefined, leaderId) };
     }).pipe(Effect.match({ onSuccess: (value) => response(value), onFailure: (error) => failure(error.message, 400) }));
   }
   const method = writing ? writeMethods.has(action) ? action : undefined : readMethods.get(action);

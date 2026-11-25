@@ -368,4 +368,73 @@ describe("SQLite store invariants (ADR-011 S5/S6)", () => {
       store.close();
     }
   });
+
+  it("defers triggers into paused_pending while Leader is paused, keeps /stop working, and replays selected items with original idempotency key", () => {
+    const store = new Store(":memory:");
+    try {
+      const conn = store.createConnection({
+        platform: "feishu",
+        lifecycleState: "active",
+        ownerId: "owner_1",
+      });
+      // In-flight delivered message before pause must NOT be turned into ignored.
+      const first = store.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "m_inflight",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "running task",
+        }),
+      );
+      assert.equal(first.kind, "dispatch");
+      store.moveInbound([first.message.id], "deliver");
+
+      // Leader pauses: connection stays active, in-flight stays delivered, new triggers enter paused_pending.
+      store.updateConnection(conn.id, { leaderPaused: true });
+      store.pauseConnectionMessages(conn.id);
+      assert.equal(store.message(first.message.id)?.state, "delivered");
+
+      const deferred = store.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "m_while_paused",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "do this later",
+        }),
+      );
+      assert.equal(deferred.kind, "paused_pending");
+      assert.equal(deferred.message.state, "paused_pending");
+      assert.equal(deferred.message.idempotencyKey, `im:${conn.id}:m_while_paused`);
+      assert.equal(store.heldMessages(conn.id).length, 0);
+      assert.equal(store.listUnackedTriggers(conn.id).length, 0);
+      assert.equal(store.pausedPendingMessages([conn.id]).length, 1);
+
+      // Verified Owner /stop still works while Leader is paused!
+      const stopOutcome = store.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "m_stop",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "/stop",
+        }),
+      );
+      assert.equal(stopOutcome.kind, "stop");
+
+      // Resume Leader and selectively replay paused item under the exact original idempotency key.
+      store.updateConnection(conn.id, { leaderPaused: false });
+      const replayed = store.decidePausedPending([deferred.message.id], "replay");
+      assert.equal(replayed.length, 1);
+      assert.equal(replayed[0]!.state, "received");
+      assert.equal(replayed[0]!.idempotencyKey, `im:${conn.id}:m_while_paused`);
+      assert.equal(store.pausedPendingMessages([conn.id]).length, 0);
+    } finally {
+      store.close();
+    }
+  });
 });

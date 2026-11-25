@@ -7,7 +7,16 @@ import { McpSchema, McpServer, Tool } from "effect/ai";
 import { McpInvocationContext } from "../mcp/McpInvocationContext.ts";
 import { type BridgePayload, isRecord } from "./XtworkImBridgeHost.ts";
 import { memoryScope } from "./XtworkImMemory.ts";
-import { imError, isImThread, memoryNeedsApproval, nativeNeedsApproval, scopedPath, untrustedEnvelope } from "./XtworkImSecurity.ts";
+import {
+  DEFAULT_LEADER_ID,
+  hashArgs,
+  imError,
+  isImThread,
+  memoryNeedsApproval,
+  nativeNeedsApproval,
+  scopedPath,
+  untrustedEnvelope,
+} from "./XtworkImSecurity.ts";
 import { XtworkIm } from "./XtworkImService.ts";
 
 const field = { type: "string" } as const;
@@ -24,6 +33,7 @@ const schemas = {
   im__contact_link: ["Link contacts to an existing person.", { contactIds: { type: "array", items: field, minItems: 2 }, }, ["contactIds"]],
   im__memory_read: ["Read companion memory or a Markdown note.", { scope: field, note: field }, []],
   im__memory_write: ["Write companion memory or a Markdown note.", { scope: field, note: field, text: field }, ["text"]],
+  im__memory_share: ["Request Owner snapshot approval to copy a specific private memory note into the current group.", { note: field }, []],
   im__native_policy: ["Internal Pi permission hook.", { toolName: field, args: { type: "object" } }, ["toolName", "args"]],
 } as const;
 
@@ -48,14 +58,24 @@ const textField = (input: BridgePayload, key: string) => {
   return value;
 };
 
-export const imToolAllowed = (threadId: string | undefined, tool: string, listing: boolean) =>
-  threadId !== undefined && isImThread(threadId)
+export const imToolAllowed = (
+  threadId: string | undefined,
+  tool: string,
+  listing: boolean,
+  isProtected?: boolean,
+) =>
+  (isProtected ?? (threadId !== undefined && isImThread(threadId)))
     ? (Object.hasOwn(schemas, tool) && (!listing || tool !== "im__native_policy")) || /^todo__[a-z]+$/u.test(tool)
     : !tool.startsWith("im__");
 
 export async function runImTool(service: ToolService, execution: ImExecution, name: ToolName, args: BridgePayload, signal: AbortSignal) {
   const { context, turnId, inbound } = execution;
-  const approve = (details: BridgePayload = args) => service.approvals.require(execution, name, details, signal);
+  const leaderId = context.leaderId ?? DEFAULT_LEADER_ID;
+  const approve = (
+    details: BridgePayload = args,
+    meta?: { readonly snapshotHash?: string; readonly targetScope?: typeof context.companionScope; readonly contentPreview?: string },
+  ) => service.approvals.require(execution, name, details, signal, meta);
+
   if (name === "im__native_policy") {
     const toolName = textField(args, "toolName");
     if (await nativeNeedsApproval(context, toolName, args.args)) {
@@ -63,24 +83,78 @@ export async function runImTool(service: ToolService, execution: ImExecution, na
     }
     return { allowed: true };
   }
+
+  // ADR-013 §4: Sharing private memory into a group MUST bind an exact content snapshot + hash
+  // and copy that snapshot into the group scope (never granting ongoing live read access to `private/`).
+  if (
+    name === "im__memory_share" ||
+    (name === "im__memory_read" && context.replyAudience === "group" && memoryScope(args.scope ?? context.companionScope) === "private")
+  ) {
+    if (!service.memory) throw new Error("Companion memory is unavailable.");
+    if (!context.companionScope.startsWith("group:")) {
+      throw new Error("Snapshot sharing is only applicable for group scopes.");
+    }
+    const note = args.note === undefined ? undefined : textField(args, "note");
+    const content = await service.memory.read("private", note, leaderId);
+    if (!content) {
+      return { shared: false, message: "No private memory content found to share." };
+    }
+    const snapshotHash = hashArgs({
+      leaderId,
+      sourceScope: "private",
+      note: note ?? "MEMORY.md",
+      targetScope: context.companionScope,
+      content,
+    });
+    await service.approvals.require(
+      execution,
+      "im__memory_share",
+      {
+        sourceScope: "private",
+        note: note ?? "MEMORY.md",
+        targetScope: context.companionScope,
+        snapshotHash,
+      },
+      signal,
+      {
+        snapshotHash,
+        targetScope: context.companionScope,
+        contentPreview: content.slice(0, 1200),
+      },
+    );
+    const sharedNote = await service.memory.writeSharedSnapshot(context.companionScope, snapshotHash, content, leaderId);
+    return {
+      shared: true,
+      snapshotHash,
+      note: sharedNote,
+      content: untrustedEnvelope(content, context),
+    };
+  }
+
   if (name === "im__memory_read" || name === "im__memory_write") {
     if (!service.memory) throw new Error("Companion memory is unavailable.");
     const scope = memoryScope(args.scope ?? context.companionScope);
     const note = args.note === undefined ? undefined : textField(args, "note");
     if (memoryNeedsApproval(context, scope) && (name === "im__memory_write" || scope !== "role")) {
-      await approve({ ...args, scope });
+      await approve({ ...args, scope, leaderId });
     }
-    if (name === "im__memory_read") return untrustedEnvelope(await service.memory.read(scope, note), context);
-    await service.memory.write(scope, textField(args, "text"), note);
+    if (name === "im__memory_read") return untrustedEnvelope(await service.memory.read(scope, note, leaderId), context);
+    await service.memory.write(scope, textField(args, "text"), note, leaderId);
     return { saved: true };
   }
+
   const host = service.host;
   if (!host) throw new Error("The IM bridge is unavailable.");
-  const target = { connectionId: context.connectionId, chatId: context.chatId, platformMsgId: inbound.platformMsgId, turnId };
+  const target = {
+    connectionId: context.connectionId,
+    chatId: context.chatId,
+    platformMsgId: inbound?.platformMsgId,
+    turnId,
+  };
   const replySucceeded = (result: unknown) =>
     isRecord(result) && isRecord(result.result) && ["sent", "uncertain"].includes(String(result.result.kind));
   if (name === "im__reply") {
-    if (!inbound.messageId) throw new Error("The current message has no internal message ID.");
+    if (!inbound?.messageId) throw new Error("The current message has no internal message ID.");
     const result = await host.request("messages.reply", {
       messageId: inbound.messageId,
       text: textField(args, "text"),
@@ -93,7 +167,7 @@ export async function runImTool(service: ToolService, execution: ImExecution, na
   if (name === "im__file_get") {
     if (!context.isolatedWorkspaceRoot) throw new Error("This turn has no isolated workspace.");
     const fileId = textField(args, "fileId");
-    const attachments = inbound.message.attachments;
+    const attachments = inbound?.message.attachments;
     if (!Array.isArray(attachments) || !attachments.some((attachment) => isRecord(attachment) && attachment.id === fileId)) {
       throw new Error("This attachment does not belong to the current message.");
     }

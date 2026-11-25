@@ -37,6 +37,7 @@ export interface Connection {
   readonly state: StoredLinkState;
   readonly stateDetail: string | null;
   readonly paused: boolean;
+  readonly leaderPaused: boolean;
   readonly secretRef: string | null;
   readonly ownerId: string | null;
   readonly claimCode: string | null;
@@ -126,6 +127,7 @@ export type IngestOutcome =
   | { readonly kind: "blocked"; readonly platformMsgId: string }
   | { readonly kind: "unapproved_background_dropped"; readonly platformMsgId: string }
   | { readonly kind: "held"; readonly message: Message; readonly chat: Chat; readonly contact: Contact }
+  | { readonly kind: "paused_pending"; readonly message: Message; readonly chat: Chat; readonly contact: Contact }
   | { readonly kind: "background"; readonly message: Message; readonly chat: Chat; readonly contact: Contact }
   | { readonly kind: "stop"; readonly message: Message; readonly chat: Chat; readonly contact: Contact }
   | { readonly kind: "dispatch"; readonly message: Message; readonly chat: Chat; readonly contact: Contact };
@@ -160,6 +162,7 @@ CREATE TABLE IF NOT EXISTS connections (
   state TEXT NOT NULL DEFAULT 'idle',
   state_detail TEXT,
   paused INTEGER NOT NULL DEFAULT 0,
+  leader_paused INTEGER NOT NULL DEFAULT 0,
   secret_ref TEXT,
   owner_id TEXT,
   claim_code TEXT,
@@ -290,11 +293,18 @@ export class Store {
   private migrate(): void {
     const row = this.db.prepare("PRAGMA user_version").get() as Row;
     const version = Number(row.user_version ?? 0);
-    if (version >= 1) return;
+    if (version >= 2) return;
     this.db.exec("BEGIN");
     try {
-      this.db.exec(SCHEMA_V1);
-      this.db.exec("PRAGMA user_version = 1");
+      if (version < 1) {
+        this.db.exec(SCHEMA_V1);
+      } else {
+        const cols = (this.db.prepare("PRAGMA table_info(connections)").all() as Row[]).map((c) => String(c.name));
+        if (!cols.includes("leader_paused")) {
+          this.db.exec("ALTER TABLE connections ADD COLUMN leader_paused INTEGER NOT NULL DEFAULT 0");
+        }
+      }
+      this.db.exec("PRAGMA user_version = 2");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -393,6 +403,7 @@ export class Store {
       state: StoredLinkState;
       stateDetail: string | null;
       paused: boolean;
+      leaderPaused: boolean;
       secretRef: string | null;
       ownerId: string | null;
       claimCode: string | null;
@@ -409,6 +420,7 @@ export class Store {
       state: "state",
       stateDetail: "state_detail",
       paused: "paused",
+      leaderPaused: "leader_paused",
       secretRef: "secret_ref",
       ownerId: "owner_id",
       claimCode: "claim_code",
@@ -421,7 +433,7 @@ export class Store {
     if (!entries.length) return this.connection(id);
     const sets = entries.map(([k]) => `${map[k]} = ?`).join(", ");
     const values: SQLInputValue[] = entries.map(([k, v]) => {
-      if (k === "paused" || k === "askAll") return v ? 1 : 0;
+      if (k === "paused" || k === "leaderPaused" || k === "askAll") return v ? 1 : 0;
       return v as SQLInputValue;
     });
     this.db.prepare(`UPDATE connections SET ${sets}, updated_at = ? WHERE id = ?`).run(...values, this.now(), id);
@@ -1012,7 +1024,8 @@ export class Store {
       return { kind: "stop", message: this.message(id)!, chat, contact };
     }
 
-    const state: InboundState = isTrigger ? "received" : "ignored";
+    const deferredByPause = isTrigger && conn.leaderPaused;
+    const state: InboundState = !isTrigger ? "ignored" : deferredByPause ? "paused_pending" : "received";
     const idempotencyKey = isTrigger ? makeIdempotencyKey(connectionId, msg.platformId) : null;
     this.db
       .prepare(
@@ -1039,9 +1052,10 @@ export class Store {
     // Allowed chat message -> index into FTS5 `trigram`!
     this.indexMessageInFts(id, msg.text);
     const saved = this.message(id)!;
-    return isTrigger
-      ? { kind: "dispatch", message: saved, chat, contact }
-      : { kind: "background", message: saved, chat, contact };
+    if (!isTrigger) return { kind: "background", message: saved, chat, contact };
+    return deferredByPause
+      ? { kind: "paused_pending", message: saved, chat, contact }
+      : { kind: "dispatch", message: saved, chat, contact };
   }
 
   private shouldTrigger(msg: InboundMessage, existingChat: Chat | undefined): boolean {
@@ -1213,6 +1227,7 @@ export class Store {
         AND m.acked_at IS NULL
         AND n.lifecycle_state = 'active'
         AND n.paused = 0
+        AND n.leader_paused = 0
         ${scope}
       ORDER BY m.created_at ASC, m.rowid ASC
     `;
@@ -1438,16 +1453,50 @@ export class Store {
     );
   }
 
-  /** Pause all active queued/delivered/waiting inbound messages for a connection. */
+  /** Defer queued/waiting inbound messages for a paused connection/leader into `paused_pending` without touching in-flight `delivered` runs. */
   pauseConnectionMessages(connectionId: string): string[] {
     const rows = this.stmt(
-      "SELECT id FROM messages WHERE connection_id = ? AND direction = 'in' AND state IN ('received', 'delivered', 'waiting')",
+      "SELECT id FROM messages WHERE connection_id = ? AND direction = 'in' AND state IN ('received', 'waiting')",
     ).all(connectionId) as Row[];
     if (!rows.length) return [];
     return this.moveInbound(
       rows.map((r) => String(r.id)),
       "pause",
     );
+  }
+
+  /** Paused backlog messages awaiting Owner review on resume, oldest first. */
+  pausedPendingMessages(
+    connectionIds?: readonly string[],
+  ): (Message & { readonly chat: Chat; readonly platform: Platform; readonly contact?: Contact })[] {
+    const filterIds = connectionIds && connectionIds.length > 0 ? connectionIds : undefined;
+    const whereClause = filterIds
+      ? `AND m.connection_id IN (${filterIds.map(() => "?").join(", ")})`
+      : "";
+    const sql = `
+      SELECT m.*, n.platform
+      FROM messages m
+      JOIN connections n ON n.id = m.connection_id
+      WHERE m.direction = 'in' AND m.state = 'paused_pending' ${whereClause}
+      ORDER BY m.created_at ASC, m.rowid ASC
+    `;
+    const rows = (filterIds ? this.db.prepare(sql).all(...filterIds) : this.db.prepare(sql).all()) as Row[];
+    const out: (Message & { readonly chat: Chat; readonly platform: Platform; readonly contact?: Contact })[] = [];
+    for (const r of rows) {
+      const msg = toMessage(r);
+      const chat = this.chat(msg.chatId);
+      if (!chat) continue;
+      const contact = msg.senderId ? this.contactByPlatformId(msg.connectionId, msg.senderId) : undefined;
+      out.push({ ...msg, chat, platform: String(r.platform) as Platform, ...(contact ? { contact } : {}) });
+    }
+    return out;
+  }
+
+  /** Selectively replay (`paused_pending` -> `received`) or dismiss (`paused_pending` -> `ignored`) paused backlog items. */
+  decidePausedPending(messageIds: readonly string[], decision: "replay" | "dismiss"): Message[] {
+    if (!messageIds.length) return [];
+    const changedIds = this.moveInbound(messageIds, decision === "replay" ? "replay_paused" : "dismiss_paused");
+    return changedIds.map((id) => this.message(id)).filter((msg): msg is Message => Boolean(msg));
   }
 }
 
@@ -1469,6 +1518,7 @@ function toConnection(r: Row): Connection {
     state: String(r.state) as StoredLinkState,
     stateDetail: str(r.state_detail),
     paused: Number(r.paused) === 1,
+    leaderPaused: Number(r.leader_paused ?? 0) === 1,
     secretRef: str(r.secret_ref),
     ownerId: str(r.owner_id),
     claimCode: str(r.claim_code),
