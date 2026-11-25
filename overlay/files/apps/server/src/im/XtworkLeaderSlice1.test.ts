@@ -7,6 +7,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,7 +34,7 @@ import {
   type Execution,
   type TurnExecutionContext,
 } from "./XtworkImSecurity.ts";
-import { classifyDeliverySendOutcome, makeDeliverySync } from "./XtworkImService.ts";
+import { classifyDeliverySendOutcome, makeBridgeEventHandler, makeDeliverySync } from "./XtworkImService.ts";
 import { buildOwnerNeedsYou, buildScopedAwareness, redactDiagnosticText } from "./XtworkLeaderAwareness.ts";
 import { makeLeaderStore } from "./XtworkLeaderStore.ts";
 
@@ -1199,7 +1200,7 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
                 {
                   event: {
                     type: "run.created",
-                    payload: { id: "run-s23-replayed" },
+                    payload: { id: `run-s23-replayed-${dispatchCalls}` },
                   },
                 },
               ],
@@ -1282,6 +1283,82 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         const replayedOutcome = yield* dispatcher.accept(payload, 1).pipe(Effect.result);
         expect(replayedOutcome._tag).toBe("Success");
         expect(dispatchCalls).toBe(1);
+
+        // 6. S23 service-queue race: T3 pauses Leader (gen 1 -> 2), BEFORE bridge receives pause
+        //    bridge emits `inbound.dispatch` stamped with `pauseGeneration: 1` into the service queue,
+        //    bridge then applies pause (`paused_pending`), T3 resumes Leader (active, gen=2) WITHOUT Replay,
+        //    and THEN the service queue drains -> MUST NOT dispatch or ACK! Explicit Replay (gen=2) DOES run!
+        const serviceQueue = yield* Queue.unbounded<{
+          readonly sequence: number;
+          readonly event: string;
+          readonly payload: Record<string, unknown>;
+        }>();
+        const bridgeRpcCalls: Array<{ method: string; params: Record<string, unknown> | undefined }> = [];
+        let simulatedBridgeState = "received";
+        const fakeServiceHost = {
+          available: true,
+          async request(method: string, params?: Record<string, unknown>) {
+            bridgeRpcCalls.push({ method, params });
+            if (method === "inbound.settle" && params?.event === "pause") {
+              if (simulatedBridgeState === "received") simulatedBridgeState = "paused_pending";
+              return { moved: true, message: { state: simulatedBridgeState } };
+            }
+            if (method === "inbound.ack") {
+              simulatedBridgeState = "delivered";
+              return { message: { state: simulatedBridgeState } };
+            }
+            return {};
+          },
+        };
+        const handleEvent = makeBridgeEventHandler(fakeServiceHost, dispatcher, leaders);
+
+        // T3 records Pause (gen 1 -> 2) FIRST
+        const paused2 = yield* leaders.updateLeader(DEFAULT_LEADER_ID, { status: "paused" });
+        expect(paused2?.pauseGeneration).toBe(2);
+
+        // Bridge (still at gen 1 before pause sync reaches it) emits `inbound.dispatch` with `pauseGeneration: 1`!
+        const queuedPayload = {
+          connectionId: "conn-feishu",
+          platformMsgId: "pm-s23-queue-race",
+          idempotencyKey: "im:conn-feishu:pm-s23-queue-race",
+          chatId: "chat-dm",
+          chatKind: "dm",
+          senderRole: "owner",
+          leaderId: binding.leaderId,
+          bindingId: binding.bindingId,
+          bindingEpoch: binding.epoch,
+          pauseGeneration: 1,
+        };
+        Queue.offerUnsafe(serviceQueue, { sequence: 1, event: "inbound.dispatch", payload: queuedPayload });
+        // Bridge receives pause sync and moves message to `paused_pending`
+        simulatedBridgeState = "paused_pending";
+        // T3 resumes Leader WITHOUT selecting Replay (status=active, gen=2)
+        const resumed2 = yield* leaders.updateLeader(DEFAULT_LEADER_ID, { status: "active" });
+        expect(resumed2?.status).toBe("active");
+        expect(resumed2?.pauseGeneration).toBe(2);
+
+        // Now the held service queue drains -> MUST reject stale gen=1 dispatch, NOT ACK, keep `paused_pending`!
+        const drained = yield* Queue.take(serviceQueue);
+        yield* handleEvent(drained);
+        expect(dispatchCalls).toBe(1); // unchanged!
+        expect(simulatedBridgeState).toBe("paused_pending");
+        expect(bridgeRpcCalls.some((c) => c.method === "inbound.ack")).toBe(false);
+        expect(
+          bridgeRpcCalls.some(
+            (c) => c.method === "inbound.settle" && c.params?.event === "pause" && c.params?.idempotencyKey === queuedPayload.idempotencyKey,
+          ),
+        ).toBe(true);
+
+        // Explicit Replay emits fresh `pauseGeneration: 2` with the ORIGINAL idempotencyKey -> commits & ACKs!
+        Queue.offerUnsafe(serviceQueue, {
+          sequence: 2,
+          event: "inbound.dispatch",
+          payload: { ...queuedPayload, pauseGeneration: 2 },
+        });
+        yield* handleEvent(yield* Queue.take(serviceQueue));
+        expect(dispatchCalls).toBe(2);
+        expect(simulatedBridgeState).toBe("delivered");
+        expect(bridgeRpcCalls.some((c) => c.method === "inbound.ack")).toBe(true);
       }).pipe(Effect.provide(fakeDeps)),
     );
   });

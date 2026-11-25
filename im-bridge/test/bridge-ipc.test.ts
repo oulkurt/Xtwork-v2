@@ -1133,6 +1133,78 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
       assert.equal(stopsAfterC.length, 1);
       assert.equal(stopsAfterC[0]!.params.threadId, null);
 
+      // S23: Bridge stamps observed `pauseGeneration` on emit, updates on syncBindings, and emits
+      // fresh `pauseGeneration` on explicit `paused.decide` replay with the original idempotencyKey!
+      notifications.length = 0;
+      await mock.events!.onMessage({
+        platformId: "s23-pre-pause",
+        chat: { platformId: "dm-owner", kind: "dm" },
+        sender: { id: "owner-1", name: "Owner", isBot: false },
+        text: "emitted before bridge sees pause",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_108_000,
+      });
+      const prePauseDispatches = notifications.filter((n) => n.method === "inbound.dispatch");
+      assert.equal(prePauseDispatches.length, 1);
+      assert.equal(prePauseDispatches[0]!.params.pauseGeneration, 0);
+      const s23MsgId = String(prePauseDispatches[0]!.params.messageId);
+      const s23Key = String(prePauseDispatches[0]!.params.idempotencyKey);
+
+      // Pause sync arrives at bridge (gen=1) -> moves unacked message to `paused_pending`
+      await bridge.handleRequest({
+        id: 230,
+        method: "connections.syncBindings",
+        params: {
+          bindings: [
+            {
+              connectionId: conn.id,
+              leaderId: "leader-c",
+              bindingId: "bind-c-3",
+              bindingEpoch: 3,
+              leaderPaused: true,
+              pauseGeneration: 1,
+            },
+          ],
+          leaderPauseGenerations: { "leader-c": 1 },
+        },
+      });
+      assert.equal(store.getLeaderPauseGeneration("leader-c"), 1);
+      assert.equal(store.message(s23MsgId)?.state, "paused_pending");
+
+      // Resume sync arrives (gen=1, unpaused) -> message stays in `paused_pending`
+      await bridge.handleRequest({
+        id: 231,
+        method: "connections.syncBindings",
+        params: {
+          bindings: [
+            {
+              connectionId: conn.id,
+              leaderId: "leader-c",
+              bindingId: "bind-c-3",
+              bindingEpoch: 3,
+              leaderPaused: false,
+              pauseGeneration: 1,
+            },
+          ],
+          leaderPauseGenerations: { "leader-c": 1 },
+        },
+      });
+      assert.equal(store.message(s23MsgId)?.state, "paused_pending");
+
+      // Explicit Replay stamps fresh pauseGeneration=1 with original idempotencyKey!
+      notifications.length = 0;
+      const replayedS23 = await bridge.handleRequest({
+        id: 232,
+        method: "paused.decide",
+        params: { messageIds: [s23MsgId], decision: "replay", leaderId: "leader-c", pauseGeneration: 1 },
+      });
+      assert.equal(replayedS23.ok, true);
+      const postReplayDispatches = notifications.filter((n) => n.method === "inbound.dispatch");
+      assert.equal(postReplayDispatches.length, 1);
+      assert.equal(postReplayDispatches[0]!.params.idempotencyKey, s23Key);
+      assert.equal(postReplayDispatches[0]!.params.pauseGeneration, 1);
+
       await bridge.shutdown();
     } finally {
       // store closed by bridge.shutdown()

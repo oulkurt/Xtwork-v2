@@ -269,6 +269,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_time
 CREATE INDEX IF NOT EXISTS idx_messages_unacked
   ON messages(direction, triggers, state, acked_at);
 
+CREATE TABLE IF NOT EXISTS leader_pause_generations (
+  leader_id TEXT PRIMARY KEY,
+  pause_generation INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   msg_id UNINDEXED,
   body,
@@ -311,7 +316,7 @@ export class Store {
   private migrate(): void {
     const row = this.db.prepare("PRAGMA user_version").get() as Row;
     const version = Number(row.user_version ?? 0);
-    if (version >= 6) return;
+    if (version >= 7) return;
     this.db.exec("BEGIN");
     try {
       if (version < 1) {
@@ -392,8 +397,16 @@ export class Store {
            WHERE thread_id IS NOT NULL
              AND (thread_leader_id IS NULL OR thread_binding_epoch IS NULL)`,
         );
+        // S23: Track per-Leader pause generations in the bridge so emitted dispatches stamp the
+        // exact generation the bridge had observed at emit time.
+        this.db.exec(
+          `CREATE TABLE IF NOT EXISTS leader_pause_generations (
+            leader_id TEXT PRIMARY KEY,
+            pause_generation INTEGER NOT NULL DEFAULT 0
+          )`,
+        );
       }
-      this.db.exec("PRAGMA user_version = 6");
+      this.db.exec("PRAGMA user_version = 7");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1672,6 +1685,29 @@ export class Store {
     );
   }
 
+  /** Record the latest pause generation synced from T3 for a Leader (S23). */
+  setLeaderPauseGeneration(leaderId: string, pauseGeneration: number): void {
+    if (!leaderId || !Number.isInteger(pauseGeneration) || pauseGeneration < 0) return;
+    this.stmt(
+      `INSERT INTO leader_pause_generations (leader_id, pause_generation)
+       VALUES (?, ?)
+       ON CONFLICT(leader_id) DO UPDATE SET
+         pause_generation = CASE
+           WHEN excluded.pause_generation > leader_pause_generations.pause_generation
+           THEN excluded.pause_generation
+           ELSE leader_pause_generations.pause_generation
+         END`,
+    ).run(leaderId, pauseGeneration);
+  }
+
+  /** Read the pause generation currently known to the bridge for a Leader (S23). */
+  getLeaderPauseGeneration(leaderId: string): number {
+    const row = this.stmt("SELECT pause_generation FROM leader_pause_generations WHERE leader_id = ?").get(
+      leaderId,
+    ) as Row | undefined;
+    return row?.pause_generation == null ? 0 : Number(row.pause_generation);
+  }
+
   /** Reconcile Leader binding identity and pause flag onto a bridge connection. */
   syncConnectionBinding(input: {
     readonly connectionId: string;
@@ -1679,7 +1715,11 @@ export class Store {
     readonly bindingId: string | null;
     readonly bindingEpoch: number;
     readonly leaderPaused: boolean;
+    readonly pauseGeneration?: number;
   }): Connection | undefined {
+    if (typeof input.pauseGeneration === "number") {
+      this.setLeaderPauseGeneration(input.leaderId, input.pauseGeneration);
+    }
     const prev = this.connection(input.connectionId);
     const updated = this.updateConnection(input.connectionId, {
       leaderId: input.leaderId,

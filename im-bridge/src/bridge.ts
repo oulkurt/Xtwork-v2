@@ -702,6 +702,21 @@ export class ImBridge {
   }
 
   private handleSyncBindings(params: Record<string, unknown>) {
+    // S23: Persist any synced per-Leader pause generations BEFORE processing bindings / startup replay.
+    if (params.leaderPauseGenerations && typeof params.leaderPauseGenerations === "object" && !Array.isArray(params.leaderPauseGenerations)) {
+      for (const [leaderId, gen] of Object.entries(params.leaderPauseGenerations as Record<string, unknown>)) {
+        if (typeof gen === "number" && Number.isInteger(gen) && gen >= 0) {
+          this.store.setLeaderPauseGeneration(leaderId, gen);
+        }
+      }
+    }
+    if (
+      typeof params.defaultLeaderPauseGeneration === "number" &&
+      Number.isInteger(params.defaultLeaderPauseGeneration) &&
+      params.defaultLeaderPauseGeneration >= 0
+    ) {
+      this.store.setLeaderPauseGeneration("leader-default", params.defaultLeaderPauseGeneration);
+    }
     const rawBindings = Array.isArray(params.bindings) ? params.bindings : [];
     const seen = new Set<string>();
     const updated: Record<string, unknown>[] = [];
@@ -713,6 +728,10 @@ export class ImBridge {
       const bindingId = typeof item.bindingId === "string" && item.bindingId ? item.bindingId : null;
       const bindingEpoch = typeof item.bindingEpoch === "number" && Number.isInteger(item.bindingEpoch) ? item.bindingEpoch : 1;
       const leaderPaused = Boolean(item.leaderPaused);
+      const pauseGeneration =
+        typeof item.pauseGeneration === "number" && Number.isInteger(item.pauseGeneration) && item.pauseGeneration >= 0
+          ? item.pauseGeneration
+          : undefined;
       if (!connectionId) continue;
       seen.add(connectionId);
       const prev = this.store.connection(connectionId);
@@ -722,6 +741,7 @@ export class ImBridge {
         bindingId,
         bindingEpoch,
         leaderPaused,
+        ...(pauseGeneration !== undefined ? { pauseGeneration } : {}),
       });
       if (next) {
         const changed =
@@ -798,6 +818,13 @@ export class ImBridge {
       throw new BridgeError("INVALID_PARAMS", 'decision must be "replay" or "dismiss"');
     }
     const leaderId = optStr(params, "leaderId");
+    const replayPauseGeneration =
+      typeof params.pauseGeneration === "number" && Number.isInteger(params.pauseGeneration) && params.pauseGeneration >= 0
+        ? params.pauseGeneration
+        : undefined;
+    if (leaderId && replayPauseGeneration !== undefined) {
+      this.store.setLeaderPauseGeneration(leaderId, replayPauseGeneration);
+    }
     const messageIds = Array.isArray(params.messageIds)
       ? params.messageIds.filter((id): id is string => typeof id === "string" && id.length > 0)
       : optStr(params, "messageId")
@@ -858,7 +885,7 @@ export class ImBridge {
       const replayed = moved[0];
       if (!replayed) continue;
       const contact = replayed.senderId ? this.store.contactByPlatformId(conn.id, replayed.senderId) : undefined;
-      this.emitDispatch(conn, chat, replayed, contact);
+      this.emitDispatch(conn, chat, replayed, contact, replayPauseGeneration);
       replayedIds.push(replayed.id);
     }
 
@@ -1644,7 +1671,13 @@ export class ImBridge {
     });
   }
 
-  private emitDispatch(conn: Connection, chat: Chat, msg: Message, contact?: Contact): void {
+  private emitDispatch(
+    conn: Connection,
+    chat: Chat,
+    msg: Message,
+    contact?: Contact,
+    overridePauseGeneration?: number,
+  ): void {
     const isOwner = Boolean(conn.ownerId && msg.senderId === conn.ownerId);
     const senderRole: VerifiedSenderRole = isOwner ? "owner" : contact?.isBot ? "bot" : "member";
     const replyAudience: ReplyAudience = chat.kind === "dm" && isOwner ? "owner_dm" : "group";
@@ -1688,6 +1721,10 @@ export class ImBridge {
     const dispatchLeaderId = msg.leaderId ?? "leader-default";
     const dispatchBindingId = msg.bindingId;
     const dispatchBindingEpoch = msg.bindingEpoch ?? 1;
+    // S23: Stamp the bridge's observed pause generation for this Leader when emitting the dispatch
+    // so dispatches emitted before a pause reaches the bridge cannot be mistaken for post-resume replays!
+    const dispatchPauseGeneration =
+      overridePauseGeneration ?? this.store.getLeaderPauseGeneration(dispatchLeaderId);
 
     this.emit({
       method: "inbound.dispatch",
@@ -1705,6 +1742,7 @@ export class ImBridge {
         leaderId: dispatchLeaderId,
         bindingId: dispatchBindingId,
         bindingEpoch: dispatchBindingEpoch,
+        pauseGeneration: dispatchPauseGeneration,
         senderId: msg.senderId,
         senderName: senderDisplayName,
         contactId: contact?.id ?? null,

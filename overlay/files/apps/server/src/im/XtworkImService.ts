@@ -355,6 +355,144 @@ export const makeDeliverySync = (
   return { sync, clearCaches };
 };
 
+const callHost = (host: DeliveryWorkerHost, method: string, params: BridgePayload) =>
+  tryWork((signal) => host.request(method, params, signal));
+
+export const makeBridgeEventHandler = (
+  host: DeliveryWorkerHost,
+  dispatch: ImDispatcher,
+  leaders: LeaderStore,
+) =>
+  Effect.fnUntraced(function* ({ event, payload }: BridgeEvent) {
+    if (event === "connection.state") {
+      const connId = typeof payload.connectionId === "string" ? payload.connectionId : "";
+      if (connId && host.available) {
+        const binding = yield* leaders.ensureBinding(connId, DEFAULT_LEADER_ID);
+        const ownerLeader = yield* leaders.getLeader(binding.leaderId);
+        const desiredPaused = ownerLeader?.status === "paused";
+        const needsSync =
+          payload.leaderId !== binding.leaderId ||
+          payload.bindingId !== binding.bindingId ||
+          payload.bindingEpoch !== binding.epoch ||
+          Boolean(payload.leaderPaused) !== desiredPaused;
+        if (needsSync) {
+          yield* callHost(host, "connections.syncBindings", {
+            bindings: [
+              {
+                connectionId: connId,
+                leaderId: binding.leaderId,
+                bindingId: binding.bindingId,
+                bindingEpoch: binding.epoch,
+                leaderPaused: desiredPaused,
+                pauseGeneration: ownerLeader?.pauseGeneration ?? 0,
+              },
+            ],
+            leaderPauseGenerations: { [binding.leaderId]: ownerLeader?.pauseGeneration ?? 0 },
+          }).pipe(Effect.ignore);
+        }
+      }
+      return;
+    }
+    if (event === "inbound.dispatch") {
+      // S23: Trust ONLY the bridge-stamped `pauseGeneration` (captured when the bridge emitted
+      // this dispatch) — never re-stamp with T3's newer generation on ingress!
+      const bridgePauseGen =
+        typeof payload.pauseGeneration === "number" && Number.isInteger(payload.pauseGeneration)
+          ? payload.pauseGeneration
+          : undefined;
+      const accepted = yield* dispatch.accept(payload, bridgePauseGen).pipe(Effect.result);
+      if (accepted._tag === "Failure") {
+        // S4/S14/S23: If a trigger raced with Leader pause (or pause -> resume), defer ONLY the
+        // stamped inbound message and sync the connection's CURRENT active binding + pauseGeneration.
+        if (containsLeaderPausedError(accepted.failure)) {
+          const connId = typeof payload.connectionId === "string" ? payload.connectionId : undefined;
+          const idempotencyKey = typeof payload.idempotencyKey === "string" ? payload.idempotencyKey : undefined;
+          if (idempotencyKey) {
+            yield* callHost(host, "inbound.settle", { idempotencyKey, event: "pause" }).pipe(Effect.ignore);
+          }
+          if (connId) {
+            const activeBinding = yield* leaders.activeBindingForConnection(connId).pipe(Effect.orElseSucceed(() => undefined));
+            const currentBinding =
+              activeBinding ?? (yield* leaders.ensureBinding(connId, DEFAULT_LEADER_ID).pipe(Effect.orElseSucceed(() => undefined)));
+            if (currentBinding) {
+              const currentLeader = yield* leaders.getLeader(currentBinding.leaderId).pipe(Effect.orElseSucceed(() => undefined));
+              const currentPaused = currentLeader?.status === "paused";
+              const currentPauseGen = currentLeader?.pauseGeneration ?? 0;
+              yield* callHost(host, "connections.syncBindings", {
+                bindings: [
+                  {
+                    connectionId: connId,
+                    leaderId: currentBinding.leaderId,
+                    bindingId: currentBinding.bindingId,
+                    bindingEpoch: currentBinding.epoch,
+                    leaderPaused: currentPaused,
+                    pauseGeneration: currentPauseGen,
+                  },
+                ],
+                leaderPauseGenerations: { [currentBinding.leaderId]: currentPauseGen },
+              }).pipe(Effect.ignore);
+            }
+          }
+          return;
+        }
+        return yield* accepted.failure;
+      }
+      const { threadId, turnId, inbound } = accepted.success;
+      yield* callHost(host, "inbound.ack", {
+        idempotencyKey: inbound.key, t3ThreadId: threadId, t3TurnId: turnId,
+      });
+      return;
+    }
+    if (payload.senderRole !== "owner" && payload.verifiedOwner !== true) return;
+    if (typeof payload.connectionId !== "string" || typeof payload.chatId !== "string") return;
+    const activeBinding = yield* leaders.activeBindingForConnection(payload.connectionId).pipe(
+      Effect.orElseSucceed(() => undefined),
+    );
+    const rawExplicitThread = typeof payload.threadId === "string" && leaders.isProtectedThreadSync(payload.threadId)
+      ? payload.threadId
+      : undefined;
+    // S19: Verify an explicit thread pointer matches the connection's CURRENT binding before trusting it!
+    let verifiedExplicitThread: string | undefined;
+    if (rawExplicitThread) {
+      const ctx = yield* dispatch.firstContext(ThreadId.make(rawExplicitThread));
+      const bindingMatches =
+        ctx !== undefined &&
+        ctx.connectionId === payload.connectionId &&
+        ctx.chatId === payload.chatId &&
+        (activeBinding === undefined ||
+          ((ctx.leaderId ?? DEFAULT_LEADER_ID) === activeBinding.leaderId &&
+            (ctx.bindingEpoch == null || ctx.bindingEpoch === activeBinding.epoch) &&
+            (ctx.bindingId == null || ctx.bindingId === activeBinding.bindingId)));
+      if (bindingMatches) verifiedExplicitThread = rawExplicitThread;
+    }
+    const candidates = verifiedExplicitThread
+      ? [{ threadId: verifiedExplicitThread }]
+      : yield* dispatch.unsettledForChat(payload.connectionId, payload.chatId);
+    const interrupted = new Set<string>();
+    for (const candidate of candidates) {
+      if (interrupted.has(candidate.threadId)) continue;
+      interrupted.add(candidate.threadId);
+      const threadId = ThreadId.make(candidate.threadId);
+      const context = yield* dispatch.firstContext(threadId);
+      if (context === undefined || context.connectionId !== payload.connectionId || context.chatId !== payload.chatId) continue;
+      if (
+        activeBinding !== undefined &&
+        ((context.leaderId ?? DEFAULT_LEADER_ID) !== activeBinding.leaderId ||
+          (context.bindingEpoch != null && context.bindingEpoch !== activeBinding.epoch))
+      ) {
+        continue;
+      }
+      const { runs } = yield* dispatch.orchestrator.getThreadRecords(threadId, ["runs"], { runStatuses: activeStatuses });
+      const run = runs.at(-1);
+      if (run === undefined) continue;
+      yield* dispatch.orchestrator.dispatch({
+        type: "run.interrupt", threadId, runId: run.id,
+        commandId: CommandId.make(`im-stop:${hashArgs([payload.connectionId, payload.platformMsgId ?? "stop", run.id])}`),
+        reason: "IM owner requested /stop.",
+      });
+    }
+  });
+
 const makeDeliveryWorker = (host: XtworkImBridgeHost, dispatch: ImDispatcher, hasReplySucceeded: (turnId: string) => boolean) => {
   const { sync, clearCaches } = makeDeliverySync(host, dispatch, hasReplySucceeded);
   return Effect.gen(function* () {
@@ -433,7 +571,8 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
   ) {
     const defaultLdr = yield* leaders.ensureDefaultLeader();
     const allLeaders = yield* leaders.listLeaders();
-    const leaderStatusById = new Map(allLeaders.map((l) => [l.id, l.status]));
+    const leaderById = new Map(allLeaders.map((l) => [l.id, l]));
+    const leaderPauseGenerations = Object.fromEntries(allLeaders.map((l) => [l.id, l.pauseGeneration]));
     const listed = yield* tryWork((signal) => callRaw("connections.list", {}, signal)).pipe(
       Effect.map((val) => (isRecord(val) && Array.isArray(val.connections) ? val.connections : [])),
       Effect.orElseSucceed(() => []),
@@ -442,13 +581,15 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
     for (const conn of listed) {
       if (!isRecord(conn) || typeof conn.id !== "string") continue;
       const binding = yield* leaders.ensureBinding(conn.id, DEFAULT_LEADER_ID);
-      const leaderPaused = leaderStatusById.get(binding.leaderId) === "paused";
+      const leaderRecord = leaderById.get(binding.leaderId);
+      const leaderPaused = leaderRecord?.status === "paused";
       bindingsPayload.push({
         connectionId: conn.id,
         leaderId: binding.leaderId,
         bindingId: binding.bindingId,
         bindingEpoch: binding.epoch,
         leaderPaused,
+        pauseGeneration: leaderRecord?.pauseGeneration ?? 0,
       });
     }
     yield* tryWork((signal) =>
@@ -456,7 +597,9 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
         "connections.syncBindings",
         {
           bindings: bindingsPayload,
+          leaderPauseGenerations,
           defaultLeaderPaused: defaultLdr.status === "paused",
+          defaultLeaderPauseGeneration: defaultLdr.pauseGeneration,
           ...(triggerReplay ? { triggerReplay: true } : {}),
         },
         signal,
@@ -476,18 +619,7 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
             if (events.length > 200) events.shift();
           }
           if (event === "inbound.dispatch" || event === "inbound.stop" || event === "connection.state") {
-            const stampedPauseGen =
-              event === "inbound.dispatch"
-                ? leaders.getPauseGenerationSync(
-                    typeof payload.leaderId === "string" && payload.leaderId ? payload.leaderId : DEFAULT_LEADER_ID,
-                  )
-                : undefined;
-            Queue.offerUnsafe(
-              queue,
-              stampedPauseGen !== undefined
-                ? { ...item, payload: { ...payload, __xtworkPauseGeneration: stampedPauseGen } }
-                : item,
-            );
+            Queue.offerUnsafe(queue, item);
           }
         },
         async (callRaw) => {
@@ -500,131 +632,7 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
     (host) => Effect.promise(() => host.close()),
   );
 
-  const handle = Effect.fnUntraced(function* ({ event, payload }: BridgeEvent) {
-    if (event === "connection.state") {
-      const connId = typeof payload.connectionId === "string" ? payload.connectionId : "";
-      if (connId && host.available) {
-        const binding = yield* leaders.ensureBinding(connId, DEFAULT_LEADER_ID);
-        const ownerLeader = yield* leaders.getLeader(binding.leaderId);
-        const desiredPaused = ownerLeader?.status === "paused";
-        const needsSync =
-          payload.leaderId !== binding.leaderId ||
-          payload.bindingId !== binding.bindingId ||
-          payload.bindingEpoch !== binding.epoch ||
-          Boolean(payload.leaderPaused) !== desiredPaused;
-        if (needsSync) {
-          yield* call(host, "connections.syncBindings", {
-            bindings: [
-              {
-                connectionId: connId,
-                leaderId: binding.leaderId,
-                bindingId: binding.bindingId,
-                bindingEpoch: binding.epoch,
-                leaderPaused: desiredPaused,
-              },
-            ],
-          }).pipe(Effect.ignore);
-        }
-      }
-      return;
-    }
-    if (event === "inbound.dispatch") {
-      const observedPauseGen =
-        typeof payload.__xtworkPauseGeneration === "number" ? payload.__xtworkPauseGeneration : undefined;
-      const cleanPayload =
-        observedPauseGen !== undefined
-          ? Object.fromEntries(Object.entries(payload).filter(([k]) => k !== "__xtworkPauseGeneration"))
-          : payload;
-      const accepted = yield* dispatch.accept(cleanPayload, observedPauseGen).pipe(Effect.result);
-      if (accepted._tag === "Failure") {
-        // S4/S14: If a trigger raced with Leader pause, defer ONLY the stamped inbound message!
-        // Derive any connection-wide pause flag strictly from the connection's CURRENT active
-        // binding so a historical dispatch from paused Leader A NEVER pauses active Leader B.
-        if (containsLeaderPausedError(accepted.failure)) {
-          const connId = typeof payload.connectionId === "string" ? payload.connectionId : undefined;
-          const idempotencyKey = typeof payload.idempotencyKey === "string" ? payload.idempotencyKey : undefined;
-          if (idempotencyKey) {
-            yield* call(host, "inbound.settle", { idempotencyKey, event: "pause" }).pipe(Effect.ignore);
-          }
-          if (connId) {
-            const activeBinding = yield* leaders.activeBindingForConnection(connId).pipe(Effect.orElseSucceed(() => undefined));
-            const currentBinding =
-              activeBinding ?? (yield* leaders.ensureBinding(connId, DEFAULT_LEADER_ID).pipe(Effect.orElseSucceed(() => undefined)));
-            if (currentBinding) {
-              const currentLeader = yield* leaders.getLeader(currentBinding.leaderId).pipe(Effect.orElseSucceed(() => undefined));
-              const currentPaused = currentLeader?.status === "paused";
-              yield* call(host, "connections.syncBindings", {
-                bindings: [
-                  {
-                    connectionId: connId,
-                    leaderId: currentBinding.leaderId,
-                    bindingId: currentBinding.bindingId,
-                    bindingEpoch: currentBinding.epoch,
-                    leaderPaused: currentPaused,
-                  },
-                ],
-              }).pipe(Effect.ignore);
-            }
-          }
-          return;
-        }
-        return yield* accepted.failure;
-      }
-      const { threadId, turnId, inbound } = accepted.success;
-      yield* call(host, "inbound.ack", {
-        idempotencyKey: inbound.key, t3ThreadId: threadId, t3TurnId: turnId,
-      });
-      return;
-    }
-    if (payload.senderRole !== "owner" && payload.verifiedOwner !== true) return;
-    if (typeof payload.connectionId !== "string" || typeof payload.chatId !== "string") return;
-    const activeBinding = yield* leaders.activeBindingForConnection(payload.connectionId).pipe(
-      Effect.orElseSucceed(() => undefined),
-    );
-    const rawExplicitThread = typeof payload.threadId === "string" && leaders.isProtectedThreadSync(payload.threadId)
-      ? payload.threadId
-      : undefined;
-    // S19: Verify an explicit thread pointer matches the connection's CURRENT binding before trusting it!
-    let verifiedExplicitThread: string | undefined;
-    if (rawExplicitThread) {
-      const ctx = yield* dispatch.firstContext(ThreadId.make(rawExplicitThread));
-      const bindingMatches =
-        ctx !== undefined &&
-        ctx.connectionId === payload.connectionId &&
-        ctx.chatId === payload.chatId &&
-        (activeBinding === undefined ||
-          ((ctx.leaderId ?? DEFAULT_LEADER_ID) === activeBinding.leaderId &&
-            (ctx.bindingEpoch == null || ctx.bindingEpoch === activeBinding.epoch) &&
-            (ctx.bindingId == null || ctx.bindingId === activeBinding.bindingId)));
-      if (bindingMatches) verifiedExplicitThread = rawExplicitThread;
-    }
-    const candidates = verifiedExplicitThread
-      ? [{ threadId: verifiedExplicitThread }]
-      : yield* dispatch.unsettledForChat(payload.connectionId, payload.chatId);
-    const interrupted = new Set<string>();
-    for (const candidate of candidates) {
-      if (interrupted.has(candidate.threadId)) continue;
-      interrupted.add(candidate.threadId);
-      const threadId = ThreadId.make(candidate.threadId);
-      const context = yield* dispatch.firstContext(threadId);
-      if (context === undefined || context.connectionId !== payload.connectionId || context.chatId !== payload.chatId) continue;
-      if (
-        activeBinding !== undefined &&
-        ((context.leaderId ?? DEFAULT_LEADER_ID) !== activeBinding.leaderId ||
-          (context.bindingEpoch != null && context.bindingEpoch !== activeBinding.epoch))
-      ) {
-        continue;
-      }
-      const { runs } = yield* dispatch.orchestrator.getThreadRecords(threadId, ["runs"], { runStatuses: activeStatuses });
-      const run = runs.at(-1);
-      if (run === undefined) continue;
-      yield* dispatch.orchestrator.dispatch({
-        type: "run.interrupt", threadId, runId: run.id,
-        commandId: CommandId.make(`im-stop:${hashArgs([payload.connectionId, payload.platformMsgId ?? "stop", run.id])}`),
-        reason: "IM owner requested /stop.",
-      });
-    }
-  });
+  const handle = makeBridgeEventHandler(host, dispatch, leaders);
 
   yield* forkParked(Queue.take(queue).pipe(
     Effect.flatMap(handle),
@@ -708,7 +716,8 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
     : [];
   // Ensure every active bridge connection has a Leader binding & synced pause state (S4/S6).
   const allLeaders = yield* service.leaders.listLeaders();
-  const leaderStatusById = new Map(allLeaders.map((l) => [l.id, l.status]));
+  const leaderById = new Map(allLeaders.map((l) => [l.id, l]));
+  const leaderPauseGenerations = Object.fromEntries(allLeaders.map((l) => [l.id, l.pauseGeneration]));
   const toSync: Array<Record<string, unknown>> = [];
   for (const conn of rawConnections) {
     if (isRecord(conn) && typeof conn.id === "string") {
@@ -716,7 +725,8 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
         Effect.orElseSucceed(() => undefined),
       );
       if (binding) {
-        const desiredPaused = leaderStatusById.get(binding.leaderId) === "paused";
+        const leaderRec = leaderById.get(binding.leaderId);
+        const desiredPaused = leaderRec?.status === "paused";
         if (
           conn.leaderId !== binding.leaderId ||
           conn.bindingId !== binding.bindingId ||
@@ -729,13 +739,17 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
             bindingId: binding.bindingId,
             bindingEpoch: binding.epoch,
             leaderPaused: desiredPaused,
+            pauseGeneration: leaderRec?.pauseGeneration ?? 0,
           });
         }
       }
     }
   }
   if (service.host?.available && toSync.length > 0) {
-    yield* call(service.host, "connections.syncBindings", { bindings: toSync }).pipe(Effect.ignore);
+    yield* call(service.host, "connections.syncBindings", {
+      bindings: toSync,
+      leaderPauseGenerations,
+    }).pipe(Effect.ignore);
   }
   const refreshedBindings = yield* service.leaders.listBindings(leader.id);
   const boundConnectionIds = new Set(refreshedBindings.map((b) => b.connectionId));
@@ -944,17 +958,24 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
       const bindings = yield* service.leaders.listBindings(updated.id);
       let pausedPending: unknown[] = [];
       if (service.host?.available) {
-        // S4: Reconcile binding + leaderPaused for all bound connections (and default Leader fallback).
+        // S4/S23: Reconcile binding + leaderPaused + pauseGeneration for all bound connections.
         const bindingsPayload = bindings.map((b) => ({
           connectionId: b.connectionId,
           leaderId: b.leaderId,
           bindingId: b.bindingId,
           bindingEpoch: b.epoch,
           leaderPaused: nextPaused,
+          pauseGeneration: updated.pauseGeneration,
         }));
         yield* call(service.host, "connections.syncBindings", {
           bindings: bindingsPayload,
-          ...(updated.id === DEFAULT_LEADER_ID ? { defaultLeaderPaused: nextPaused } : {}),
+          leaderPauseGenerations: { [updated.id]: updated.pauseGeneration },
+          ...(updated.id === DEFAULT_LEADER_ID
+            ? {
+                defaultLeaderPaused: nextPaused,
+                defaultLeaderPauseGeneration: updated.pauseGeneration,
+              }
+            : {}),
         }).pipe(Effect.ignore);
         const listed = yield* call(service.host, "paused.list", { leaderId: updated.id }).pipe(
           Effect.orElseSucceed(() => ({})),
@@ -997,6 +1018,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
       return yield* call(service.host, "paused.decide", {
         ...params,
         leaderId: leader.id,
+        pauseGeneration: leader.pauseGeneration,
         messageIds: scopedIds,
       }).pipe(
         Effect.match({ onSuccess: (val) => response(val), onFailure: (err) => failure(err.message, 400) }),
