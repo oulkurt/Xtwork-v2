@@ -317,9 +317,127 @@ export function keychainSecrets(
     };
   };
 
-  const parts = (stored: string | undefined) => {
-    const match = stored?.match(/^parts:(\d+)$/);
-    return match ? Number(match[1]) : 0;
+  interface KeychainChunkSet {
+    readonly gen: number | null;
+    readonly count: number;
+  }
+
+  type ParsedKeychainManifest =
+    | { readonly kind: "b64"; readonly b64: string; readonly prev: readonly KeychainChunkSet[] }
+    | {
+        readonly kind: "chunks";
+        readonly active: KeychainChunkSet;
+        readonly prev: readonly KeychainChunkSet[];
+      }
+    | { readonly kind: "legacy"; readonly raw: string; readonly prev: readonly KeychainChunkSet[] };
+
+  const formatChunkSet = (spec: KeychainChunkSet): string =>
+    spec.gen === null ? `legacy:${spec.count}` : `g${spec.gen}:${spec.count}`;
+
+  const chunkAccountName = (ref: string, spec: KeychainChunkSet, index: number): string =>
+    spec.gen === null ? `${ref}#${index}` : `${ref}#g${spec.gen}#${index}`;
+
+  const parsePrevList = (rawPrev: string): KeychainChunkSet[] => {
+    const out: KeychainChunkSet[] = [];
+    for (const token of rawPrev.split(",")) {
+      const trimmed = token.trim();
+      if (!trimmed) continue;
+      const genMatch = /^g(\d+):(\d+)$/.exec(trimmed);
+      if (genMatch) {
+        const count = Number(genMatch[2]);
+        if (count > 0) out.push({ gen: Number(genMatch[1]), count });
+        continue;
+      }
+      const legacyMatch = /^legacy:(\d+)$/.exec(trimmed);
+      if (legacyMatch) {
+        const count = Number(legacyMatch[1]);
+        if (count > 0) out.push({ gen: null, count });
+      }
+    }
+    return out;
+  };
+
+  const parseManifest = (stored: string): ParsedKeychainManifest => {
+    const prevMarker = ";prev:";
+    const prevIdx = stored.indexOf(prevMarker);
+    const head = prevIdx >= 0 ? stored.slice(0, prevIdx) : stored;
+    const prev = prevIdx >= 0 ? parsePrevList(stored.slice(prevIdx + prevMarker.length)) : [];
+
+    const genParts = /^parts:g(\d+):(\d+)$/.exec(head);
+    if (genParts) {
+      return {
+        kind: "chunks",
+        active: { gen: Number(genParts[1]), count: Number(genParts[2]) },
+        prev,
+      };
+    }
+    const legacyParts = /^parts:(\d+)$/.exec(head);
+    if (legacyParts) {
+      return {
+        kind: "chunks",
+        active: { gen: null, count: Number(legacyParts[1]) },
+        prev,
+      };
+    }
+    if (head.startsWith("b64:")) {
+      return { kind: "b64", b64: head.slice(4), prev };
+    }
+    return { kind: "legacy", raw: stored, prev: [] };
+  };
+
+  const dedupeChunkSets = (sets: readonly KeychainChunkSet[]): KeychainChunkSet[] => {
+    const seen = new Set<string>();
+    const out: KeychainChunkSet[] = [];
+    for (const spec of sets) {
+      if (spec.count <= 0) continue;
+      const key = formatChunkSet(spec);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(spec);
+    }
+    return out;
+  };
+
+  const maxGeneration = (manifest: ParsedKeychainManifest | null): number => {
+    if (!manifest) return 0;
+    let max = 0;
+    if (manifest.kind === "chunks" && manifest.active.gen !== null) {
+      max = Math.max(max, manifest.active.gen);
+    }
+    for (const prev of manifest.prev) {
+      if (prev.gen !== null) max = Math.max(max, prev.gen);
+    }
+    return max;
+  };
+
+  const runBatchAdd = async (commands: readonly string[]): Promise<void> => {
+    const writeResult = await run(SECURITY, ["-i"], `${commands.join("\n")}\n`);
+    if (isCommandInterrupted(writeResult)) {
+      throw new SecretStoreUnavailableError(
+        "SECRET_STORE_UNAVAILABLE",
+        `macOS Keychain write ${interruptedReason(writeResult)}`,
+      );
+    }
+    if (writeResult.code === 127) {
+      throw new SecretStoreUnavailableError(
+        "SECRET_STORE_UNAVAILABLE",
+        "macOS Keychain tool (/usr/bin/security) is unavailable",
+      );
+    }
+    if (writeResult.code !== 0) {
+      const detail = sanitizeErrorDetail(writeResult.stderr);
+      const suffix = detail ? ` (${detail})` : ` (exit code ${writeResult.code})`;
+      if (isMacOsDenied(writeResult.code, writeResult.stderr)) {
+        throw new SecretStoreUnavailableError(
+          "SECRET_ACCESS_DENIED",
+          `macOS Keychain denied saving credentials${suffix}`,
+        );
+      }
+      throw new SecretStoreUnavailableError(
+        "SECRET_WRITE_VERIFY_FAILED",
+        `Could not write credentials to macOS Keychain${suffix}`,
+      );
+    }
   };
 
   /**
@@ -376,12 +494,12 @@ export function keychainSecrets(
     const raw = await readRaw(ref);
     if (raw.status !== "found") return raw;
 
-    const stored = raw.value;
-    const count = parts(stored);
-    if (count > 0) {
+    const manifest = parseManifest(raw.value);
+    if (manifest.kind === "chunks") {
+      const { active } = manifest;
       let joined = "";
-      for (let i = 1; i <= count; i++) {
-        const part = await readRaw(`${ref}#${i}`);
+      for (let i = 1; i <= active.count; i++) {
+        const part = await readRaw(chunkAccountName(ref, active, i));
         if (part.status === "unavailable" || part.status === "denied") {
           return part;
         }
@@ -390,7 +508,7 @@ export function keychainSecrets(
             status: "unavailable",
             error: new SecretStoreUnavailableError(
               "SECRET_DECRYPT_FAILED",
-              `macOS Keychain chunk ${i}/${count} is missing for credential entry`,
+              `macOS Keychain chunk ${i}/${active.count} is missing for credential entry`,
             ),
           };
         }
@@ -398,13 +516,13 @@ export function keychainSecrets(
       }
       return { status: "found", value: Buffer.from(joined, "base64").toString("utf8") };
     }
-    if (stored.startsWith("b64:")) {
-      return { status: "found", value: Buffer.from(stored.slice(4), "base64").toString("utf8") };
+    if (manifest.kind === "b64") {
+      return { status: "found", value: Buffer.from(manifest.b64, "base64").toString("utf8") };
     }
-    if (/^(?:[0-9a-f]{2})+$/i.test(stored)) {
-      return { status: "found", value: Buffer.from(stored, "hex").toString("utf8") };
+    if (/^(?:[0-9a-f]{2})+$/i.test(manifest.raw)) {
+      return { status: "found", value: Buffer.from(manifest.raw, "hex").toString("utf8") };
     }
-    return { status: "found", value: stored };
+    return { status: "found", value: manifest.raw };
   };
 
   const store: SecretStore = {
@@ -421,57 +539,77 @@ export function keychainSecrets(
       if (existing.status === "unavailable" || existing.status === "denied") {
         throw existing.error;
       }
-      const previous = existing.status === "found" ? parts(existing.value) : 0;
+      const prevManifest = existing.status === "found" ? parseManifest(existing.value) : null;
+      const prevToCleanup = dedupeChunkSets([
+        ...(prevManifest ? prevManifest.prev : []),
+        ...(prevManifest && prevManifest.kind === "chunks" ? [prevManifest.active] : []),
+      ]);
+      const nextGen = maxGeneration(prevManifest) + 1;
+
       const encoded = Buffer.from(value, "utf8").toString("base64");
       const add = (account: string, data: string) =>
         `add-generic-password -s ${quote(service)} -a ${quote(account)} -U -w "${data}"`;
-      const commands: string[] = [];
-      let count = 0;
+
+      let cleanHead: string;
       if (encoded.length <= CHUNK) {
-        commands.push(add(ref, `b64:${encoded}`));
+        cleanHead = `b64:${encoded}`;
       } else {
+        const chunkCommands: string[] = [];
+        const expectedSlices: Array<{ readonly account: string; readonly slice: string }> = [];
+        let count = 0;
         for (let at = 0; at < encoded.length; at += CHUNK) {
           count++;
-          commands.push(add(`${ref}#${count}`, encoded.slice(at, at + CHUNK)));
+          const account = chunkAccountName(ref, { gen: nextGen, count }, count);
+          const slice = encoded.slice(at, at + CHUNK);
+          chunkCommands.push(add(account, slice));
+          expectedSlices.push({ account, slice });
         }
-        commands.push(add(ref, `parts:${count}`));
-      }
-      const writeResult = await run(SECURITY, ["-i"], `${commands.join("\n")}\n`);
-      if (isCommandInterrupted(writeResult)) {
-        throw new SecretStoreUnavailableError(
-          "SECRET_STORE_UNAVAILABLE",
-          `macOS Keychain write ${interruptedReason(writeResult)}`,
-        );
-      }
-      if (writeResult.code === 127) {
-        throw new SecretStoreUnavailableError(
-          "SECRET_STORE_UNAVAILABLE",
-          "macOS Keychain tool (/usr/bin/security) is unavailable",
-        );
-      }
-      if (writeResult.code !== 0) {
-        const detail = sanitizeErrorDetail(writeResult.stderr);
-        const suffix = detail ? ` (${detail})` : ` (exit code ${writeResult.code})`;
-        if (isMacOsDenied(writeResult.code, writeResult.stderr)) {
-          throw new SecretStoreUnavailableError(
-            "SECRET_ACCESS_DENIED",
-            `macOS Keychain denied saving credentials${suffix}`,
-          );
+        // Write and verify every new generation-tagged chunk BEFORE updating the root manifest.
+        await runBatchAdd(chunkCommands);
+        for (const { account, slice } of expectedSlices) {
+          const check = await readRaw(account);
+          if (check.status === "unavailable" || check.status === "denied") {
+            throw check.error;
+          }
+          if (check.status !== "found" || check.value !== slice) {
+            throw new SecretStoreUnavailableError(
+              "SECRET_WRITE_VERIFY_FAILED",
+              "Could not verify new chunk written to macOS Keychain",
+            );
+          }
         }
-        throw new SecretStoreUnavailableError(
-          "SECRET_WRITE_VERIFY_FAILED",
-          `Could not write credentials to macOS Keychain${suffix}`,
-        );
+        cleanHead = `parts:g${nextGen}:${count}`;
       }
+
+      // Two-phase manifest: record all previous chunk sets alongside the new value UNTIL every
+      // old chunk is individually deleted and read-back verified `missing`. If cleanup fails,
+      // the manifest still locates every orphaned chunk for a subsequent retry or `delete()`.
+      const manifestWithPrev =
+        prevToCleanup.length > 0
+          ? `${cleanHead};prev:${prevToCleanup.map(formatChunkSet).join(",")}`
+          : cleanHead;
+      await runBatchAdd([add(ref, manifestWithPrev)]);
       if ((await store.get(ref)) !== value) {
         throw new SecretStoreUnavailableError(
           "SECRET_WRITE_VERIFY_FAILED",
           "Could not save and verify credentials in macOS Keychain",
         );
       }
-      // Clean up any trailing chunks from a previous larger value individually & verified.
-      for (let i = count + 1; i <= previous; i++) {
-        await deleteOneAccount(`${ref}#${i}`);
+
+      if (prevToCleanup.length > 0) {
+        for (const spec of prevToCleanup) {
+          for (let i = 1; i <= spec.count; i++) {
+            await deleteOneAccount(chunkAccountName(ref, spec, i));
+          }
+        }
+        // Phase 3: strip `;prev:` ONLY AFTER every previous chunk has been confirmed missing.
+        await runBatchAdd([add(ref, cleanHead)]);
+        if ((await store.get(ref)) !== value) {
+          throw new SecretStoreUnavailableError(
+            "SECRET_WRITE_VERIFY_FAILED",
+            "Could not finalize cleaned manifest in macOS Keychain",
+          );
+        }
       }
     },
     async delete(ref) {
@@ -483,11 +621,17 @@ export function keychainSecrets(
       if (existing.status === "missing") {
         return;
       }
-      const count = parts(existing.value);
-      // Delete and verify EACH chunk individually BEFORE deleting the root manifest, so a failed
-      // chunk delete never drops the manifest and orphans remaining chunk secrets.
-      for (let i = 1; i <= count; i++) {
-        await deleteOneAccount(`${ref}#${i}`);
+      const manifest = parseManifest(existing.value);
+      const chunkSetsToDelete = dedupeChunkSets([
+        ...(manifest.kind === "chunks" ? [manifest.active] : []),
+        ...manifest.prev,
+      ]);
+      // Delete and verify EACH active and pending-previous chunk individually BEFORE deleting
+      // the root manifest, so a failed chunk delete never drops the manifest and orphans secrets.
+      for (const spec of chunkSetsToDelete) {
+        for (let i = 1; i <= spec.count; i++) {
+          await deleteOneAccount(chunkAccountName(ref, spec, i));
+        }
       }
       await deleteOneAccount(ref);
     },

@@ -123,11 +123,11 @@ describe("runtime/secretStore single-source hardened OS SecretStore (ADR-012 §3
     await store.delete("team-key");
     assert.deepEqual(await store.read?.("team-key"), { status: "missing" });
 
-    // Chunked delete removes chunks 1..N before root manifest
+    // Chunked delete removes generation-tagged chunks 1..N before root manifest
     await store.set("large-key", "X".repeat(5000));
     deleteOrder.length = 0;
     await store.delete("large-key");
-    assert.deepEqual(deleteOrder, ["large-key#1", "large-key#2", "large-key#3", "large-key"]);
+    assert.deepEqual(deleteOrder, ["large-key#g1#1", "large-key#g1#2", "large-key#g1#3", "large-key"]);
   });
 
   it("Linux secret-tool rejects timed-out/signaled lookups as unavailable and handles clear exit-1 on absent entries", async () => {

@@ -14,7 +14,7 @@ index e06fc7e0..0897507f 100644
        ? yield* moveInlineSettingsSecrets(settingsWithRuntime)
        : folded;
 diff --git a/packages/provider-pi/src/server/adapter.test.ts b/packages/provider-pi/src/server/adapter.test.ts
-index 4af5beda..80bb054f 100644
+index 4af5beda..4a018ed5 100644
 --- a/packages/provider-pi/src/server/adapter.test.ts
 +++ b/packages/provider-pi/src/server/adapter.test.ts
 @@ -56,7 +56,10 @@ import {
@@ -103,7 +103,7 @@ index 4af5beda..80bb054f 100644
      promptThinkingLevels,
      promptModels,
      changeNatively: (change) => {
-@@ -7183,3 +7209,131 @@ process.stdout.write('{"type":"ready"}\\n');
+@@ -7183,3 +7209,136 @@ process.stdout.write('{"type":"ready"}\\n');
        }).pipe(Effect.provide(NodeServices.layer)),
    );
  });
@@ -184,6 +184,11 @@ index 4af5beda..80bb054f 100644
 +        yield* completeTurn(1, "xtwork/standard");
 +        assert.equal(fake.promptModels[0], "chan-a/model-a");
 +
++        // 1b. Native Pi model drift after stale-selection fallback MUST still be detected and corrected on next turn (#12)!
++        fake.changeNatively({ model: "chan-other/model-other" });
++        yield* completeTurn(2, "xtwork/standard");
++        assert.equal(fake.promptModels[1], "chan-a/model-a");
++
 +        // 2. Update models.json + settings.json to switch to `chan-b/model-b`, but fail `/xtwork-reload-models` first.
 +        yield* fileSystem.writeFileString(
 +          modelsPath,
@@ -195,15 +200,15 @@ index 4af5beda..80bb054f 100644
 +        );
 +        fake.queueModels([{ provider: "chan-b", id: "model-b", contextWindow: 128000 }]);
 +        fake.failNextReload();
-+        yield* completeTurn(2, "chan-a/model-a");
-+
-+        // Because reload failed on turn 2, snapshot MUST NOT be acknowledged -> turn 3 retries reload,
-+        // and failing `get_available_models` on turn 3 ALSO leaves snapshot unacknowledged!
-+        fake.failNextAvailableModels();
 +        yield* completeTurn(3, "chan-a/model-a");
 +
-+        // Turn 4 retries reload again, BOTH succeed, and stale explicit `chan-a/model-a` reconciles to `chan-b/model-b`!
++        // Because reload failed on turn 3, snapshot MUST NOT be acknowledged -> turn 4 retries reload,
++        // and failing `get_available_models` on turn 4 ALSO leaves snapshot unacknowledged!
++        fake.failNextAvailableModels();
 +        yield* completeTurn(4, "chan-a/model-a");
++
++        // Turn 5 retries reload again, BOTH succeed, and stale explicit `chan-a/model-a` reconciles to `chan-b/model-b`!
++        yield* completeTurn(5, "chan-a/model-a");
 +        assert.equal(fake.promptModels[fake.promptModels.length - 1], "chan-b/model-b");
 +
 +        const reloadCalls = fake
@@ -225,7 +230,7 @@ index 4af5beda..80bb054f 100644
 +          [],
 +          "turn-zero",
 +          modelSelection("chan-b/model-b"),
-+          5,
++          6,
 +        ).pipe(Effect.result);
 +        assert.isTrue(
 +          zeroResult._tag === "Failure" &&
@@ -236,7 +241,7 @@ index 4af5beda..80bb054f 100644
 +  );
 +});
 diff --git a/packages/provider-pi/src/server/adapter.ts b/packages/provider-pi/src/server/adapter.ts
-index 3befbaba..880856a2 100644
+index 3befbaba..42d1c14a 100644
 --- a/packages/provider-pi/src/server/adapter.ts
 +++ b/packages/provider-pi/src/server/adapter.ts
 @@ -79,7 +79,11 @@ import {
@@ -411,7 +416,7 @@ index 3befbaba..880856a2 100644
            if (appliedModel !== null && baselineModel !== null) {
              const restoredModel = yield* request({ type: "set_model", ...baselineModel });
              appliedThinking = null;
-@@ -3239,28 +3371,48 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+@@ -3239,28 +3371,57 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
            if (findReportedPiModel(modelSelection.model, discoveredModels) === undefined) {
              yield* discoverModels();
            }
@@ -456,6 +461,15 @@ index 3befbaba..880856a2 100644
 -            driver: PI_PROVIDER,
 -            providerSession: sessionEntity,
 -          });
++          // If a stale explicit selection reconciled to the previously applied fallback slug,
++          // check Pi's LIVE current model state so any native Pi model drift still triggers set_model.
++          if (!modelDrifted && !modelsReloaded && effectiveModelSlug === appliedModel) {
++            const liveState = yield* request({ type: "get_state" });
++            const liveModel = recordField(liveState, "model");
++            const livePiModel = `${recordString(liveModel, "provider")}/${recordString(liveModel, "id")}`;
++            modelDrifted = livePiModel !== effectiveModelSlug;
++            appliedThinking = recordString(liveState, "thinkingLevel") ?? null;
++          }
 +          if (modelDrifted || modelsReloaded || effectiveModelSlug !== appliedModel) {
 +            const selectedModel = yield* request({
 +              type: "set_model",

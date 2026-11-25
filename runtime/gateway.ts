@@ -372,6 +372,19 @@ const ALLOWED_PASSTHROUGH_HEADERS: Readonly<Record<GatewayApiKind, ReadonlySet<s
   ]),
 };
 
+function hasInvalidPercentEncoding(pathname: string): boolean {
+  for (const segment of pathname.split("/")) {
+    if (!segment.includes("%")) continue;
+    try {
+      const decoded = decodeURIComponent(segment);
+      if (decoded.includes("\0")) return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
 function safeDecodePathSegment(segment: string): string | null {
   try {
     const decoded = decodeURIComponent(segment);
@@ -578,10 +591,17 @@ function effectiveUpstreamModelId(model: GatewayModelConfig): string {
   return stripLegacyContextSuffix(model.upstreamModelId ?? model.id);
 }
 
+interface CompiledChannelOAuthBinding {
+  readonly provider: OAuthSubscriptionProvider;
+  readonly secretRef: string;
+  readonly generation: number;
+}
+
 interface CompiledChannel {
   readonly config: GatewayChannelConfig;
   readonly enabledModels: ReadonlyMap<string, GatewayModelConfig>;
   readonly allModels: ReadonlyMap<string, GatewayModelConfig>;
+  readonly oauthBinding?: CompiledChannelOAuthBinding;
 }
 
 interface DevFallbackRoute {
@@ -600,6 +620,7 @@ function compileRouteSnapshot(
   revision: number,
   channels: readonly GatewayChannelConfig[],
   devFallback: DevFallbackRoute | null,
+  fence: ChannelCredentialFence,
 ): GatewayRouteSnapshot {
   const map = new Map<string, CompiledChannel>();
   for (const ch of channels) {
@@ -613,13 +634,24 @@ function compileRouteSnapshot(
       if (
         ch.enabled &&
         normalizedModel.enabled &&
-        isCopilotModelPermitted(cleanId, ch.availableModelIds) &&
         isCopilotModelPermitted(targetUpstreamId, ch.availableModelIds)
       ) {
         enabledModels.set(cleanId, normalizedModel);
       }
     }
-    map.set(ch.id, { config: ch, enabledModels, allModels });
+    const oauthBinding: CompiledChannelOAuthBinding | undefined = ch.oauth
+      ? {
+          provider: ch.oauth.provider,
+          secretRef: ch.oauth.secretRef,
+          generation: fence.generation(ch.id),
+        }
+      : undefined;
+    map.set(ch.id, {
+      config: ch,
+      enabledModels,
+      allModels,
+      ...(oauthBinding !== undefined ? { oauthBinding } : {}),
+    });
   }
   return Object.freeze({ revision, channels: map, devFallback });
 }
@@ -629,7 +661,7 @@ function compileRouteSnapshot(
  * 1. `xiaotong-work-team/deepseek-flash` if enabled;
  * 2. First enabled model on `xiaotong-work-team`;
  * 3. First enabled model on any enabled channel (respecting Copilot `availableModelIds` against
- *    both local and effective upstream model IDs);
+ *    the resolved effective upstream model ID);
  * 4. `xtwork/standard` if dev fallback is active;
  * 5. `null` (zero-channel onboarding state).
  */
@@ -657,7 +689,6 @@ export function resolveFallbackModel(
       const targetUpstreamId = effectiveUpstreamModelId({ ...model, id: cleanId });
       if (
         model.enabled &&
-        isCopilotModelPermitted(cleanId, ch.availableModelIds) &&
         isCopilotModelPermitted(targetUpstreamId, ch.availableModelIds)
       ) {
         return formatModelSlug(ch.id, cleanId);
@@ -688,11 +719,7 @@ export function buildPiModelsJson(
       .map((m) => ({ ...m, id: stripLegacyContextSuffix(m.id) }))
       .filter((m) => {
         const targetUpstreamId = effectiveUpstreamModelId(m);
-        return (
-          m.enabled &&
-          isCopilotModelPermitted(m.id, ch.availableModelIds) &&
-          isCopilotModelPermitted(targetUpstreamId, ch.availableModelIds)
-        );
+        return m.enabled && isCopilotModelPermitted(targetUpstreamId, ch.availableModelIds);
       });
     if (activeModels.length === 0) continue;
 
@@ -880,41 +907,58 @@ function redactString(text: string, secrets: readonly string[]): string {
   return out;
 }
 
-/**
- * Compute the longest trailing suffix of `text` that is a proper prefix of any secret in `secrets`.
- * Normal SSE frames ending in `\n\n` or JSON braces match length 0 and flush with ZERO delay,
- * while secrets split across arbitrary chunk boundaries are held just long enough to be redacted.
- */
-function longestSecretPrefixSuffix(text: string, secrets: readonly string[]): number {
-  let maxHold = 0;
-  for (const secret of secrets) {
-    const limit = Math.min(text.length, secret.length - 1);
-    if (limit <= maxHold) continue;
-    const firstChar = secret[0]!;
-    const startSearch = text.length - limit;
-    let idx = text.indexOf(firstChar, startSearch);
+const REDACTED_BUFFER = Buffer.from(REDACTED_MARKER, "utf8");
+
+function redactBuffer(input: Buffer, secretBuffers: readonly Buffer[]): Buffer {
+  let buf = input;
+  for (const secret of secretBuffers) {
+    let idx = buf.indexOf(secret);
+    if (idx === -1) continue;
+    const parts: Buffer[] = [];
+    let cursor = 0;
     while (idx !== -1) {
-      const suffixLen = text.length - idx;
+      if (idx > cursor) parts.push(buf.subarray(cursor, idx));
+      parts.push(REDACTED_BUFFER);
+      cursor = idx + secret.byteLength;
+      idx = buf.indexOf(secret, cursor);
+    }
+    if (cursor < buf.byteLength) parts.push(buf.subarray(cursor));
+    buf = Buffer.concat(parts);
+  }
+  return buf;
+}
+
+/**
+ * Compute the longest trailing byte suffix of `buf` that is a proper prefix of any UTF-8 secret
+ * byte sequence in `secretBuffers`. Binary-safe so ALL forwarded responses (SSE, JSON, or
+ * `application/octet-stream`) redact secrets across arbitrary chunk boundaries with ZERO latency
+ * on normal SSE frames.
+ */
+function longestSecretPrefixSuffixBytes(buf: Buffer, secretBuffers: readonly Buffer[]): number {
+  let maxHold = 0;
+  for (const secret of secretBuffers) {
+    const limit = Math.min(buf.byteLength, secret.byteLength - 1);
+    if (limit <= maxHold) continue;
+    const firstByte = secret[0]!;
+    let idx = buf.indexOf(firstByte, buf.byteLength - limit);
+    while (idx !== -1) {
+      const suffixLen = buf.byteLength - idx;
       if (suffixLen <= maxHold) break;
-      if (secret.startsWith(text.slice(idx))) {
+      let match = true;
+      for (let i = 1; i < suffixLen; i++) {
+        if (buf[idx + i] !== secret[i]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
         maxHold = suffixLen;
         break;
       }
-      idx = text.indexOf(firstChar, idx + 1);
+      idx = buf.indexOf(firstByte, idx + 1);
     }
   }
   return maxHold;
-}
-
-function isBinaryContentType(contentType: string | null): boolean {
-  if (!contentType) return false;
-  const lower = contentType.toLowerCase();
-  return (
-    lower.startsWith("image/") ||
-    lower.startsWith("audio/") ||
-    lower.startsWith("video/") ||
-    lower.startsWith("application/octet-stream")
-  );
 }
 
 const ALLOWED_RESPONSE_HEADERS = [
@@ -947,12 +991,11 @@ async function streamUpstreamResponse(
     return;
   }
 
-  const shouldRedactStream =
-    redactionSecrets.length > 0 && !isBinaryContentType(upstream.headers.get("content-type"));
-  const decoder = shouldRedactStream ? new TextDecoder("utf-8", { fatal: false }) : null;
-  let carry = "";
+  // Redact ALL forwarded response bodies regardless of content-type (binary-safe Buffer scanning).
+  const secretBuffers = redactionSecrets.map((s) => Buffer.from(s, "utf8"));
+  let carry = Buffer.alloc(0);
 
-  const writeChunk = async (chunk: Uint8Array | string) => {
+  const writeChunk = async (chunk: Uint8Array) => {
     if (response.destroyed) return;
     const ok = response.write(chunk);
     if (!ok && !response.destroyed) {
@@ -972,24 +1015,26 @@ async function streamUpstreamResponse(
       if (done) break;
       if (!value || value.byteLength === 0) continue;
 
-      if (!shouldRedactStream || decoder === null) {
+      if (secretBuffers.length === 0) {
         await writeChunk(value);
         continue;
       }
 
-      const combined = redactString(carry + decoder.decode(value, { stream: true }), redactionSecrets);
-      const holdLen = longestSecretPrefixSuffix(combined, redactionSecrets);
-      const emitEnd = combined.length - holdLen;
-      carry = holdLen > 0 ? combined.slice(emitEnd) : "";
+      const chunkBuf = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+      const merged = carry.byteLength > 0 ? Buffer.concat([carry, chunkBuf]) : chunkBuf;
+      const redacted = redactBuffer(merged, secretBuffers);
+      const holdLen = longestSecretPrefixSuffixBytes(redacted, secretBuffers);
+      const emitEnd = redacted.byteLength - holdLen;
+      carry = holdLen > 0 ? Buffer.from(redacted.subarray(emitEnd)) : Buffer.alloc(0);
       if (emitEnd > 0) {
-        await writeChunk(combined.slice(0, emitEnd));
+        await writeChunk(redacted.subarray(0, emitEnd));
       }
     }
 
-    if (shouldRedactStream && decoder !== null && !abort.signal.aborted && !response.destroyed) {
-      const tail = redactString(carry + decoder.decode(), redactionSecrets);
-      carry = "";
-      if (tail.length > 0) {
+    if (secretBuffers.length > 0 && carry.byteLength > 0 && !abort.signal.aborted && !response.destroyed) {
+      const tail = redactBuffer(carry, secretBuffers);
+      carry = Buffer.alloc(0);
+      if (tail.byteLength > 0) {
         await writeChunk(tail);
       }
     }
@@ -1113,6 +1158,12 @@ async function handleGatewayRequest(
 
   if (request.method !== "POST") {
     rejectRequest(response, 405, "Method not allowed.", "method_not_allowed");
+    return;
+  }
+
+  // Validate percent-encoding on EVERY path segment (channel AND protocol subpath) before routing.
+  if (hasInvalidPercentEncoding(parsedUrl.pathname)) {
+    rejectRequest(response, 400, "Malformed percent-encoding in request path.", "invalid_request");
     return;
   }
 
@@ -1250,10 +1301,7 @@ async function handleGatewayRequest(
     const known = compiled.allModels.get(requestedModelId);
     if (known) {
       const knownUpstreamId = effectiveUpstreamModelId(known);
-      if (
-        !isCopilotModelPermitted(requestedModelId, compiled.config.availableModelIds) ||
-        !isCopilotModelPermitted(knownUpstreamId, compiled.config.availableModelIds)
-      ) {
+      if (!isCopilotModelPermitted(knownUpstreamId, compiled.config.availableModelIds)) {
         rejectRequest(
           response,
           403,
@@ -1324,7 +1372,13 @@ async function handleGatewayRequest(
   try {
     if (compiled.config.oauth) {
       const oauthProvider = compiled.config.oauth.provider;
-      const creds = await ctx.oauthManager.getValidCredentials(channelId, abort.signal);
+      const binding = compiled.oauthBinding;
+      const creds = await ctx.oauthManager.getValidCredentials(channelId, {
+        signal: abort.signal,
+        expectedProvider: binding?.provider ?? oauthProvider,
+        expectedSecretRef: binding?.secretRef ?? compiled.config.oauth.secretRef,
+        ...(binding !== undefined ? { expectedGeneration: binding.generation } : {}),
+      });
       injectedSecretCandidates.push(creds.access, creds.refresh);
 
       if (oauthProvider === "openai-codex") {
@@ -1340,10 +1394,7 @@ async function handleGatewayRequest(
       } else if (oauthProvider === "github-copilot") {
         const copilotCreds = creds as GithubCopilotOAuthCredentials;
         oauthEnterpriseUrl = copilotCreds.enterpriseUrl;
-        if (
-          !isCopilotModelPermitted(requestedModelId, copilotCreds.availableModelIds) ||
-          !isCopilotModelPermitted(upstreamModelId, copilotCreds.availableModelIds)
-        ) {
+        if (!isCopilotModelPermitted(upstreamModelId, copilotCreds.availableModelIds)) {
           rejectRequest(
             response,
             403,
@@ -1511,6 +1562,8 @@ export interface StartBundledPiOptions {
   readonly devFallback?: boolean;
   /** Skip executable permission checks on `binaryPath` / `pi-shell` (for unit tests). */
   readonly skipBinaryAccessCheck?: boolean;
+  /** Optional lifecycle hook invoked right before atomically committing a Pi config file (for tests). */
+  readonly onBeforeCommitFile?: (file: "settings.json" | "models.json") => void | Promise<void>;
 }
 
 function shouldEnableDevFallback(
@@ -1600,7 +1653,7 @@ export async function startBundledPi(
 
   let currentChannels: readonly GatewayChannelConfig[] = options.channels ? [...options.channels] : [];
   let registeredOAuthIds: ReadonlySet<string> = syncChannelOAuth(currentChannels, new Set());
-  let snapshot = compileRouteSnapshot(1, currentChannels, devFallbackRoute);
+  let snapshot = compileRouteSnapshot(1, currentChannels, devFallbackRoute, fence);
 
   const server = createServer((request, response) => {
     void handleGatewayRequest(request, response, {
@@ -1628,15 +1681,9 @@ export async function startBundledPi(
 
   let port = 0;
 
-  const persistPiRuntimeConfigs = async (
-    channels: readonly GatewayChannelConfig[],
-    fallbackActive: boolean,
-  ) => {
-    const modelsJson = buildPiModelsJson(port, channels, fallbackActive);
-    const defaultSlug = resolveFallbackModel(channels, fallbackActive);
+  const buildPiSettingsJson = (defaultSlug: string | null) => {
     const parsedDefault = defaultSlug ? parseModelSlug(defaultSlug) : null;
-    await writeRuntimeConfig(join(agentDir, "models.json"), modelsJson);
-    await writeRuntimeConfig(join(agentDir, "settings.json"), {
+    return {
       shellPath,
       // Deterministic HTTP/SSE transport ensures Codex & all channels route reliably via the local loopback proxy.
       transport: "sse",
@@ -1646,10 +1693,6 @@ export async function startBundledPi(
             defaultModel: parsedDefault.modelId,
           }
         : {}),
-    });
-    return {
-      defaultModelSlug: defaultSlug,
-      zeroChannelState: defaultSlug === null,
     };
   };
 
@@ -1665,9 +1708,18 @@ export async function startBundledPi(
     }
     port = address.port;
     await mkdir(agentDir, { recursive: true, mode: 0o700 });
-    const persisted = await persistPiRuntimeConfigs(currentChannels, devFallbackActive);
-    defaultModelSlug = persisted.defaultModelSlug;
-    zeroChannelState = persisted.zeroChannelState;
+    const initialDefault = resolveFallbackModel(currentChannels, devFallbackActive);
+    // Write settings.json FIRST and commit models.json LAST so any reader observing models.json
+    // is guaranteed to see matching settings.json and active gateway routes.
+    await options.onBeforeCommitFile?.("settings.json");
+    await writeRuntimeConfig(join(agentDir, "settings.json"), buildPiSettingsJson(initialDefault));
+    await options.onBeforeCommitFile?.("models.json");
+    await writeRuntimeConfig(
+      join(agentDir, "models.json"),
+      buildPiModelsJson(port, currentChannels, devFallbackActive),
+    );
+    defaultModelSlug = initialDefault;
+    zeroChannelState = initialDefault === null;
   } catch (cause) {
     await closeGateway();
     throw cause;
@@ -1692,34 +1744,63 @@ export async function startBundledPi(
   };
 
   /**
-   * Serialized atomic channel catalog update: persists `runtime/pi/models.json` and
-   * `runtime/pi/settings.json` FIRST and publishes the new gateway route revision, defaults,
-   * and OAuth registrations ONLY AFTER disk persistence succeeds. In-flight streaming requests
-   * continue undisturbed on the immutable route snapshot they started with.
+   * Serialized atomic channel catalog update with `models.json` atomic rename as the FINAL commit
+   * point:
+   * 1. Atomically persist `settings.json` first;
+   * 2. Activate OAuth registrations and publish the new gateway route snapshot (already-started
+   *    in-flight requests stay pinned to their request-start snapshot);
+   * 3. Atomically rename `models.json` LAST, rolling back routes, OAuth registrations, defaults,
+   *    and `settings.json` if committing `models.json` fails.
    */
   const updateChannels = async (nextChannels: readonly GatewayChannelConfig[]) =>
     runSerializedUpdate(async () => {
       const candidateChannels = [...nextChannels];
+      const nextDefaultSlug = resolveFallbackModel(candidateChannels, devFallbackActive);
+      const nextModelsJson = buildPiModelsJson(port, candidateChannels, devFallbackActive);
+      const nextSettingsJson = buildPiSettingsJson(nextDefaultSlug);
+      const settingsPath = join(agentDir, "settings.json");
+      const modelsPath = join(agentDir, "models.json");
+
+      // Phase 1: persist settings.json atomically FIRST. If this fails, routes & models.json are untouched.
+      await options.onBeforeCommitFile?.("settings.json");
+      await writeRuntimeConfig(settingsPath, nextSettingsJson);
+
+      // Phase 2: publish OAuth registrations + new gateway route snapshot BEFORE models.json becomes visible.
+      const prevOAuthIds = registeredOAuthIds;
+      const prevChannels = currentChannels;
+      const prevSnapshot = snapshot;
+      const prevDefaultModelSlug = defaultModelSlug;
+      const prevZeroChannelState = zeroChannelState;
+
+      registeredOAuthIds = syncChannelOAuth(candidateChannels, prevOAuthIds);
       const candidateSnapshot = compileRouteSnapshot(
-        snapshot.revision + 1,
+        prevSnapshot.revision + 1,
         candidateChannels,
         devFallbackRoute,
+        fence,
       );
-      let persisted: { defaultModelSlug: string | null; zeroChannelState: boolean };
+      currentChannels = candidateChannels;
+      snapshot = candidateSnapshot;
+      defaultModelSlug = nextDefaultSlug;
+      zeroChannelState = nextDefaultSlug === null;
+
+      // Phase 3 (FINAL commit point): atomically rename models.json LAST so any Pi reader observing
+      // the new models.json is guaranteed to see matching settings.json and live gateway routes.
       try {
-        persisted = await persistPiRuntimeConfigs(candidateChannels, devFallbackActive);
+        await options.onBeforeCommitFile?.("models.json");
+        await writeRuntimeConfig(modelsPath, nextModelsJson);
       } catch (error) {
-        // Best-effort restore of previous config files if partial write occurred before failing.
-        await persistPiRuntimeConfigs(currentChannels, devFallbackActive).catch(() => undefined);
+        registeredOAuthIds = syncChannelOAuth(prevChannels, registeredOAuthIds);
+        currentChannels = prevChannels;
+        snapshot = compileRouteSnapshot(prevSnapshot.revision, prevChannels, devFallbackRoute, fence);
+        defaultModelSlug = prevDefaultModelSlug;
+        zeroChannelState = prevZeroChannelState;
+        await writeRuntimeConfig(settingsPath, buildPiSettingsJson(prevDefaultModelSlug)).catch(
+          () => undefined,
+        );
         throw error;
       }
 
-      // Publish atomically ONLY AFTER disk persistence succeeded!
-      registeredOAuthIds = syncChannelOAuth(candidateChannels, registeredOAuthIds);
-      currentChannels = candidateChannels;
-      snapshot = candidateSnapshot;
-      defaultModelSlug = persisted.defaultModelSlug;
-      zeroChannelState = persisted.zeroChannelState;
       return {
         revision: snapshot.revision,
         defaultModelSlug,

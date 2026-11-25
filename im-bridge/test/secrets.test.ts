@@ -117,25 +117,63 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
     const large = JSON.stringify({ token: "Z".repeat(5000) });
     await store.set("bot-large", large);
     assert.equal(await store.get("bot-large"), large);
-    assert.match(db.get("bot-large") ?? "", /^parts:3$/);
+    assert.match(db.get("bot-large") ?? "", /^parts:g1:3$/);
 
     // If chunk #2 fails to delete, root manifest MUST remain intact so retry can still clean up remaining chunks!
-    failAccountOnce = "bot-large#2";
+    failAccountOnce = "bot-large#g1#2";
     await assert.rejects(
       () => store.delete("bot-large"),
       (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_DELETE_VERIFY_FAILED",
     );
     assert.equal(db.has("bot-large"), true, "Root manifest must NOT be deleted when a chunk delete fails");
-    assert.equal(db.has("bot-large#2"), true);
-    assert.equal(db.has("bot-large#3"), true);
-    assert.deepEqual(deleteOrder, ["bot-large#1", "bot-large#2"]);
+    assert.equal(db.has("bot-large#g1#2"), true);
+    assert.equal(db.has("bot-large#g1#3"), true);
+    assert.deepEqual(deleteOrder, ["bot-large#g1#1", "bot-large#g1#2"]);
 
     // Retry succeeds: already-deleted #1 (44) verifies missing, #2 and #3 delete & verify, THEN root manifest deletes last!
     deleteOrder.length = 0;
     await store.delete("bot-large");
-    assert.deepEqual(deleteOrder, ["bot-large#1", "bot-large#2", "bot-large#3", "bot-large"]);
+    assert.deepEqual(deleteOrder, ["bot-large#g1#1", "bot-large#g1#2", "bot-large#g1#3", "bot-large"]);
     assert.equal(await store.get("bot-large"), undefined);
     assert.equal(db.size, 1);
+
+    // Shrinking write with failing old-chunk cleanup MUST retain `;prev:` in manifest so retry OR delete still removes orphaned chunks (#9)!
+    await store.set("bot-shrink", JSON.stringify({ token: "A".repeat(5000) }));
+    assert.match(db.get("bot-shrink") ?? "", /^parts:g1:3$/);
+    failAccountOnce = "bot-shrink#g1#3";
+    await assert.rejects(
+      () => store.set("bot-shrink", '{"token":"tiny"}'),
+      (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_DELETE_VERIFY_FAILED",
+    );
+    // New value is already readable, AND manifest still points to `prev:g1:3` so orphaned #g1#3 is NOT lost!
+    assert.equal(await store.get("bot-shrink"), '{"token":"tiny"}');
+    assert.match(db.get("bot-shrink") ?? "", /^b64:[^;]+;prev:g1:3$/);
+    assert.equal(db.has("bot-shrink#g1#3"), true);
+
+    // Calling delete() cleans up the orphaned `prev:g1:3` chunk BEFORE deleting the root manifest!
+    deleteOrder.length = 0;
+    await store.delete("bot-shrink");
+    assert.deepEqual(deleteOrder, ["bot-shrink#g1#1", "bot-shrink#g1#2", "bot-shrink#g1#3", "bot-shrink"]);
+    assert.equal(db.has("bot-shrink#g1#3"), false);
+    assert.equal(db.has("bot-shrink"), false);
+
+    // Also verify retry of set() after failed chunked->smaller-chunked shrink cleans up old generation and strips `;prev:`!
+    await store.set("bot-shrink-2", "B".repeat(5000));
+    assert.match(db.get("bot-shrink-2") ?? "", /^parts:g1:3$/);
+    failAccountOnce = "bot-shrink-2#g1#2";
+    const medium = "C".repeat(3000); // 2 chunks
+    await assert.rejects(
+      () => store.set("bot-shrink-2", medium),
+      (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_DELETE_VERIFY_FAILED",
+    );
+    assert.match(db.get("bot-shrink-2") ?? "", /^parts:g2:2;prev:g1:3$/);
+    assert.equal(await store.get("bot-shrink-2"), medium);
+    // Retrying set() cleans up BOTH g1 and g2, writes g3, and strips `;prev:`!
+    await store.set("bot-shrink-2", "short-final");
+    assert.match(db.get("bot-shrink-2") ?? "", /^b64:[^;]+$/);
+    assert.equal(db.has("bot-shrink-2#g1#2"), false);
+    assert.equal(db.has("bot-shrink-2#g2#1"), false);
+    assert.equal(await store.get("bot-shrink-2"), "short-final");
   });
 
   it("macOS Keychain distinguishes missing (44) vs unavailable (127 / non-zero / timedOut) vs denied (128/36/51)", async () => {

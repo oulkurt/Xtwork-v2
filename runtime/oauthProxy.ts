@@ -456,6 +456,16 @@ export interface OAuthTokenManagerOptions {
   readonly now?: () => number;
 }
 
+export interface GetValidCredentialsOptions {
+  readonly signal?: AbortSignal;
+  /** Bind credential resolution strictly to the route snapshot's registered `secretRef`. */
+  readonly expectedSecretRef?: string;
+  /** Bind credential resolution strictly to the route snapshot's registered OAuth provider. */
+  readonly expectedProvider?: OAuthSubscriptionProvider;
+  /** Bind credential resolution strictly to the route snapshot's account fence generation. */
+  readonly expectedGeneration?: number;
+}
+
 /**
  * Single-flight serialized OAuth credential manager backed by the hardened OS SecretStore
  * and protected by `ChannelCredentialFence`.
@@ -538,6 +548,10 @@ export class OAuthTokenManager {
     return this.cache.get(channelId) as T | undefined;
   }
 
+  getAccountGeneration(channelId: string): number {
+    return this.fence.generation(channelId);
+  }
+
   private async loadCredentials(
     config: RegisteredOAuthChannel,
     lease: CredentialFenceLease,
@@ -582,17 +596,42 @@ export class OAuthTokenManager {
 
   async getValidCredentials<T extends OAuthSubscriptionCredentials>(
     channelId: string,
-    signal?: AbortSignal,
+    signalOrOptions?: AbortSignal | GetValidCredentialsOptions,
   ): Promise<T> {
+    const opts: GetValidCredentialsOptions =
+      signalOrOptions instanceof AbortSignal
+        ? { signal: signalOrOptions }
+        : (signalOrOptions ?? {});
     this.assertNotDeleting(channelId);
     const config = this.configs.get(channelId);
     if (!config) {
-      throw new Error(`No OAuth configuration registered for channel "${channelId}"`);
+      throw new SecretStoreUnavailableError(
+        "SECRET_FENCE_STALE",
+        `No OAuth configuration registered for channel "${channelId}"`,
+      );
+    }
+    if (
+      (opts.expectedSecretRef !== undefined && config.secretRef !== opts.expectedSecretRef) ||
+      (opts.expectedProvider !== undefined && config.provider !== opts.expectedProvider)
+    ) {
+      throw new SecretStoreUnavailableError(
+        "SECRET_FENCE_STALE",
+        `OAuth channel "${channelId}" account binding changed after request started`,
+      );
     }
     // Acquire generation lease BEFORE touching SecretStore so any concurrent logout/delete
-    // invalidates this read before it can cache, return, or start a refresh under a newer gen.
-    const readLease = this.fence.acquire(channelId, signal);
+    // or account replacement invalidates this read before it can cache, return, or refresh.
+    const readLease = this.fence.acquire(channelId, opts.signal);
     try {
+      if (
+        opts.expectedGeneration !== undefined &&
+        readLease.generation !== opts.expectedGeneration
+      ) {
+        throw new SecretStoreUnavailableError(
+          "SECRET_FENCE_STALE",
+          `OAuth channel "${channelId}" account generation changed (${opts.expectedGeneration} !== ${readLease.generation})`,
+        );
+      }
       const current = await this.loadCredentials(config, readLease);
       this.assertNotDeleting(channelId);
       readLease.assertCurrent();

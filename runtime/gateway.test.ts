@@ -1046,9 +1046,19 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
     }
   });
 
-  it("sanitizes credential errors and redacts injected secrets in headers and chunk-split SSE responses (#3)", async () => {
+  it("sanitizes credential errors and redacts injected secrets in headers, SSE, and binary application/octet-stream responses (#3)", async () => {
     const secretKey = "sk-super-secret-reflection-98765";
+    let binaryMode = false;
     const stub = await startStubServer(async (_req, res) => {
+      if (binaryMode) {
+        // Binary response (`application/octet-stream`) with raw non-UTF8 bytes AND secret split across chunks!
+        res.writeHead(200, { "content-type": "application/octet-stream" });
+        res.write(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(secretKey.slice(0, 14), "utf8")]));
+        await new Promise((r) => setTimeout(r, 10));
+        res.write(Buffer.concat([Buffer.from(secretKey.slice(14), "utf8"), Buffer.from([0x00, 0x7f])]));
+        res.end();
+        return;
+      }
       // Echo the secret both in an allowed response header AND split across two SSE TCP chunks!
       res.writeHead(200, {
         "content-type": "text/event-stream",
@@ -1136,6 +1146,27 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         const sseText = await okRes.text();
         assert.equal(sseText.includes(secretKey), false);
         assert.match(sseText, /leaked \[REDACTED\] ok/);
+
+        // 3. Binary `application/octet-stream` responses MUST NOT bypass redaction either!
+        binaryMode = true;
+        const binRes = await fetch(
+          `http://127.0.0.1:${runtime.port}/c/reflect-chan/openai-completions/chat/completions`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${runtime.gatewayToken}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ model: "gpt-4o", messages: [] }),
+          },
+        );
+        assert.equal(binRes.status, 200);
+        const binBuf = Buffer.from(await binRes.arrayBuffer());
+        assert.equal(binBuf.includes(Buffer.from(secretKey, "utf8")), false);
+        assert.deepEqual(
+          binBuf,
+          Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("[REDACTED]", "utf8"), Buffer.from([0x00, 0x7f])]),
+        );
       } finally {
         await runtime.close();
       }
@@ -1192,19 +1223,22 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         const bombJson = (await bombRes.json()) as { error: { code: string } };
         assert.equal(bombJson.error.code, "payload_too_large");
 
-        // 2. Malformed percent-escape in channel segment MUST return 400 (never crash server!)
-        const badEsc = await fetch(
-          `http://127.0.0.1:${runtime.port}/c/%E0%A4%A/openai-completions/chat/completions`,
-          {
+        // 2. Malformed percent-escapes in channel segment OR protocol subpath MUST return 400 (never 404 or crash!)
+        for (const badPath of [
+          "/c/%E0%A4%A/openai-completions/chat/completions",
+          "/c/chan-z/openai-completions/%E0%A4%A",
+          "/c/chan-z/openai-completions/chat/%ZZ",
+        ]) {
+          const badEsc = await fetch(`http://127.0.0.1:${runtime.port}${badPath}`, {
             method: "POST",
             headers: {
               authorization: `Bearer ${runtime.gatewayToken}`,
               "content-type": "application/json",
             },
             body: JSON.stringify({ model: "m1" }),
-          },
-        );
-        assert.equal(badEsc.status, 400);
+          });
+          assert.equal(badEsc.status, 400, `Expected 400 for malformed path ${badPath}, got ${badEsc.status}`);
+        }
 
         // 3. Server remains completely healthy afterwards
         const healthy = await fetch(
@@ -1345,7 +1379,9 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
               baseUrl: stub.baseUrl,
               availableModelIds: ["gpt-4.1"],
               models: [
-                // Local id is permitted, but upstreamModelId rewrites to a DISALLOWED model!
+                // Local alias mapped to an ALLOWED upstreamModelId MUST be kept & routed (#7)!
+                { id: "my-fast-gpt", upstreamModelId: "gpt-4.1", enabled: true },
+                // Local id is permitted, but upstreamModelId rewrites to a DISALLOWED model -> MUST be blocked!
                 { id: "gpt-4.1", upstreamModelId: "claude-opus-blocked", enabled: true },
               ],
               oauth: {
@@ -1373,9 +1409,30 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         },
       );
       try {
-        // 1. Disallowed upstreamModelId MUST be excluded from models.json AND rejected with 403!
-        const rawModels = readFileSync(join(runtime.agentDir, "models.json"), "utf8");
-        assert.equal(rawModels.includes("copilot-alias"), false);
+        // 1. Allowed local alias (`my-fast-gpt` -> `gpt-4.1`) MUST be kept in models.json and routed,
+        // while disallowed upstreamModelId (`gpt-4.1` -> `claude-opus-blocked`) MUST be excluded & rejected with 403!
+        const parsedModels = JSON.parse(readFileSync(join(runtime.agentDir, "models.json"), "utf8")) as {
+          providers: Record<string, { models: Array<{ id: string }> }>;
+        };
+        assert.deepEqual(
+          parsedModels.providers["copilot-alias"]?.models.map((m) => m.id),
+          ["my-fast-gpt"],
+        );
+        const allowedAliasRes = await fetch(
+          `http://127.0.0.1:${runtime.port}/c/copilot-alias/openai-completions/chat/completions`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${runtime.gatewayToken}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ model: "my-fast-gpt", messages: [] }),
+          },
+        );
+        assert.equal(allowedAliasRes.status, 200);
+        await allowedAliasRes.text();
+        assert.equal(JSON.parse(stub.recorded[0]!.body).model, "gpt-4.1");
+
         const copilotRes = await fetch(
           `http://127.0.0.1:${runtime.port}/c/copilot-alias/openai-completions/chat/completions`,
           {
@@ -1445,8 +1502,8 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
           req.end(JSON.stringify({ model: "gpt-4o", messages: [] }));
         });
         assert.equal(rawHttpStatus, 200);
-        assert.equal(stub.recorded.length, 1);
-        const rec = stub.recorded[0]!;
+        assert.equal(stub.recorded.length, 2);
+        const rec = stub.recorded[1]!;
         assert.equal(rec.url, "/v1/chat/completions?tenant=configured");
         assert.equal(rec.headers["openai-beta"], "assistants=v2");
         assert.equal(rec.headers["x-client-request-id"], undefined);
@@ -1551,6 +1608,189 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
       }
     } finally {
       await Promise.all([stub1.close(), stub2.close()]);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects body-waiting OAuth request if channel account was replaced mid-request (#6) and commits models.json LAST (#14)", async () => {
+    const stub = await startStubServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"ok":true}');
+    });
+    const dir = mkdtempSync(join(tmpdir(), "xtwork-gw-round2-"));
+    try {
+      const secretStore = memorySecrets();
+      await secretStore.set(
+        "oauth:acct-1",
+        JSON.stringify({ access: "tok-account-1", refresh: "r1", expires: Date.now() + 3_600_000 }),
+      );
+      await secretStore.set(
+        "oauth:acct-2",
+        JSON.stringify({ access: "tok-account-2", refresh: "r2", expires: Date.now() + 3_600_000 }),
+      );
+
+      let pauseBeforeModels = false;
+      let failBeforeModels = false;
+      let hitModelsCommit!: () => void;
+      let hitModelsPromise = new Promise<void>((r) => {
+        hitModelsCommit = r;
+      });
+      let releaseModelsCommit!: () => void;
+      let modelsGate = new Promise<void>((r) => {
+        releaseModelsCommit = r;
+      });
+
+      const acct1Chan: GatewayChannelConfig = {
+        id: "xai-swap-req",
+        providerType: "xai",
+        enabled: true,
+        api: "openai-responses",
+        baseUrl: `${stub.baseUrl}/v1`,
+        models: [{ id: "grok-1", enabled: true }],
+        oauth: {
+          provider: "xai",
+          secretRef: "oauth:acct-1",
+          refresh: async (c) => c,
+        },
+      };
+      const acct2Chan: GatewayChannelConfig = {
+        ...acct1Chan,
+        models: [{ id: "grok-2", enabled: true }],
+        oauth: {
+          provider: "xai",
+          secretRef: "oauth:acct-2",
+          refresh: async (c) => c,
+        },
+      };
+
+      const runtime = await startBundledPi(
+        "/bin/true",
+        dir,
+        {},
+        {
+          channels: [acct1Chan],
+          secretStore,
+          validateOAuthDestination: allowLoopbackOAuthForTests,
+          skipBinaryAccessCheck: true,
+          onBeforeCommitFile: async (file) => {
+            if (file === "models.json" && failBeforeModels) {
+              failBeforeModels = false;
+              throw new Error("simulated models.json commit failure");
+            }
+            if (file === "models.json" && pauseBeforeModels) {
+              pauseBeforeModels = false;
+              hitModelsCommit();
+              await modelsGate;
+            }
+          },
+        },
+      );
+
+      try {
+        // --- Proof A (#6): Request captures rev 1 (acct-1), pauses mid-body while channel swaps to acct-2 ---
+        const slowBodyResponse = new Promise<{ status: number; text: string }>((resolveResp, rejectResp) => {
+          const req = httpRequest(
+            {
+              host: "127.0.0.1",
+              port: runtime.port,
+              path: "/c/xai-swap-req/openai-responses/responses",
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${runtime.gatewayToken}`,
+                "content-type": "application/json",
+                "transfer-encoding": "chunked",
+              },
+            },
+            (res) => {
+              const chunks: Buffer[] = [];
+              res.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+              res.on("end", () =>
+                resolveResp({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8") }),
+              );
+            },
+          );
+          req.on("error", rejectResp);
+          // Send first half of JSON body and hold stream open so gateway already captured rev 1 snapshot!
+          req.write('{"model":"grok-1",');
+
+          // Swap account to acct-2 while request body is in flight, then finish sending body.
+          void (async () => {
+            await new Promise((r) => setTimeout(r, 25));
+            await runtime.updateChannels([acct2Chan]);
+            req.end('"input":"hi"}');
+          })();
+        });
+
+        const slowRes = await slowBodyResponse;
+        assert.equal(slowRes.status, 502);
+        assert.match(slowRes.text, /credential_error/);
+        // Upstream MUST NEVER have received acct-2's token on behalf of the rev-1 request!
+        assert.equal(stub.recorded.length, 0);
+
+        // --- Proof B (#14): models.json is committed LAST after settings.json + route activation ---
+        pauseBeforeModels = true;
+        hitModelsPromise = new Promise<void>((r) => {
+          hitModelsCommit = r;
+        });
+        modelsGate = new Promise<void>((r) => {
+          releaseModelsCommit = r;
+        });
+        const updatePromise = runtime.updateChannels([acct1Chan]);
+        await hitModelsPromise;
+
+        // Right BEFORE models.json is renamed:
+        // 1) models.json on disk MUST still be rev 2 (`grok-2`)
+        const modelsBeforeCommit = JSON.parse(readFileSync(join(runtime.agentDir, "models.json"), "utf8"));
+        assert.equal(modelsBeforeCommit.providers["xai-swap-req"].models[0].id, "grok-2");
+        // 2) settings.json on disk MUST ALREADY be rev 3 (`grok-1`)
+        const settingsBeforeCommit = JSON.parse(readFileSync(join(runtime.agentDir, "settings.json"), "utf8"));
+        assert.equal(settingsBeforeCommit.defaultModel, "grok-1");
+        // 3) Gateway routes MUST ALREADY accept rev 3 (`grok-1`) with acct-1!
+        const liveRev3 = await fetch(
+          `http://127.0.0.1:${runtime.port}/c/xai-swap-req/openai-responses/responses`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${runtime.gatewayToken}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ model: "grok-1", input: "ready-before-models-rename" }),
+          },
+        );
+        assert.equal(liveRev3.status, 200);
+        await liveRev3.text();
+        assert.equal(stub.recorded[0]!.headers.authorization, "Bearer tok-account-1");
+
+        releaseModelsCommit();
+        await updatePromise;
+        const modelsAfterCommit = JSON.parse(readFileSync(join(runtime.agentDir, "models.json"), "utf8"));
+        assert.equal(modelsAfterCommit.providers["xai-swap-req"].models[0].id, "grok-1");
+
+        // --- Proof C (#14 rollback): If models.json commit fails, settings.json + routes + OAuth roll back! ---
+        failBeforeModels = true;
+        await assert.rejects(() => runtime.updateChannels([acct2Chan]));
+        assert.equal(runtime.getDefaultModelSlug(), "xai-swap-req/grok-1");
+        const rolledBackSettings = JSON.parse(readFileSync(join(runtime.agentDir, "settings.json"), "utf8"));
+        assert.equal(rolledBackSettings.defaultModel, "grok-1");
+        const afterRollback = await fetch(
+          `http://127.0.0.1:${runtime.port}/c/xai-swap-req/openai-responses/responses`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${runtime.gatewayToken}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ model: "grok-1", input: "still-works-after-rollback" }),
+          },
+        );
+        assert.equal(afterRollback.status, 200);
+        await afterRollback.text();
+        assert.equal(stub.recorded[1]!.headers.authorization, "Bearer tok-account-1");
+      } finally {
+        await runtime.close();
+      }
+    } finally {
+      await stub.close();
       rmSync(dir, { recursive: true, force: true });
     }
   });
