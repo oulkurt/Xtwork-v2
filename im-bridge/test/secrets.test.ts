@@ -32,6 +32,12 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
         const val = db.get(`${svc}::${account}`);
         return val === undefined ? { code: 44, stdout: "" } : { code: 0, stdout: `${val}\n` };
       }
+      if (args[0] === "delete-generic-password") {
+        const svc = args[args.indexOf("-s") + 1]!;
+        const account = args[args.indexOf("-a") + 1]!;
+        const existed = db.delete(`${svc}::${account}`);
+        return existed ? { code: 0, stdout: "" } : { code: 44, stdout: "" };
+      }
       if (args[0] === "-i") {
         for (const line of stdin.split("\n").filter(Boolean)) {
           const add = /^add-generic-password -s "([^"]+)" -a "([^"]+)" -U -w "([^"]+)"$/.exec(line);
@@ -68,23 +74,35 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
     assert.equal(await modelStore.get("shared-ref"), "model-secret");
   });
 
-  it("macOS Keychain stores short and chunked (>3000 b64) secrets via stdin and verifies read-back & delete", async () => {
+  it("macOS Keychain stores short/chunked secrets via stdin and deletes & verifies EACH chunk individually BEFORE the root manifest", async () => {
     const db = new Map<string, string>();
+    const deleteOrder: string[] = [];
+    let failAccountOnce: string | null = null;
+
     const runner: CommandRunner = async (_file, args, stdin) => {
       if (args[0] === "find-generic-password") {
         const account = args[args.indexOf("-a") + 1]!;
         const val = db.get(account);
         return val === undefined ? { code: 44, stdout: "" } : { code: 0, stdout: `${val}\n` };
       }
+      if (args[0] === "delete-generic-password") {
+        const account = args[args.indexOf("-a") + 1]!;
+        deleteOrder.push(account);
+        if (failAccountOnce === account) {
+          failAccountOnce = null;
+          return { code: 1, stdout: "", stderr: "security: SecKeychainItemDelete failed" };
+        }
+        const existed = db.delete(account);
+        return existed ? { code: 0, stdout: "" } : { code: 44, stdout: "" };
+      }
       if (args[0] === "-i") {
+        // Must NEVER pass delete commands in a batched `security -i` call where a later exit status masks an earlier failure!
+        assert.equal(stdin.includes("delete-generic-password"), false);
         for (const line of stdin.split("\n").filter(Boolean)) {
           const add = /^add-generic-password -s "[^"]+" -a "([^"]+)" -U -w "([^"]+)"$/.exec(line);
           if (add) {
             db.set(add[1]!, add[2]!);
-            continue;
           }
-          const del = /^delete-generic-password -s "[^"]+" -a "([^"]+)"$/.exec(line);
-          if (del) db.delete(del[1]!);
         }
         return { code: 0, stdout: "" };
       }
@@ -99,14 +117,28 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
     const large = JSON.stringify({ token: "Z".repeat(5000) });
     await store.set("bot-large", large);
     assert.equal(await store.get("bot-large"), large);
-    assert.match(db.get("bot-large") ?? "", /^parts:\d+$/);
+    assert.match(db.get("bot-large") ?? "", /^parts:3$/);
 
+    // If chunk #2 fails to delete, root manifest MUST remain intact so retry can still clean up remaining chunks!
+    failAccountOnce = "bot-large#2";
+    await assert.rejects(
+      () => store.delete("bot-large"),
+      (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_DELETE_VERIFY_FAILED",
+    );
+    assert.equal(db.has("bot-large"), true, "Root manifest must NOT be deleted when a chunk delete fails");
+    assert.equal(db.has("bot-large#2"), true);
+    assert.equal(db.has("bot-large#3"), true);
+    assert.deepEqual(deleteOrder, ["bot-large#1", "bot-large#2"]);
+
+    // Retry succeeds: already-deleted #1 (44) verifies missing, #2 and #3 delete & verify, THEN root manifest deletes last!
+    deleteOrder.length = 0;
     await store.delete("bot-large");
+    assert.deepEqual(deleteOrder, ["bot-large#1", "bot-large#2", "bot-large#3", "bot-large"]);
     assert.equal(await store.get("bot-large"), undefined);
     assert.equal(db.size, 1);
   });
 
-  it("macOS Keychain distinguishes missing (44) vs unavailable (127 / non-zero) vs denied (128/36/51)", async () => {
+  it("macOS Keychain distinguishes missing (44) vs unavailable (127 / non-zero / timedOut) vs denied (128/36/51)", async () => {
     const missingStore = keychainSecrets(async () => ({ code: 44, stdout: "", stderr: "The specified item could not be found in the keychain." }));
     assert.deepEqual(await missingStore.read?.("absent"), { status: "missing" });
     assert.equal(await missingStore.get("absent"), undefined);
@@ -118,6 +150,9 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
       () => unavailableTool.get("k"),
       (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_STORE_UNAVAILABLE",
     );
+
+    const timedOutStore = keychainSecrets(async () => ({ code: 44, stdout: "", stderr: "", killed: true, signal: "SIGTERM", timedOut: true }));
+    assert.equal((await timedOutStore.read?.("k"))?.status, "unavailable");
 
     // Arbitrary non-zero exit code MUST NOT collapse into missing / undefined!
     const arbitraryErr = keychainSecrets(async () => ({ code: 50, stdout: "", stderr: "One or more parameters passed to a function were not valid." }));
@@ -147,7 +182,7 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
   it("macOS Keychain rejects failed delete (non-zero exit OR item still readable on read-back)", async () => {
     const db = new Map<string, string>([["ref-1", `b64:${Buffer.from("top-secret").toString("base64")}`]]);
 
-    // Case 1: security -i returns non-zero exit code on delete
+    // Case 1: delete-generic-password returns non-zero exit code
     const failingDeleteRunner: CommandRunner = async (_f, args) => {
       if (args[0] === "find-generic-password") {
         const account = args[args.indexOf("-a") + 1]!;
@@ -162,7 +197,7 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
       (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_DELETE_VERIFY_FAILED",
     );
 
-    // Case 2: security -i returns exit code 0 silently WITHOUT actually deleting item -> read-back catches it!
+    // Case 2: delete-generic-password returns exit code 0 silently WITHOUT actually deleting item -> read-back catches it!
     const silentNoOpDeleteRunner: CommandRunner = async (_f, args) => {
       if (args[0] === "find-generic-password") {
         const account = args[args.indexOf("-a") + 1]!;
@@ -210,7 +245,7 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
     );
   });
 
-  it("Linux secret-tool distinguishes missing vs unavailable vs denied and verifies delete", async () => {
+  it("Linux secret-tool never classifies timed-out/signaled lookup as missing and verifies clear exit-1 via completed lookup", async () => {
     const unavailable: CommandRunner = async () => ({ code: 127, stdout: "" });
     const storeUnavail = linuxSecrets(unavailable);
     await assert.rejects(
@@ -235,11 +270,10 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
       (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_ACCESS_DENIED",
     );
 
-    // Healthy keyring that later hits D-Bus error on lookup or fails delete
+    // Healthy keyring that later hits D-Bus error, timeout/signal, or exit-1 clear on already-missing item
     const items = new Map<string, string>();
-    let failLookupWithDbus = false;
-    let failClearWithError = false;
-    let silentClearNoOp = false;
+    let lookupMode: "normal" | "dbus-error" | "timeout" | "sigkill" = "normal";
+    let clearMode: "normal" | "fail-exit" | "silent-noop" | "missing-exit-1" = "normal";
     const runner: CommandRunner = async (_file, args, stdin) => {
       const op = args[0];
       const account = args[args.indexOf("account") + 1]!;
@@ -248,19 +282,30 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
         return { code: 0, stdout: "" };
       }
       if (op === "lookup") {
-        if (failLookupWithDbus && account !== "__xtwork_probe__") {
-          return { code: 1, stdout: "", stderr: "org.freedesktop.DBus.Error.NoReply: daemon down" };
+        if (account !== "__xtwork_probe__") {
+          if (lookupMode === "dbus-error") {
+            return { code: 1, stdout: "", stderr: "org.freedesktop.DBus.Error.NoReply: daemon down" };
+          }
+          if (lookupMode === "timeout") {
+            return { code: 1, stdout: "", stderr: "", killed: true, signal: "SIGTERM", timedOut: true };
+          }
+          if (lookupMode === "sigkill") {
+            return { code: 1, stdout: "", stderr: "", killed: true, signal: "SIGKILL", timedOut: false };
+          }
         }
         const val = items.get(account);
         return val === undefined ? { code: 1, stdout: "", stderr: "" } : { code: 0, stdout: val };
       }
       if (op === "clear") {
-        if (failClearWithError && account !== "__xtwork_probe__") {
-          return { code: 1, stdout: "", stderr: "secret-tool: clear failed" };
+        if (account !== "__xtwork_probe__") {
+          if (clearMode === "fail-exit") return { code: 1, stdout: "", stderr: "secret-tool: clear failed" };
+          if (clearMode === "silent-noop") return { code: 0, stdout: "" };
+          if (clearMode === "missing-exit-1") {
+            const existed = items.delete(account);
+            return existed ? { code: 0, stdout: "" } : { code: 1, stdout: "", stderr: "" };
+          }
         }
-        if (!silentClearNoOp || account === "__xtwork_probe__") {
-          items.delete(account);
-        }
+        items.delete(account);
         return { code: 0, stdout: "" };
       }
       return { code: 1, stdout: "" };
@@ -272,40 +317,70 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
     assert.deepEqual(await store.read?.("never-set"), { status: "missing" });
 
     // Non-empty stderr on exit code 1 MUST be classified as unavailable, NOT missing!
-    failLookupWithDbus = true;
+    lookupMode = "dbus-error";
     assert.equal((await store.read?.("wecom-1"))?.status, "unavailable");
     await assert.rejects(
       () => store.get("wecom-1"),
       (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_STORE_UNAVAILABLE",
     );
-    failLookupWithDbus = false;
 
-    // Delete exit code failure throws SECRET_DELETE_VERIFY_FAILED
-    failClearWithError = true;
+    // Timed-out or signaled lookup with exit code 1 and empty stderr MUST NEVER be classified as missing!
+    lookupMode = "timeout";
+    assert.equal((await store.read?.("wecom-1"))?.status, "unavailable");
+    await assert.rejects(
+      () => store.get("wecom-1"),
+      (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_STORE_UNAVAILABLE",
+    );
+    // Delete verification during a timed-out lookup MUST fail instead of falsely claiming item is missing!
+    await assert.rejects(
+      () => store.delete("wecom-1"),
+      (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_STORE_UNAVAILABLE",
+    );
+
+    lookupMode = "sigkill";
+    assert.equal((await store.read?.("wecom-1"))?.status, "unavailable");
+    lookupMode = "normal";
+    // Restore wecom-1 (was deleted in map during timed-out delete test)
+    await store.set("wecom-1", '{"secret":"abc"}');
+
+    // Delete exit code failure with stderr throws SECRET_DELETE_VERIFY_FAILED
+    clearMode = "fail-exit";
     await assert.rejects(
       () => store.delete("wecom-1"),
       (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_DELETE_VERIFY_FAILED",
     );
-    failClearWithError = false;
 
     // Silent no-op delete (exit 0 but item remains) caught by read-back check!
-    silentClearNoOp = true;
+    clearMode = "silent-noop";
     await assert.rejects(
       () => store.delete("wecom-1"),
       (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_DELETE_VERIFY_FAILED",
     );
-    silentClearNoOp = false;
 
-    // Clean verified delete succeeds
+    // `secret-tool clear` returning exit 1 with empty stderr on an ALREADY-MISSING entry succeeds
+    // once a completed lookup confirms absence!
+    clearMode = "missing-exit-1";
     await store.delete("wecom-1");
     assert.equal(await store.get("wecom-1"), undefined);
+    await store.delete("wecom-1"); // already missing -> clear returns exit 1 + empty stderr -> lookup confirms missing!
   });
 
-  it("Windows DPAPI stores only sealed dpapi: blobs, verifies round-trip, refuses plaintext, and classifies denied", async () => {
+  it("Windows DPAPI has no plaintext cache and fences in-flight Unprotect reads against concurrent verified delete", async () => {
     const dir = mkdtempSync(join(tmpdir(), "im-bridge-dpapi-"));
     const blobPath = join(dir, "dpapi.json");
     try {
       let denyNext = false;
+      let unprotectCalls = 0;
+      let pauseNextUnprotect = false;
+      let enteredPausedUnprotect!: () => void;
+      const enteredPausedPromise = new Promise<void>((r) => {
+        enteredPausedUnprotect = r;
+      });
+      let releasePausedUnprotect!: () => void;
+      const pausedGate = new Promise<void>((r) => {
+        releasePausedUnprotect = r;
+      });
+
       const mockDpapi: CommandRunner = async (_file, args, stdin) => {
         if (denyNext) {
           return { code: 1, stdout: "", stderr: "Access to the path is denied." };
@@ -315,6 +390,12 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
           return { code: 0, stdout: Buffer.from(`SEALED:${stdin}`, "utf8").toString("base64") };
         }
         if (cmd.includes("::Unprotect(")) {
+          unprotectCalls++;
+          if (pauseNextUnprotect) {
+            pauseNextUnprotect = false;
+            enteredPausedUnprotect();
+            await pausedGate;
+          }
           const decoded = Buffer.from(stdin, "base64").toString("utf8");
           if (!decoded.startsWith("SEALED:")) return { code: 1, stdout: "" };
           return { code: 0, stdout: decoded.slice("SEALED:".length) };
@@ -329,23 +410,30 @@ describe("hardened fail-closed OS secret store (ADR-011 L4 & ADR-012 §3.1)", ()
       assert.equal(rawOnDisk.includes("super-secret-token"), false);
       assert.ok(rawOnDisk.includes("dpapi:"));
 
-      // Fresh instance decrypts cleanly
-      const store2 = windowsSecrets(blobPath, mockDpapi);
-      assert.equal(await store2.get("wechat-1"), '{"token":"super-secret-token"}');
+      // Every read calls DPAPI fresh (no store-level plaintext cache!).
+      const callsBefore = unprotectCalls;
+      assert.equal(await store.get("wechat-1"), '{"token":"super-secret-token"}');
+      assert.equal(await store.get("wechat-1"), '{"token":"super-secret-token"}');
+      assert.equal(unprotectCalls - callsBefore, 2);
+
+      // In-flight Unprotect read racing verified delete MUST NOT return deleted plaintext OR repopulate a cache!
+      pauseNextUnprotect = true;
+      const racingRead = store.get("wechat-1");
+      await enteredPausedPromise;
+      await store.delete("wechat-1");
+      releasePausedUnprotect();
+      assert.equal(await racingRead, undefined);
+      assert.equal(await store.get("wechat-1"), undefined);
 
       // Denied DPAPI error is classified as denied
+      await store.set("wechat-2", '{"token":"second-secret"}');
       denyNext = true;
-      const storeDenied = windowsSecrets(blobPath, mockDpapi);
-      assert.equal((await storeDenied.read?.("wechat-1"))?.status, "denied");
+      assert.equal((await store.read?.("wechat-2"))?.status, "denied");
       await assert.rejects(
-        () => storeDenied.get("wechat-1"),
+        () => store.get("wechat-2"),
         (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_ACCESS_DENIED",
       );
       denyNext = false;
-
-      // Verified delete removes from disk
-      await store2.delete("wechat-1");
-      assert.equal(await windowsSecrets(blobPath, mockDpapi).get("wechat-1"), undefined);
 
       // Plaintext tampered file MUST be refused
       writeFileSync(blobPath, JSON.stringify({ "wechat-1": '{"token":"plain"}' }));

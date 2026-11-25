@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import * as canonicalSecrets from "../im-bridge/src/platform/secrets.ts";
 import * as secretStoreMod from "./secretStore.ts";
 import {
   ChannelCredentialFence,
@@ -19,10 +20,12 @@ import {
   windowsSecrets,
 } from "./secretStore.ts";
 
-describe("runtime/secretStore hardened shared OS SecretStore (ADR-012 §3.1)", () => {
-  it("exposes zero plaintext fallback and defaults to app.xtwork.model-channels namespace", async () => {
+describe("runtime/secretStore single-source hardened OS SecretStore (ADR-012 §3.1)", () => {
+  it("shares the canonical implementation with im-bridge, exposes zero plaintext fallback, and defaults to app.xtwork.model-channels", async () => {
     assert.equal("fileSecrets" in secretStoreMod, false);
     assert.strictEqual(SecretStoreError, SecretStoreUnavailableError);
+    assert.strictEqual(SecretStoreUnavailableError, canonicalSecrets.SecretStoreUnavailableError);
+    assert.strictEqual(ChannelCredentialFence, canonicalSecrets.ChannelCredentialFence);
 
     let capturedService = "";
     const runner: CommandRunner = async (_file, args) => {
@@ -42,8 +45,9 @@ describe("runtime/secretStore hardened shared OS SecretStore (ADR-012 §3.1)", (
     assert.equal(capturedService, IM_BRIDGE_SECRET_NAMESPACE);
   });
 
-  it("macOS Keychain distinguishes missing vs unavailable vs denied and rejects failed/unverified deletes", async () => {
+  it("macOS Keychain distinguishes missing vs unavailable vs denied and deletes chunks individually before manifest", async () => {
     const db = new Map<string, string>();
+    const deleteOrder: string[] = [];
     let failDeleteCode = 0;
     let silentDropDelete = false;
     const runner: CommandRunner = async (_file, args, stdin) => {
@@ -58,23 +62,22 @@ describe("runtime/secretStore hardened shared OS SecretStore (ADR-012 §3.1)", (
         const val = db.get(account);
         return val === undefined ? { code: 44, stdout: "" } : { code: 0, stdout: `${val}\n` };
       }
-      if (args[0] === "-i") {
-        if (stdin.includes("delete-generic-password")) {
-          if (failDeleteCode !== 0) {
-            return { code: failDeleteCode, stdout: "", stderr: "delete failed" };
-          }
-          if (silentDropDelete) {
-            return { code: 0, stdout: "" };
-          }
+      if (args[0] === "delete-generic-password") {
+        const account = args[args.indexOf("-a") + 1]!;
+        deleteOrder.push(account);
+        if (failDeleteCode !== 0) {
+          return { code: failDeleteCode, stdout: "", stderr: "delete failed" };
         }
+        if (silentDropDelete) {
+          return { code: 0, stdout: "" };
+        }
+        const existed = db.delete(account);
+        return existed ? { code: 0, stdout: "" } : { code: 44, stdout: "" };
+      }
+      if (args[0] === "-i") {
         for (const line of stdin.split("\n").filter(Boolean)) {
           const add = /^add-generic-password -s "[^"]+" -a "([^"]+)" -U -w "([^"]+)"$/.exec(line);
-          if (add) {
-            db.set(add[1]!, add[2]!);
-            continue;
-          }
-          const del = /^delete-generic-password -s "[^"]+" -a "([^"]+)"$/.exec(line);
-          if (del) db.delete(del[1]!);
+          if (add) db.set(add[1]!, add[2]!);
         }
         return { code: 0, stdout: "" };
       }
@@ -119,12 +122,18 @@ describe("runtime/secretStore hardened shared OS SecretStore (ADR-012 §3.1)", (
     // Verified delete succeeds and confirms missing
     await store.delete("team-key");
     assert.deepEqual(await store.read?.("team-key"), { status: "missing" });
+
+    // Chunked delete removes chunks 1..N before root manifest
+    await store.set("large-key", "X".repeat(5000));
+    deleteOrder.length = 0;
+    await store.delete("large-key");
+    assert.deepEqual(deleteOrder, ["large-key#1", "large-key#2", "large-key#3", "large-key"]);
   });
 
-  it("Linux secret-tool distinguishes missing vs unavailable vs denied and verifies delete", async () => {
+  it("Linux secret-tool rejects timed-out/signaled lookups as unavailable and handles clear exit-1 on absent entries", async () => {
     const items = new Map<string, string>();
-    let lookupMode: "normal" | "dbus-error" | "denied" = "normal";
-    let clearMode: "normal" | "fail-exit" | "silent-noop" = "normal";
+    let lookupMode: "normal" | "dbus-error" | "denied" | "timeout" = "normal";
+    let clearMode: "normal" | "fail-exit" | "silent-noop" | "missing-exit-1" = "normal";
 
     const runner: CommandRunner = async (_file, args, stdin) => {
       const op = args[0];
@@ -141,6 +150,9 @@ describe("runtime/secretStore hardened shared OS SecretStore (ADR-012 §3.1)", (
           if (lookupMode === "denied") {
             return { code: 1, stdout: "", stderr: "Keyring is locked and unlock was cancelled" };
           }
+          if (lookupMode === "timeout") {
+            return { code: 1, stdout: "", stderr: "", killed: true, signal: "SIGTERM", timedOut: true };
+          }
         }
         const val = items.get(account);
         return val === undefined ? { code: 1, stdout: "", stderr: "" } : { code: 0, stdout: val };
@@ -149,6 +161,10 @@ describe("runtime/secretStore hardened shared OS SecretStore (ADR-012 §3.1)", (
         if (account !== "__xtwork_probe__") {
           if (clearMode === "fail-exit") return { code: 1, stdout: "", stderr: "clear failed" };
           if (clearMode === "silent-noop") return { code: 0, stdout: "" };
+          if (clearMode === "missing-exit-1") {
+            const existed = items.delete(account);
+            return existed ? { code: 0, stdout: "" } : { code: 1, stdout: "", stderr: "" };
+          }
         }
         items.delete(account);
         return { code: 0, stdout: "" };
@@ -165,6 +181,8 @@ describe("runtime/secretStore hardened shared OS SecretStore (ADR-012 §3.1)", (
     assert.equal((await store.read?.("anthropic-1"))?.status, "unavailable");
     lookupMode = "denied";
     assert.equal((await store.read?.("anthropic-1"))?.status, "denied");
+    lookupMode = "timeout";
+    assert.equal((await store.read?.("anthropic-1"))?.status, "unavailable");
     lookupMode = "normal";
 
     clearMode = "fail-exit";
@@ -177,22 +195,38 @@ describe("runtime/secretStore hardened shared OS SecretStore (ADR-012 §3.1)", (
       () => store.delete("anthropic-1"),
       (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_DELETE_VERIFY_FAILED",
     );
-    clearMode = "normal";
+    clearMode = "missing-exit-1";
 
     await store.delete("anthropic-1");
     assert.equal(await store.get("anthropic-1"), undefined);
+    await store.delete("anthropic-1"); // already-missing entry where clear exits 1 + empty stderr succeeds after completed lookup!
   });
 
-  it("Windows DPAPI enforces sealed blobs, read-back verification, and delete confirmation", async () => {
+  it("Windows DPAPI enforces sealed blobs without plaintext cache and fences reads against deletes", async () => {
     const dir = mkdtempSync(join(tmpdir(), "xtwork-dpapi-"));
     const blobPath = join(dir, "channels-dpapi.json");
     try {
+      let pauseUnprotect = false;
+      let entered!: () => void;
+      const enteredP = new Promise<void>((r) => {
+        entered = r;
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+
       const mockDpapi: CommandRunner = async (_file, args, stdin) => {
         const cmd = args.join(" ");
         if (cmd.includes("::Protect(")) {
           return { code: 0, stdout: Buffer.from(`SEALED:${stdin}`, "utf8").toString("base64") };
         }
         if (cmd.includes("::Unprotect(")) {
+          if (pauseUnprotect) {
+            pauseUnprotect = false;
+            entered();
+            await gate;
+          }
           const decoded = Buffer.from(stdin, "base64").toString("utf8");
           if (!decoded.startsWith("SEALED:")) return { code: 1, stdout: "" };
           return { code: 0, stdout: decoded.slice("SEALED:".length) };
@@ -203,9 +237,16 @@ describe("runtime/secretStore hardened shared OS SecretStore (ADR-012 §3.1)", (
       await store.set("openai-1", "sk-openai-real");
       assert.equal(existsSync(blobPath), true);
       assert.equal(readFileSync(blobPath, "utf8").includes("sk-openai-real"), false);
-      assert.equal(await windowsSecrets(blobPath, mockDpapi).get("openai-1"), "sk-openai-real");
+      assert.equal(await store.get("openai-1"), "sk-openai-real");
+
+      // In-flight read finishing after verified delete must NOT return or cache deleted secret!
+      pauseUnprotect = true;
+      const racingGet = store.get("openai-1");
+      await enteredP;
       await store.delete("openai-1");
-      assert.equal(await windowsSecrets(blobPath, mockDpapi).get("openai-1"), undefined);
+      release();
+      assert.equal(await racingGet, undefined);
+      assert.equal(await store.get("openai-1"), undefined);
 
       writeFileSync(blobPath, JSON.stringify({ "openai-1": "sk-plaintext" }));
       await assert.rejects(

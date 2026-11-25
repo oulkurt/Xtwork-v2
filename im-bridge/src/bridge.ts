@@ -51,7 +51,7 @@ import {
   stepMachine,
   stored,
 } from "./core/link.ts";
-import type { SecretStore } from "./platform/secrets.ts";
+import { SecretStoreUnavailableError, type SecretStore } from "./platform/secrets.ts";
 import {
   type Chat,
   type Connection,
@@ -671,6 +671,17 @@ export class ImBridge {
 
   private async handleConnectionDisconnect(connectionId: string) {
     const conn = this.requireConnection(connectionId);
+    if (conn.secretRef) {
+      try {
+        await this.secrets.delete(conn.secretRef);
+      } catch (error) {
+        const code =
+          error instanceof SecretStoreUnavailableError ? error.code : "SECRET_DELETE_FAILED";
+        const message =
+          error instanceof Error ? error.message : "Could not delete connection credentials";
+        throw new BridgeError(code, message);
+      }
+    }
     this.dispatchLinkEvent(conn.id, { kind: "remove" });
     const managed = this.links.get(conn.id);
     if (managed?.retryTimer) clearTimeout(managed.retryTimer);
@@ -678,9 +689,6 @@ export class ImBridge {
       await managed.live.close().catch(() => {});
     }
     this.links.delete(conn.id);
-    if (conn.secretRef) {
-      await this.secrets.delete(conn.secretRef).catch(() => {});
-    }
     this.store.deleteConnection(conn.id);
     this.emit({
       method: "connection.state",

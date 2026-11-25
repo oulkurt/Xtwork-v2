@@ -5,8 +5,9 @@ import { constants } from "node:fs";
 import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
-import { zstdDecompressSync } from "node:zlib";
+import { createZstdDecompress } from "node:zlib";
 import {
+  assertStrictOAuthDestination,
   buildCopilotUpstreamHeaders,
   CODEX_DEFAULT_UPSTREAM_BASE_URL,
   type CodexOAuthCredentials,
@@ -15,6 +16,7 @@ import {
   extractCodexAccountId,
   type GithubCopilotOAuthCredentials,
   isCopilotModelPermitted,
+  type OAuthDestinationValidator,
   OAuthTokenManager,
   type OAuthSubscriptionCredentials,
   type OAuthSubscriptionProvider,
@@ -23,7 +25,8 @@ import {
 } from "./oauthProxy.ts";
 import {
   ChannelCredentialFence,
-  memorySecrets,
+  createSecretStore,
+  MODEL_CHANNELS_SECRET_NAMESPACE,
   type SecretStore,
 } from "./secretStore.ts";
 
@@ -38,6 +41,7 @@ export const CODING_PLAN_USER_AGENT = "Proma/1.0.0 (+https://github.com/ErlichLi
 const MAGPIE_URL = "http://127.0.0.1:3425/v1";
 const MAGPIE_MODEL = "our-free-model/hy4-flash-free";
 const REQUEST_LIMIT = 16 * 1024 * 1024;
+const REDACTED_MARKER = "[REDACTED]";
 
 export type GatewayApiKind =
   | "openai-completions"
@@ -310,6 +314,148 @@ function normalizeGoogleBaseUrl(rawUrl: string): URL {
   return url;
 }
 
+const GOOGLE_ENDPOINT_PATTERN =
+  /^(?:\/v1(?:beta)?)?\/models\/([^/:]+):(streamGenerateContent|generateContent)$/;
+
+const ALLOWED_QUERY_PARAMS_BY_PROTOCOL: Readonly<Record<GatewayApiKind, ReadonlySet<string>>> = {
+  "openai-completions": new Set(),
+  "openai-responses": new Set(),
+  "openai-codex-responses": new Set(),
+  "anthropic-messages": new Set(),
+  "google-generative-ai": new Set(["alt"]),
+};
+
+const ALLOWED_PASSTHROUGH_HEADERS: Readonly<Record<GatewayApiKind, ReadonlySet<string>>> = {
+  "openai-completions": new Set([
+    "accept",
+    "content-type",
+    "openai-beta",
+    "openai-organization",
+    "openai-project",
+    "x-client-request-id",
+  ]),
+  "openai-responses": new Set([
+    "accept",
+    "content-type",
+    "openai-beta",
+    "openai-organization",
+    "openai-project",
+    "session-id",
+    "session_id",
+    "x-client-request-id",
+    "x-session-id",
+    "x-session-affinity",
+  ]),
+  "openai-codex-responses": new Set([
+    "accept",
+    "content-type",
+    "openai-beta",
+    "originator",
+    "session-id",
+    "session_id",
+    "x-client-request-id",
+    "x-session-id",
+    "x-session-affinity",
+  ]),
+  "anthropic-messages": new Set([
+    "accept",
+    "content-type",
+    "anthropic-version",
+    "anthropic-beta",
+    "x-client-request-id",
+  ]),
+  "google-generative-ai": new Set([
+    "accept",
+    "content-type",
+    "x-goog-api-client",
+    "x-client-request-id",
+  ]),
+};
+
+function safeDecodePathSegment(segment: string): string | null {
+  try {
+    const decoded = decodeURIComponent(segment);
+    if (!decoded || decoded.includes("/") || decoded.includes("\\") || decoded.includes("\0")) {
+      return null;
+    }
+    if (decoded === "." || decoded === "..") return null;
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function hasPathTraversal(rawPath: string): boolean {
+  if (rawPath.includes("\\") || rawPath.includes("\0")) return true;
+  if (/%2f|%5c|%00/i.test(rawPath)) return true;
+  const segments = rawPath.split("/");
+  for (const seg of segments) {
+    if (seg === ".." || seg === ".") return true;
+    try {
+      const dec = decodeURIComponent(seg);
+      if (dec === ".." || dec === "." || dec.includes("/") || dec.includes("\\")) return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+interface ParsedProtocolEndpoint {
+  readonly canonicalSubpath: string;
+  readonly googleModelId?: string;
+  readonly googleAction?: "streamGenerateContent" | "generateContent";
+}
+
+/**
+ * Strictly allowlist exact endpoint paths per protocol so authenticated local clients cannot
+ * invoke arbitrary upstream endpoints (`/files`, `/models`, `/batches`, etc.) with real keys.
+ */
+function parseAllowedProtocolSubpath(
+  apiKind: GatewayApiKind,
+  subpath: string,
+): ParsedProtocolEndpoint | null {
+  if (hasPathTraversal(subpath)) return null;
+
+  if (apiKind === "openai-completions") {
+    if (subpath === "/chat/completions" || subpath === "/v1/chat/completions") {
+      return { canonicalSubpath: subpath };
+    }
+    return null;
+  }
+  if (apiKind === "openai-responses") {
+    if (subpath === "/responses" || subpath === "/v1/responses") {
+      return { canonicalSubpath: subpath };
+    }
+    return null;
+  }
+  if (apiKind === "openai-codex-responses") {
+    if (subpath === "/codex/responses") {
+      return { canonicalSubpath: subpath };
+    }
+    return null;
+  }
+  if (apiKind === "anthropic-messages") {
+    if (subpath === "/messages" || subpath === "/v1/messages") {
+      return { canonicalSubpath: subpath };
+    }
+    return null;
+  }
+  if (apiKind === "google-generative-ai") {
+    const match = GOOGLE_ENDPOINT_PATTERN.exec(subpath);
+    if (!match) return null;
+    const decodedModel = safeDecodePathSegment(match[1]!);
+    if (!decodedModel || !/^[A-Za-z0-9._:@[\]-]+$/.test(decodedModel)) return null;
+    const action = match[2]! as "streamGenerateContent" | "generateContent";
+    return {
+      canonicalSubpath: `/models/${encodeURIComponent(decodedModel)}:${action}`,
+      googleModelId: decodedModel,
+      googleAction: action,
+    };
+  }
+  return null;
+}
+
 function resolveChannelUpstreamUrl(
   baseUrlStr: string,
   apiKind: GatewayApiKind,
@@ -354,12 +500,18 @@ function resolveChannelUpstreamUrl(
   const target = new URL(base.toString());
   target.pathname = finalPath;
 
-  // Merge base query and request query (request query wins, never leak `?key=<gatewayToken>`).
+  // Strictly allowlist client-supplied query parameters per protocol while preserving the
+  // channel's own configured baseUrl query parameters. Never leak `?key=<gatewayToken>` or
+  // arbitrary client-injected query parameters upstream.
   const merged = new URLSearchParams(base.search);
-  const incoming = new URLSearchParams(requestQuery);
-  incoming.delete("key");
-  for (const [k, v] of incoming.entries()) {
-    merged.set(k, v);
+  const allowedClientParams = ALLOWED_QUERY_PARAMS_BY_PROTOCOL[apiKind];
+  if (allowedClientParams.size > 0 && requestQuery) {
+    const incoming = new URLSearchParams(requestQuery);
+    for (const [k, v] of incoming.entries()) {
+      if (allowedClientParams.has(k)) {
+        merged.set(k, v);
+      }
+    }
   }
   const mergedStr = merged.toString();
   target.search = mergedStr ? `?${mergedStr}` : "";
@@ -390,9 +542,40 @@ function extractGatewayTokenFromRequest(request: IncomingMessage, parsedUrl: URL
   return undefined;
 }
 
-function extractGoogleModelId(subpath: string): string | undefined {
-  const match = subpath.match(/\/models\/([^/:]+)(?::[A-Za-z0-9_]+)?$/);
-  return match?.[1] ? decodeURIComponent(match[1]) : undefined;
+function collectConnectionNominatedHeaders(request: IncomingMessage): Set<string> {
+  const nominated = new Set<string>();
+  const raw = request.headers.connection;
+  const values = Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [];
+  for (const entry of values) {
+    for (const token of entry.split(",")) {
+      const normalized = token.trim().toLowerCase();
+      if (normalized) nominated.add(normalized);
+    }
+  }
+  return nominated;
+}
+
+function buildSafePassthroughHeaders(
+  request: IncomingMessage,
+  apiKind: GatewayApiKind,
+): Record<string, string> {
+  const allowed = ALLOWED_PASSTHROUGH_HEADERS[apiKind];
+  const connectionNominated = collectConnectionNominatedHeaders(request);
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(request.headers)) {
+    const lower = name.toLowerCase();
+    if (!allowed.has(lower) || connectionNominated.has(lower)) continue;
+    if (typeof value === "string") {
+      out[lower] = value;
+    } else if (Array.isArray(value)) {
+      out[lower] = value.join(", ");
+    }
+  }
+  return out;
+}
+
+function effectiveUpstreamModelId(model: GatewayModelConfig): string {
+  return stripLegacyContextSuffix(model.upstreamModelId ?? model.id);
 }
 
 interface CompiledChannel {
@@ -425,11 +608,13 @@ function compileRouteSnapshot(
     for (const model of ch.models) {
       const cleanId = stripLegacyContextSuffix(model.id);
       const normalizedModel: GatewayModelConfig = { ...model, id: cleanId };
+      const targetUpstreamId = effectiveUpstreamModelId(normalizedModel);
       allModels.set(cleanId, normalizedModel);
       if (
         ch.enabled &&
         normalizedModel.enabled &&
-        isCopilotModelPermitted(cleanId, ch.availableModelIds)
+        isCopilotModelPermitted(cleanId, ch.availableModelIds) &&
+        isCopilotModelPermitted(targetUpstreamId, ch.availableModelIds)
       ) {
         enabledModels.set(cleanId, normalizedModel);
       }
@@ -443,7 +628,8 @@ function compileRouteSnapshot(
  * Determine the next available fallback model slug `<channelId>/<modelId>`:
  * 1. `xiaotong-work-team/deepseek-flash` if enabled;
  * 2. First enabled model on `xiaotong-work-team`;
- * 3. First enabled model on any enabled channel (respecting Copilot `availableModelIds`);
+ * 3. First enabled model on any enabled channel (respecting Copilot `availableModelIds` against
+ *    both local and effective upstream model IDs);
  * 4. `xtwork/standard` if dev fallback is active;
  * 5. `null` (zero-channel onboarding state).
  */
@@ -468,7 +654,12 @@ export function resolveFallbackModel(
   for (const ch of enabledChannels) {
     for (const model of ch.models) {
       const cleanId = stripLegacyContextSuffix(model.id);
-      if (model.enabled && isCopilotModelPermitted(cleanId, ch.availableModelIds)) {
+      const targetUpstreamId = effectiveUpstreamModelId({ ...model, id: cleanId });
+      if (
+        model.enabled &&
+        isCopilotModelPermitted(cleanId, ch.availableModelIds) &&
+        isCopilotModelPermitted(targetUpstreamId, ch.availableModelIds)
+      ) {
         return formatModelSlug(ch.id, cleanId);
       }
     }
@@ -495,7 +686,14 @@ export function buildPiModelsJson(
   for (const ch of enabledChannels) {
     const activeModels = ch.models
       .map((m) => ({ ...m, id: stripLegacyContextSuffix(m.id) }))
-      .filter((m) => m.enabled && isCopilotModelPermitted(m.id, ch.availableModelIds));
+      .filter((m) => {
+        const targetUpstreamId = effectiveUpstreamModelId(m);
+        return (
+          m.enabled &&
+          isCopilotModelPermitted(m.id, ch.availableModelIds) &&
+          isCopilotModelPermitted(targetUpstreamId, ch.availableModelIds)
+        );
+      });
     if (activeModels.length === 0) continue;
 
     const isCodex = ch.api === "openai-codex-responses" || ch.providerType === "openai-codex";
@@ -589,22 +787,157 @@ async function readRequestBody(
   }
 }
 
+type ZstdDecodeResult =
+  | { readonly ok: true; readonly data: Buffer }
+  | { readonly ok: false; readonly reason: "too_large" | "invalid" };
+
+/**
+ * Stream-decompress zstd payloads with a strict decoded-byte cap (`maxBytes`) so a tiny
+ * compressed zstd bomb cannot exhaust memory or block the event loop.
+ */
+function decompressZstdWithLimit(compressed: Buffer, maxBytes: number): Promise<ZstdDecodeResult> {
+  return new Promise((resolveDecode) => {
+    const decompressor = createZstdDecompress({ chunkSize: 16 * 1024 });
+    const chunks: Buffer[] = [];
+    let decodedSize = 0;
+    let settled = false;
+
+    const finish = (result: ZstdDecodeResult) => {
+      if (settled) return;
+      settled = true;
+      resolveDecode(result);
+    };
+
+    decompressor.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      decodedSize += chunk.byteLength;
+      if (decodedSize > maxBytes) {
+        finish({ ok: false, reason: "too_large" });
+        decompressor.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    decompressor.on("error", () => {
+      finish({ ok: false, reason: "invalid" });
+    });
+
+    decompressor.on("end", () => {
+      finish({ ok: true, data: Buffer.concat(chunks, decodedSize) });
+    });
+
+    // Feed compressed input in small slices via setImmediate so decompression yields and
+    // stops promptly once the decoded cap is crossed.
+    const SLICE = 16 * 1024;
+    let offset = 0;
+    const pump = () => {
+      if (settled || decompressor.destroyed) return;
+      if (offset >= compressed.byteLength) {
+        decompressor.end();
+        return;
+      }
+      const nextEnd = Math.min(offset + SLICE, compressed.byteLength);
+      const slice = compressed.subarray(offset, nextEnd);
+      offset = nextEnd;
+      const canContinue = decompressor.write(slice);
+      if (settled || decompressor.destroyed) return;
+      if (canContinue) {
+        setImmediate(pump);
+      } else {
+        decompressor.once("drain", () => setImmediate(pump));
+      }
+    };
+    setImmediate(pump);
+  });
+}
+
+function normalizeRedactionList(candidates: readonly (string | undefined)[]): readonly string[] {
+  const unique = new Set<string>();
+  const add = (value: string | undefined) => {
+    if (!value) return;
+    const trimmed = value.trim();
+    if (trimmed.length >= 4) {
+      unique.add(trimmed);
+    }
+    if (/^bearer\s+/i.test(trimmed)) {
+      const inner = trimmed.replace(/^bearer\s+/i, "").trim();
+      if (inner.length >= 4) unique.add(inner);
+    }
+  };
+  for (const c of candidates) add(c);
+  // Longest secrets first so prefixes never leave partial secret tails behind.
+  return [...unique].sort((a, b) => b.length - a.length);
+}
+
+function redactString(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const secret of secrets) {
+    if (out.includes(secret)) {
+      out = out.replaceAll(secret, REDACTED_MARKER);
+    }
+  }
+  return out;
+}
+
+/**
+ * Compute the longest trailing suffix of `text` that is a proper prefix of any secret in `secrets`.
+ * Normal SSE frames ending in `\n\n` or JSON braces match length 0 and flush with ZERO delay,
+ * while secrets split across arbitrary chunk boundaries are held just long enough to be redacted.
+ */
+function longestSecretPrefixSuffix(text: string, secrets: readonly string[]): number {
+  let maxHold = 0;
+  for (const secret of secrets) {
+    const limit = Math.min(text.length, secret.length - 1);
+    if (limit <= maxHold) continue;
+    const firstChar = secret[0]!;
+    const startSearch = text.length - limit;
+    let idx = text.indexOf(firstChar, startSearch);
+    while (idx !== -1) {
+      const suffixLen = text.length - idx;
+      if (suffixLen <= maxHold) break;
+      if (secret.startsWith(text.slice(idx))) {
+        maxHold = suffixLen;
+        break;
+      }
+      idx = text.indexOf(firstChar, idx + 1);
+    }
+  }
+  return maxHold;
+}
+
+function isBinaryContentType(contentType: string | null): boolean {
+  if (!contentType) return false;
+  const lower = contentType.toLowerCase();
+  return (
+    lower.startsWith("image/") ||
+    lower.startsWith("audio/") ||
+    lower.startsWith("video/") ||
+    lower.startsWith("application/octet-stream")
+  );
+}
+
+const ALLOWED_RESPONSE_HEADERS = [
+  "content-type",
+  "cache-control",
+  "retry-after",
+  "retry-after-ms",
+  "x-request-id",
+  "anthropic-request-id",
+] as const;
+
 async function streamUpstreamResponse(
   upstream: Response,
   response: ServerResponse,
   abort: AbortController,
+  redactionSecrets: readonly string[],
 ): Promise<void> {
   const headers: Record<string, string> = {};
-  for (const name of [
-    "content-type",
-    "cache-control",
-    "retry-after",
-    "retry-after-ms",
-    "x-request-id",
-    "anthropic-request-id",
-  ]) {
+  for (const name of ALLOWED_RESPONSE_HEADERS) {
     const value = upstream.headers.get(name);
-    if (value !== null) headers[name] = value;
+    if (value !== null) {
+      headers[name] = redactionSecrets.length > 0 ? redactString(value, redactionSecrets) : value;
+    }
   }
   response.writeHead(upstream.status, headers);
   response.flushHeaders();
@@ -613,6 +946,20 @@ async function streamUpstreamResponse(
     response.end();
     return;
   }
+
+  const shouldRedactStream =
+    redactionSecrets.length > 0 && !isBinaryContentType(upstream.headers.get("content-type"));
+  const decoder = shouldRedactStream ? new TextDecoder("utf-8", { fatal: false }) : null;
+  let carry = "";
+
+  const writeChunk = async (chunk: Uint8Array | string) => {
+    if (response.destroyed) return;
+    const ok = response.write(chunk);
+    if (!ok && !response.destroyed) {
+      await once(response, "drain");
+    }
+  };
+
   const reader = upstream.body.getReader();
   const onAbort = () => {
     void reader.cancel().catch(() => undefined);
@@ -623,13 +970,30 @@ async function streamUpstreamResponse(
       if (abort.signal.aborted || response.destroyed) break;
       const { done, value } = await reader.read();
       if (done) break;
-      if (value && value.byteLength > 0) {
-        const ok = response.write(value);
-        if (!ok && !response.destroyed) {
-          await once(response, "drain");
-        }
+      if (!value || value.byteLength === 0) continue;
+
+      if (!shouldRedactStream || decoder === null) {
+        await writeChunk(value);
+        continue;
+      }
+
+      const combined = redactString(carry + decoder.decode(value, { stream: true }), redactionSecrets);
+      const holdLen = longestSecretPrefixSuffix(combined, redactionSecrets);
+      const emitEnd = combined.length - holdLen;
+      carry = holdLen > 0 ? combined.slice(emitEnd) : "";
+      if (emitEnd > 0) {
+        await writeChunk(combined.slice(0, emitEnd));
       }
     }
+
+    if (shouldRedactStream && decoder !== null && !abort.signal.aborted && !response.destroyed) {
+      const tail = redactString(carry + decoder.decode(), redactionSecrets);
+      carry = "";
+      if (tail.length > 0) {
+        await writeChunk(tail);
+      }
+    }
+
     if (!response.destroyed && !response.writableEnded) {
       response.end();
     }
@@ -647,27 +1011,13 @@ const VALID_API_KINDS = new Set<GatewayApiKind>([
   "google-generative-ai",
 ]);
 
-const STRIPPED_REQUEST_HEADERS = new Set([
-  "host",
-  "connection",
-  "keep-alive",
-  "transfer-encoding",
-  "content-length",
-  "content-encoding",
-  "authorization",
-  "x-api-key",
-  "api-key",
-  "x-goog-api-key",
-  "chatgpt-account-id",
-  GATEWAY_TOKEN_HEADER,
-]);
-
 interface GatewayRuntimeContext {
   readonly token: string;
   readonly getSnapshot: () => GatewayRouteSnapshot;
   readonly secretStore: SecretStore;
   readonly oauthManager: OAuthTokenManager;
   readonly fetchImpl: typeof fetch;
+  readonly validateOAuthDestination: OAuthDestinationValidator;
 }
 
 async function resolveChannelApiKey(
@@ -687,6 +1037,7 @@ async function handleLegacyDevFallback(
   fallback: DevFallbackRoute,
   abort: AbortController,
   fetchImpl: typeof fetch,
+  gatewayToken: string,
 ): Promise<void> {
   const raw = await readRequestBody(request, response);
   if (raw === null) return;
@@ -712,6 +1063,7 @@ async function handleLegacyDevFallback(
     return;
   }
 
+  const redactionSecrets = normalizeRedactionList([gatewayToken, fallback.upstreamKey]);
   try {
     const upstream = await fetchImpl(fallback.url, {
       method: "POST",
@@ -723,7 +1075,7 @@ async function handleLegacyDevFallback(
       redirect: "error",
       signal: abort.signal,
     });
-    await streamUpstreamResponse(upstream, response, abort);
+    await streamUpstreamResponse(upstream, response, abort, redactionSecrets);
   } catch {
     if (abort.signal.aborted) return;
     if (response.headersSent) response.destroy();
@@ -743,13 +1095,24 @@ async function handleGatewayRequest(
   response: ServerResponse,
   ctx: GatewayRuntimeContext,
 ): Promise<void> {
-  // Capture immutable route snapshot at request start so mid-stream channel mutations cannot affect this request!
+  // Capture immutable route snapshot at request start so mid-stream channel mutations cannot affect this request.
   const snapshot = ctx.getSnapshot();
-  const parsedUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+  } catch {
+    rejectRequest(response, 400, "Malformed model request URL.", "invalid_request");
+    return;
+  }
 
   const providedToken = extractGatewayTokenFromRequest(request, parsedUrl);
   if (!timingSafeEquals(providedToken, ctx.token)) {
     rejectRequest(response, 401, "Invalid Xtwork model gateway token.", "unauthorized");
+    return;
+  }
+
+  if (request.method !== "POST") {
+    rejectRequest(response, 405, "Method not allowed.", "method_not_allowed");
     return;
   }
 
@@ -764,10 +1127,6 @@ async function handleGatewayRequest(
 
   // Legacy dev/E2E fallback route (/v1/chat/completions)
   if (parsedUrl.pathname === "/v1/chat/completions") {
-    if (request.method !== "POST") {
-      rejectRequest(response, 405, "Method not allowed.", "method_not_allowed");
-      return;
-    }
     if (!snapshot.devFallback) {
       rejectRequest(
         response,
@@ -777,7 +1136,14 @@ async function handleGatewayRequest(
       );
       return;
     }
-    await handleLegacyDevFallback(request, response, snapshot.devFallback, abort, ctx.fetchImpl);
+    await handleLegacyDevFallback(
+      request,
+      response,
+      snapshot.devFallback,
+      abort,
+      ctx.fetchImpl,
+      ctx.token,
+    );
     return;
   }
 
@@ -787,15 +1153,30 @@ async function handleGatewayRequest(
     rejectRequest(response, 404, "Unknown model endpoint.", "not_found");
     return;
   }
-  const channelId = decodeURIComponent(routeMatch[1]!);
+  const channelId = safeDecodePathSegment(routeMatch[1]!);
+  if (channelId === null) {
+    rejectRequest(response, 400, "Invalid channel identifier in request path.", "invalid_request");
+    return;
+  }
   const rawApiKind = routeMatch[2]!;
-  const subpath = routeMatch[3] ?? "/";
+  const rawSubpath = routeMatch[3] ?? "/";
 
   if (!VALID_API_KINDS.has(rawApiKind as GatewayApiKind)) {
     rejectRequest(response, 404, `Unsupported protocol route "${rawApiKind}".`, "not_found");
     return;
   }
   const apiKind = rawApiKind as GatewayApiKind;
+
+  const allowedEndpoint = parseAllowedProtocolSubpath(apiKind, rawSubpath);
+  if (allowedEndpoint === null) {
+    rejectRequest(
+      response,
+      404,
+      `Endpoint path is not allowed for protocol "${apiKind}".`,
+      "endpoint_not_allowed",
+    );
+    return;
+  }
 
   const compiled = snapshot.channels.get(channelId);
   if (!compiled) {
@@ -810,16 +1191,29 @@ async function handleGatewayRequest(
   const rawBody = await readRequestBody(request, response);
   if (rawBody === null) return;
 
-  // Decompress zstd request bodies (Pi 1.5.2 openai-codex-responses SSE sends content-encoding: zstd).
+  // Stream-decompress zstd request bodies with a strict 16 MiB decoded-byte cap (prevents zstd bombs).
   const encoding = String(request.headers["content-encoding"] ?? "").trim().toLowerCase();
   let decodedBodyBuf = rawBody;
   if (encoding === "zstd" && rawBody.byteLength > 0) {
-    try {
-      decodedBodyBuf = Buffer.from(zstdDecompressSync(rawBody));
-    } catch {
-      rejectRequest(response, 400, "Could not decompress zstd request body.", "invalid_request");
+    const decoded = await decompressZstdWithLimit(rawBody, REQUEST_LIMIT);
+    if (!decoded.ok) {
+      if (decoded.reason === "too_large") {
+        response.setHeader("connection", "close");
+        rejectRequest(
+          response,
+          413,
+          "Decompressed model request exceeds maximum allowed size.",
+          "payload_too_large",
+        );
+      } else {
+        rejectRequest(response, 400, "Could not decompress zstd request body.", "invalid_request");
+      }
       return;
     }
+    decodedBodyBuf = decoded.data;
+  } else if (encoding.length > 0 && encoding !== "identity") {
+    rejectRequest(response, 415, "Unsupported request Content-Encoding.", "unsupported_encoding");
+    return;
   }
 
   let parsedBody: Record<string, unknown> | undefined;
@@ -838,10 +1232,10 @@ async function handleGatewayRequest(
     }
   }
 
-  // Extract requested model ID and enforce enabled-model + Copilot subscription allowlist.
+  // Extract requested model ID and enforce enabled-model + Copilot policy against ACTUAL upstream model ID.
   const rawRequestedModel =
     apiKind === "google-generative-ai"
-      ? extractGoogleModelId(subpath)
+      ? allowedEndpoint.googleModelId
       : typeof parsedBody?.model === "string"
         ? parsedBody.model
         : undefined;
@@ -854,20 +1248,37 @@ async function handleGatewayRequest(
   const modelEntry = compiled.enabledModels.get(requestedModelId);
   if (!modelEntry) {
     const known = compiled.allModels.get(requestedModelId);
-    if (known && !isCopilotModelPermitted(requestedModelId, compiled.config.availableModelIds)) {
-      rejectRequest(
-        response,
-        403,
-        `Model "${requestedModelId}" is not permitted by GitHub Copilot subscription policy.`,
-        "model_not_permitted",
-      );
-      return;
+    if (known) {
+      const knownUpstreamId = effectiveUpstreamModelId(known);
+      if (
+        !isCopilotModelPermitted(requestedModelId, compiled.config.availableModelIds) ||
+        !isCopilotModelPermitted(knownUpstreamId, compiled.config.availableModelIds)
+      ) {
+        rejectRequest(
+          response,
+          403,
+          `Model "${requestedModelId}" is not permitted by GitHub Copilot subscription policy.`,
+          "model_not_permitted",
+        );
+        return;
+      }
     }
     rejectRequest(
       response,
       403,
       `Model "${channelId}/${requestedModelId}" is disabled or not enabled on this channel.`,
       "model_disabled",
+    );
+    return;
+  }
+
+  const upstreamModelId = effectiveUpstreamModelId(modelEntry);
+  if (!isCopilotModelPermitted(upstreamModelId, compiled.config.availableModelIds)) {
+    rejectRequest(
+      response,
+      403,
+      `Model "${requestedModelId}" is not permitted by GitHub Copilot subscription policy.`,
+      "model_not_permitted",
     );
     return;
   }
@@ -883,41 +1294,56 @@ async function handleGatewayRequest(
     return;
   }
 
-  // Copy safe pass-through headers from Pi while stripping all local/auth/hop-by-hop headers.
-  const upstreamHeaders: Record<string, string> = {};
-  for (const [name, value] of Object.entries(request.headers)) {
-    const lower = name.toLowerCase();
-    if (STRIPPED_REQUEST_HEADERS.has(lower)) continue;
-    if (typeof value === "string") {
-      upstreamHeaders[lower] = value;
-    } else if (Array.isArray(value)) {
-      upstreamHeaders[lower] = value.join(", ");
-    }
-  }
+  // Strictly allowlist protocol-safe pass-through headers (dropping cookies, proxy auth,
+  // connection-nominated headers, dummy local auth headers, and gateway tokens).
+  const upstreamHeaders = buildSafePassthroughHeaders(request, apiKind);
+  const injectedSecretCandidates: Array<string | undefined> = [ctx.token];
+
   if (compiled.config.upstreamHeaders) {
     for (const [k, v] of Object.entries(compiled.config.upstreamHeaders)) {
-      upstreamHeaders[k.toLowerCase()] = v;
+      const lower = k.toLowerCase();
+      upstreamHeaders[lower] = v;
+      if (
+        lower === "authorization" ||
+        lower === "x-api-key" ||
+        lower === "api-key" ||
+        lower === "x-goog-api-key" ||
+        lower === "cookie" ||
+        lower.includes("token") ||
+        lower.includes("secret") ||
+        lower.includes("key")
+      ) {
+        injectedSecretCandidates.push(v);
+      }
     }
   }
 
   // Resolve real upstream credentials and target base URL strictly on the server side.
   let effectiveBaseUrl = compiled.config.baseUrl;
+  let oauthEnterpriseUrl: string | undefined;
   try {
     if (compiled.config.oauth) {
       const oauthProvider = compiled.config.oauth.provider;
       const creds = await ctx.oauthManager.getValidCredentials(channelId, abort.signal);
+      injectedSecretCandidates.push(creds.access, creds.refresh);
+
       if (oauthProvider === "openai-codex") {
         const codexCreds = creds as CodexOAuthCredentials;
         const accountId = codexCreds.accountId ?? extractCodexAccountId(codexCreds.access);
         if (!accountId) {
-          throw new Error(`Missing chatgpt_account_id for Codex channel "${channelId}"`);
+          throw new Error("Missing Codex account identifier.");
         }
+        injectedSecretCandidates.push(accountId);
         upstreamHeaders["authorization"] = `Bearer ${codexCreds.access}`;
         upstreamHeaders["chatgpt-account-id"] = accountId;
         effectiveBaseUrl ??= CODEX_DEFAULT_UPSTREAM_BASE_URL;
       } else if (oauthProvider === "github-copilot") {
         const copilotCreds = creds as GithubCopilotOAuthCredentials;
-        if (!isCopilotModelPermitted(requestedModelId, copilotCreds.availableModelIds)) {
+        oauthEnterpriseUrl = copilotCreds.enterpriseUrl;
+        if (
+          !isCopilotModelPermitted(requestedModelId, copilotCreds.availableModelIds) ||
+          !isCopilotModelPermitted(upstreamModelId, copilotCreds.availableModelIds)
+        ) {
           rejectRequest(
             response,
             403,
@@ -934,6 +1360,7 @@ async function handleGatewayRequest(
         effectiveBaseUrl ??= deriveGitHubCopilotBaseUrl(
           copilotCreds.access,
           copilotCreds.enterpriseUrl,
+          ctx.validateOAuthDestination,
         );
       } else if (oauthProvider === "xai") {
         const xaiCreds = creds as XaiOAuthCredentials;
@@ -946,6 +1373,7 @@ async function handleGatewayRequest(
         rawKey !== undefined && compiled.config.providerType === "zhipu-coding-team"
           ? extractZhipuCodingTeamApiToken(rawKey)
           : rawKey;
+      injectedSecretCandidates.push(rawKey, token);
 
       if (apiKind === "anthropic-messages") {
         if (requiresCodingPlanUserAgent(compiled.config.providerType)) {
@@ -970,12 +1398,13 @@ async function handleGatewayRequest(
         }
       }
     }
-  } catch (error) {
+  } catch {
     if (abort.signal.aborted) return;
+    // NEVER leak raw OAuth refresh responses or OS SecretStore internal errors to Pi.
     rejectRequest(
       response,
       502,
-      error instanceof Error ? error.message : "Failed to resolve channel credentials.",
+      `Authentication failed for model channel "${channelId}". Please check or re-authenticate credentials in Settings.`,
       "credential_error",
     );
     return;
@@ -991,18 +1420,23 @@ async function handleGatewayRequest(
     return;
   }
 
-  // Apply protocol-specific request body rewrites (upstream model ID, [1m] stripping, DeepSeek V4 Anthropic).
+  // Apply protocol-specific request body & path rewrites (upstream model ID, [1m] stripping, DeepSeek V4 Anthropic).
+  const targetSubpath =
+    apiKind === "google-generative-ai" && allowedEndpoint.googleAction
+      ? `/models/${encodeURIComponent(upstreamModelId)}:${allowedEndpoint.googleAction}`
+      : allowedEndpoint.canonicalSubpath;
+
   let forwardBody: string | undefined;
   if (parsedBody !== undefined) {
     let nextBody: Record<string, unknown> = { ...parsedBody };
     if (apiKind !== "google-generative-ai") {
-      nextBody.model = modelEntry.upstreamModelId ?? requestedModelId;
+      nextBody.model = upstreamModelId;
     }
     if (apiKind === "anthropic-messages") {
       nextBody = rewriteDeepSeekV4AnthropicBody(
         nextBody,
         compiled.config.providerType,
-        requestedModelId,
+        upstreamModelId,
       );
     }
     forwardBody = JSON.stringify(nextBody);
@@ -1014,28 +1448,40 @@ async function handleGatewayRequest(
     upstreamUrl = resolveChannelUpstreamUrl(
       effectiveBaseUrl,
       apiKind,
-      subpath,
+      targetSubpath,
       parsedUrl.search,
     );
-  } catch (error) {
+    if (compiled.config.oauth) {
+      ctx.validateOAuthDestination(
+        compiled.config.oauth.provider,
+        upstreamUrl,
+        "inference",
+        oauthEnterpriseUrl ? { enterpriseUrl: oauthEnterpriseUrl } : undefined,
+      );
+    }
+  } catch {
     rejectRequest(
       response,
-      500,
-      error instanceof Error ? error.message : "Invalid channel upstream URL.",
-      "misconfigured_channel",
+      compiled.config.oauth ? 403 : 500,
+      compiled.config.oauth
+        ? `Upstream destination for OAuth channel "${channelId}" is not permitted.`
+        : `Channel "${channelId}" has an invalid upstream URL configuration.`,
+      compiled.config.oauth ? "invalid_oauth_destination" : "misconfigured_channel",
     );
     return;
   }
 
+  const redactionSecrets = normalizeRedactionList(injectedSecretCandidates);
+
   try {
     const upstream = await ctx.fetchImpl(upstreamUrl, {
-      method: request.method ?? "POST",
+      method: "POST",
       headers: upstreamHeaders,
       ...(forwardBody !== undefined ? { body: forwardBody } : {}),
       redirect: "error",
       signal: abort.signal,
     });
-    await streamUpstreamResponse(upstream, response, abort);
+    await streamUpstreamResponse(upstream, response, abort, redactionSecrets);
   } catch {
     if (abort.signal.aborted) return;
     if (response.headersSent) response.destroy();
@@ -1052,9 +1498,15 @@ async function handleGatewayRequest(
 
 export interface StartBundledPiOptions {
   readonly channels?: readonly GatewayChannelConfig[];
+  /** Defaults to the real OS SecretStore (`app.xtwork.model-channels`). Inject `memorySecrets()` in tests. */
   readonly secretStore?: SecretStore;
   readonly fence?: ChannelCredentialFence;
   readonly fetchImpl?: typeof fetch;
+  /**
+   * Override OAuth destination validation (strict HTTPS provider allowlist by default).
+   * Intended strictly for automated tests routing to loopback stubs.
+   */
+  readonly validateOAuthDestination?: OAuthDestinationValidator;
   /** Explicitly force dev fallback on or off (defaults to env-based detection). */
   readonly devFallback?: boolean;
   /** Skip executable permission checks on `binaryPath` / `pi-shell` (for unit tests). */
@@ -1108,12 +1560,21 @@ export async function startBundledPi(
   }
 
   const gatewayToken = randomBytes(32).toString("hex");
-  const secretStore = options.secretStore ?? memorySecrets();
+  const secretStore =
+    options.secretStore ??
+    createSecretStore({
+      namespace: MODEL_CHANNELS_SECRET_NAMESPACE,
+      windowsDpapiPath: join(dataDir, "channels", "dpapi-secrets.json"),
+    });
   const fence = options.fence ?? new ChannelCredentialFence();
   const oauthManager = new OAuthTokenManager({ secretStore, fence });
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const validateOAuthDestination = options.validateOAuthDestination ?? assertStrictOAuthDestination;
 
-  const registerChannelOAuth = (channels: readonly GatewayChannelConfig[]) => {
+  const syncChannelOAuth = (
+    channels: readonly GatewayChannelConfig[],
+    previousIds: ReadonlySet<string>,
+  ) => {
     const activeIds = new Set<string>();
     for (const ch of channels) {
       if (ch.oauth) {
@@ -1129,11 +1590,16 @@ export async function startBundledPi(
         });
       }
     }
+    for (const previousId of previousIds) {
+      if (!activeIds.has(previousId)) {
+        oauthManager.unregister(previousId);
+      }
+    }
     return activeIds;
   };
 
-  let currentChannels: readonly GatewayChannelConfig[] = options.channels ?? [];
-  let registeredOAuthIds = registerChannelOAuth(currentChannels);
+  let currentChannels: readonly GatewayChannelConfig[] = options.channels ? [...options.channels] : [];
+  let registeredOAuthIds: ReadonlySet<string> = syncChannelOAuth(currentChannels, new Set());
   let snapshot = compileRouteSnapshot(1, currentChannels, devFallbackRoute);
 
   const server = createServer((request, response) => {
@@ -1143,6 +1609,14 @@ export async function startBundledPi(
       secretStore,
       oauthManager,
       fetchImpl,
+      validateOAuthDestination,
+    }).catch(() => {
+      if (response.destroyed || response.writableEnded) return;
+      if (response.headersSent) {
+        response.destroy();
+        return;
+      }
+      rejectRequest(response, 500, "Internal model gateway error.", "internal_error");
     });
   });
 
@@ -1199,30 +1673,59 @@ export async function startBundledPi(
     throw cause;
   }
 
-  /**
-   * Atomically update the gateway's channel routing table and rewrite `runtime/pi/models.json`
-   * and `runtime/pi/settings.json`. In-flight streaming requests continue undisturbed on the
-   * immutable route snapshot they started with.
-   */
-  const updateChannels = async (nextChannels: readonly GatewayChannelConfig[]) => {
-    const nextOAuthIds = registerChannelOAuth(nextChannels);
-    for (const previousId of registeredOAuthIds) {
-      if (!nextOAuthIds.has(previousId)) {
-        oauthManager.unregister(previousId);
-      }
+  // Async mutex serializing all channel catalog updates so `models.json`, `settings.json`,
+  // OAuth registrations, and gateway routes never diverge across concurrent updates or write errors.
+  let updateMutex: Promise<void> = Promise.resolve();
+  const runSerializedUpdate = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const previous = updateMutex;
+    let release!: () => void;
+    const gate = new Promise<void>((resolveGate) => {
+      release = resolveGate;
+    });
+    updateMutex = previous.catch(() => undefined).then(() => gate);
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
     }
-    registeredOAuthIds = nextOAuthIds;
-    currentChannels = [...nextChannels];
-    snapshot = compileRouteSnapshot(snapshot.revision + 1, currentChannels, devFallbackRoute);
-    const persisted = await persistPiRuntimeConfigs(currentChannels, devFallbackActive);
-    defaultModelSlug = persisted.defaultModelSlug;
-    zeroChannelState = persisted.zeroChannelState;
-    return {
-      revision: snapshot.revision,
-      defaultModelSlug,
-      zeroChannelState,
-    };
   };
+
+  /**
+   * Serialized atomic channel catalog update: persists `runtime/pi/models.json` and
+   * `runtime/pi/settings.json` FIRST and publishes the new gateway route revision, defaults,
+   * and OAuth registrations ONLY AFTER disk persistence succeeds. In-flight streaming requests
+   * continue undisturbed on the immutable route snapshot they started with.
+   */
+  const updateChannels = async (nextChannels: readonly GatewayChannelConfig[]) =>
+    runSerializedUpdate(async () => {
+      const candidateChannels = [...nextChannels];
+      const candidateSnapshot = compileRouteSnapshot(
+        snapshot.revision + 1,
+        candidateChannels,
+        devFallbackRoute,
+      );
+      let persisted: { defaultModelSlug: string | null; zeroChannelState: boolean };
+      try {
+        persisted = await persistPiRuntimeConfigs(candidateChannels, devFallbackActive);
+      } catch (error) {
+        // Best-effort restore of previous config files if partial write occurred before failing.
+        await persistPiRuntimeConfigs(currentChannels, devFallbackActive).catch(() => undefined);
+        throw error;
+      }
+
+      // Publish atomically ONLY AFTER disk persistence succeeded!
+      registeredOAuthIds = syncChannelOAuth(candidateChannels, registeredOAuthIds);
+      currentChannels = candidateChannels;
+      snapshot = candidateSnapshot;
+      defaultModelSlug = persisted.defaultModelSlug;
+      zeroChannelState = persisted.zeroChannelState;
+      return {
+        revision: snapshot.revision,
+        defaultModelSlug,
+        zeroChannelState,
+      };
+    });
 
   return {
     config: {

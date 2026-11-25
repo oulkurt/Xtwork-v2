@@ -12,11 +12,21 @@
 
 import {
   type ChannelCredentialFence,
+  type CredentialFenceLease,
   type SecretStore,
   SecretStoreUnavailableError,
 } from "./secretStore.ts";
 
 export type OAuthSubscriptionProvider = "openai-codex" | "github-copilot" | "xai";
+
+export type OAuthDestinationPurpose = "inference" | "token_refresh";
+
+export type OAuthDestinationValidator = (
+  provider: OAuthSubscriptionProvider,
+  url: URL,
+  purpose: OAuthDestinationPurpose,
+  context?: { readonly enterpriseUrl?: string },
+) => void;
 
 export interface CodexOAuthCredentials {
   readonly access: string;
@@ -58,6 +68,22 @@ export const GITHUB_COPILOT_STATIC_HEADERS: Readonly<Record<string, string>> = O
   "Copilot-Integration-Id": "vscode-chat",
 });
 
+const FQDN_PATTERN =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
+const IPV4_PATTERN = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+const COPILOT_PUBLIC_API_HOST_PATTERN =
+  /^api(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)?\.githubcopilot\.com$/i;
+
+function isSafePublicFqdn(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (!FQDN_PATTERN.test(host)) return false;
+  if (IPV4_PATTERN.test(host)) return false;
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) {
+    return false;
+  }
+  return true;
+}
+
 /**
  * Create a non-secret placeholder JWT that satisfies Pi 1.5.2 `openai-codex-responses.js:1272`
  * (`extractAccountId` uses `atob(parts[1])` and reads `payload["https://api.openai.com/auth"].chatgpt_account_id`).
@@ -97,39 +123,130 @@ export function extractCodexAccountId(accessToken: string): string | undefined {
   }
 }
 
-function normalizeEnterpriseDomain(input: string | undefined): string | undefined {
-  if (!input) return undefined;
+export function normalizeEnterpriseDomain(input: string | undefined): string | undefined {
+  if (input === undefined) return undefined;
   const trimmed = input.trim();
   if (!trimmed) return undefined;
+  let url: URL;
   try {
-    const url = trimmed.includes("://") ? new URL(trimmed) : new URL(`https://${trimmed}`);
-    return url.hostname;
+    url = trimmed.includes("://") ? new URL(trimmed) : new URL(`https://${trimmed}`);
   } catch {
-    return undefined;
+    throw new Error("Invalid GitHub Enterprise domain.");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.port ||
+    url.search ||
+    url.hash ||
+    (url.pathname && url.pathname !== "/")
+  ) {
+    throw new Error("GitHub Enterprise domain must be a bare HTTPS hostname.");
+  }
+  const host = url.hostname.toLowerCase();
+  if (!isSafePublicFqdn(host)) {
+    throw new Error("GitHub Enterprise domain must be a valid public DNS hostname.");
+  }
+  return host;
+}
+
+/**
+ * Strict production OAuth destination allowlist: prevents bearer/refresh tokens from ever being
+ * sent over plaintext HTTP, to arbitrary `proxy-ep` hosts, or to untrusted `baseUrl` overrides.
+ */
+export function assertStrictOAuthDestination(
+  provider: OAuthSubscriptionProvider,
+  url: URL,
+  purpose: OAuthDestinationPurpose,
+  context?: { readonly enterpriseUrl?: string },
+): void {
+  if (url.protocol !== "https:" || url.username || url.password || url.port || url.hash) {
+    throw new Error(
+      `OAuth ${provider} ${purpose} destination must be a standard HTTPS origin without credentials, port, or fragment.`,
+    );
+  }
+  const host = url.hostname.toLowerCase();
+  if (!isSafePublicFqdn(host)) {
+    throw new Error(`Untrusted OAuth ${provider} destination host "${host}".`);
+  }
+
+  if (provider === "openai-codex") {
+    const allowed = purpose === "token_refresh" ? "auth.openai.com" : "chatgpt.com";
+    if (host !== allowed) {
+      throw new Error(`OAuth openai-codex ${purpose} host "${host}" is not allowed (expected ${allowed}).`);
+    }
+    return;
+  }
+
+  if (provider === "xai") {
+    const allowed = purpose === "token_refresh" ? "auth.x.ai" : "api.x.ai";
+    if (host !== allowed) {
+      throw new Error(`OAuth xai ${purpose} host "${host}" is not allowed (expected ${allowed}).`);
+    }
+    return;
+  }
+
+  if (provider === "github-copilot") {
+    const enterpriseDomain = normalizeEnterpriseDomain(context?.enterpriseUrl);
+    if (purpose === "token_refresh") {
+      const allowedHosts = new Set<string>(["api.github.com", "github.com"]);
+      if (enterpriseDomain) {
+        allowedHosts.add(enterpriseDomain);
+        allowedHosts.add(`api.${enterpriseDomain}`);
+      }
+      if (!allowedHosts.has(host)) {
+        throw new Error(`OAuth github-copilot token_refresh host "${host}" is not allowed.`);
+      }
+      return;
+    }
+
+    if (COPILOT_PUBLIC_API_HOST_PATTERN.test(host)) {
+      return;
+    }
+    if (enterpriseDomain && host === `copilot-api.${enterpriseDomain}`) {
+      return;
+    }
+    throw new Error(`OAuth github-copilot inference host "${host}" is not allowed.`);
   }
 }
 
 /**
- * Derive the real GitHub Copilot upstream API base URL from the Copilot token's `proxy-ep=...`
- * field or enterprise domain (matching Pi 1.5.2 `github-copilot.js:41-61`), kept strictly on the
- * server side so Pi's `toAuth` never overwrites the local gateway URL.
+ * Derive and strictly validate the real GitHub Copilot upstream API base URL from the Copilot
+ * token's `proxy-ep=...` field or enterprise domain (matching Pi 1.5.2 `github-copilot.js:41-61`),
+ * kept strictly on the server side so Pi's `toAuth` never overwrites the local gateway URL.
+ *
+ * Untrusted or malformed `proxy-ep` values are REJECTED (never allowed to redirect Bearer tokens
+ * to an attacker-controlled host).
  */
 export function deriveGitHubCopilotBaseUrl(
   copilotAccessToken: string | undefined,
   enterpriseUrl?: string,
+  validateDestination: OAuthDestinationValidator = assertStrictOAuthDestination,
 ): string {
+  const enterpriseDomain = normalizeEnterpriseDomain(enterpriseUrl);
   if (copilotAccessToken) {
-    const match = copilotAccessToken.match(/proxy-ep=([^;\s]+)/);
+    const match = copilotAccessToken.match(/(?:^|;)proxy-ep=([^;\s]+)/i);
     if (match?.[1]) {
-      const apiHost = match[1].replace(/^proxy\./, "api.");
-      return `https://${apiHost}`;
+      const rawHost = match[1].trim();
+      if (!/^[a-z0-9.-]+$/i.test(rawHost)) {
+        throw new Error("Malformed GitHub Copilot proxy-ep host.");
+      }
+      const apiHost = rawHost.toLowerCase().replace(/^proxy\./, "api.");
+      const derived = new URL(`https://${apiHost}`);
+      validateDestination("github-copilot", derived, "inference", {
+        ...(enterpriseDomain ? { enterpriseUrl: enterpriseDomain } : {}),
+      });
+      return derived.origin;
     }
   }
-  const enterpriseDomain = normalizeEnterpriseDomain(enterpriseUrl);
-  if (enterpriseDomain) {
-    return `https://copilot-api.${enterpriseDomain}`;
-  }
-  return GITHUB_COPILOT_DEFAULT_UPSTREAM_BASE_URL;
+  const fallback = enterpriseDomain
+    ? new URL(`https://copilot-api.${enterpriseDomain}`)
+    : new URL(GITHUB_COPILOT_DEFAULT_UPSTREAM_BASE_URL);
+  validateDestination("github-copilot", fallback, "inference", {
+    ...(enterpriseDomain ? { enterpriseUrl: enterpriseDomain } : {}),
+  });
+  return fallback.origin;
 }
 
 /**
@@ -199,6 +316,7 @@ export interface XaiRefreshEndpointOptions {
   readonly clientId?: string;
   readonly fetchImpl?: typeof fetch;
   readonly now?: () => number;
+  readonly validateDestination?: OAuthDestinationValidator;
 }
 
 const XAI_DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -207,7 +325,8 @@ const XAI_DEFAULT_LIFETIME_SECONDS = 3600;
 
 /**
  * Perform one xAI OAuth `refresh_token` grant (matching Pi 1.5.2 `auth/oauth/xai.js`).
- * Preserves the previous refresh token if xAI omits `refresh_token` when unrotated.
+ * Validates the token endpoint strictly, disables HTTP redirects (`redirect: "error"`), and
+ * preserves the previous refresh token if xAI omits `refresh_token` when unrotated.
  */
 export async function refreshXaiOAuthToken(
   current: XaiOAuthCredentials,
@@ -215,7 +334,9 @@ export async function refreshXaiOAuthToken(
   options: XaiRefreshEndpointOptions = {},
 ): Promise<XaiOAuthCredentials> {
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-  const tokenUrl = options.tokenUrl ?? XAI_DEFAULT_TOKEN_URL;
+  const tokenUrl = new URL(options.tokenUrl ?? XAI_DEFAULT_TOKEN_URL);
+  const validate = options.validateDestination ?? assertStrictOAuthDestination;
+  validate("xai", tokenUrl, "token_refresh");
   const clientId = options.clientId ?? XAI_DEFAULT_CLIENT_ID;
   const now = options.now ?? Date.now;
 
@@ -230,6 +351,7 @@ export async function refreshXaiOAuthToken(
       client_id: clientId,
       refresh_token: current.refresh,
     }),
+    redirect: "error",
     ...(signal ? { signal } : {}),
   });
 
@@ -265,6 +387,7 @@ export interface CodexRefreshEndpointOptions {
   readonly clientId?: string;
   readonly fetchImpl?: typeof fetch;
   readonly now?: () => number;
+  readonly validateDestination?: OAuthDestinationValidator;
 }
 
 const CODEX_DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -276,7 +399,9 @@ export async function refreshCodexOAuthToken(
   options: CodexRefreshEndpointOptions = {},
 ): Promise<CodexOAuthCredentials> {
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-  const tokenUrl = options.tokenUrl ?? CODEX_DEFAULT_TOKEN_URL;
+  const tokenUrl = new URL(options.tokenUrl ?? CODEX_DEFAULT_TOKEN_URL);
+  const validate = options.validateDestination ?? assertStrictOAuthDestination;
+  validate("openai-codex", tokenUrl, "token_refresh");
   const clientId = options.clientId ?? CODEX_DEFAULT_CLIENT_ID;
   const now = options.now ?? Date.now;
 
@@ -288,6 +413,7 @@ export async function refreshCodexOAuthToken(
       refresh_token: current.refresh,
       client_id: clientId,
     }),
+    redirect: "error",
     ...(signal ? { signal } : {}),
   });
   if (!response.ok) {
@@ -338,8 +464,10 @@ export interface OAuthTokenManagerOptions {
  * - Proactive 60s expiry skew refresh before upstream requests;
  * - Single-flight per-channel serialization (concurrent requests share one refresh, preventing
  *   rotating refresh token exhaustion on xAI / Codex / Copilot);
- * - Logout / channel delete bumps fence generation, aborts any in-flight refresh, clears cache,
- *   and prevents stale write-backs from resurrecting deleted credentials.
+ * - Lease/generation is acquired BEFORE reading from SecretStore and checked BEFORE caching,
+ *   returning, or persisting credentials; new reads are rejected while logout/delete is pending;
+ * - Metadata-only re-registrations preserve live/rotated tokens; changing `secretRef`/`provider`
+ *   or unregistering fences/aborts in-flight refreshes and drops cached credentials immediately.
  */
 export class OAuthTokenManager {
   private readonly secretStore: SecretStore;
@@ -348,6 +476,7 @@ export class OAuthTokenManager {
   private readonly now: () => number;
   private readonly configs = new Map<string, RegisteredOAuthChannel>();
   private readonly cache = new Map<string, OAuthSubscriptionCredentials>();
+  private readonly pendingDeletes = new Map<string, number>();
   private readonly inflight = new Map<
     string,
     { readonly generation: number; readonly promise: Promise<OAuthSubscriptionCredentials> }
@@ -360,14 +489,46 @@ export class OAuthTokenManager {
     this.now = options.now ?? Date.now;
   }
 
-  register<T extends OAuthSubscriptionCredentials>(config: RegisteredOAuthChannel<T>): void {
-    this.configs.set(config.channelId, config as unknown as RegisteredOAuthChannel);
-    if (config.initialCredentials) {
-      this.cache.set(config.channelId, config.initialCredentials);
+  private assertNotDeleting(channelId: string): void {
+    if ((this.pendingDeletes.get(channelId) ?? 0) > 0) {
+      throw new SecretStoreUnavailableError(
+        "SECRET_FENCE_STALE",
+        `OAuth credentials for channel "${channelId}" are currently being revoked`,
+      );
     }
   }
 
-  unregister(channelId: string): void {
+  register<T extends OAuthSubscriptionCredentials>(config: RegisteredOAuthChannel<T>): void {
+    const nextConfig = config as unknown as RegisteredOAuthChannel;
+    const previous = this.configs.get(config.channelId);
+    if (previous) {
+      const accountChanged =
+        previous.secretRef !== nextConfig.secretRef || previous.provider !== nextConfig.provider;
+      if (accountChanged) {
+        this.fence.invalidate(
+          config.channelId,
+          `OAuth channel secretRef/provider changed (${previous.provider}:${previous.secretRef} -> ${nextConfig.provider}:${nextConfig.secretRef})`,
+        );
+        this.cache.delete(config.channelId);
+        this.inflight.delete(config.channelId);
+        this.configs.set(config.channelId, nextConfig);
+        if (nextConfig.initialCredentials) {
+          this.cache.set(config.channelId, nextConfig.initialCredentials);
+        }
+        return;
+      }
+      // Same channelId, provider, and secretRef: preserve rotated cached credentials & inflight refresh!
+      this.configs.set(config.channelId, nextConfig);
+      return;
+    }
+    this.configs.set(config.channelId, nextConfig);
+    if (nextConfig.initialCredentials) {
+      this.cache.set(config.channelId, nextConfig.initialCredentials);
+    }
+  }
+
+  unregister(channelId: string, reason = "OAuth channel removed"): void {
+    this.fence.invalidate(channelId, reason);
     this.configs.delete(channelId);
     this.cache.delete(channelId);
     this.inflight.delete(channelId);
@@ -379,10 +540,21 @@ export class OAuthTokenManager {
 
   private async loadCredentials(
     config: RegisteredOAuthChannel,
+    lease: CredentialFenceLease,
   ): Promise<OAuthSubscriptionCredentials> {
+    this.assertNotDeleting(config.channelId);
+    lease.assertCurrent();
     const cached = this.cache.get(config.channelId);
-    if (cached) return cached;
+    if (cached) {
+      this.assertNotDeleting(config.channelId);
+      lease.assertCurrent();
+      return cached;
+    }
     const raw = await this.secretStore.get(config.secretRef);
+    // CRITICAL: Re-check fence & pending-delete state IMMEDIATELY after SecretStore read resolves,
+    // BEFORE parsing, caching, returning, or starting a refresh!
+    this.assertNotDeleting(config.channelId);
+    lease.assertCurrent();
     if (!raw) {
       throw new SecretStoreUnavailableError(
         "SECRET_STORE_UNAVAILABLE",
@@ -402,6 +574,8 @@ export class OAuthTokenManager {
         `Malformed OAuth credentials stored for channel "${config.channelId}"`,
       );
     }
+    this.assertNotDeleting(config.channelId);
+    lease.assertCurrent();
     this.cache.set(config.channelId, parsed);
     return parsed;
   }
@@ -410,49 +584,79 @@ export class OAuthTokenManager {
     channelId: string,
     signal?: AbortSignal,
   ): Promise<T> {
+    this.assertNotDeleting(channelId);
     const config = this.configs.get(channelId);
     if (!config) {
       throw new Error(`No OAuth configuration registered for channel "${channelId}"`);
     }
-    const current = await this.loadCredentials(config);
-    if (current.expires - this.now() > this.skewMs) {
-      return current as T;
+    // Acquire generation lease BEFORE touching SecretStore so any concurrent logout/delete
+    // invalidates this read before it can cache, return, or start a refresh under a newer gen.
+    const readLease = this.fence.acquire(channelId, signal);
+    try {
+      const current = await this.loadCredentials(config, readLease);
+      this.assertNotDeleting(channelId);
+      readLease.assertCurrent();
+      if (current.expires - this.now() > this.skewMs) {
+        return current as T;
+      }
+      return await this.refreshSerial<T>(config, current, readLease);
+    } finally {
+      readLease.release();
     }
-    return this.refreshSerial<T>(config, current, signal);
   }
 
   private async refreshSerial<T extends OAuthSubscriptionCredentials>(
     config: RegisteredOAuthChannel,
     fallback: OAuthSubscriptionCredentials,
-    signal?: AbortSignal,
+    readLease: CredentialFenceLease,
   ): Promise<T> {
-    const currentGen = this.fence.generation(config.channelId);
+    this.assertNotDeleting(config.channelId);
+    readLease.assertCurrent();
+    const expectedGen = readLease.generation;
+
     const existing = this.inflight.get(config.channelId);
-    if (existing && existing.generation === currentGen) {
-      return (await existing.promise) as T;
+    if (existing && existing.generation === expectedGen) {
+      const sharedResult = await existing.promise;
+      this.assertNotDeleting(config.channelId);
+      readLease.assertCurrent();
+      return sharedResult as T;
     }
 
-    const lease = this.fence.acquire(config.channelId, signal);
+    // Acquire a refresh-scoped fence lease pinned strictly to `expectedGen` (NEVER jumping to
+    // a post-logout generation). Not tied to a single caller's HTTP disconnect signal so
+    // concurrent waiters on the same single-flight refresh are not spuriously aborted.
+    const refreshLease = this.fence.acquire(config.channelId);
+    if (refreshLease.generation !== expectedGen) {
+      refreshLease.release();
+      readLease.assertCurrent();
+      throw new SecretStoreUnavailableError(
+        "SECRET_FENCE_STALE",
+        `Channel "${config.channelId}" fence generation advanced before refresh started`,
+      );
+    }
+
     let inflightEntry:
       | { readonly generation: number; readonly promise: Promise<OAuthSubscriptionCredentials> }
       | undefined;
     const refreshPromise = (async (): Promise<OAuthSubscriptionCredentials> => {
       try {
+        this.assertNotDeleting(config.channelId);
+        refreshLease.assertCurrent();
         const latest = this.cache.get(config.channelId) ?? fallback;
         if (latest.expires - this.now() > this.skewMs) {
           return latest;
         }
-        lease.assertCurrent();
-        const refreshed = await config.refresh(latest, lease.signal);
-        lease.assertCurrent();
+        const refreshed = await config.refresh(latest, refreshLease.signal);
+        this.assertNotDeleting(config.channelId);
+        refreshLease.assertCurrent();
         await this.fence.writeIfCurrent(
           this.secretStore,
           config.channelId,
           config.secretRef,
           JSON.stringify(refreshed),
-          lease.generation,
+          refreshLease.generation,
         );
-        if (!lease.isCurrent()) {
+        if (!refreshLease.isCurrent() || (this.pendingDeletes.get(config.channelId) ?? 0) > 0) {
           throw new SecretStoreUnavailableError(
             "SECRET_FENCE_STALE",
             `Channel "${config.channelId}" was invalidated during OAuth refresh`,
@@ -461,22 +665,25 @@ export class OAuthTokenManager {
         this.cache.set(config.channelId, refreshed);
         return refreshed;
       } finally {
-        lease.release();
+        refreshLease.release();
         if (inflightEntry !== undefined && this.inflight.get(config.channelId) === inflightEntry) {
           this.inflight.delete(config.channelId);
         }
       }
     })();
 
-    inflightEntry = { generation: lease.generation, promise: refreshPromise };
+    inflightEntry = { generation: expectedGen, promise: refreshPromise };
     this.inflight.set(config.channelId, inflightEntry);
-    return (await refreshPromise) as T;
+    const result = await refreshPromise;
+    this.assertNotDeleting(config.channelId);
+    readLease.assertCurrent();
+    return result as T;
   }
 
   /**
    * Logout / delete a channel's OAuth credentials safely under the fencing token:
-   * aborts any in-flight refresh, clears in-memory caches, and performs verified deletion
-   * from the OS SecretStore.
+   * blocks new reads while deletion is pending, aborts any in-flight refresh, clears in-memory
+   * caches, and performs verified deletion from the OS SecretStore.
    */
   async revokeAndDelete(
     channelId: string,
@@ -485,11 +692,21 @@ export class OAuthTokenManager {
   ): Promise<number> {
     const config = this.configs.get(channelId);
     const secretRef = secretRefOverride ?? config?.secretRef;
+    this.pendingDeletes.set(channelId, (this.pendingDeletes.get(channelId) ?? 0) + 1);
     this.cache.delete(channelId);
     this.inflight.delete(channelId);
-    if (!secretRef) {
-      return this.fence.invalidate(channelId, reason);
+    try {
+      if (!secretRef) {
+        return this.fence.invalidate(channelId, reason);
+      }
+      return await this.fence.deleteAndInvalidate(this.secretStore, channelId, secretRef, reason);
+    } finally {
+      const remaining = (this.pendingDeletes.get(channelId) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.pendingDeletes.delete(channelId);
+      } else {
+        this.pendingDeletes.set(channelId, remaining);
+      }
     }
-    return this.fence.deleteAndInvalidate(this.secretStore, channelId, secretRef, reason);
   }
 }

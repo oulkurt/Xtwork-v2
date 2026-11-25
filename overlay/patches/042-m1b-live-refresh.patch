@@ -13,8 +13,230 @@ index e06fc7e0..0897507f 100644
      const migrated = settingsFileTrusted
        ? yield* moveInlineSettingsSecrets(settingsWithRuntime)
        : folded;
+diff --git a/packages/provider-pi/src/server/adapter.test.ts b/packages/provider-pi/src/server/adapter.test.ts
+index 4af5beda..80bb054f 100644
+--- a/packages/provider-pi/src/server/adapter.test.ts
++++ b/packages/provider-pi/src/server/adapter.test.ts
+@@ -56,7 +56,10 @@ import {
+ } from "./adapter.ts";
+ import { makePiRpcConnection, type PiRpcRecord } from "./rpc.ts";
+ import { loadMcpBridge } from "./mcpBridge.testkit.ts";
+-import { PI_T3_SERVICE_TIER_COMMAND } from "./mcpExtensionSource.ts";
++import {
++  PI_T3_SERVICE_TIER_COMMAND,
++  PI_XTWORK_RELOAD_MODELS_COMMAND,
++} from "./mcpExtensionSource.ts";
+ import { turnItemOutputText } from "../../../client-runtime/src/work-log/itemDetail.ts";
+ 
+ const layerTest = Layer.mergeAll(
+@@ -172,6 +175,8 @@ interface FakePi {
+   readonly resolveDeferredState: (data: unknown) => Effect.Effect<void>;
+   readonly failNextState: (skip?: number) => void;
+   readonly failNextThinking: () => void;
++  readonly failNextReload: () => void;
++  readonly failNextAvailableModels: () => void;
+   readonly deferNextLifecycle: (
+     type: "switch_session" | "new_session" | "fork" | "prompt" | "abort",
+   ) => void;
+@@ -237,6 +242,8 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+   let deferredStateRequest: PiRpcRecord | undefined;
+   let failStateAfter: number | null = null;
+   let failThinking = false;
++  let failReload = false;
++  let failAvailableModels = false;
+   let vetoSwitch = false;
+   let failFork = false;
+   let vetoNewSession = false;
+@@ -256,6 +263,7 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+   let promptDisposition = true;
+   let currentModel = "default";
+   const serviceTierCommand = `/${PI_T3_SERVICE_TIER_COMMAND}`;
++  const reloadModelsCommand = `/${PI_XTWORK_RELOAD_MODELS_COMMAND}`;
+ 
+   const emit = (record: PiRpcRecord, chunkBytes?: number) =>
+     Effect.gen(function* () {
+@@ -318,6 +326,13 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+           serviceTier = String(record["message"]).slice(serviceTierCommand.length).trim() || null;
+           return promptDisposition ? { ...base, data: { disposition: "handled" } } : base;
+         }
++        if (String(record["message"]) === reloadModelsCommand) {
++          if (failReload) {
++            failReload = false;
++            return { ...base, success: false, error: "reload unavailable" };
++          }
++          return promptDisposition ? { ...base, data: { disposition: "handled" } } : base;
++        }
+         if (isCompacting) {
+           return { ...base, success: false, error: PI_COMPACTING_PROMPT_ERROR };
+         }
+@@ -333,6 +348,10 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+           ? { ...base, data: { disposition: "queued" } }
+           : base;
+       case "get_available_models":
++        if (failAvailableModels) {
++          failAvailableModels = false;
++          return { ...base, success: false, error: "models unavailable" };
++        }
+         return { ...base, data: { models } };
+       case "new_session": {
+         const cancelled = vetoNewSession;
+@@ -383,7 +402,8 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+         const record = decodeJsonLine(line) as PiRpcRecord;
+         if (
+           record["type"] === "prompt" &&
+-          !String(record["message"]).startsWith(serviceTierCommand)
++          !String(record["message"]).startsWith(serviceTierCommand) &&
++          String(record["message"]) !== reloadModelsCommand
+         ) {
+           promptThinkingLevels.push(thinkingLevel);
+           promptModels.push(currentModel);
+@@ -450,6 +470,12 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
+     failNextThinking: () => {
+       failThinking = true;
+     },
++    failNextReload: () => {
++      failReload = true;
++    },
++    failNextAvailableModels: () => {
++      failAvailableModels = true;
++    },
+     promptThinkingLevels,
+     promptModels,
+     changeNatively: (change) => {
+@@ -7183,3 +7209,131 @@ process.stdout.write('{"type":"ready"}\\n');
+       }).pipe(Effect.provide(NodeServices.layer)),
+   );
+ });
++
++describe("Xtwork live model refresh and stale selection reconciliation", () => {
++  it.effect(
++    "retries live reload until BOTH /xtwork-reload-models AND get_available_models succeed, and reconciles stale explicit selections",
++    () =>
++      Effect.gen(function* () {
++        const fileSystem = yield* FileSystem.FileSystem;
++        const agentDir = yield* fileSystem.makeTempDirectoryScoped();
++        const modelsPath = `${agentDir}/models.json`;
++        const settingsPath = `${agentDir}/settings.json`;
++        yield* fileSystem.writeFileString(
++          modelsPath,
++          JSON.stringify({ providers: { "chan-a": { models: [{ id: "model-a" }] } } }),
++        );
++        yield* fileSystem.writeFileString(
++          settingsPath,
++          JSON.stringify({ defaultProvider: "chan-a", defaultModel: "model-a" }),
++        );
++
++        const fake = yield* makeFakePi;
++        fake.queueModels([{ provider: "chan-a", id: "model-a", contextWindow: 128000 }]);
++
++        const adapter = yield* makePiAdapterV2({
++          instanceId: PI_INSTANCE_ID,
++          settings: { enabled: true, binaryPath: "pi", launchArgs: "", customModels: [] },
++          environment: { PI_CODING_AGENT_DIR: agentDir },
++        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, fake.spawner));
++
++        const runtime = yield* adapter.openSession({
++          threadId: THREAD_ID,
++          providerSessionId: SESSION_ID,
++          modelSelection: modelSelection("xtwork/standard"),
++          runtimePolicy,
++        });
++        const emitted = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
++        yield* runtime.events.pipe(
++          Stream.runForEach((event) => Queue.offer(emitted, event)),
++          Effect.forkScoped,
++        );
++        const takeEvent = (
++          predicate: (event: ProviderAdapter.ProviderAdapterV2Event) => boolean,
++        ) =>
++          Effect.gen(function* () {
++            while (true) {
++              const event = yield* Queue.take(emitted);
++              if (predicate(event)) return event;
++            }
++          });
++        const providerThread = yield* runtime.ensureThread({
++          threadId: THREAD_ID,
++          modelSelection: modelSelection("xtwork/standard"),
++          runtimePolicy,
++        });
++
++        const completeTurn = (ordinal: number, selectionModel: string) =>
++          Effect.gen(function* () {
++            yield* startTurn(
++              runtime,
++              providerThread,
++              selectionModel,
++              [],
++              `turn-${ordinal}`,
++              modelSelection(selectionModel),
++              ordinal,
++            );
++            while (true) {
++              const promptReq = yield* fake.takeRequest("prompt");
++              if (String(promptReq["message"]) !== `/${PI_XTWORK_RELOAD_MODELS_COMMAND}`) break;
++            }
++            yield* fake.emit({ type: "agent_settled" });
++            yield* takeEvent((event) => event.type === "turn.terminal");
++          });
++
++        // 1. Saved legacy explicit `xtwork/standard` reconciles to gateway settings.json preferred default (`chan-a/model-a`)!
++        yield* completeTurn(1, "xtwork/standard");
++        assert.equal(fake.promptModels[0], "chan-a/model-a");
++
++        // 2. Update models.json + settings.json to switch to `chan-b/model-b`, but fail `/xtwork-reload-models` first.
++        yield* fileSystem.writeFileString(
++          modelsPath,
++          JSON.stringify({ providers: { "chan-b": { models: [{ id: "model-b" }] } } }),
++        );
++        yield* fileSystem.writeFileString(
++          settingsPath,
++          JSON.stringify({ defaultProvider: "chan-b", defaultModel: "model-b" }),
++        );
++        fake.queueModels([{ provider: "chan-b", id: "model-b", contextWindow: 128000 }]);
++        fake.failNextReload();
++        yield* completeTurn(2, "chan-a/model-a");
++
++        // Because reload failed on turn 2, snapshot MUST NOT be acknowledged -> turn 3 retries reload,
++        // and failing `get_available_models` on turn 3 ALSO leaves snapshot unacknowledged!
++        fake.failNextAvailableModels();
++        yield* completeTurn(3, "chan-a/model-a");
++
++        // Turn 4 retries reload again, BOTH succeed, and stale explicit `chan-a/model-a` reconciles to `chan-b/model-b`!
++        yield* completeTurn(4, "chan-a/model-a");
++        assert.equal(fake.promptModels[fake.promptModels.length - 1], "chan-b/model-b");
++
++        const reloadCalls = fake
++          .allRequests()
++          .filter(
++            (r) =>
++              r["type"] === "prompt" && r["message"] === `/${PI_XTWORK_RELOAD_MODELS_COMMAND}`,
++          );
++        assert.equal(reloadCalls.length, 3);
++
++        // 3. Removing all channels (empty models.json & empty discovered models) fails cleanly!
++        yield* fileSystem.writeFileString(modelsPath, JSON.stringify({ providers: {} }));
++        yield* fileSystem.writeFileString(settingsPath, JSON.stringify({ transport: "sse" }));
++        fake.queueModels([]);
++        const zeroResult = yield* startTurn(
++          runtime,
++          providerThread,
++          "chan-b/model-b",
++          [],
++          "turn-zero",
++          modelSelection("chan-b/model-b"),
++          5,
++        ).pipe(Effect.result);
++        assert.isTrue(
++          zeroResult._tag === "Failure" &&
++            isProviderProtocolError(zeroResult.failure.cause) &&
++            zeroResult.failure.cause.message.includes("No enabled models are available in 小瞳"),
++        );
++      }).pipe(Effect.scoped, Effect.provide(layerTest)),
++  );
++});
 diff --git a/packages/provider-pi/src/server/adapter.ts b/packages/provider-pi/src/server/adapter.ts
-index 3befbaba..9ca2ee09 100644
+index 3befbaba..880856a2 100644
 --- a/packages/provider-pi/src/server/adapter.ts
 +++ b/packages/provider-pi/src/server/adapter.ts
 @@ -79,7 +79,11 @@ import {
@@ -30,27 +252,75 @@ index 3befbaba..9ca2ee09 100644
  import { PI_STANDARD_SERVICE_TIER } from "./modelCapabilities.ts";
  
  export const PI_PROVIDER = ProviderDriverKind.make("pi");
-@@ -692,6 +696,16 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+@@ -692,6 +696,36 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
        let contextWindow: number | null = null;
        const modelContextWindows = new Map<string, number>();
        let discoveredModels: ReadonlyArray<unknown> | null = null;
-+      const modelsJsonPath =
++      const agentDir =
 +        typeof options.environment.PI_CODING_AGENT_DIR === "string" &&
 +        options.environment.PI_CODING_AGENT_DIR.length > 0
-+          ? path.join(options.environment.PI_CODING_AGENT_DIR, "models.json")
++          ? options.environment.PI_CODING_AGENT_DIR
 +          : null;
++      const modelsJsonPath = agentDir !== null ? path.join(agentDir, "models.json") : null;
++      const settingsJsonPath = agentDir !== null ? path.join(agentDir, "settings.json") : null;
 +      const readModelsJsonSnapshot = () =>
 +        modelsJsonPath === null
 +          ? Effect.succeed(null)
 +          : fileSystem.readFileString(modelsJsonPath).pipe(Effect.orElseSucceed(() => null));
++      const decodeUnknownJsonOption = Schema.decodeUnknownOption(
++        Schema.fromJsonString(Schema.Unknown),
++      );
++      const readPreferredDefaultModel = Effect.fnUntraced(function* () {
++        if (settingsJsonPath === null) return null;
++        const raw = yield* fileSystem
++          .readFileString(settingsJsonPath)
++          .pipe(Effect.orElseSucceed(() => null));
++        if (raw === null) return null;
++        const parsedOption = decodeUnknownJsonOption(raw);
++        if (Option.isNone(parsedOption)) return null;
++        const parsed = parsedOption.value;
++        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
++        const provider = recordString(parsed, "defaultProvider");
++        const modelId = recordString(parsed, "defaultModel");
++        if (provider === undefined || modelId === undefined) return null;
++        return { provider, modelId };
++      });
 +      let appliedModelsJsonSnapshot: string | null = yield* readModelsJsonSnapshot();
        let nextPromptId = 0;
        const pendingPromptResponses: Array<PiPromptSend & { readonly id: string }> = [];
        const pendingCompactResponses: Array<{
-@@ -3198,8 +3212,44 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+@@ -2896,7 +2930,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+         if (Array.isArray(models)) {
+           for (const model of models) rememberModelContextWindow(model);
+           discoveredModels = models;
++          return true;
+         }
++        return false;
+       });
+ 
+       // CLI --fork uses Pi's own session format and sets the destination cwd. RPC
+@@ -3198,8 +3234,69 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
            ),
        );
  
++      const resolveFallbackPiModel = Effect.fnUntraced(function* () {
++        const preferred = yield* readPreferredDefaultModel();
++        if (
++          preferred !== null &&
++          findReportedPiModel(`${preferred.provider}/${preferred.modelId}`, discoveredModels) !==
++            undefined
++        ) {
++          return preferred;
++        }
++        const firstModel = Array.isArray(discoveredModels) ? discoveredModels[0] : undefined;
++        const fallbackProvider = recordString(firstModel, "provider");
++        const fallbackModelId = recordString(firstModel, "id");
++        if (fallbackProvider !== undefined && fallbackModelId !== undefined) {
++          return { provider: fallbackProvider, modelId: fallbackModelId };
++        }
++        return null;
++      });
++
 +      const reloadLiveModels = Effect.fnUntraced(function* () {
 +        const result = yield* request({
 +          type: "prompt",
@@ -59,8 +329,13 @@ index 3befbaba..9ca2ee09 100644
 +        if (recordString(result, "disposition") !== "handled") {
 +          return false;
 +        }
++        const previousContextWindows = new Map(modelContextWindows);
 +        modelContextWindows.clear();
-+        yield* discoverModels();
++        const discovered = yield* discoverModels();
++        if (!discovered) {
++          for (const [k, v] of previousContextWindows) modelContextWindows.set(k, v);
++          return false;
++        }
 +        return true;
 +      });
 +
@@ -73,10 +348,12 @@ index 3befbaba..9ca2ee09 100644
 +          latestModelsJsonSnapshot !== appliedModelsJsonSnapshot
 +        ) {
 +          modelsReloaded = yield* reloadLiveModels();
-+          appliedModelsJsonSnapshot = latestModelsJsonSnapshot;
 +          if (modelsReloaded) {
++            // Acknowledge the new models.json revision ONLY AFTER both `/xtwork-reload-models`
++            // AND `discoverModels()` succeed; otherwise leave it unacknowledged so the next turn retries.
++            appliedModelsJsonSnapshot = latestModelsJsonSnapshot;
 +            // Re-bind the model on the next turn so metadata edits (baseUrl/compat) for the same
-+            // provider/model take effect and deleted/disabled models fail cleanly.
++            // provider/model take effect and deleted/disabled models reconcile cleanly.
 +            appliedModel = null;
 +            if (
 +              baselineModel !== null &&
@@ -92,11 +369,16 @@ index 3befbaba..9ca2ee09 100644
          // pi.setModel and /preset can change the model without an RPC event.
          // Confirm cached selections against Pi before skipping them.
          const modelCached =
-@@ -3213,6 +3263,38 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+@@ -3213,6 +3310,41 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
            appliedThinking = recordString(state, "thinkingLevel") ?? null;
          }
          if (modelSelection.model === PI_INHERIT_MODEL_SLUG) {
-+          if (modelsReloaded) {
++          const needsFallbackCheck =
++            modelsReloaded ||
++            (latestModelsJsonSnapshot !== null &&
++              Array.isArray(discoveredModels) &&
++              discoveredModels.length === 0);
++          if (needsFallbackCheck) {
 +            const state = yield* request({ type: "get_state" });
 +            const stateModel = recordField(state, "model");
 +            const activeProvider = recordString(stateModel, "provider");
@@ -109,16 +391,14 @@ index 3befbaba..9ca2ee09 100644
 +              activeSlug === null ||
 +              findReportedPiModel(activeSlug, discoveredModels) === undefined
 +            ) {
-+              const firstModel = Array.isArray(discoveredModels) ? discoveredModels[0] : undefined;
-+              const fallbackProvider = recordString(firstModel, "provider");
-+              const fallbackModelId = recordString(firstModel, "id");
-+              if (fallbackProvider !== undefined && fallbackModelId !== undefined) {
++              const fallback = yield* resolveFallbackPiModel();
++              if (fallback !== null) {
 +                const selectedFallback = yield* request({
 +                  type: "set_model",
-+                  provider: fallbackProvider,
-+                  modelId: fallbackModelId,
++                  provider: fallback.provider,
++                  modelId: fallback.modelId,
 +                });
-+                baselineModel = { provider: fallbackProvider, modelId: fallbackModelId };
++                baselineModel = fallback;
 +                appliedThinking = null;
 +                contextWindow = rememberModelContextWindow(selectedFallback);
 +              } else {
@@ -131,6 +411,72 @@ index 3befbaba..9ca2ee09 100644
            if (appliedModel !== null && baselineModel !== null) {
              const restoredModel = yield* request({ type: "set_model", ...baselineModel });
              appliedThinking = null;
+@@ -3239,28 +3371,48 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+           if (findReportedPiModel(modelSelection.model, discoveredModels) === undefined) {
+             yield* discoverModels();
+           }
+-          const parsed = resolvePiModelSlug(modelSelection.model, discoveredModels);
++          let effectiveModelSlug = modelSelection.model;
++          let parsed = resolvePiModelSlug(effectiveModelSlug, discoveredModels);
++          // Reconcile stale explicit selections (including saved legacy `xtwork/standard` or
++          // deleted/disabled channel models) against the gateway's preferred default in
++          // settings.json, or return a clean unavailable error when zero channels exist.
++          if (
++            latestModelsJsonSnapshot !== null &&
++            Array.isArray(discoveredModels) &&
++            findReportedPiModel(effectiveModelSlug, discoveredModels) === undefined
++          ) {
++            const fallback = yield* resolveFallbackPiModel();
++            if (fallback === null) {
++              return yield* protocolError(
++                "No enabled models are available in 小瞳. Configure a model channel in Settings.",
++              );
++            }
++            parsed = fallback;
++            effectiveModelSlug = `${fallback.provider}/${fallback.modelId}`;
++          }
+           if (parsed === null) {
+             return yield* protocolError(
+               `Pi model '${modelSelection.model}' must use provider/model format`,
+             );
+           }
+-          const selectedModel = yield* request({
+-            type: "set_model",
+-            provider: parsed.provider,
+-            modelId: parsed.modelId,
+-          });
+-          // Pi resets thinking to the target model's configured default on set_model.
+-          appliedThinking = null;
+-          contextWindow = rememberModelContextWindow(selectedModel);
+-          appliedModel = modelSelection.model;
+-          const updatedAt = yield* DateTime.now;
+-          sessionEntity = { ...sessionEntity, model: modelSelection.model, updatedAt };
+-          yield* emit({
+-            type: "provider_session.updated",
+-            driver: PI_PROVIDER,
+-            providerSession: sessionEntity,
+-          });
++          if (modelDrifted || modelsReloaded || effectiveModelSlug !== appliedModel) {
++            const selectedModel = yield* request({
++              type: "set_model",
++              provider: parsed.provider,
++              modelId: parsed.modelId,
++            });
++            // Pi resets thinking to the target model's configured default on set_model.
++            appliedThinking = null;
++            contextWindow = rememberModelContextWindow(selectedModel);
++            appliedModel = effectiveModelSlug;
++            const updatedAt = yield* DateTime.now;
++            sessionEntity = { ...sessionEntity, model: effectiveModelSlug, updatedAt };
++            yield* emit({
++              type: "provider_session.updated",
++              driver: PI_PROVIDER,
++              providerSession: sessionEntity,
++            });
++          }
+         }
+         if (
+           thinking !== undefined &&
 diff --git a/packages/provider-pi/src/server/mcpExtensionSource.ts b/packages/provider-pi/src/server/mcpExtensionSource.ts
 index 3d151b63..bdcd86e4 100644
 --- a/packages/provider-pi/src/server/mcpExtensionSource.ts

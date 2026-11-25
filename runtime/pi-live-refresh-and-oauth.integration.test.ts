@@ -32,11 +32,18 @@ import {
   startBundledPi,
 } from "./gateway.ts";
 import {
+  assertStrictOAuthDestination,
   createCodexPlaceholderJwt,
+  type OAuthDestinationValidator,
   refreshXaiOAuthToken,
   type XaiOAuthCredentials,
 } from "./oauthProxy.ts";
 import { ChannelCredentialFence, memorySecrets } from "./secretStore.ts";
+
+const allowLoopbackOAuthForTests: OAuthDestinationValidator = (provider, url, purpose, context) => {
+  if (url.protocol === "http:" && url.hostname === "127.0.0.1") return;
+  assertStrictOAuthDestination(provider, url, purpose, context);
+};
 import {
   PI_T3_MCP_EXTENSION_SOURCE,
   PI_XTWORK_RELOAD_MODELS_COMMAND,
@@ -310,7 +317,12 @@ describe("Real Pi 1.5.2 RPC integration: Live Refresh (4 scenarios) + OAuth Prox
   it("boots cleanly in zero-channel state without crashing", async () => {
     const dir = mkdtempSync(join(tmpdir(), "xtwork-pi-zero-"));
     try {
-      const runtime = await startBundledPi("/bin/true", dir, {}, { skipBinaryAccessCheck: true });
+      const runtime = await startBundledPi(
+        "/bin/true",
+        dir,
+        {},
+        { secretStore: memorySecrets(), skipBinaryAccessCheck: true },
+      );
       const piEnv = Object.fromEntries(runtime.environment.map((e) => [e.name, e.value]));
       const rpc = spawnPiRpc(piCli, piEnv);
       try {
@@ -403,7 +415,7 @@ describe("Real Pi 1.5.2 RPC integration: Live Refresh (4 scenarios) + OAuth Prox
         "/bin/true",
         dir,
         {},
-        { channels: [chanA], skipBinaryAccessCheck: true },
+        { channels: [chanA], secretStore: memorySecrets(), skipBinaryAccessCheck: true },
       );
       const piEnv = Object.fromEntries(runtime.environment.map((e) => [e.name, e.value]));
       const rpc = spawnPiRpc(piCli, piEnv, extPath);
@@ -695,6 +707,7 @@ describe("Real Pi 1.5.2 RPC integration: Live Refresh (4 scenarios) + OAuth Prox
             refresh: (cur, signal) =>
               refreshXaiOAuthToken(cur as XaiOAuthCredentials, signal, {
                 tokenUrl: `${xaiStub.baseUrl}/oauth2/token`,
+                validateDestination: allowLoopbackOAuthForTests,
               }),
           },
         },
@@ -704,7 +717,13 @@ describe("Real Pi 1.5.2 RPC integration: Live Refresh (4 scenarios) + OAuth Prox
         "/bin/true",
         dir,
         {},
-        { channels, secretStore, fence, skipBinaryAccessCheck: true },
+        {
+          channels,
+          secretStore,
+          fence,
+          validateOAuthDestination: allowLoopbackOAuthForTests,
+          skipBinaryAccessCheck: true,
+        },
       );
       const piEnv = Object.fromEntries(runtime.environment.map((e) => [e.name, e.value]));
       const rpc = spawnPiRpc(piCli, piEnv);
