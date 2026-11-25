@@ -1,0 +1,108 @@
+--- a/packages/provider-pi/src/server/adapter.ts
++++ b/packages/provider-pi/src/server/adapter.ts
+@@ -490,6 +490,7 @@
+     ) {
+       const scope = yield* Effect.scope;
+       const cwd = input.runtimePolicy.cwd ?? host.paths.cwd;
++      const imSession = input.threadId.startsWith("xtwork-im-");
+       const mcpSession = yield* mcpSessions.read(input.threadId);
+       const provideCacheFs = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem>) =>
+         effect.pipe(
+@@ -536,7 +537,7 @@
+         const connectionScope = yield* Scope.fork(scope, "sequential");
+         return yield* Effect.gen(function* () {
+           const launch = buildPiRpcLaunch({
+-            launchArgs: resolvedLaunchArgs.args,
++            launchArgs: imSession ? [...resolvedLaunchArgs.args, "--no-context-files"] : resolvedLaunchArgs.args,
+             // PortScanner.AGENT_THREAD_ENV, as a literal because this package cannot reach apps/server.
+             environment: { ...options.environment, T3CODE_THREAD_ID: input.threadId },
+             mcpSession,
+@@ -1821,7 +1822,7 @@
+         }
+         const approvalTitle = recordString(event, "title") ?? "";
+         const approvalKey = `${approvalTitle.length}:${approvalTitle}${recordString(event, "message") ?? ""}`;
+-        if (method === "confirm" && sessionApprovals.has(approvalKey)) {
++        if (!imSession && method === "confirm" && sessionApprovals.has(approvalKey)) {
+           yield* connection.send({
+             type: "extension_ui_response",
+             id: nativeRequestId,
+@@ -3735,7 +3736,7 @@
+             });
+             pendingPrompts.delete(String(requestInput.requestId));
+             if (pending.expirationFiber !== null) yield* Fiber.interrupt(pending.expirationFiber);
+-            if (pending.method === "confirm" && requestInput.decision === "acceptForSession") {
++            if (!imSession && pending.method === "confirm" && requestInput.decision === "acceptForSession") {
+               sessionApprovals.add(pending.approvalKey);
+             }
+             const resolvedAt = yield* DateTime.now;
+--- a/packages/provider-pi/src/server/mcpExtensionSource.ts
++++ b/packages/provider-pi/src/server/mcpExtensionSource.ts
+@@ -360,7 +360,36 @@
+       NodePath.resolve(tool.sourceInfo.path) === NodePath.resolve(extensionPath));
+   };
+ 
++  const endpoint = env(URL_ENV);
++  const token = env(TOKEN_ENV);
++  let catalog: ReadonlyArray<McpTool> = [];
++  const client = endpoint !== undefined && token !== undefined ? createMcpClient(endpoint, token) : undefined;
++  const imSession = process.env.T3CODE_THREAD_ID?.startsWith("xtwork-im-") === true;
++
+   pi.on("tool_call", async (event, ctx) => {
++    if (imSession) {
++      if (event.toolName === "tool_search" && hasBuiltinToolSearch()) return;
++      const extensionPath = env(EXTENSION_PATH_ENV);
++      const isBridgeTool = extensionPath !== undefined && typeof pi.getAllTools === "function" &&
++        pi.getAllTools().some((tool) => tool.name === event.toolName &&
++          typeof tool.sourceInfo?.path === "string" &&
++          NodePath.resolve(tool.sourceInfo.path) === NodePath.resolve(extensionPath));
++      const toolName = isBridgeTool
++        ? catalog.find((tool) => ["mcp__t3-code__", "mcp__t3_code__"].some(
++          (prefix) => event.toolName === prefix + tool.name))?.name
++        : undefined;
++      if (toolName?.startsWith("im__") || toolName?.startsWith("todo__")) return;
++      try {
++        if (endpoint === undefined || token === undefined || client === undefined) throw new Error("The IM policy is unavailable.");
++        const result = await client.callTool(
++          "im__native_policy",
++          { toolName: event.toolName, args: event.input },
++          ctx.signal,
++        ) as { isError?: boolean; structuredContent?: { allowed?: boolean } } | undefined;
++        if (result?.isError !== true && result?.structuredContent?.allowed === true) return;
++      } catch {}
++      return { block: true, reason: "This tool call did not receive IM authorization." };
++    }
+     const mode = runtimeMode();
+     if (mode === "full-access") return;
+     if ((event.toolName === "tool_search" ? hasBuiltinToolSearch() : READ_ONLY_TOOLS.has(event.toolName)) || isReadOnlyMcpTool(event.toolName)) {
+@@ -382,21 +411,17 @@
+-  const endpoint = env(URL_ENV);
+-  const token = env(TOKEN_ENV);
+-  if (endpoint === undefined || token === undefined) {
++  if (endpoint === undefined || token === undefined || client === undefined) {
+     pi.on("session_start", async (_event, ctx) => {
+       ctx.ui.notify(
+         "t3-code MCP unavailable: T3_MCP_URL or T3_MCP_BEARER_TOKEN is missing.",
+         "warning",
+       );
+     });
+     return;
+   }
+ 
+   // Tool exposure arrived with registerMcpServer in Pi 0.99. Keep the HTTP
+   // bridge as the credential owner: mcp.json overrides native registrations.
+   const supportsExposure = "registerMcpServer" in pi && typeof pi.registerMcpServer === "function";
+   const directTools = new Set(["orchestrator_capabilities", "delegate_task", "task_status"]);
+   let deferOptionalTools = supportsExposure;
+-  let catalog: ReadonlyArray<McpTool> = [];
+ 
+-  const client = createMcpClient(endpoint, token);
+   let started: Promise<void> | undefined;
+@@ -412,6 +437,6 @@
+       for (const prefix of prefixes) {
+         if (tool.annotations?.readOnlyHint === true) readOnlyMcpTools.add(\`\${prefix}\${name}\`);
+         const exposure = prefix === "mcp__t3_code__" ? "hidden" :
+-          deferOptionalTools && !directTools.has(name) ? "deferred" : "direct";
++          !imSession && deferOptionalTools && !directTools.has(name) ? "deferred" : "direct";
+         pi.registerTool({
+           name: \`\${prefix}\${name}\`,
+           label: name,

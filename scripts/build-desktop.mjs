@@ -1,7 +1,8 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { chmodSync, cpSync, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assertNoLeakedUserVisibleBrand } from "./brandCatalog.mjs";
 import { brand, build, lock, overlay, readJson, root, run, t3 } from "./project.mjs";
@@ -74,6 +75,40 @@ const pi = join(runtime, "pi");
 cpSync(join(root, "runtime", "pi"), pi, { recursive: true });
 run("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: pi });
 for (const binary of ["pi", "pi-shell"]) chmodSync(join(pi, binary), 0o755);
+const imSource = join(root, "im-bridge");
+const imBridge = join(resources, "im-bridge");
+const hasImBridge = existsSync(imSource);
+if (hasImBridge) {
+  const stagingRoot = mkdtempSync(join(tmpdir(), "xtwork-im-build-"));
+  try {
+    const imStaging = join(stagingRoot, "im-bridge");
+    mkdirSync(imStaging);
+    cpSync(imSource, imStaging, {
+      recursive: true,
+      filter: (path) => ![".git", "node_modules", "dist", ".im-bridge-data"].includes(path.slice(path.lastIndexOf("/") + 1)),
+    });
+    run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: imStaging });
+    run("npm", ["run", "build"], { cwd: imStaging });
+    rmSync(imBridge, { recursive: true, force: true });
+    mkdirSync(imBridge, { recursive: true });
+    cpSync(join(imStaging, "dist"), join(imBridge, "dist"), { recursive: true });
+    for (const file of ["package.json", "package-lock.json", "THIRD_PARTY_NOTICES"]) {
+      cpSync(join(imStaging, file), join(imBridge, file));
+    }
+    run("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: imBridge });
+    if (!existsSync(join(imBridge, "dist", "main.js"))) {
+      throw new Error("Build im-bridge/dist/main.js before packaging the desktop app");
+    }
+    if (!existsSync(join(imBridge, "THIRD_PARTY_NOTICES"))) {
+      throw new Error("The IM bridge is missing THIRD_PARTY_NOTICES");
+    }
+    for (const forbidden of ["src", "test", "tsconfig.json", "tsconfig.build.json", ".im-bridge-data"]) {
+      if (existsSync(join(imBridge, forbidden))) throw new Error(`The packaged IM bridge contains ${forbidden}`);
+    }
+  } finally {
+    rmSync(stagingRoot, { recursive: true, force: true });
+  }
+}
 const pluginHost = join(resources, "plugin-host");
 mkdirSync(pluginHost);
 run("go", ["build", "-trimpath", "-o", join(pluginHost, "xtwork-plugin-host"), "."], { cwd: join(root, "plugin-host") });
@@ -106,6 +141,45 @@ const appResources = join(app, "Contents", "Resources");
 assertNoLeakedUserVisibleBrand(join(appResources, "server", "dist"));
 run(join(appResources, "node", "bin", "node"), [join(appResources, "server", "dist", "bin.mjs"), "--version"]);
 run(join(appResources, "runtime", "pi", "pi"), ["--version"]);
+
+if (hasImBridge) {
+  const packagedBridge = join(appResources, "im-bridge");
+  const entry = join(packagedBridge, "dist", "main.js");
+  if (!existsSync(entry) || !existsSync(join(packagedBridge, "THIRD_PARTY_NOTICES"))) {
+    throw new Error("The packaged IM bridge is missing its entry point or notices");
+  }
+  const scratch = mkdtempSync(join(tmpdir(), "xtwork-im-smoke-"));
+  try {
+    const probe = spawnSync(join(appResources, "node", "bin", "node"), [entry], {
+      cwd: scratch,
+      env: {
+        PATH: "/usr/bin:/bin",
+        HOME: scratch,
+        XTWORK_IM_DATA_DIR: join(scratch, "im"),
+        XTWORK_COMPANION_DIR: join(scratch, "companion"),
+        XTWORK_IM_PROTOCOL_VERSION: "1",
+      },
+      input: [
+        { id: 1, method: "bridge.hello", params: { protocolVersion: 1 } },
+        { id: 2, method: "bridge.shutdown", params: {} },
+      ].map((frame) => JSON.stringify(frame)).join("\n") + "\n",
+      encoding: "utf8",
+      timeout: 10_000,
+      killSignal: "SIGKILL",
+    });
+    if (probe.error) throw probe.error;
+    const replies = probe.stdout.split("\n").filter(Boolean).map(JSON.parse);
+    const hello = replies.find((reply) => reply.id === 1);
+    const shutdown = replies.find((reply) => reply.id === 2);
+    if (probe.status !== 0 || Number(hello?.result?.protocolVersion) !== 1 || !shutdown || shutdown.error) {
+      throw new Error("The packaged IM bridge failed its bundled Node handshake or shutdown");
+    }
+    console.log("Packaged IM bridge hello/shutdown passed");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
 
 if (upload) {
   const manifestName = `update-${platform}.json`;

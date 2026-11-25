@@ -2319,8 +2319,8 @@ index 96b821ea..6dc0b865 100644
 +import { useDesktopDeveloperFeatures } from "../../hooks/useDeveloperFeatures";
 +import { isXtworkDesktop } from "../../desktopFeatureVisibility";
  import { DeveloperFeaturesSettings } from "./DeveloperFeaturesSettings";
+ import { RemoteImSettings } from "./RemoteImSettings";
  import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
- import { m as resolveMessage } from "~/i18n/messages";
 @@ -458,7 +460,7 @@ function AboutVersionSection() {
            }
          />

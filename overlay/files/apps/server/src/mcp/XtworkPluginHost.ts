@@ -10,6 +10,7 @@ export interface PluginTool {
   readonly name: string;
   readonly title: string;
   readonly description: string;
+  readonly confirm?: boolean;
   readonly inputSchema: ToolJson;
 }
 
@@ -84,10 +85,11 @@ export class XtworkPluginHost {
   invoke(
     name: string,
     input: Schema.Json,
-    context: { readonly threadId: string; readonly operationKey: string | undefined },
+    context: { readonly threadId: string; readonly operationKey: string | undefined; readonly scope?: string },
     signal: AbortSignal,
+    approved = false,
   ) {
-    return this.request("tools.invoke", { name, input, context }, signal);
+    return this.request("tools.invoke", { name, input, context, approved }, signal);
   }
 
   callView(name: string, input: Schema.Json, signal: AbortSignal) {

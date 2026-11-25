@@ -1,0 +1,159 @@
+Xtwork v2 IM Bridge third-party notices
+=======================================
+
+This package (`im-bridge/`) vendors and adapts MIT-licensed channel interfaces,
+channel adapters, state machines, formatting utilities, and OS credential store
+integrations from upstream open-source projects, and depends on two official
+MIT-licensed IM platform SDKs.
+
+  1. earayu/Mingle (commit 006220e880d2134665ce2745ab6233f52c8eabe9) .. MIT
+  2. xmanrui/dsh-im (protocol reference in WeChat / WeCom adapters) ... MIT
+  3. @larksuiteoapi/node-sdk v1.76.0 ................................. MIT
+  4. @wecom/aibot-node-sdk v1.0.7 ..................................... MIT
+
+------------------------------------------------------------------------
+1. earayu/Mingle
+------------------------------------------------------------------------
+
+What:     Platform-agnostic IM Channel abstraction, mention parser,
+          connection/inbound/access state machines, message formatter,
+          OS keychain/DPAPI/Secret Service credential helpers, and
+          Feishu / WeCom / WeChat channel adapters.
+Upstream: https://github.com/earayu/Mingle
+Commit:   006220e880d2134665ce2745ab6233f52c8eabe9
+License:  MIT
+
+Files adapted in im-bridge/:
+  src/channels/channel.ts
+  src/channels/mention.ts
+  src/channels/registry.ts
+  src/channels/feishu/feishu.ts
+  src/channels/feishu/comments.ts
+  src/channels/wecom/wecom.ts
+  src/channels/wechat/wechat.ts
+  src/core/link.ts
+  src/core/inbound.ts
+  src/core/access.ts
+  src/core/format.ts
+  src/core/ids.ts
+  src/core/terms.ts
+  src/platform/secrets.ts
+  src/store/store.ts
+
+MIT License
+
+Copyright (c) 2026 earayu
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------
+2. xmanrui/dsh-im
+------------------------------------------------------------------------
+
+What:     WeChat iLink protocol endpoints, login/polling states, context
+          tokens, AES-128-ECB CDN media handling, and WeCom QR bot
+          creation endpoints referenced in src/channels/wechat/wechat.ts
+          and src/channels/wecom/wecom.ts (via earayu/Mingle).
+Upstream: https://github.com/xmanrui/dsh-im
+License:  MIT
+
+MIT License
+
+Copyright (c) xmanrui
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------
+3. @larksuiteoapi/node-sdk v1.76.0
+------------------------------------------------------------------------
+
+What:     Official Feishu / Lark Open Platform Node.js SDK (WebSocket
+          event subscription, messaging, cards, reactions, media).
+Upstream: https://github.com/larksuite/node-sdk
+Package:  https://www.npmjs.com/package/@larksuiteoapi/node-sdk
+License:  MIT
+
+MIT License
+
+Copyright (c) 2022 Lark Technologies Pte. Ltd.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------
+4. @wecom/aibot-node-sdk v1.0.7
+------------------------------------------------------------------------
+
+What:     Official WeCom (Enterprise WeChat) AI Bot WebSocket Node.js SDK.
+Upstream: https://github.com/WecomTeam/aibot-node-sdk
+Package:  https://www.npmjs.com/package/@wecom/aibot-node-sdk
+License:  MIT (declared "license": "MIT" in package.json; no standalone LICENSE file shipped)
+
+MIT License
+
+Copyright (c) WecomTeam
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
