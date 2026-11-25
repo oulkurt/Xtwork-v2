@@ -2032,8 +2032,11 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         releaseDelete();
         await deletePromise;
 
-        // Committing the staged update after delete finishes MUST NOT carry over stale initialCredentials!
+        // Committing the staged update after delete finishes MUST NOT carry over stale initialCredentials,
+        // and the transaction payload itself must strip initialCredentials and be strictly single-use!
+        assert.equal(pausedTx.nextConfigs[0]!.initialCredentials, undefined);
         pausedMgr.commitUpdate(pausedTx);
+        pausedMgr.commitUpdate(pausedTx); // retry must be a strict no-op
         assert.equal(pausedMgr.getCached("paused-ch-b"), undefined);
         await assert.rejects(
           () => pausedMgr.getValidCredentials("paused-ch-b"),
@@ -2041,6 +2044,41 @@ describe("multi-protocol Proxy-Only model gateway & OAuth helpers (ADR-012 M1b-G
         );
         assert.equal(pausedRefreshCalls, 0);
         assert.equal(await basePausedStore.get("oauth:paused-del"), undefined);
+
+        // Also prove: committing a normal tx with initialCredentials, then logging out, then retrying commitUpdate(tx)
+        // CANNOT resurrect initialCredentials!
+        const retryStore = memorySecrets();
+        let retryRefreshCalls = 0;
+        const retryMgr = new OAuthTokenManager({
+          secretStore: retryStore,
+          fence: new ChannelCredentialFence(),
+          now: () => 500_000,
+        });
+        const retryTx = retryMgr.stageUpdate([
+          {
+            channelId: "retry-ch",
+            provider: "xai",
+            secretRef: "oauth:retry-del",
+            initialCredentials: { access: "init-tok", refresh: "init-r", expires: 100 },
+            refresh: async () => {
+              retryRefreshCalls += 1;
+              return { access: "resurrected-by-retry", refresh: "r2", expires: 9_999_999 };
+            },
+          },
+        ]);
+        assert.equal(retryTx.nextConfigs[0]!.initialCredentials, undefined);
+        retryMgr.commitUpdate(retryTx);
+        assert.equal(retryMgr.getCached("retry-ch")?.access, "init-tok");
+        await retryMgr.revokeAndDelete("retry-ch", undefined, "logout before commit retry");
+        assert.equal(retryMgr.getCached("retry-ch"), undefined);
+        retryMgr.commitUpdate(retryTx); // retry after logout MUST NOT re-seed cache!
+        assert.equal(retryMgr.getCached("retry-ch"), undefined);
+        await assert.rejects(
+          () => retryMgr.getValidCredentials("retry-ch"),
+          (err: unknown) => err instanceof SecretStoreUnavailableError && err.code === "SECRET_STORE_UNAVAILABLE",
+        );
+        assert.equal(retryRefreshCalls, 0);
+        assert.equal(await retryStore.get("oauth:retry-del"), undefined);
       } finally {
         await runtime.close();
       }

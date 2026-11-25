@@ -488,6 +488,12 @@ function secretRefFenceKeyFor(secretRef: string): string {
   return `secretRef:${secretRef}`;
 }
 
+function stripInitialCredentials(config: RegisteredOAuthChannel): RegisteredOAuthChannel {
+  if (config.initialCredentials === undefined) return config;
+  const { initialCredentials: _dropped, ...rest } = config;
+  return rest;
+}
+
 interface DualFenceLease {
   readonly bindingGeneration: number;
   readonly secretRefGeneration: number;
@@ -525,6 +531,7 @@ export class OAuthTokenManager {
   private readonly now: () => number;
   private readonly active = new Map<string, OAuthBindingRecord>();
   private readonly staged = new Map<string, OAuthBindingRecord>();
+  private readonly settledTransactions = new WeakSet<StagedOAuthUpdate>();
   private readonly pendingDeletes = new Map<string, number>();
   private readonly pendingDeletesBySecretRef = new Map<string, number>();
 
@@ -605,24 +612,25 @@ export class OAuthTokenManager {
 
   register<T extends OAuthSubscriptionCredentials>(config: RegisteredOAuthChannel<T>): string {
     const nextConfig = config as unknown as RegisteredOAuthChannel;
+    const sanitizedConfig = stripInitialCredentials(nextConfig);
     const previous = this.active.get(config.channelId);
     if (previous) {
       const accountChanged =
-        previous.config.secretRef !== nextConfig.secretRef ||
-        previous.config.provider !== nextConfig.provider;
+        previous.config.secretRef !== sanitizedConfig.secretRef ||
+        previous.config.provider !== sanitizedConfig.provider;
       if (accountChanged) {
         this.invalidateRecordFences(
           previous,
-          `OAuth channel secretRef/provider changed (${previous.config.provider}:${previous.config.secretRef} -> ${nextConfig.provider}:${nextConfig.secretRef})`,
+          `OAuth channel secretRef/provider changed (${previous.config.provider}:${previous.config.secretRef} -> ${sanitizedConfig.provider}:${sanitizedConfig.secretRef})`,
         );
         const replacement: OAuthBindingRecord = {
           bindingId: randomUUID(),
           fenceKey: config.channelId,
-          secretRefFenceKey: secretRefFenceKeyFor(nextConfig.secretRef),
+          secretRefFenceKey: secretRefFenceKeyFor(sanitizedConfig.secretRef),
           priorFenceKeys: new Set(),
-          config: nextConfig,
+          config: sanitizedConfig,
           ...(nextConfig.initialCredentials !== undefined &&
-          !this.isDeleting(nextConfig.channelId, nextConfig.secretRef)
+          !this.isDeleting(sanitizedConfig.channelId, sanitizedConfig.secretRef)
             ? { cache: nextConfig.initialCredentials }
             : {}),
         };
@@ -630,17 +638,17 @@ export class OAuthTokenManager {
         return replacement.bindingId;
       }
       // Same channelId, provider, and secretRef: preserve rotated cached credentials & inflight refresh!
-      previous.config = nextConfig;
+      previous.config = sanitizedConfig;
       return previous.bindingId;
     }
     const created: OAuthBindingRecord = {
       bindingId: randomUUID(),
       fenceKey: config.channelId,
-      secretRefFenceKey: secretRefFenceKeyFor(nextConfig.secretRef),
+      secretRefFenceKey: secretRefFenceKeyFor(sanitizedConfig.secretRef),
       priorFenceKeys: new Set(),
-      config: nextConfig,
+      config: sanitizedConfig,
       ...(nextConfig.initialCredentials !== undefined &&
-      !this.isDeleting(nextConfig.channelId, nextConfig.secretRef)
+      !this.isDeleting(sanitizedConfig.channelId, sanitizedConfig.secretRef)
         ? { cache: nextConfig.initialCredentials }
         : {}),
     };
@@ -656,38 +664,41 @@ export class OAuthTokenManager {
   stageUpdate(nextConfigs: readonly RegisteredOAuthChannel[]): StagedOAuthUpdate {
     const stagedBindingIds = new Map<string, string>();
     const bindingIdsByChannel = new Map<string, string>();
+    const sanitizedConfigs: RegisteredOAuthChannel[] = [];
 
     for (const nextConfig of nextConfigs) {
-      const existing = this.active.get(nextConfig.channelId);
+      const sanitizedConfig = stripInitialCredentials(nextConfig);
+      sanitizedConfigs.push(sanitizedConfig);
+      const existing = this.active.get(sanitizedConfig.channelId);
       if (
         existing &&
-        existing.config.provider === nextConfig.provider &&
-        existing.config.secretRef === nextConfig.secretRef
+        existing.config.provider === sanitizedConfig.provider &&
+        existing.config.secretRef === sanitizedConfig.secretRef
       ) {
         // Same account: reuse active binding & rotated cache without creating a duplicate.
-        bindingIdsByChannel.set(nextConfig.channelId, existing.bindingId);
+        bindingIdsByChannel.set(sanitizedConfig.channelId, existing.bindingId);
         continue;
       }
       // New channel OR account swap: create an isolated staged record without touching `active`!
       const bindingId = randomUUID();
       const stagedRecord: OAuthBindingRecord = {
         bindingId,
-        fenceKey: `${nextConfig.channelId}#staged:${bindingId}`,
-        secretRefFenceKey: secretRefFenceKeyFor(nextConfig.secretRef),
+        fenceKey: `${sanitizedConfig.channelId}#staged:${bindingId}`,
+        secretRefFenceKey: secretRefFenceKeyFor(sanitizedConfig.secretRef),
         priorFenceKeys: new Set(),
-        config: nextConfig,
+        config: sanitizedConfig,
         ...(nextConfig.initialCredentials !== undefined &&
-        !this.isDeleting(nextConfig.channelId, nextConfig.secretRef)
+        !this.isDeleting(sanitizedConfig.channelId, sanitizedConfig.secretRef)
           ? { cache: nextConfig.initialCredentials }
           : {}),
       };
       this.staged.set(bindingId, stagedRecord);
-      stagedBindingIds.set(nextConfig.channelId, bindingId);
-      bindingIdsByChannel.set(nextConfig.channelId, bindingId);
+      stagedBindingIds.set(sanitizedConfig.channelId, bindingId);
+      bindingIdsByChannel.set(sanitizedConfig.channelId, bindingId);
     }
 
     return {
-      nextConfigs: [...nextConfigs],
+      nextConfigs: sanitizedConfigs,
       stagedBindingIds,
       bindingIdsByChannel,
     };
@@ -698,48 +709,48 @@ export class OAuthTokenManager {
    * promotes staged records to `active` (preserving any token refreshed while staged AND
    * tracking the staged fence key so any later logout/unregister aborts pre-commit refreshes!),
    * updates unchanged channels in place, and retires/fences removed or replaced accounts.
+   * Single-use: retrying an already committed or discarded transaction is a strict no-op.
    */
   commitUpdate(tx: StagedOAuthUpdate): void {
+    if (this.settledTransactions.has(tx)) {
+      return;
+    }
+    this.settledTransactions.add(tx);
     const nextChannelIds = new Set<string>();
     for (const nextConfig of tx.nextConfigs) {
-      nextChannelIds.add(nextConfig.channelId);
-      const stagedId = tx.stagedBindingIds.get(nextConfig.channelId);
+      const sanitizedConfig = stripInitialCredentials(nextConfig);
+      nextChannelIds.add(sanitizedConfig.channelId);
+      const stagedId = tx.stagedBindingIds.get(sanitizedConfig.channelId);
       if (stagedId !== undefined) {
         const stagedRecord = this.staged.get(stagedId);
         this.staged.delete(stagedId);
-        const previous = this.active.get(nextConfig.channelId);
+        const previous = this.active.get(sanitizedConfig.channelId);
         if (previous) {
           this.invalidateRecordFences(
             previous,
-            `OAuth channel account replaced (${previous.config.provider}:${previous.config.secretRef} -> ${nextConfig.provider}:${nextConfig.secretRef})`,
+            `OAuth channel account replaced (${previous.config.provider}:${previous.config.secretRef} -> ${sanitizedConfig.provider}:${sanitizedConfig.secretRef})`,
           );
         }
         const promotedPriorKeys = new Set<string>(stagedRecord?.priorFenceKeys ?? []);
         if (stagedRecord) {
           promotedPriorKeys.add(stagedRecord.fenceKey);
         }
-        const deleting = this.isDeleting(nextConfig.channelId, nextConfig.secretRef);
+        const deleting = this.isDeleting(sanitizedConfig.channelId, sanitizedConfig.secretRef);
         const promoted: OAuthBindingRecord = {
           bindingId: stagedRecord?.bindingId ?? stagedId,
-          fenceKey: nextConfig.channelId,
-          secretRefFenceKey: secretRefFenceKeyFor(nextConfig.secretRef),
+          fenceKey: sanitizedConfig.channelId,
+          secretRefFenceKey: secretRefFenceKeyFor(sanitizedConfig.secretRef),
           priorFenceKeys: promotedPriorKeys,
-          config: nextConfig,
-          ...(!deleting
-            ? stagedRecord !== undefined
-              ? stagedRecord.cache !== undefined
-                ? { cache: stagedRecord.cache }
-                : {}
-              : nextConfig.initialCredentials !== undefined
-                ? { cache: nextConfig.initialCredentials }
-                : {}
+          config: sanitizedConfig,
+          ...(!deleting && stagedRecord?.cache !== undefined
+            ? { cache: stagedRecord.cache }
             : {}),
         };
-        this.active.set(nextConfig.channelId, promoted);
+        this.active.set(sanitizedConfig.channelId, promoted);
       } else {
-        const existing = this.active.get(nextConfig.channelId);
+        const existing = this.active.get(sanitizedConfig.channelId);
         if (existing) {
-          existing.config = nextConfig;
+          existing.config = sanitizedConfig;
         }
       }
     }
@@ -757,6 +768,10 @@ export class OAuthTokenManager {
    * rotated caches 100% untouched!
    */
   discardUpdate(tx: StagedOAuthUpdate): void {
+    if (this.settledTransactions.has(tx)) {
+      return;
+    }
+    this.settledTransactions.add(tx);
     for (const stagedId of tx.stagedBindingIds.values()) {
       const stagedRecord = this.staged.get(stagedId);
       if (stagedRecord) {
