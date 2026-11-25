@@ -851,6 +851,20 @@ describe("Sol Round 1 regression guards", () => {
       expect(mixedStackedLabelAndTag.missingSections).toEqual(["goal"]);
     }
 
+    for (const emptyStackedGoal of [
+      "Goal: Success Criteria:",
+      "Goal: Guardrails:",
+      "目标：完成标准：",
+    ]) {
+      const res = validateCodingAgentHandoffBrief(
+        `${emptyStackedGoal}\n## Scope\nOnly touch auth.\n## Files\napps/server/src/auth.ts`,
+      );
+      expect(res.valid).toBe(false);
+      if (!res.valid) {
+        expect(res.missingSections).toEqual(["goal"]);
+      }
+    }
+
     // Normal prose containing a colon, bold text, or Markdown link with keywords like "file" MUST still be accepted!
     const colonInNormalProse = validateCodingAgentHandoffBrief(
       [

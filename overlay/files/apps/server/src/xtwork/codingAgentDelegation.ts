@@ -855,35 +855,70 @@ export function validateDelegationWorkspace(input: {
 interface BriefSectionRule {
   readonly key: HandoffBriefSectionKey;
   readonly label: string;
+  readonly enTokens: ReadonlyArray<string>;
+  readonly zhTokens: ReadonlyArray<string>;
   readonly headingPatterns: ReadonlyArray<RegExp>;
 }
 
-const BRIEF_SECTION_RULES: ReadonlyArray<BriefSectionRule> = [
-  {
-    key: "goal",
-    label: "Goal & Acceptance Criteria (目标与验收标准)",
-    headingPatterns: [
-      /(?:^|\b)(?:goal|objective|acceptance(?:\s+criteria)?|success\s+criteria|expected\s+result)(?:\b|$)/iu,
-      /目标|验收|验收标准|完成标准|预期结果/u,
-    ],
-  },
-  {
-    key: "constraints",
-    label: "Constraints & Scope (约束与范围)",
-    headingPatterns: [
-      /(?:^|\b)(?:constraints?|scope|boundar(?:y|ies)|non-?goals?|guardrails?|rules?)(?:\b|$)/iu,
-      /约束|范围|边界|限制|禁止|不要修改|不改/u,
-    ],
-  },
-  {
-    key: "files",
-    label: "File/Attachment Paths (相关文件与路径)",
-    headingPatterns: [
-      /(?:^|\b)(?:files?|paths?|attachments?|file\/attachment\s+paths?|target\s+files?|relevant\s+files?|workspace\s+paths?)(?:\b|$)/iu,
-      /文件路径|相关文件|涉及文件|文件|路径|附件|目录/u,
-    ],
-  },
-];
+const BRIEF_SECTION_RULES: ReadonlyArray<BriefSectionRule> = (
+  [
+    {
+      key: "goal",
+      label: "Goal & Acceptance Criteria (目标与验收标准)",
+      enTokens: [
+        "goals?",
+        "objectives?",
+        "acceptance(?:\\s+criteria)?",
+        "success\\s+criteria",
+        "expected\\s+result",
+      ],
+      zhTokens: ["目标", "验收标准", "验收", "完成标准", "预期结果"],
+    },
+    {
+      key: "constraints",
+      label: "Constraints & Scope (约束与范围)",
+      enTokens: [
+        "constraints?",
+        "scopes?",
+        "boundar(?:y|ies)",
+        "non-?goals?",
+        "guardrails?",
+        "rules?",
+      ],
+      zhTokens: ["约束", "范围", "边界", "限制", "禁止", "不要修改", "不改"],
+    },
+    {
+      key: "files",
+      label: "File/Attachment Paths (相关文件与路径)",
+      enTokens: [
+        "file\\/attachment\\s+paths?",
+        "target\\s+files?",
+        "relevant\\s+files?",
+        "workspace\\s+paths?",
+        "files?",
+        "paths?",
+        "attachments?",
+      ],
+      zhTokens: ["文件路径", "相关文件", "涉及文件", "文件", "路径", "附件", "目录"],
+    },
+  ] as const
+).map((spec) => ({
+  ...spec,
+  headingPatterns: [
+    new RegExp(`(?:^|\\b)(?:${spec.enTokens.join("|")})(?:\\b|$)`, "iu"),
+    new RegExp(spec.zhTokens.join("|"), "u"),
+  ],
+}));
+
+const ALL_EXPLICIT_SECTION_TOKENS = BRIEF_SECTION_RULES.flatMap((rule) => [
+  ...rule.enTokens,
+  ...rule.zhTokens,
+]).join("|");
+
+const EXPLICIT_SECTION_LABEL_PATTERN = new RegExp(
+  `^(?:${ALL_EXPLICIT_SECTION_TOKENS})(?:\\s*(?:&|\\/|and|与|和)\\s*(?:${ALL_EXPLICIT_SECTION_TOKENS}))*$`,
+  "iu",
+);
 
 function hasMeaningfulSectionBody(text: string): boolean {
   return /[\p{L}\p{N}]/u.test(text);
@@ -958,13 +993,6 @@ function parseSectionHeaderLine(rawLine: string): ParsedSectionHeader | null {
 
   return null;
 }
-
-const EXPLICIT_SECTION_LABEL_TOKEN =
-  "(?:goals?|objectives?|acceptance(?:\\s+criteria)?|tasks?|requirements?|constraints?|scopes?|boundaries|rules?|non-?goals?|files?|file\\s+paths?|paths?|attachments?|targets?|目标|验收(?:标准)?|任务|需求|约束|范围|边界|限制|规则|文件路径|相关文件|涉及文件|文件|路径|附件|目录)";
-const EXPLICIT_SECTION_LABEL_PATTERN = new RegExp(
-  `^${EXPLICIT_SECTION_LABEL_TOKEN}(?:\\s*(?:&|\\/|and|与|和)\\s*${EXPLICIT_SECTION_LABEL_TOKEN})*$`,
-  "iu",
-);
 
 /**
  * Rejects degenerate inline bodies composed of explicit stacked section headings/tags
