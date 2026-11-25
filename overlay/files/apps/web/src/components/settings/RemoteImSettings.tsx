@@ -55,7 +55,20 @@ type Access = {
   chat?: { kind?: string | null; name?: string | null; parentId?: string | null };
 };
 
-type Approval = { id: string; toolName: string; details: string; replyAudience: string };
+type Approval = {
+  id: string;
+  turnId: string;
+  threadId?: string;
+  toolName: string;
+  details: string;
+  replyAudience: "local_only" | "owner_dm" | "group";
+  snapshotHash?: string;
+  targetScope?: string;
+  targetChatId?: string;
+  targetChatName?: string;
+  contentSnapshot?: string;
+  contentPreview?: string;
+};
 type Event = { sequence: number; event: string; payload: Record<string, unknown> };
 
 export type Onboarding = {
@@ -818,7 +831,12 @@ export function RemoteImSettings() {
     <SettingsPageContainer width="wide">
       <section id="remote-im" className="space-y-4">
         <div className="flex flex-wrap items-baseline justify-between gap-2 px-1">
-          <h2 className="text-base font-semibold text-foreground">远程连接</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-base font-semibold text-foreground">远程连接</h2>
+            <span className="rounded-full border border-border/70 bg-muted/50 px-2 py-0.5 text-[11px] text-muted-foreground">
+              绑定至默认 Leader（小瞳）
+            </span>
+          </div>
           <p className="text-xs text-muted-foreground" role="status">
             {!desktop
               ? "请在桌面端使用远程连接"
@@ -973,40 +991,72 @@ export function RemoteImSettings() {
 
       {approvals.length > 0 ? (
         <SettingsSection id="remote-im-approvals" title="操作授权">
-          {approvals.map((item) => (
-            <SettingsRow
-              key={item.id}
-              title={item.toolName}
-              description={
-                <>
-                  <span>{item.replyAudience === "group" ? "群聊请求单次授权" : "远程任务请求单次授权"}</span>
-                  <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap break-all font-mono text-xs">
-                    {item.details}
-                  </pre>
-                </>
-              }
-              control={
-                <div className="flex gap-2">
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={busy}
-                    onClick={() => void perform(() => request("approvals/decide", { id: item.id, approved: true }))}
-                  >
-                    允许一次
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={busy}
-                    onClick={() => void perform(() => request("approvals/decide", { id: item.id, approved: false }))}
-                  >
-                    拒绝
-                  </Button>
-                </div>
-              }
-            />
-          ))}
+          {approvals.map((item) => {
+            const isSnapshotShare = Boolean(item.snapshotHash);
+            const fullSnapshot = item.contentSnapshot ?? item.contentPreview;
+            const destinationLabel = item.targetChatName || item.targetChatId || item.targetScope;
+            const canApprove =
+              !busy &&
+              Boolean(item.turnId) &&
+              (!isSnapshotShare || (typeof fullSnapshot === "string" && fullSnapshot.length > 0));
+            return (
+              <SettingsRow
+                key={item.id}
+                title={item.toolName}
+                description={
+                  <>
+                    <span>
+                      {item.replyAudience === "group" ? "群聊请求单次授权" : "远程任务请求单次授权"}
+                      {destinationLabel ? ` · 目标：${destinationLabel}` : ""}
+                      {item.snapshotHash ? ` · 快照 ${item.snapshotHash.slice(0, 8)}` : ""}
+                    </span>
+                    <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-all font-mono text-xs">
+                      {isSnapshotShare ? (fullSnapshot ?? "") : item.details}
+                    </pre>
+                  </>
+                }
+                control={
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={!canApprove}
+                      onClick={() =>
+                        void perform(() =>
+                          request("approvals/decide", {
+                            id: item.id,
+                            approved: true,
+                            expectedRunId: item.turnId,
+                            expectedAudience: item.replyAudience,
+                            ...(item.snapshotHash ? { expectedSnapshotHash: item.snapshotHash } : {}),
+                          }),
+                        )
+                      }
+                    >
+                      允许一次
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={busy || !item.turnId}
+                      onClick={() =>
+                        void perform(() =>
+                          request("approvals/decide", {
+                            id: item.id,
+                            approved: false,
+                            expectedRunId: item.turnId,
+                            expectedAudience: item.replyAudience,
+                          }),
+                        )
+                      }
+                    >
+                      拒绝
+                    </Button>
+                  </div>
+                }
+              />
+            );
+          })}
         </SettingsSection>
       ) : null}
     </SettingsPageContainer>

@@ -274,8 +274,19 @@ try {
   assert.match(initialChineseHome, /对话/);
   assert.match(initialChineseHome, /文件夹/);
   assert.doesNotMatch(initialChineseHome, /T3 Code|会话|线程|Try asking|Example tasks/i);
+  await page.locator('[data-testid="leader-sidebar-slot"]').waitFor({ state: "visible" });
+  await page.locator('[data-testid="leader-slot-leader-default"]').waitFor({ state: "visible" });
   await page.screenshot({ path: join(testOutput, "ordinary-home-zh.png") });
-  console.log("Passed first-run default Chinese UI on clean draft.");
+  await page.locator('[data-testid="leader-slot-leader-default"]').click();
+  await page.locator('[data-testid="leader-supervisory-bar"]').waitFor({ state: "visible" });
+  await page.getByRole("button", { name: "管理", exact: true }).click();
+  await page.locator('[data-testid="leader-config-panel"]').waitFor({ state: "visible" });
+  const leaderViewText = await page.locator("body").innerText();
+  assert.doesNotMatch(leaderViewText, /T3 Code|会话|线程/);
+  await page.screenshot({ path: join(testOutput, "leader-desktop-zh.png") });
+  await go(draftPath);
+  await page.locator("[data-chat-composer-form]").waitFor({ state: "visible" });
+  console.log("Passed first-run default Chinese UI, fixed Leader sidebar slot, and Leader supervisory bar.");
 
   await go("/settings/general");
   await page.getByRole("switch", { name: "显示开发者功能" }).waitFor({ state: "visible" });

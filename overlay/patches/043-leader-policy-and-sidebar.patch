@@ -1,0 +1,756 @@
+diff --git a/apps/server/src/mcp/McpHttpServer.ts b/apps/server/src/mcp/McpHttpServer.ts
+index 8d0db4f2..07f7e690 100644
+--- a/apps/server/src/mcp/McpHttpServer.ts
++++ b/apps/server/src/mcp/McpHttpServer.ts
+@@ -94,8 +94,7 @@ import { HtmlPreviewTool, HtmlPreviewToolkit, HtmlRenderToolkit } from "./toolki
+ import { MCP_HTTP_PATH } from "../httpCors.ts";
+ import { requestUrl } from "../requestUrl.ts";
+ import * as XtworkImMcp from "../im/XtworkImMcp.ts";
+-import { isImThread } from "../im/XtworkImSecurity.ts";
+-import { XtworkIm } from "../im/XtworkImService.ts";
++import { isProtectedXtworkThread, XtworkIm } from "../im/XtworkImService.ts";
+ import * as XtworkPluginMcp from "./XtworkPluginMcp.ts";
+ import { isPluginToolName } from "./XtworkPluginHost.ts";
+ 
+@@ -317,8 +316,9 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
+     if (limited.client?.linked === true && !linkedEnvironments) return linkedEnvironmentsOff;
+     const origin = Option.getOrUndefined(Option.map(requestUrl(request), (url) => url.origin));
+     const threadId = limited.thread?.threadId;
+-    const execution = threadId !== undefined && isImThread(threadId) && im?.dispatch
+-      ? yield* im.dispatch.resolveExecution(threadId).pipe(Effect.orElseSucceed(() => undefined))
++    const boundRunId = limited.thread?.runId;
++    const execution = threadId !== undefined && isProtectedXtworkThread(threadId) && im?.dispatch
++      ? yield* im.dispatch.resolveExecution(threadId, boundRunId).pipe(Effect.orElseSucceed(() => undefined))
+       : undefined;
+     return { ...limited, linkedEnvironments, origin, ...(execution === undefined ? {} : { imExecution: execution }) };
+   });
+@@ -1407,7 +1407,8 @@ export const layerTools = Layer.mergeAll(
+       Effect.map((scope) => {
+         const invocation = Option.getOrUndefined(scope);
+         const threadId = invocation?.thread?.threadId;
+-        return method.startsWith("tools/") && !XtworkImMcp.imToolAllowed(threadId, target, method === "tools/list")
++        const isProtected = isProtectedXtworkThread(threadId);
++        return method.startsWith("tools/") && !XtworkImMcp.imToolAllowed(threadId, target, method === "tools/list", isProtected)
+           ? false
+           : true;
+       }),
+diff --git a/apps/server/src/mcp/McpInvocationContext.ts b/apps/server/src/mcp/McpInvocationContext.ts
+index e7235d0c..f10a96b6 100644
+--- a/apps/server/src/mcp/McpInvocationContext.ts
++++ b/apps/server/src/mcp/McpInvocationContext.ts
+@@ -7,6 +7,7 @@ import {
+   type ProviderInstanceId,
+   type ProviderInteractionMode,
+   type OrchestrationV2LinkedSender,
++  type RunId,
+   type RuntimeMode,
+   type ThreadId,
+ } from "@t3tools/contracts";
+@@ -31,6 +32,8 @@ export interface McpThreadCaller {
+   readonly threadId: ThreadId;
+   readonly providerSessionId: string;
+   readonly providerInstanceId: ProviderInstanceId;
++  /** Exact bound runId for protected execution enforcement (ADR-013 S1). */
++  readonly runId?: RunId;
+   /** A delegated child task; its parent owns the work it hands back. */
+   readonly subagent?: boolean;
+ }
+diff --git a/apps/server/src/mcp/McpSessionRegistry.ts b/apps/server/src/mcp/McpSessionRegistry.ts
+index 9a7142ce..8fe5377a 100644
+--- a/apps/server/src/mcp/McpSessionRegistry.ts
++++ b/apps/server/src/mcp/McpSessionRegistry.ts
+@@ -1,4 +1,4 @@
+-import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
++import { ProviderInstanceId, type RunId, ThreadId } from "@t3tools/contracts";
+ import * as Clock from "effect/Clock";
+ import * as Context from "effect/Context";
+ import * as Digest from "effect/crypto/Digest";
+@@ -16,6 +16,7 @@ import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
+ export interface McpCredentialRequest {
+   readonly threadId: ThreadId;
+   readonly providerInstanceId: ProviderInstanceId;
++  readonly runId?: RunId;
+   /** False omits the preview capability wherever the token is honored. Defaults to full access. */
+   readonly browserToolsAvailable?: boolean;
+   readonly capabilities?: ReadonlySet<McpInvocationContext.McpCapability>;
+@@ -32,6 +33,7 @@ export interface McpSessionRegistryShape {
+     rawToken: string,
+   ) => Effect.Effect<McpInvocationContext.McpThreadInvocationScope | undefined>;
+   readonly touch: (threadId: ThreadId) => Effect.Effect<void>;
++  readonly bindRun?: (threadId: ThreadId, runId: RunId) => Effect.Effect<void>;
+   readonly revokeProviderSession: (providerSessionId: string) => Effect.Effect<void>;
+   readonly revokeThread: (threadId: ThreadId) => Effect.Effect<void>;
+   readonly revokeAll: Effect.Effect<void>;
+@@ -132,6 +134,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
+           threadId: ThreadId.make(request.threadId),
+           providerSessionId,
+           providerInstanceId: ProviderInstanceId.make(request.providerInstanceId),
++          ...(request.runId === undefined ? {} : { runId: request.runId }),
+           subagent: request.subagent === true,
+         },
+         client: undefined,
+@@ -199,6 +202,26 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
+     },
+   );
+ 
++  const bindRun: McpSessionRegistryShape["bindRun"] = Effect.fn("McpSessionRegistry.bindRun")(
++    function* (threadId, runId) {
++      yield* SynchronizedRef.update(state, ({ records }) => {
++        const next = new Map(records);
++        for (const [tokenHash, record] of records) {
++          if (record.scope.thread.threadId === threadId) {
++            next.set(tokenHash, {
++              ...record,
++              scope: {
++                ...record.scope,
++                thread: { ...record.scope.thread, runId },
++              },
++            });
++          }
++        }
++        return { records: next };
++      });
++    },
++  );
++
+   const revokeWhere = (predicate: (record: CredentialRecord) => boolean) =>
+     SynchronizedRef.update(state, ({ records }) => ({
+       records: new Map(Array.from(records).filter(([, record]) => !predicate(record))),
+@@ -208,6 +231,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
+     issue,
+     resolve,
+     touch,
++    bindRun,
+     revokeProviderSession: Effect.fn("McpSessionRegistry.revokeProviderSession")(
+       function* (providerSessionId) {
+         yield* revokeWhere((record) => record.scope.thread.providerSessionId === providerSessionId);
+diff --git a/apps/server/src/orchestration-v2/EventSink.ts b/apps/server/src/orchestration-v2/EventSink.ts
+index cad0aff3..69f59598 100644
+--- a/apps/server/src/orchestration-v2/EventSink.ts
++++ b/apps/server/src/orchestration-v2/EventSink.ts
+@@ -38,6 +38,12 @@ import * as EventStore from "./EventStore.ts";
+ import * as ProjectionStore from "./ProjectionStore.ts";
+ import * as ProjectStore from "./ProjectStore.ts";
+ import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
++import {
++  bindXtworkRunPolicyInTxn,
++  isProtectedXtworkThread,
++  publishXtworkBoundRunPolicySync,
++} from "../im/XtworkImService.ts";
++import type { PersistedRunPolicy } from "../im/XtworkLeaderStore.ts";
+ 
+ export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
+   "EventSinkWriteError",
+@@ -798,7 +804,7 @@ const layerBase: Layer.Layer<
+           });
+           if (!reserved) {
+             const existing = yield* existingCommandResult(input.commandId);
+-            return { ...existing, committed: false as const, cancelledEffectIds: [] };
++            return { ...existing, committed: false as const, cancelledEffectIds: [], xtworkBoundPolicies: [] as ReadonlyArray<PersistedRunPolicy> };
+           }
+ 
+           // Planning does not lock the source. Once deletion commits, maintenance
+@@ -828,6 +834,7 @@ const layerBase: Layer.Layer<
+                   storedEvents: [],
+                   committed: false as const,
+                   cancelledEffectIds: [],
++                  xtworkBoundPolicies: [] as ReadonlyArray<PersistedRunPolicy>,
+                 };
+               }
+             }
+@@ -843,6 +850,19 @@ const layerBase: Layer.Layer<
+             commandId: input.commandId,
+             events: normalized,
+           });
++          // ADR-013 S12: Bind persisted run policy INSIDE the atomic event transaction so a crash
++          // before commit rolls back both run.created and run_id reservation together.
++          const xtworkBoundPolicies: Array<PersistedRunPolicy> = [];
++          for (const stored of storedEvents) {
++            if (stored.event.type === "run.created" && isProtectedXtworkThread(stored.event.threadId)) {
++              const bound = yield* bindXtworkRunPolicyInTxn(
++                input.commandId,
++                stored.event.threadId,
++                stored.event.payload.id,
++              );
++              if (bound !== undefined) xtworkBoundPolicies.push(bound);
++            }
++          }
+           // A Stop that changes nothing can still queue the stop of its delegated tasks.
+           const sequence =
+             storedEvents.at(-1)?.sequence ??
+@@ -873,10 +893,15 @@ const layerBase: Layer.Layer<
+                   threadId: input.threadId,
+                   ...input.cancelUnsettledEffects,
+                 });
+-          return { receipt, storedEvents, outcomes, committed: true as const, cancelledEffectIds };
++          return { receipt, storedEvents, outcomes, committed: true as const, cancelledEffectIds, xtworkBoundPolicies };
+         }),
+         (result) =>
+           Effect.gen(function* () {
++            if (result.committed) {
++              for (const policy of result.xtworkBoundPolicies) {
++                publishXtworkBoundRunPolicySync(policy);
++              }
++            }
+             yield* effectOutbox.signalCancellations(result.cancelledEffectIds);
+             if (result.committed && input.effects.length > 0) {
+               yield* effectOutbox.notifyAvailable(input.effects.length);
+diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
+index 060b199d..c5369faf 100644
+--- a/apps/server/src/orchestration-v2/Orchestrator.ts
++++ b/apps/server/src/orchestration-v2/Orchestrator.ts
+@@ -1,4 +1,5 @@
+-import { ImDispatchAuthority, isImThread, localForkThreadId } from "../im/XtworkImSecurity.ts";
++import { ImDispatchAuthority, localForkThreadId } from "../im/XtworkImSecurity.ts";
++import { hasPersistedXtworkRunPolicy, isProtectedXtworkThread } from "../im/XtworkImService.ts";
+ import type {
+   OrchestrationV2ThreadLinkMetadata,
+   GuestShareId,
+@@ -5742,7 +5743,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+     // A side chat may open during the parent's first turn; it starts from a digest instead.
+     if (
+       sourceRun === null &&
+-      !((command.sideChat === true || isImThread(command.sourceThreadId)) && command.sourcePoint.type === "latest_stable")
++      !((command.sideChat === true || isProtectedXtworkThread(command.sourceThreadId)) && command.sourcePoint.type === "latest_stable")
+     ) {
+       return yield* new OrchestratorDispatchError({
+         commandId: command.commandId,
+@@ -5796,7 +5797,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+       threadId: command.targetThreadId,
+       providerInstanceId: targetThread.providerInstanceId,
+       occurredAt: now,
+-      payload: isImThread(command.sourceThreadId) ? { ...targetThread, worktreePath: null, branch: null } : targetThread,
++      payload: isProtectedXtworkThread(command.sourceThreadId) ? { ...targetThread, worktreePath: null, branch: null } : targetThread,
+     });
+     yield* emitEvent({
+       type: "context-transfer.created",
+@@ -15840,14 +15841,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+ 
+   const dispatchAudienceSafe = Effect.fnUntraced(function* (command: OrchestrationV2ServerCommand) {
+     const threadId = commandThreadId(command);
+-    if (command.type === "thread.merge_back" && (isImThread(command.sourceThreadId) || isImThread(threadId))) {
++    if (
++      command.type === "thread.merge_back" &&
++      (isProtectedXtworkThread(command.sourceThreadId) || isProtectedXtworkThread(threadId))
++    ) {
+       return yield* new OrchestratorDispatchError({
+         commandId: command.commandId,
+         commandType: command.type,
+         cause: "IM threads cannot merge conversation histories.",
+       });
+     }
+-    if (!isImThread(threadId) || (yield* ImDispatchAuthority)) {
++    if (
++      command.type === "message.dispatch" &&
++      command.scheduledTaskId !== undefined &&
++      isProtectedXtworkThread(threadId) &&
++      !hasPersistedXtworkRunPolicy({ commandId: command.commandId })
++    ) {
++      return yield* new OrchestratorDispatchError({
++        commandId: command.commandId,
++        commandType: command.type,
++        cause: "Scheduled runs on protected threads require a persisted execution policy.",
++      });
++    }
++    if (!isProtectedXtworkThread(threadId) || (yield* ImDispatchAuthority)) {
+       return yield* dispatchWithReceipt(command);
+     }
+     if (command.type === "message.dispatch" && command.guestMessageId === undefined &&
+diff --git a/apps/server/src/orchestration-v2/ProviderEventIngestor.ts b/apps/server/src/orchestration-v2/ProviderEventIngestor.ts
+index 45ed0d1c..081851e7 100644
+--- a/apps/server/src/orchestration-v2/ProviderEventIngestor.ts
++++ b/apps/server/src/orchestration-v2/ProviderEventIngestor.ts
+@@ -42,6 +42,7 @@ import { makeProviderFailureTurnItem } from "@t3tools/provider-core/server/failu
+ import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+ import { stripUnservedToolOutputImageBytes } from "./toolOutputImageBytes.ts";
+ import { boundFileChangeForStorage } from "./WireProjection.ts";
++import { recordXtworkNativeThreadPolicy, resolveXtworkProviderPolicy } from "../im/XtworkImService.ts";
+ 
+ export class ProviderEventNormalizeError extends Schema.TaggedError<ProviderEventNormalizeError>()(
+   "ProviderEventNormalizeError",
+@@ -790,6 +791,37 @@ export const layer: Layer.Layer<
+           },
+           (effect, input) =>
+             effect.pipe(
++              Effect.tap((storedEvents) =>
++                Effect.gen(function* () {
++                  if (storedEvents.length === 0) return;
++                  const activeRunId =
++                    input.runId ??
++                    input.writeIfProviderThreadOwner?.runId ??
++                    input.writeIfRunCurrent?.runId;
++                  if (activeRunId === undefined) return;
++                  for (const stored of storedEvents) {
++                    if (stored.event.type !== "provider-thread.updated") continue;
++                    const nativeId = stored.event.payload.nativeThreadRef?.nativeId;
++                    if (!nativeId) continue;
++                    const policy = resolveXtworkProviderPolicy(stored.event.threadId, activeRunId);
++                    if (!policy.protected || policy.failClosed || policy.policyDigest === null) continue;
++                    yield* recordXtworkNativeThreadPolicy(
++                      stored.event.threadId,
++                      nativeId,
++                      policy.policyDigest,
++                    ).pipe(
++                      Effect.mapError(
++                        (cause) =>
++                          new ProviderEventPublishError({
++                            providerSessionId: input.providerSessionId,
++                            eventCount: storedEvents.length,
++                            cause,
++                          }),
++                      ),
++                    );
++                  }
++                }),
++              ),
+               Effect.tap((storedEvents) =>
+                 Effect.gen(function* () {
+                   if (
+diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
+index 113821ea..dc7db499 100644
+--- a/apps/server/src/orchestration-v2/ProviderSessionManager.ts
++++ b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
+@@ -1,6 +1,8 @@
+ import { AgentScope } from "@t3tools/shared/AgentScope";
+ import * as KeyedLock from "@t3tools/shared/KeyedLock";
+ import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
++import { canReuseProviderSession } from "../im/XtworkImSecurity.ts";
++import { resolveXtworkProviderPolicy } from "../im/XtworkImService.ts";
+ import {
+   isOrchestrationV2WorkActive,
+   ModelSelection,
+@@ -14,6 +16,7 @@ import {
+   type OrchestrationV2Subagent,
+   ProviderInstanceId,
+   ProviderSessionId,
++  type RunId,
+   ThreadId,
+   type OrchestrationV2TurnItem,
+   type ProviderThreadId,
+@@ -223,6 +226,7 @@ export interface ProviderSessionManagerV2Shape {
+   readonly shutdown: Effect.Effect<void>;
+   readonly open: (input: {
+     readonly threadId: ThreadId;
++    readonly runId?: RunId;
+     readonly providerSessionId: ProviderSessionId;
+     readonly modelSelection: ModelSelection;
+     readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
+@@ -298,6 +302,7 @@ interface LiveSessionEntry {
+   readonly linkedEnvironmentsByThread: ReadonlyMap<ThreadId, boolean | null>;
+   /** Scope revocation to recorded credential ids so superseded sessions cannot revoke replacements opened before detach. */
+   readonly mcpCredentialIdByThread: ReadonlyMap<ThreadId, string>;
++  readonly policyDigestByThread: ReadonlyMap<ThreadId, string | null>;
+   readonly supportsMultipleProviderThreads: boolean;
+   readonly runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
+   readonly exposedRuntime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
+@@ -554,6 +559,7 @@ export const layerWithOptions = (
+       const prepareMcpSession = (
+         threadId: ThreadId,
+         providerInstanceId: ProviderInstanceId,
++        runId?: RunId,
+       ): Effect.Effect<PreparedMcpCredential> =>
+         options.configureMcp === false
+           ? mcpSessions
+@@ -574,6 +580,7 @@ export const layerWithOptions = (
+                   Effect.map((thread) => thread.lineage.relationshipToParent === "subagent"),
+                   Effect.orElseSucceed(() => false),
+                 );
++                const xtworkProtectedPolicy = resolveXtworkProviderPolicy(threadId, runId);
+                 const existing = yield* mcpSessions.read(threadId);
+                 if (existing !== undefined) {
+                   // Reserve before async validation so release cannot revoke between validation and reservation.
+@@ -596,7 +603,11 @@ export const layerWithOptions = (
+                     resolved.capabilities.has("preview") === browserToolsAvailable &&
+                     resolved.capabilities.has("device") === deviceToolsAvailable &&
+                     // A credential issued while the lineage read failed is replaced once it works.
+-                    (resolved.thread.subagent === true) === subagent
++                    (resolved.thread.subagent === true) === subagent &&
++                    (!xtworkProtectedPolicy.protected || resolved.thread.runId === runId) &&
++                    existing.xtworkProtectedPolicy?.protected === xtworkProtectedPolicy.protected &&
++                    existing.xtworkProtectedPolicy?.policyDigest === xtworkProtectedPolicy.policyDigest &&
++                    existing.xtworkProtectedPolicy?.failClosed === xtworkProtectedPolicy.failClosed
+                   ) {
+                     return { mcpCredentialId: existing.providerSessionId, issued: false };
+                   }
+@@ -606,12 +617,14 @@ export const layerWithOptions = (
+                 const credential = yield* mcpSessionRegistry.issue({
+                   threadId,
+                   providerInstanceId,
++                  ...(runId === undefined ? {} : { runId }),
+                   browserToolsAvailable,
+                   capabilities,
+                   subagent,
+                 });
+                 yield* mcpSessions.set({
+                   ...credential.config,
++                  xtworkProtectedPolicy,
+                   hasPendingWake: projectionStore
+                     .getThreadRecords(threadId, ["runs", "subagents"])
+                     .pipe(
+@@ -2461,14 +2474,45 @@ export const layerWithOptions = (
+               Effect.map(({ loaded }) => loaded),
+             ),
+           startTurn: (input) =>
+-            observeActivity(
+-              providerSessionId,
+-              ensureThreadAttached({
+-                providerSessionId,
+-                threadId: input.threadId,
+-                providerInstanceId: runtime.instanceId,
+-              }),
+-            ).pipe(
++            Effect.gen(function* () {
++              const currentPolicy = resolveXtworkProviderPolicy(input.threadId, input.runId);
++              if (currentPolicy.failClosed) {
++                return yield* new ProviderAdapter.ProviderAdapterTurnStartError({
++                  driver: runtime.driver,
++                  threadId: input.threadId,
++                  providerThreadId: input.providerThread.id,
++                  runId: input.runId,
++                  cause: "Protected turn refused: missing verified execution policy.",
++                });
++              }
++              const sessionEntry = (yield* Ref.get(sessions)).get(sessionKey(providerSessionId));
++              const openedDigest = sessionEntry?.policyDigestByThread.get(input.threadId);
++              if (
++                openedDigest !== undefined &&
++                !canReuseProviderSession(openedDigest, currentPolicy.policyDigest)
++              ) {
++                return yield* new ProviderAdapter.ProviderAdapterTurnStartError({
++                  driver: runtime.driver,
++                  threadId: input.threadId,
++                  providerThreadId: input.providerThread.id,
++                  runId: input.runId,
++                  cause: "Execution policy changed; a fresh provider session is required.",
++                });
++              }
++              if (currentPolicy.protected && mcpSessionRegistry !== undefined) {
++                if (mcpSessionRegistry.bindRun) yield* mcpSessionRegistry.bindRun(input.threadId, input.runId);
++              }
++            }).pipe(
++              Effect.andThen(
++                observeActivity(
++                  providerSessionId,
++                  ensureThreadAttached({
++                    providerSessionId,
++                    threadId: input.threadId,
++                    providerInstanceId: runtime.instanceId,
++                  }),
++                ),
++              ),
+               // Failed or stopped starts may omit turn.terminal; clear their turns so sessions can idle.
+               Effect.andThen(
+                 holdThreadLoaded({
+@@ -2997,8 +3041,31 @@ export const layerWithOptions = (
+                 }
+               }
+               const key = sessionKey(input.providerSessionId);
++              const nextPolicy = resolveXtworkProviderPolicy(input.threadId, input.runId, input.initialNativeThreadId);
++              if (nextPolicy.failClosed) {
++                return yield* new ProviderSessionOpenError({
++                  instanceId: input.modelSelection.instanceId,
++                  providerSessionId: input.providerSessionId,
++                  cause: "Protected session refused: missing verified execution policy for this run.",
++                });
++              }
+               const live = (yield* Ref.get(sessions)).get(key);
+-              if (live !== undefined) yield* releaseForLinkedEnvironments(live);
++              const openedDigest = live?.policyDigestByThread.get(input.threadId);
++              const policyChanged =
++                nextPolicy.policyChanged ||
++                (openedDigest !== undefined &&
++                  !canReuseProviderSession(openedDigest, nextPolicy.policyDigest));
++              if (live !== undefined) {
++                if (policyChanged) {
++                  yield* releaseEntry({
++                    providerSessionId: live.runtime.providerSessionId,
++                    reason: "idle_timeout",
++                    detail: "Execution policy changed; reopening the provider session.",
++                  });
++                } else {
++                  yield* releaseForLinkedEnvironments(live);
++                }
++              }
+               const existing = (yield* Ref.get(sessions)).get(key);
+               if (existing !== undefined) {
+                 const attached = existing.attachedThreadIds.has(input.threadId);
+@@ -3010,6 +3077,9 @@ export const layerWithOptions = (
+                   });
+                 }
+                 if (!attached) yield* agentScope.clear(input.threadId);
++                if (nextPolicy.protected && input.runId !== undefined && mcpSessionRegistry !== undefined) {
++                  if (mcpSessionRegistry.bindRun) yield* mcpSessionRegistry.bindRun(input.threadId, input.runId);
++                }
+                 yield* ensureThreadAttached({
+                   providerSessionId: input.providerSessionId,
+                   threadId: input.threadId,
+@@ -3033,6 +3103,7 @@ export const layerWithOptions = (
+               const prepared = yield* prepareMcpSession(
+                 input.threadId,
+                 input.modelSelection.instanceId,
++                input.runId,
+               );
+               const mcpCredentialId = prepared.mcpCredentialId;
+               let reservationDropped = mcpCredentialId === undefined;
+@@ -3053,13 +3124,14 @@ export const layerWithOptions = (
+                     modelSelection: input.modelSelection,
+                     runtimePolicy: input.runtimePolicy,
+                     promptSuggestions: promptSuggestionsEnabled,
+-                    ...(input.resumeFromSession === undefined
++                    // ADR-013 S2: On policy digest mismatch, start a clean Pi conversation without forwarding prior session/native IDs.
++                    ...(policyChanged || input.resumeFromSession === undefined
+                       ? {}
+                       : { resumeFromSession: input.resumeFromSession }),
+-                    ...(input.initialNativeThreadId === undefined
++                    ...(policyChanged || input.initialNativeThreadId === undefined
+                       ? {}
+                       : { initialNativeThreadId: input.initialNativeThreadId }),
+-                    ...(input.initialProviderItemIdentityVersion === undefined
++                    ...(policyChanged || input.initialProviderItemIdentityVersion === undefined
+                       ? {}
+                       : {
+                           initialProviderItemIdentityVersion:
+@@ -3111,6 +3183,9 @@ export const layerWithOptions = (
+                   mcpCredentialId === undefined
+                     ? new Map()
+                     : new Map([[input.threadId, mcpCredentialId]]),
++                policyDigestByThread: new Map([
++                  [input.threadId, nextPolicy.policyDigest],
++                ]),
+                 supportsMultipleProviderThreads:
+                   runtime.providerSession.capabilities.sessions
+                     .supportsMultipleProviderThreadsPerSession,
+diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
+index 8208ee0a..605f56f0 100644
+--- a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
++++ b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
+@@ -1,4 +1,5 @@
+ import { modelSelectionsEqual } from "@t3tools/shared/model";
++import { recordXtworkNativeThreadPolicy, resolveXtworkProviderPolicy } from "../im/XtworkImService.ts";
+ import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
+ import { expandAssistantCitationsForProvider } from "@t3tools/shared/assistantCitations";
+ import {
+@@ -874,7 +875,13 @@ export const layer: Layer.Layer<
+         run,
+         checkpointScope,
+       });
+-      const brokenNativeThread = providerThread.status === "error";
++      const xtworkPolicy = resolveXtworkProviderPolicy(
++        projection.thread.id,
++        run.id,
++        providerThread.nativeThreadRef?.nativeId,
++      );
++      const xtworkPolicyChanged = xtworkPolicy.policyChanged;
++      const brokenNativeThread = providerThread.status === "error" || xtworkPolicyChanged;
+       // Opened without the broken native id, a session that was not live starts fresh.
+       const opensFreshSession =
+         brokenNativeThread &&
+@@ -883,16 +890,17 @@ export const layer: Layer.Layer<
+       const sessionResult = yield* Effect.result(
+         providerSessions.open({
+           threadId: projection.thread.id,
++          runId: run.id,
+           providerSessionId,
+           modelSelection: run.modelSelection,
+           runtimePolicy: resolvedRuntimePolicy,
+-          ...(existingSessionProjection === undefined
++          ...(existingSessionProjection === undefined || xtworkPolicyChanged
+             ? {}
+             : { resumeFromSession: existingSessionProjection }),
+           ...(providerThread.nativeThreadRef?.nativeId == null || brokenNativeThread
+             ? {}
+             : { initialNativeThreadId: providerThread.nativeThreadRef.nativeId }),
+-          ...(providerThread.nativeMetadata?.itemIdentityVersion === undefined
++          ...(providerThread.nativeMetadata?.itemIdentityVersion === undefined || xtworkPolicyChanged
+             ? {}
+             : {
+                 initialProviderItemIdentityVersion:
+@@ -1436,8 +1444,9 @@ export const layer: Layer.Layer<
+           });
+           return loaded;
+         }
+-        if (providerThread.nativeThreadRef === null) {
++        if (providerThread.nativeThreadRef === null || xtworkPolicyChanged) {
+           // Pass the stored provider row for adoption; adapter-minted duplicates make activeProviderThreadId flap.
++          // ADR-013 S2: On policy digest change, clear nativeThreadRef and force a clean Pi conversation.
+           return yield* loadFromProvider(
+             session.ensureThread({
+               threadId: projection.thread.id,
+@@ -1445,7 +1454,10 @@ export const layer: Layer.Layer<
+               modelSelection: run.modelSelection,
+               runtimePolicy: resolvedRuntimePolicy,
+               providerSessionId,
+-              existingProviderThread: providerThread,
++              existingProviderThread: xtworkPolicyChanged
++                ? { ...providerThread, nativeThreadRef: null }
++                : providerThread,
++              ...(xtworkPolicyChanged ? { forceNewNativeThread: true } : {}),
+             }),
+           );
+         }
+@@ -1672,6 +1684,19 @@ export const layer: Layer.Layer<
+         return replacement;
+       });
+       if (loadedProviderThread === undefined) return;
++      if (
++        xtworkPolicy.protected &&
++        xtworkPolicy.policyDigest !== null &&
++        loadedProviderThread.nativeThreadRef?.nativeId
++      ) {
++        yield* recordXtworkNativeThreadPolicy(
++          projection.thread.id,
++          loadedProviderThread.nativeThreadRef.nativeId,
++          xtworkPolicy.policyDigest,
++        ).pipe(
++          Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })),
++        );
++      }
+       if (!(yield* isCurrentAttemptInStatus("starting"))) {
+         return;
+       }
+@@ -1718,6 +1743,20 @@ export const layer: Layer.Layer<
+         createdAt: providerThread.createdAt,
+         updatedAt: now,
+       };
++      if (
++        xtworkPolicy.protected &&
++        xtworkPolicy.policyDigest !== null &&
++        runningProviderThread.nativeThreadRef?.nativeId &&
++        runningProviderThread.nativeThreadRef.nativeId !== loadedProviderThread.nativeThreadRef?.nativeId
++      ) {
++        yield* recordXtworkNativeThreadPolicy(
++          projection.thread.id,
++          runningProviderThread.nativeThreadRef.nativeId,
++          xtworkPolicy.policyDigest,
++        ).pipe(
++          Effect.mapError((cause) => new ProviderTurnStartError({ runId, cause })),
++        );
++      }
+       const runningRun: OrchestrationV2Run = {
+         ...run,
+         status: "running",
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index a15da677..b984a694 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -6,6 +6,7 @@ import { m } from "../i18n/messages";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { useGT, useMessages } from "gt-react";
+ import { ChildThreadApprovals } from "./chat/ChildThreadApprovals";
++import { LeaderSupervisoryBar } from "./leader/LeaderSupervisoryBar";
+ import { workspaceAreaProps } from "../lib/workspaceFocus";
+ import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
+ import { resolveNewThreadModelSelection } from "@t3tools/shared/usageLimits";
+@@ -3495,6 +3496,10 @@ export default function ChatView(props: ChatViewProps) {
+           </header>
+         )}
+ 
++        <LeaderSupervisoryBar
++          threadId={activeThread.id}
++          environmentId={activeThread.environmentId}
++        />
+         <div className="relative flex min-h-0 min-w-0 flex-1">
+           <ThreadFindCanvas
+             findOptions={{
+diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
+index f7c793ea..a4c79d63 100644
+--- a/apps/web/src/components/Sidebar.tsx
++++ b/apps/web/src/components/Sidebar.tsx
+@@ -1,4 +1,5 @@
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
++import { LeaderSidebarSlot } from "./leader/LeaderSidebarSlot";
+ import { msg, T, useGT, useMessages } from "gt-react";
+ import { m } from "../i18n/messages";
+ import { attachSidebarTree } from "../lib/sidebarTree";
+@@ -1109,7 +1110,14 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+             ),
+           ),
+         );
+-  const threads = useQuietThreadShells();
++  const [leaderPinnedThreadIds, setLeaderPinnedThreadIds] = useState<ReadonlySet<string>>(
++    () => new Set(),
++  );
++  const rawThreads = useQuietThreadShells();
++  const threads =
++    leaderPinnedThreadIds.size === 0
++      ? rawThreads
++      : rawThreads.filter((thread) => !leaderPinnedThreadIds.has(thread.id));
+   const promotingDraftThreadKeys = usePromotingDraftThreadKeys();
+   const listedThreads =
+     promotingDraftThreadKeys.length === 0
+@@ -3235,6 +3243,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+         }
+       >
+         <SidebarGroup className="flex-1" role="presentation">
++          <LeaderSidebarSlot onPinnedThreadIdsChange={setLeaderPinnedThreadIds} />
+           {isSearchingThreads ? (
+             threadSearchResults.length > 0 ? (
+               <TooltipProvider
+diff --git a/packages/provider-core/src/server/mcpSession.ts b/packages/provider-core/src/server/mcpSession.ts
+index 20d17df6..963e641c 100644
+--- a/packages/provider-core/src/server/mcpSession.ts
++++ b/packages/provider-core/src/server/mcpSession.ts
+@@ -20,6 +20,12 @@ export interface McpProviderSessionConfig {
+   readonly agentDeviceEnvironment?: Readonly<Record<string, string>>;
+   /** True while a delegated task this thread started will wake it with its result. */
+   readonly hasPendingWake?: Effect.Effect<boolean>;
++  /** Fail-closed per-run policy state resolved by Xtwork before opening a protected provider session. */
++  readonly xtworkProtectedPolicy?: {
++    readonly protected: boolean;
++    readonly policyDigest: string | null;
++    readonly failClosed: boolean;
++  };
+ }
+ 
+ export function withAgentDeviceEnvironment(
+diff --git a/packages/provider-pi/src/server/adapter.ts b/packages/provider-pi/src/server/adapter.ts
+index 3befbaba..aad68b5b 100644
+--- a/packages/provider-pi/src/server/adapter.ts
++++ b/packages/provider-pi/src/server/adapter.ts
+@@ -490,8 +490,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+     ) {
+       const scope = yield* Effect.scope;
+       const cwd = input.runtimePolicy.cwd ?? host.paths.cwd;
+-      const imSession = input.threadId.startsWith("xtwork-im-");
+       const mcpSession = yield* mcpSessions.read(input.threadId);
++      const protectedPolicy = mcpSession?.xtworkProtectedPolicy;
++      const imSession = protectedPolicy?.protected === true || input.threadId.startsWith("xtwork-im-");
++      if (imSession && (protectedPolicy?.failClosed === true || !protectedPolicy?.policyDigest)) {
++        return yield* protocolError("Protected session is missing a verified execution policy.");
++      }
+       const provideCacheFs = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem>) =>
+         effect.pipe(
+           Effect.provideService(FileSystem.FileSystem, fileSystem),
+@@ -539,7 +543,16 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+           const launch = buildPiRpcLaunch({
+             launchArgs: imSession ? [...resolvedLaunchArgs.args, "--no-context-files"] : resolvedLaunchArgs.args,
+             // PortScanner.AGENT_THREAD_ENV, as a literal because this package cannot reach apps/server.
+-            environment: { ...options.environment, T3CODE_THREAD_ID: input.threadId },
++            environment: {
++              ...options.environment,
++              T3CODE_THREAD_ID: input.threadId,
++              ...(imSession
++                ? {
++                    XTWORK_PROTECTED_SESSION: "1",
++                    XTWORK_POLICY_DIGEST: protectedPolicy?.policyDigest ?? "",
++                  }
++                : {}),
++            },
+             mcpSession,
+             extensionPath,
+             sessionPath,
+diff --git a/packages/provider-pi/src/server/mcpExtensionSource.ts b/packages/provider-pi/src/server/mcpExtensionSource.ts
+index 3d151b63..623f8a71 100644
+--- a/packages/provider-pi/src/server/mcpExtensionSource.ts
++++ b/packages/provider-pi/src/server/mcpExtensionSource.ts
+@@ -364,7 +364,9 @@ export default async function t3McpExtension(pi: ExtensionAPI) {
+   const token = env(TOKEN_ENV);
+   let catalog: ReadonlyArray<McpTool> = [];
+   const client = endpoint !== undefined && token !== undefined ? createMcpClient(endpoint, token) : undefined;
+-  const imSession = process.env.T3CODE_THREAD_ID?.startsWith("xtwork-im-") === true;
++  const imSession =
++    process.env.XTWORK_PROTECTED_SESSION === "1" ||
++    process.env.T3CODE_THREAD_ID?.startsWith("xtwork-im-") === true;
+ 
+   pi.on("tool_call", async (event, ctx) => {
+     if (imSession) {

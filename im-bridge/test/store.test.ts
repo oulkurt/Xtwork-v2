@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import type { InboundMessage } from "../src/channels/channel.ts";
 import { CLAIM_TTL_MS } from "../src/core/access.ts";
@@ -366,6 +370,309 @@ describe("SQLite store invariants (ADR-011 S5/S6)", () => {
       assert.equal(store.listUnackedTriggers(conn.id).length, 1);
     } finally {
       store.close();
+    }
+  });
+
+  it("defers triggers into paused_pending while Leader is paused, keeps /stop working, and replays selected items with original idempotency key", () => {
+    const store = new Store(":memory:");
+    try {
+      const conn = store.createConnection({
+        platform: "feishu",
+        secretRef: null,
+        lifecycleState: "active",
+        ownerId: "owner_1",
+      });
+      // In-flight delivered message before pause must NOT be turned into ignored.
+      const first = store.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "m_inflight",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "running task",
+        }),
+      );
+      assert.equal(first.kind, "dispatch");
+      // ACKed in-flight run stays `delivered` on Pause, whereas an unacked `delivered` row moves to `paused_pending` (S28)!
+      store.ackInbound(
+        { idempotencyKey: first.message.idempotencyKey! },
+        { t3ThreadId: "xtwork-im-dm-acked", t3TurnId: "run-acked-1" },
+      );
+      const unackedDelivered = store.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "m_unacked_delivered",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "unacked delivered trigger",
+        }),
+      );
+      assert.equal(unackedDelivered.kind, "dispatch");
+      store.moveInbound([unackedDelivered.message.id], "deliver");
+      assert.equal(store.message(unackedDelivered.message.id)?.state, "delivered");
+
+      // Leader pauses: connection stays active, ACKed in-flight stays delivered, unacked delivered & new triggers enter paused_pending.
+      store.updateConnection(conn.id, { leaderPaused: true });
+      store.pauseConnectionMessages(conn.id);
+      assert.equal(store.message(first.message.id)?.state, "delivered");
+      assert.equal(store.message(unackedDelivered.message.id)?.state, "paused_pending");
+
+      const deferred = store.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "m_while_paused",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "do this later",
+        }),
+      );
+      assert.equal(deferred.kind, "paused_pending");
+      assert.equal(deferred.message.state, "paused_pending");
+      assert.equal(deferred.message.idempotencyKey, `im:${conn.id}:m_while_paused`);
+      assert.equal(store.heldMessages(conn.id).length, 0);
+      assert.equal(store.listUnackedTriggers(conn.id).length, 0);
+      assert.equal(store.pausedPendingMessages([conn.id]).length, 2);
+
+      // Verified Owner /stop still works while Leader is paused!
+      const stopOutcome = store.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "m_stop",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "/stop",
+        }),
+      );
+      assert.equal(stopOutcome.kind, "stop");
+
+      // Resume Leader and selectively replay paused item under the exact original idempotency key.
+      store.updateConnection(conn.id, { leaderPaused: false });
+      const replayed = store.decidePausedPending([deferred.message.id], "replay");
+      assert.equal(replayed.length, 1);
+      assert.equal(replayed[0]!.state, "received");
+      assert.equal(replayed[0]!.idempotencyKey, `im:${conn.id}:m_while_paused`);
+      assert.equal(store.pausedPendingMessages([conn.id]).length, 1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("reconciles ack arriving after pause into delivered so reply settles it, and preserves stamped Leader binding identity across rebinds (S3/S6)", () => {
+    const store = new Store(":memory:");
+    try {
+      const conn = store.createConnection({
+        platform: "feishu",
+        secretRef: null,
+        lifecycleState: "active",
+        ownerId: "owner_1",
+      });
+      store.syncConnectionBinding({
+        connectionId: conn.id,
+        leaderId: "leader-a",
+        bindingId: "bind-a-1",
+        bindingEpoch: 1,
+        leaderPaused: false,
+      });
+
+      // S3: Dispatched (`received`, unacked) -> paused -> late `ackInbound` arrives for committed run!
+      const inFlight = store.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "m_race",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "committed before pause",
+        }),
+      );
+      assert.equal(inFlight.kind, "dispatch");
+      assert.equal(inFlight.message.leaderId, "leader-a");
+      assert.equal(inFlight.message.bindingId, "bind-a-1");
+      assert.equal(inFlight.message.bindingEpoch, 1);
+
+      store.syncConnectionBinding({
+        connectionId: conn.id,
+        leaderId: "leader-a",
+        bindingId: "bind-a-1",
+        bindingEpoch: 1,
+        leaderPaused: true,
+      });
+      assert.equal(store.message(inFlight.message.id)?.state, "paused_pending");
+
+      // Committed run ack arrives -> MUST reconcile back to `delivered` and exit paused backlog!
+      const acked = store.ackInbound(
+        { idempotencyKey: inFlight.message.idempotencyKey! },
+        { t3ThreadId: "xtwork-im-dm-1", t3TurnId: "run-committed-1" },
+      );
+      assert.equal(acked?.state, "delivered");
+      assert.equal(store.pausedPendingMessages({ leaderId: "leader-a" }).length, 0);
+      // Reply can now settle it!
+      assert.deepEqual(store.moveInbound([inFlight.message.id], "reply"), [inFlight.message.id]);
+      assert.equal(store.message(inFlight.message.id)?.state, "replied");
+
+      // S6: New message paused under Leader A keeps Leader A binding even after connection rebinds to Leader B!
+      const pausedA = store.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "m_leader_a_backlog",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "backlog for leader A",
+        }),
+      );
+      assert.equal(pausedA.kind, "paused_pending");
+      assert.equal(pausedA.message.leaderId, "leader-a");
+      assert.equal(pausedA.message.bindingId, "bind-a-1");
+
+      // Rebind connection to Leader B
+      store.syncConnectionBinding({
+        connectionId: conn.id,
+        leaderId: "leader-b",
+        bindingId: "bind-b-2",
+        bindingEpoch: 2,
+        leaderPaused: false,
+      });
+      assert.equal(store.pausedPendingMessages({ leaderId: "leader-b" }).length, 0);
+      const leaderABacklog = store.pausedPendingMessages({ leaderId: "leader-a" });
+      assert.equal(leaderABacklog.length, 1);
+      assert.equal(leaderABacklog[0]!.id, pausedA.message.id);
+      assert.equal(leaderABacklog[0]!.bindingId, "bind-a-1");
+      assert.equal(leaderABacklog[0]!.bindingEpoch, 1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("backfills legacy pre-Leader inbound rows to leader-default epoch 1 on migration (S6)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "xtwork-im-migrate-"));
+    const dbPath = join(dir, "im.sqlite");
+    try {
+      // Seed an older v3 database with NULL leader_id / binding_id / binding_epoch on legacy inbound rows
+      const initial = new Store(dbPath);
+      const conn = initial.createConnection({
+        platform: "feishu",
+        secretRef: null,
+        lifecycleState: "active",
+        ownerId: "owner_1",
+        askAll: true,
+      });
+      const held = initial.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "legacy_held_1",
+          chat: { platformId: "dm_stranger", kind: "dm" },
+          sender: { id: "stranger_1", name: "Stranger", isBot: false },
+          text: "hello before upgrade",
+        }),
+      );
+      assert.equal(held.kind, "held");
+      initial.close();
+
+      const raw = new DatabaseSync(dbPath);
+      raw.exec("UPDATE messages SET leader_id = NULL, binding_id = NULL, binding_epoch = NULL");
+      raw.exec("PRAGMA user_version = 3");
+      raw.close();
+
+      // Reopen via Store -> runs v4 backfill
+      const upgraded = new Store(dbPath);
+      try {
+        const backfilled = upgraded.message(held.message.id);
+        assert.equal(backfilled?.leaderId, "leader-default");
+        assert.equal(backfilled?.bindingId, null);
+        assert.equal(backfilled?.bindingEpoch, 1);
+
+        // Even after rebinding to Leader B, backlog queries use historical message identity
+        upgraded.syncConnectionBinding({
+          connectionId: conn.id,
+          leaderId: "leader-b",
+          bindingId: "bind-b-2",
+          bindingEpoch: 2,
+          leaderPaused: false,
+        });
+        upgraded.moveInbound([held.message.id], "admit");
+        upgraded.moveInbound([held.message.id], "pause");
+        assert.equal(upgraded.pausedPendingMessages({ leaderId: "leader-b" }).length, 0);
+        assert.equal(upgraded.pausedPendingMessages({ leaderId: "leader-default" }).length, 1);
+      } finally {
+        upgraded.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("backfills legacy ADR-011 DM thread pointers on upgrade and preserves them across initial default-binding sync (S20)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "xtwork-im-s20-"));
+    const dbPath = join(dir, "im.sqlite");
+    try {
+      // Simulate an ADR-011 DB where DM chat already has thread_id and an acked message, before thread_* columns existed
+      const initial = new Store(dbPath);
+      const conn = initial.createConnection({
+        platform: "feishu",
+        secretRef: null,
+        lifecycleState: "active",
+        ownerId: "owner_1",
+      });
+      const dm = initial.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "legacy_dm_1",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "remember this dm",
+        }),
+      );
+      assert.equal(dm.kind, "dispatch");
+      initial.ackInbound({ idempotencyKey: dm.message.idempotencyKey! }, { t3ThreadId: "xtwork-im-dm-legacy", t3TurnId: "run-1" });
+      initial.close();
+
+      // Strip Leader-era pointer ownership columns to reproduce an ADR-011 pre-upgrade database
+      const raw = new DatabaseSync(dbPath);
+      raw.exec("UPDATE messages SET leader_id = NULL, binding_id = NULL, binding_epoch = NULL");
+      raw.exec("UPDATE chats SET thread_leader_id = NULL, thread_binding_id = NULL, thread_binding_epoch = NULL");
+      raw.exec("PRAGMA user_version = 1");
+      raw.close();
+
+      const upgraded = new Store(dbPath);
+      try {
+        const beforeSync = upgraded.chat(dm.chat.id);
+        assert.equal(beforeSync?.threadId, "xtwork-im-dm-legacy");
+        assert.equal(beforeSync?.threadLeaderId, "leader-default");
+        assert.equal(beforeSync?.threadBindingEpoch, 1);
+
+        // Initial default-binding sync MUST preserve the existing DM thread pointer and stamp bindingId
+        upgraded.syncConnectionBinding({
+          connectionId: conn.id,
+          leaderId: "leader-default",
+          bindingId: "bind-default-1",
+          bindingEpoch: 1,
+          leaderPaused: false,
+        });
+        const afterDefaultSync = upgraded.chat(dm.chat.id);
+        assert.equal(afterDefaultSync?.threadId, "xtwork-im-dm-legacy");
+        assert.equal(afterDefaultSync?.threadBindingId, "bind-default-1");
+
+        // Rebinding to Leader B (epoch 2) MUST clear the stale pointer
+        upgraded.syncConnectionBinding({
+          connectionId: conn.id,
+          leaderId: "leader-b",
+          bindingId: "bind-b-2",
+          bindingEpoch: 2,
+          leaderPaused: false,
+        });
+        assert.equal(upgraded.chat(dm.chat.id)?.threadId, null);
+      } finally {
+        upgraded.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

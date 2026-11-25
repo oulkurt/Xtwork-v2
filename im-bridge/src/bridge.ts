@@ -187,6 +187,7 @@ export class ImBridge {
   private readonly links = new Map<string, ManagedLink>();
   private readonly onboardings = new Map<string, ActiveOnboarding>();
   private readonly liveReplies = new Map<string, { readonly live: LiveReply; readonly connectionId: string; readonly chatId: string; readonly replyTo: string }>();
+  private readonly inflightOperations = new Map<string, Promise<unknown>>();
 
   private sleepTimer: NodeJS.Timeout | undefined;
   private lastClockTickAt: number;
@@ -259,17 +260,24 @@ export class ImBridge {
     }
   }
 
-  /** Replay all gate-approved unacked `received`/`delivered` triggers with their stable idempotency keys. */
+  /** Replay all gate-approved unacked `received`/`delivered` triggers with their stable idempotency keys (S28: sweep paused Leaders' unacked items into `paused_pending`). */
   replayUnackedTriggers(): number {
-    const pending = this.store.listUnackedTriggers();
+    const pending = this.store.listUnackedTriggers({ includePaused: true });
+    let dispatched = 0;
     for (const msg of pending) {
       const chat = this.store.chat(msg.chatId);
       const conn = this.store.connection(msg.connectionId);
       if (!chat || !conn) continue;
+      const msgLeaderId = msg.leaderId ?? "leader-default";
+      if (this.store.isLeaderPausedForConnection(msgLeaderId, conn)) {
+        this.store.moveInbound([msg.id], "pause");
+        continue;
+      }
       const contact = msg.senderId ? this.store.contactByPlatformId(conn.id, msg.senderId) : undefined;
       this.emitDispatch(conn, chat, msg, contact);
+      dispatched++;
     }
-    return pending.length;
+    return dispatched;
   }
 
   async shutdown(): Promise<void> {
@@ -341,6 +349,14 @@ export class ImBridge {
         return this.handleConnectionPause(reqStr(params, "connectionId"));
       case "connections.resume":
         return this.handleConnectionResume(reqStr(params, "connectionId"));
+      case "connections.setLeaderPaused":
+        return this.handleSetLeaderPaused(params);
+      case "connections.syncBindings":
+        return this.handleSyncBindings(params);
+      case "paused.list":
+        return this.handlePausedList(params);
+      case "paused.decide":
+        return this.handlePausedDecide(params);
       case "connections.disconnect":
         return this.handleConnectionDisconnect(reqStr(params, "connectionId"));
       case "connections.claimRefresh":
@@ -401,8 +417,9 @@ export class ImBridge {
       );
     }
     const platforms = Object.keys(this.channels).sort();
-    // Schedule crash-recovery redelivery right after hello response flushes.
-    if (!this.replayedOnHello) {
+    // Schedule crash-recovery redelivery right after hello response flushes unless
+    // the server requests deferred replay until Leader bindings & pause flags sync (S4).
+    if (params.deferReplay !== true && !this.replayedOnHello) {
       this.replayedOnHello = true;
       queueMicrotask(() => {
         if (!this.closed) this.replayUnackedTriggers();
@@ -669,6 +686,358 @@ export class ImBridge {
     return { connection: sanitizeConnection(this.store.connection(conn.id)!) };
   }
 
+  private handleSetLeaderPaused(params: Record<string, unknown>) {
+    const paused = Boolean(params.paused);
+    const filterLeaderId = optStr(params, "leaderId");
+    const pauseGeneration =
+      typeof params.pauseGeneration === "number" && Number.isInteger(params.pauseGeneration) && params.pauseGeneration >= 0
+        ? params.pauseGeneration
+        : undefined;
+    const pauseVersion =
+      typeof params.pauseVersion === "number" && Number.isInteger(params.pauseVersion) && params.pauseVersion >= 0
+        ? params.pauseVersion
+        : undefined;
+    const pausePatch = {
+      paused,
+      ...(pauseGeneration !== undefined ? { pauseGeneration } : {}),
+      ...(pauseVersion !== undefined ? { pauseVersion } : {}),
+    };
+    const leaderStateCache = new Map<string, ReturnType<Store["setLeaderPauseState"]>>();
+    const reconcileLeader = (leaderId: string) => {
+      let state = leaderStateCache.get(leaderId);
+      if (!state) {
+        state = this.store.setLeaderPauseState(leaderId, pausePatch);
+        leaderStateCache.set(leaderId, state);
+      }
+      return state;
+    };
+    if (filterLeaderId) {
+      reconcileLeader(filterLeaderId);
+    } else if (!Array.isArray(params.connectionIds)) {
+      reconcileLeader("leader-default");
+    }
+    const connectionIds = Array.isArray(params.connectionIds)
+      ? params.connectionIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+      : this.store.connections().map((c) => c.id);
+    const updated: Record<string, unknown>[] = [];
+    for (const connectionId of connectionIds) {
+      const conn = this.store.connection(connectionId);
+      if (!conn) continue;
+      // S14: Never overwrite pause state for a connection currently bound to a different Leader.
+      if (filterLeaderId && conn.leaderId !== filterLeaderId) continue;
+      // S29c: Always honor the store's authoritative monotonic pause state (never write a rejected
+      // unversioned flag directly to the connection!).
+      const leaderState = reconcileLeader(conn.leaderId);
+      const effectivePaused = leaderState.paused;
+      const next =
+        conn.leaderPaused === effectivePaused
+          ? conn
+          : this.store.updateConnection(conn.id, { leaderPaused: effectivePaused })!;
+      if (effectivePaused) {
+        this.store.pauseConnectionMessages(conn.id, next.leaderId);
+      }
+      if (conn.leaderPaused !== next.leaderPaused || leaderState.updatedConnectionIds.includes(conn.id)) {
+        this.emitConnectionState(next);
+      }
+      updated.push(sanitizeConnection(next));
+    }
+    const authoritativePaused = filterLeaderId
+      ? this.store.getLeaderPaused(filterLeaderId)
+      : updated.length > 0
+        ? updated.every((c) => c.leaderPaused === true)
+        : this.store.getLeaderPaused("leader-default");
+    return {
+      paused: authoritativePaused,
+      connections: updated,
+      pausedPending: this.handlePausedList({ connectionIds }).items,
+    };
+  }
+
+  private handleSyncBindings(params: Record<string, unknown>) {
+    // S23/S25/S26/S29: Merge per-Leader pause states (paused + pauseGeneration + pauseVersion) into
+    // one atomic update per Leader so out-of-order syncs are monotonically rejected across BOTH
+    // Leader state and bound connections!
+    type LeaderSyncUpdate = { paused?: boolean; pauseGeneration?: number; pauseVersion?: number };
+    const leaderUpdates = new Map<string, LeaderSyncUpdate>();
+    const ensureEntry = (leaderId: string): LeaderSyncUpdate => {
+      let entry = leaderUpdates.get(leaderId);
+      if (!entry) {
+        entry = {};
+        leaderUpdates.set(leaderId, entry);
+      }
+      return entry;
+    };
+    const validNonNegInt = (v: unknown): number | undefined =>
+      typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : undefined;
+
+    if (params.leaderStates && typeof params.leaderStates === "object" && !Array.isArray(params.leaderStates)) {
+      for (const [leaderId, raw] of Object.entries(params.leaderStates as Record<string, unknown>)) {
+        if (!leaderId || !raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+        const item = raw as Record<string, unknown>;
+        const entry = ensureEntry(leaderId);
+        if (typeof item.paused === "boolean") entry.paused = item.paused;
+        const gen = validNonNegInt(item.pauseGeneration);
+        if (gen !== undefined) entry.pauseGeneration = gen;
+        const ver = validNonNegInt(item.pauseVersion);
+        if (ver !== undefined) entry.pauseVersion = ver;
+      }
+    }
+    if (params.leaderPauseGenerations && typeof params.leaderPauseGenerations === "object" && !Array.isArray(params.leaderPauseGenerations)) {
+      for (const [leaderId, gen] of Object.entries(params.leaderPauseGenerations as Record<string, unknown>)) {
+        const parsed = validNonNegInt(gen);
+        if (leaderId && parsed !== undefined) ensureEntry(leaderId).pauseGeneration ??= parsed;
+      }
+    }
+    if (params.leaderPausedById && typeof params.leaderPausedById === "object" && !Array.isArray(params.leaderPausedById)) {
+      for (const [leaderId, pausedFlag] of Object.entries(params.leaderPausedById as Record<string, unknown>)) {
+        if (leaderId && typeof pausedFlag === "boolean") ensureEntry(leaderId).paused ??= pausedFlag;
+      }
+    }
+    if (params.leaderPauseVersions && typeof params.leaderPauseVersions === "object" && !Array.isArray(params.leaderPauseVersions)) {
+      for (const [leaderId, ver] of Object.entries(params.leaderPauseVersions as Record<string, unknown>)) {
+        const parsed = validNonNegInt(ver);
+        if (leaderId && parsed !== undefined) ensureEntry(leaderId).pauseVersion ??= parsed;
+      }
+    }
+    if (
+      typeof params.defaultLeaderPaused === "boolean" ||
+      validNonNegInt(params.defaultLeaderPauseGeneration) !== undefined ||
+      validNonNegInt(params.defaultLeaderPauseVersion) !== undefined
+    ) {
+      const entry = ensureEntry("leader-default");
+      if (typeof params.defaultLeaderPaused === "boolean") entry.paused ??= params.defaultLeaderPaused;
+      const gen = validNonNegInt(params.defaultLeaderPauseGeneration);
+      if (gen !== undefined) entry.pauseGeneration ??= gen;
+      const ver = validNonNegInt(params.defaultLeaderPauseVersion);
+      if (ver !== undefined) entry.pauseVersion ??= ver;
+    }
+
+    const emittedConnIds = new Set<string>();
+    const updated: Record<string, unknown>[] = [];
+    for (const [leaderId, state] of leaderUpdates.entries()) {
+      const res = this.store.setLeaderPauseState(leaderId, state);
+      for (const connId of res.updatedConnectionIds) {
+        emittedConnIds.add(connId);
+      }
+    }
+
+    const rawBindings = Array.isArray(params.bindings) ? params.bindings : [];
+    const seen = new Set<string>();
+    for (const entry of rawBindings) {
+      if (!entry || typeof entry !== "object") continue;
+      const item = entry as Record<string, unknown>;
+      const connectionId = typeof item.connectionId === "string" ? item.connectionId : "";
+      const leaderId = typeof item.leaderId === "string" && item.leaderId ? item.leaderId : "leader-default";
+      const bindingId = typeof item.bindingId === "string" && item.bindingId ? item.bindingId : null;
+      const bindingEpoch = typeof item.bindingEpoch === "number" && Number.isInteger(item.bindingEpoch) ? item.bindingEpoch : 1;
+      // S29: Preserve omitted `leaderPaused` (never coerce `undefined` to `false`!).
+      const leaderPaused = typeof item.leaderPaused === "boolean" ? item.leaderPaused : undefined;
+      const pauseGeneration = validNonNegInt(item.pauseGeneration);
+      const pauseVersion = validNonNegInt(item.pauseVersion);
+      if (!connectionId) continue;
+      seen.add(connectionId);
+      const prev = this.store.connection(connectionId);
+      const next = this.store.syncConnectionBinding({
+        connectionId,
+        leaderId,
+        bindingId,
+        bindingEpoch,
+        ...(leaderPaused !== undefined ? { leaderPaused } : {}),
+        ...(pauseGeneration !== undefined ? { pauseGeneration } : {}),
+        ...(pauseVersion !== undefined ? { pauseVersion } : {}),
+      });
+      if (next) {
+        const changed =
+          !prev ||
+          prev.leaderId !== next.leaderId ||
+          prev.bindingId !== next.bindingId ||
+          prev.bindingEpoch !== next.bindingEpoch ||
+          prev.leaderPaused !== next.leaderPaused ||
+          emittedConnIds.has(next.id);
+        emittedConnIds.delete(next.id);
+        if (changed) this.emitConnectionState(next);
+        updated.push(sanitizeConnection(next));
+      }
+    }
+    if (typeof params.defaultLeaderPaused === "boolean") {
+      // S29: Mirror the authoritative monotonic state for `leader-default` onto unbound connections
+      // without passing an unversioned override.
+      for (const conn of this.store.connections()) {
+        if (seen.has(conn.id)) continue;
+        // S4: Apply default Leader pause fallback ONLY to unbound connections;
+        // never overwrite connections bound to another Leader!
+        if (conn.bindingId !== null || conn.leaderId !== "leader-default") continue;
+        const next = this.store.syncConnectionBinding({
+          connectionId: conn.id,
+          leaderId: conn.leaderId,
+          bindingId: conn.bindingId,
+          bindingEpoch: conn.bindingEpoch,
+        });
+        if (next) {
+          const changed = conn.leaderPaused !== next.leaderPaused || emittedConnIds.has(next.id);
+          emittedConnIds.delete(next.id);
+          if (changed) this.emitConnectionState(next);
+          updated.push(sanitizeConnection(next));
+        }
+      }
+    }
+    for (const connId of emittedConnIds) {
+      const conn = this.store.connection(connId);
+      if (conn) {
+        this.emitConnectionState(conn);
+        if (!seen.has(conn.id)) updated.push(sanitizeConnection(conn));
+      }
+    }
+    if (params.triggerReplay === true && !this.replayedOnHello) {
+      this.replayedOnHello = true;
+      queueMicrotask(() => {
+        if (!this.closed) this.replayUnackedTriggers();
+      });
+    }
+    return { synced: updated.length, connections: updated };
+  }
+
+  private handlePausedList(params: Record<string, unknown>) {
+    const connectionIds = Array.isArray(params.connectionIds)
+      ? params.connectionIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+      : optStr(params, "connectionId")
+        ? [reqStr(params, "connectionId")]
+        : undefined;
+    const leaderId = optStr(params, "leaderId");
+    const items = this.store.pausedPendingMessages({
+      ...(connectionIds ? { connectionIds } : {}),
+      ...(leaderId ? { leaderId } : {}),
+    }).map((item) => ({
+      id: item.id,
+      connectionId: item.connectionId,
+      platform: item.platform,
+      chatId: item.chatId,
+      chatKind: item.chat.kind,
+      chatName: item.chat.name,
+      senderId: item.senderId,
+      senderName: contactName(item.contact) ?? item.senderName,
+      platformMsgId: item.platformMsgId,
+      idempotencyKey: item.idempotencyKey,
+      leaderId: item.leaderId,
+      bindingId: item.bindingId,
+      bindingEpoch: item.bindingEpoch,
+      body: item.body,
+      createdAt: item.createdAt,
+    }));
+    return { items };
+  }
+
+  private handlePausedDecide(params: Record<string, unknown>) {
+    const decision = reqStr(params, "decision");
+    if (decision !== "replay" && decision !== "dismiss") {
+      throw new BridgeError("INVALID_PARAMS", 'decision must be "replay" or "dismiss"');
+    }
+    const leaderId = optStr(params, "leaderId");
+    const replayPauseGeneration =
+      typeof params.pauseGeneration === "number" && Number.isInteger(params.pauseGeneration) && params.pauseGeneration >= 0
+        ? params.pauseGeneration
+        : undefined;
+    const replayPauseVersion =
+      typeof params.pauseVersion === "number" && Number.isInteger(params.pauseVersion) && params.pauseVersion >= 0
+        ? params.pauseVersion
+        : undefined;
+    if (leaderId && decision === "replay" && replayPauseVersion !== undefined) {
+      this.store.setLeaderPauseState(leaderId, {
+        paused: false,
+        ...(replayPauseGeneration !== undefined ? { pauseGeneration: replayPauseGeneration } : {}),
+        pauseVersion: replayPauseVersion,
+      });
+    } else if (leaderId && replayPauseGeneration !== undefined) {
+      this.store.setLeaderPauseState(leaderId, { pauseGeneration: replayPauseGeneration });
+    }
+    const messageIds = Array.isArray(params.messageIds)
+      ? params.messageIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+      : optStr(params, "messageId")
+        ? [reqStr(params, "messageId")]
+        : [];
+    if (decision === "dismiss") {
+      const eligible = messageIds.filter((id) => {
+        const msg = this.store.message(id);
+        if (!msg || msg.state !== "paused_pending") return false;
+        if (leaderId && (msg.leaderId ?? "leader-default") !== leaderId) return false;
+        return true;
+      });
+      const changed = this.store.decidePausedPending(eligible, "dismiss");
+      return { decision, count: changed.length, messageIds: changed.map((m) => m.id), blockedIds: [], heldIds: [], skippedIds: [] };
+    }
+
+    const replayedIds: string[] = [];
+    const blockedIds: string[] = [];
+    const heldIds: string[] = [];
+    const skippedIds: string[] = [];
+
+    for (const id of messageIds) {
+      const msg = this.store.message(id);
+      if (!msg || msg.state !== "paused_pending") continue;
+      const conn = this.store.connection(msg.connectionId);
+      const chat = this.store.chat(msg.chatId);
+      if (!conn || !chat) {
+        skippedIds.push(id);
+        continue;
+      }
+      if (leaderId && (msg.leaderId ?? "leader-default") !== leaderId) {
+        skippedIds.push(id);
+        continue;
+      }
+      // S5/S18/S26/S29: Validate active/unpaused connection, target Leader state, and monotonic
+      // pauseVersion/pauseGeneration BEFORE transitioning any row out of `paused_pending`!
+      // Stale Replay requests (carrying an older pauseVersion or pauseGeneration than what the
+      // bridge already knows for this Leader) are skipped cleanly without moving rows.
+      const msgLeaderId = msg.leaderId ?? "leader-default";
+      const leaderPauseState = this.store.getLeaderPauseState(msgLeaderId);
+      const staleReplayVersion =
+        replayPauseVersion !== undefined &&
+        leaderPauseState.exists &&
+        replayPauseVersion < leaderPauseState.pauseVersion;
+      const staleReplayGeneration =
+        replayPauseGeneration !== undefined && replayPauseGeneration < leaderPauseState.pauseGeneration;
+      if (
+        conn.lifecycleState !== "active" ||
+        this.store.isLeaderPausedForConnection(msgLeaderId, conn) ||
+        staleReplayVersion ||
+        staleReplayGeneration
+      ) {
+        skippedIds.push(id);
+        continue;
+      }
+      // S5: Re-evaluate current access gate BEFORE transitioning out of `paused_pending`.
+      const trust = this.channels[conn.platform]?.trust ?? "public";
+      const verdict = this.store.evaluateInboundGate(msg, trust);
+      if (verdict === "drop") {
+        this.store.moveInbound([msg.id], "refuse");
+        blockedIds.push(msg.id);
+        continue;
+      }
+      if (verdict === "ask") {
+        this.store.moveInbound([msg.id], "rehold_paused");
+        heldIds.push(msg.id);
+        continue;
+      }
+      // S24/S27: Atomically commit `paused_pending -> received` AND refresh `pause_generation` in one UPDATE!
+      const freshGen = replayPauseGeneration ?? this.store.getLeaderPauseGeneration(msgLeaderId);
+      const moved = this.store.decidePausedPending([msg.id], "replay", freshGen);
+      const replayed = moved[0];
+      if (!replayed) continue;
+      const contact = replayed.senderId ? this.store.contactByPlatformId(conn.id, replayed.senderId) : undefined;
+      this.emitDispatch(conn, chat, replayed, contact, freshGen);
+      replayedIds.push(replayed.id);
+    }
+
+    return {
+      decision,
+      count: replayedIds.length,
+      messageIds: replayedIds,
+      blockedIds,
+      heldIds,
+      skippedIds,
+    };
+  }
+
   private async handleConnectionDisconnect(connectionId: string) {
     const conn = this.requireConnection(connectionId);
     if (conn.secretRef) {
@@ -797,15 +1166,35 @@ export class ImBridge {
     if (toRefuse.length > 0) {
       this.store.moveInbound(toRefuse, "refuse");
     }
-    const admittedIds = this.store.moveInbound(toAdmit, "admit");
-    for (const msgId of admittedIds) {
-      const msg = this.store.message(msgId);
-      if (!msg) continue;
-      const conn = this.store.connection(msg.connectionId);
-      const chat = this.store.chat(msg.chatId);
-      if (!conn || !chat) continue;
-      const contact = msg.senderId ? this.store.contactByPlatformId(conn.id, msg.senderId) : undefined;
-      this.emitDispatch(conn, chat, msg, contact);
+    const admittedIds: string[] = [];
+    for (const msgId of toAdmit) {
+      // S26/S27: Atomically transition `held -> paused_pending` (when paused) OR `held -> received`
+      // with `pause_generation` committed in ONE single SQL statement (never split across two writes!).
+      const result = this.store.admitHeldMessage(msgId);
+      if (!result) continue;
+      admittedIds.push(result.message.id);
+      const contact = result.message.senderId
+        ? this.store.contactByPlatformId(result.conn.id, result.message.senderId)
+        : undefined;
+      if (result.kind === "paused_pending") {
+        this.emit({
+          method: "inbound.paused",
+          params: {
+            connectionId: result.conn.id,
+            platform: result.conn.platform,
+            chatId: result.chat.id,
+            chatKind: result.chat.kind,
+            chatName: result.chat.name,
+            messageId: result.message.id,
+            idempotencyKey: result.message.idempotencyKey,
+            senderName: contactName(contact) ?? result.message.senderName,
+            body: result.message.body,
+            createdAt: result.message.createdAt,
+          },
+        });
+        continue;
+      }
+      this.emitDispatch(result.conn, result.chat, result.message, contact, result.pauseGeneration);
     }
 
     return { targetKind, targetId, decision, affectedMessages: admittedIds };
@@ -863,82 +1252,165 @@ export class ImBridge {
 
   // ------------------------------------------------------------------ messages
 
+  /**
+   * S17: Check whether an idempotent outbound operationKey already reached `sent`, `uncertain`,
+   * or a recovered `pending` state from a crash after provider acceptance before result persistence.
+   */
+  private recordedOutboundResponse(operationKey: string, replyToId?: string | null) {
+    const existing = this.store.findOutboundByOperationKey(operationKey);
+    if (!existing) return undefined;
+    // S17: Fall back to the persisted outbound row's `replyTo` so retries after bridge restart
+    // (when in-memory `liveReplies` is empty) still settle the inbound message row!
+    const inboundTargetId = replyToId ?? existing.replyTo;
+    if (existing.state === "pending") {
+      // `runIdempotentSend` serializes live in-process calls via `inflightOperations`, so a
+      // persisted `pending` row here means an earlier process died mid-send before persisting the
+      // outcome. Treat it as `uncertain` instead of risking a duplicate send!
+      this.store.setOutboundResult(existing.id, "uncertain", existing.platformMsgId);
+      const promoted = this.store.message(existing.id) ?? { ...existing, state: "uncertain" as const };
+      if (inboundTargetId && this.store.message(inboundTargetId)) {
+        this.store.moveInbound([inboundTargetId], "reply");
+      }
+      return { message: promoted, result: { kind: "uncertain" as const }, deduplicated: true };
+    }
+    if (existing.state === "sent" || existing.state === "uncertain") {
+      if (inboundTargetId && this.store.message(inboundTargetId)) {
+        this.store.moveInbound([inboundTargetId], "reply");
+      }
+      const result: SendResult =
+        existing.state === "sent"
+          ? { kind: "sent", platformId: existing.platformMsgId ?? existing.id }
+          : { kind: "uncertain" };
+      return { message: existing, result, deduplicated: true };
+    }
+    return undefined;
+  }
+
+  /** S17: Serialize concurrent retries sharing the same outbound operationKey in-process. */
+  private async runIdempotentSend<T>(operationKey: string | undefined, work: () => Promise<T>): Promise<T> {
+    if (!operationKey) return work();
+    const pending = this.inflightOperations.get(operationKey);
+    if (pending) return (await pending) as T;
+    const promise = work();
+    this.inflightOperations.set(operationKey, promise);
+    try {
+      return await promise;
+    } finally {
+      if (this.inflightOperations.get(operationKey) === promise) {
+        this.inflightOperations.delete(operationKey);
+      }
+    }
+  }
+
   private async handleMessagesReply(params: Record<string, unknown>) {
     const messageId = reqStr(params, "messageId");
     const text = reqStr(params, "text");
-    const target = this.store.message(messageId);
-    if (!target) throw new BridgeError("MESSAGE_NOT_FOUND", `Message not found: ${messageId}`);
-    const chat = this.store.chat(target.chatId);
-    if (!chat) throw new BridgeError("CHAT_NOT_FOUND", `Chat not found: ${target.chatId}`);
-    const live = this.requireActiveChat(chat);
+    const operationKey = optStr(params, "operationKey");
+    return this.runIdempotentSend(operationKey, async () => {
+      if (operationKey) {
+        const recorded = this.recordedOutboundResponse(operationKey, messageId);
+        if (recorded) return recorded;
+      }
+      const target = this.store.message(messageId);
+      if (!target) throw new BridgeError("MESSAGE_NOT_FOUND", `Message not found: ${messageId}`);
+      const chat = this.store.chat(target.chatId);
+      if (!chat) throw new BridgeError("CHAT_NOT_FOUND", `Chat not found: ${target.chatId}`);
+      const live = this.requireActiveChat(chat);
 
-    const outRecord = this.store.insertOutbound({
-      connectionId: chat.connectionId,
-      chatId: chat.id,
-      body: text,
-      replyTo: target.id,
+      const existing = operationKey ? this.store.findOutboundByOperationKey(operationKey) : undefined;
+      const outRecord = existing
+        ? this.store.resetOutboundForRetry(existing.id, text)
+        : this.store.insertOutbound({
+            connectionId: chat.connectionId,
+            chatId: chat.id,
+            body: text,
+            replyTo: target.id,
+            operationKey: operationKey ?? null,
+          });
+
+      const outbound: OutboundMessage = {
+        chat: toChatRef(chat, this.store),
+        text,
+        ...(target.platformMsgId ? { replyTo: target.platformMsgId } : {}),
+        ...(Array.isArray(params.files) ? { files: params.files as OutboundMessage["files"] } : {}),
+        ...(Array.isArray(params.mentions) ? { mentions: params.mentions as readonly Mention[] } : {}),
+        ...(params.inThread ? { inThread: params.inThread as { readonly title: string } } : {}),
+        ...(params.inChat === true ? { inChat: true } : {}),
+      };
+
+      let result: SendResult;
+      try {
+        result = await sendWithRetry(live, outbound);
+      } catch (error) {
+        this.store.setOutboundResult(outRecord.id, "failed", null);
+        throw error;
+      }
+      this.store.setOutboundResult(
+        outRecord.id,
+        result.kind === "sent" ? "sent" : result.kind === "uncertain" ? "uncertain" : "failed",
+        result.kind === "sent" ? result.platformId : null,
+      );
+      if (result.kind === "sent" || result.kind === "uncertain") {
+        this.store.moveInbound([target.id], "reply");
+      }
+      return { message: this.store.message(outRecord.id), result };
     });
-
-    const outbound: OutboundMessage = {
-      chat: toChatRef(chat, this.store),
-      text,
-      ...(target.platformMsgId ? { replyTo: target.platformMsgId } : {}),
-      ...(Array.isArray(params.files) ? { files: params.files as OutboundMessage["files"] } : {}),
-      ...(Array.isArray(params.mentions) ? { mentions: params.mentions as readonly Mention[] } : {}),
-      ...(params.inThread ? { inThread: params.inThread as { readonly title: string } } : {}),
-      ...(params.inChat === true ? { inChat: true } : {}),
-    };
-
-    const result = await sendWithRetry(live, outbound);
-    this.store.setOutboundResult(
-      outRecord.id,
-      result.kind === "sent" ? "sent" : result.kind === "uncertain" ? "uncertain" : "failed",
-      result.kind === "sent" ? result.platformId : null,
-    );
-    if (result.kind === "sent" || result.kind === "uncertain") {
-      this.store.moveInbound([target.id], "reply");
-    }
-    return { message: this.store.message(outRecord.id), result };
   }
 
   private async handleMessagesSend(params: Record<string, unknown>) {
     const chatId = reqStr(params, "chatId");
     const text = reqStr(params, "text");
-    const chat = this.store.chat(chatId);
-    if (!chat) throw new BridgeError("CHAT_NOT_FOUND", `Chat not found: ${chatId}`);
-    const live = this.requireActiveChat(chat);
-
+    const operationKey = optStr(params, "operationKey");
     const replyToId = optStr(params, "replyTo");
-    const replyTarget = replyToId ? this.store.message(replyToId) : undefined;
+    return this.runIdempotentSend(operationKey, async () => {
+      if (operationKey) {
+        const recorded = this.recordedOutboundResponse(operationKey, replyToId);
+        if (recorded) return recorded;
+      }
+      const chat = this.store.chat(chatId);
+      if (!chat) throw new BridgeError("CHAT_NOT_FOUND", `Chat not found: ${chatId}`);
+      const live = this.requireActiveChat(chat);
 
-    const outRecord = this.store.insertOutbound({
-      connectionId: chat.connectionId,
-      chatId: chat.id,
-      body: text,
-      replyTo: replyTarget?.id ?? null,
+      const replyTarget = replyToId ? this.store.message(replyToId) : undefined;
+      const existing = operationKey ? this.store.findOutboundByOperationKey(operationKey) : undefined;
+      const outRecord = existing
+        ? this.store.resetOutboundForRetry(existing.id, text)
+        : this.store.insertOutbound({
+            connectionId: chat.connectionId,
+            chatId: chat.id,
+            body: text,
+            replyTo: replyTarget?.id ?? null,
+            operationKey: operationKey ?? null,
+          });
+
+      const outbound: OutboundMessage = {
+        chat: toChatRef(chat, this.store),
+        text,
+        ...(replyTarget?.platformMsgId ? { replyTo: replyTarget.platformMsgId } : replyToId ? { replyTo: replyToId } : {}),
+        ...(Array.isArray(params.files) ? { files: params.files as OutboundMessage["files"] } : {}),
+        ...(Array.isArray(params.mentions) ? { mentions: params.mentions as readonly Mention[] } : {}),
+        ...(params.inThread ? { inThread: params.inThread as { readonly title: string } } : {}),
+        ...(params.inChat === true ? { inChat: true } : {}),
+      };
+
+      let result: SendResult;
+      try {
+        result = await sendWithRetry(live, outbound);
+      } catch (error) {
+        this.store.setOutboundResult(outRecord.id, "failed", null);
+        throw error;
+      }
+      this.store.setOutboundResult(
+        outRecord.id,
+        result.kind === "sent" ? "sent" : result.kind === "uncertain" ? "uncertain" : "failed",
+        result.kind === "sent" ? result.platformId : null,
+      );
+      if (result.kind === "sent" || result.kind === "uncertain") {
+        if (replyTarget) this.store.moveInbound([replyTarget.id], "reply");
+        else this.store.settleChatOnSend(chat.id);
+      }
+      return { message: this.store.message(outRecord.id), result };
     });
-
-    const outbound: OutboundMessage = {
-      chat: toChatRef(chat, this.store),
-      text,
-      ...(replyTarget?.platformMsgId ? { replyTo: replyTarget.platformMsgId } : replyToId ? { replyTo: replyToId } : {}),
-      ...(Array.isArray(params.files) ? { files: params.files as OutboundMessage["files"] } : {}),
-      ...(Array.isArray(params.mentions) ? { mentions: params.mentions as readonly Mention[] } : {}),
-      ...(params.inThread ? { inThread: params.inThread as { readonly title: string } } : {}),
-      ...(params.inChat === true ? { inChat: true } : {}),
-    };
-
-    const result = await sendWithRetry(live, outbound);
-    this.store.setOutboundResult(
-      outRecord.id,
-      result.kind === "sent" ? "sent" : result.kind === "uncertain" ? "uncertain" : "failed",
-      result.kind === "sent" ? result.platformId : null,
-    );
-    if (result.kind === "sent" || result.kind === "uncertain") {
-      if (replyTarget) this.store.moveInbound([replyTarget.id], "reply");
-      else this.store.settleChatOnSend(chat.id);
-    }
-    return { message: this.store.message(outRecord.id), result };
   }
 
   private async handleLiveStart(params: Record<string, unknown>) {
@@ -976,24 +1448,49 @@ export class ImBridge {
   private async handleLiveFinish(params: Record<string, unknown>) {
     const liveId = reqStr(params, "liveId");
     const markdown = reqStr(params, "markdown");
+    const operationKey = optStr(params, "operationKey");
     const mentions = Array.isArray(params.mentions) ? (params.mentions as readonly Mention[]) : undefined;
-    const entry = this.liveReplies.get(liveId);
-    if (!entry) throw new BridgeError("LIVE_NOT_FOUND", `Live reply not found: ${liveId}`);
-    this.liveReplies.delete(liveId);
-    const result = await entry.live.finish(markdown, mentions);
-    if (result.kind === "sent") {
-      const out = this.store.insertOutbound({
-        connectionId: entry.connectionId,
-        chatId: entry.chatId,
-        body: markdown,
-        replyTo: this.store.message(entry.replyTo)?.id ?? null,
-      });
-      this.store.setOutboundResult(out.id, "sent", result.platformId);
-      if (this.store.message(entry.replyTo)) {
-        this.store.moveInbound([entry.replyTo], "reply");
+    return this.runIdempotentSend(operationKey, async () => {
+      const existingEntry = this.liveReplies.get(liveId);
+      if (operationKey) {
+        const recorded = this.recordedOutboundResponse(operationKey, existingEntry?.replyTo);
+        if (recorded) {
+          this.liveReplies.delete(liveId);
+          return recorded;
+        }
       }
-    }
-    return { result };
+      if (!existingEntry) throw new BridgeError("LIVE_NOT_FOUND", `Live reply not found: ${liveId}`);
+      this.liveReplies.delete(liveId);
+      const replyTargetId = this.store.message(existingEntry.replyTo)?.id ?? null;
+      const existingOut = operationKey ? this.store.findOutboundByOperationKey(operationKey) : undefined;
+      const outRecord = existingOut
+        ? this.store.resetOutboundForRetry(existingOut.id, markdown)
+        : this.store.insertOutbound({
+            connectionId: existingEntry.connectionId,
+            chatId: existingEntry.chatId,
+            body: markdown,
+            replyTo: replyTargetId,
+            operationKey: operationKey ?? null,
+          });
+      let result: SendResult;
+      try {
+        result = await existingEntry.live.finish(markdown, mentions);
+      } catch (error) {
+        this.store.setOutboundResult(outRecord.id, "failed", null);
+        throw error;
+      }
+      this.store.setOutboundResult(
+        outRecord.id,
+        result.kind === "sent" ? "sent" : result.kind === "uncertain" ? "uncertain" : "failed",
+        result.kind === "sent" ? result.platformId : null,
+      );
+      if (result.kind === "sent" || result.kind === "uncertain") {
+        if (replyTargetId) {
+          this.store.moveInbound([replyTargetId], "reply");
+        }
+      }
+      return { message: this.store.message(outRecord.id), result };
+    });
   }
 
   private async handleMessagesReact(params: Record<string, unknown>) {
@@ -1268,19 +1765,48 @@ export class ImBridge {
         return;
       }
       case "stop": {
+        // S19: Only emit chat.threadId if its stored binding matches the connection's CURRENT binding!
+        const pointerMatchesCurrentBinding =
+          outcome.chat.threadId !== null &&
+          outcome.chat.threadLeaderId === conn.leaderId &&
+          outcome.chat.threadBindingEpoch === conn.bindingEpoch &&
+          (outcome.chat.threadBindingId === null ||
+            conn.bindingId === null ||
+            outcome.chat.threadBindingId === conn.bindingId);
         this.emit({
           method: "inbound.stop",
           params: {
             connectionId: conn.id,
             platform: conn.platform,
             chatId: outcome.chat.id,
-            threadId: outcome.chat.threadId,
+            threadId: pointerMatchesCurrentBinding ? outcome.chat.threadId : null,
+            leaderId: conn.leaderId,
+            bindingId: conn.bindingId,
+            bindingEpoch: conn.bindingEpoch,
             messageId: outcome.message.id,
             platformMsgId: outcome.message.platformMsgId,
             senderId: outcome.message.senderId,
             createdAt: outcome.message.createdAt,
             verifiedOwner: true,
             senderRole: "owner",
+          },
+        });
+        return;
+      }
+      case "paused_pending": {
+        this.emit({
+          method: "inbound.paused",
+          params: {
+            connectionId: conn.id,
+            platform: conn.platform,
+            chatId: outcome.chat.id,
+            chatKind: outcome.chat.kind,
+            chatName: outcome.chat.name,
+            messageId: outcome.message.id,
+            idempotencyKey: outcome.message.idempotencyKey,
+            senderName: contactName(outcome.contact) ?? outcome.message.senderName,
+            body: outcome.message.body,
+            createdAt: outcome.message.createdAt,
           },
         });
         return;
@@ -1304,6 +1830,7 @@ export class ImBridge {
         state: conn.state,
         stateDetail: conn.stateDetail,
         paused: conn.paused,
+        leaderPaused: conn.leaderPaused,
         ownerId: conn.ownerId,
         claimCode: conn.claimCode,
         claimExpiresAt: conn.claimExpiresAt,
@@ -1311,7 +1838,13 @@ export class ImBridge {
     });
   }
 
-  private emitDispatch(conn: Connection, chat: Chat, msg: Message, contact?: Contact): void {
+  private emitDispatch(
+    conn: Connection,
+    chat: Chat,
+    msg: Message,
+    contact?: Contact,
+    overridePauseGeneration?: number,
+  ): void {
     const isOwner = Boolean(conn.ownerId && msg.senderId === conn.ownerId);
     const senderRole: VerifiedSenderRole = isOwner ? "owner" : contact?.isBot ? "bot" : "member";
     const replyAudience: ReplyAudience = chat.kind === "dm" && isOwner ? "owner_dm" : "group";
@@ -1349,6 +1882,17 @@ export class ImBridge {
       senderName: senderDisplayName,
     });
 
+    // S6: Always emit the message's stamped historical binding identity as one atomic tuple
+    // (never borrow the connection's current binding after rebind!). Legacy unbackfilled rows
+    // default to ('leader-default', null, 1).
+    const dispatchLeaderId = msg.leaderId ?? "leader-default";
+    const dispatchBindingId = msg.bindingId;
+    const dispatchBindingEpoch = msg.bindingEpoch ?? 1;
+    // S23/S24/S27: Every dispatchable message commits `pause_generation` atomically when it enters
+    // `received` (on ingest, admission, or explicit Replay). Never fill a missing `pause_generation`
+    // from the Leader's newer synced generation on automatic redelivery — fail closed to 0!
+    const dispatchPauseGeneration = overridePauseGeneration ?? msg.pauseGeneration ?? 0;
+
     this.emit({
       method: "inbound.dispatch",
       params: {
@@ -1362,6 +1906,10 @@ export class ImBridge {
         messageId: msg.id,
         platformMsgId: msg.platformMsgId,
         idempotencyKey: msg.idempotencyKey,
+        leaderId: dispatchLeaderId,
+        bindingId: dispatchBindingId,
+        bindingEpoch: dispatchBindingEpoch,
+        pauseGeneration: dispatchPauseGeneration,
         senderId: msg.senderId,
         senderName: senderDisplayName,
         contactId: contact?.id ?? null,
@@ -1449,6 +1997,10 @@ function sanitizeConnection(conn: Connection) {
     state: conn.state,
     stateDetail: conn.stateDetail,
     paused: conn.paused,
+    leaderPaused: conn.leaderPaused,
+    leaderId: conn.leaderId,
+    bindingId: conn.bindingId,
+    bindingEpoch: conn.bindingEpoch,
     ownerId: conn.ownerId,
     claimCode: conn.claimCode,
     claimExpiresAt: conn.claimExpiresAt,

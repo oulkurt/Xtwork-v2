@@ -10,6 +10,14 @@ export interface BridgeOptions {
   readonly companionDir: string;
 }
 
+export function bridgeRpcError(message: string, code?: string): Error {
+  const err = new Error(message);
+  if (code !== undefined) {
+    Object.defineProperty(err, "code", { value: code, enumerable: true, configurable: true });
+  }
+  return err;
+}
+
 export type BridgePayload = Record<string, unknown>;
 export const isRecord = (value: unknown): value is BridgePayload =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -42,10 +50,16 @@ export class XtworkImBridgeHost {
 
   private readonly options: BridgeOptions;
   private readonly onEvent: (event: string, payload: BridgePayload) => void;
+  private readonly onReady: ((call: (method: string, params?: BridgePayload, signal?: AbortSignal) => Promise<unknown>) => Promise<void>) | undefined;
 
-  constructor(options: BridgeOptions, onEvent: (event: string, payload: BridgePayload) => void) {
+  constructor(
+    options: BridgeOptions,
+    onEvent: (event: string, payload: BridgePayload) => void,
+    onReady?: (call: (method: string, params?: BridgePayload, signal?: AbortSignal) => Promise<unknown>) => Promise<void>,
+  ) {
     this.options = options;
     this.onEvent = onEvent;
+    this.onReady = onReady;
   }
 
   get available() {
@@ -97,7 +111,8 @@ export class XtworkImBridgeHost {
         if (typeof frame.id === "number") {
           const pending = connection.pending.get(frame.id);
           if (isRecord(frame.error) && typeof frame.error.message === "string") {
-            pending?.reject(new Error(frame.error.message));
+            const code = typeof frame.error.code === "string" ? frame.error.code : undefined;
+            pending?.reject(bridgeRpcError(frame.error.message, code));
           } else {
             pending?.resolve(frame.result);
           }
@@ -126,12 +141,21 @@ export class XtworkImBridgeHost {
       }, delay);
       this.restart.unref();
     });
-    void this.call(connection, "bridge.hello", { protocolVersion: 1 }, AbortSignal.timeout(5000))
-      .then((result) => {
+    void this.call(
+      connection,
+      "bridge.hello",
+      { protocolVersion: 1, ...(this.onReady ? { deferReplay: true } : {}) },
+      AbortSignal.timeout(5000),
+    )
+      .then(async (result) => {
         if (!isRecord(result) || Number(result.protocolVersion) !== 1) {
           throw new Error("Incompatible IM bridge protocol.");
         }
         if (this.connection !== connection || this.closing) return;
+        if (this.onReady) {
+          await this.onReady((method, params = {}, signal) => this.call(connection, method, params, signal));
+          if (this.connection !== connection || this.closing) return;
+        }
         connection.ready = true;
         for (const [event, payload] of connection.events.splice(0)) this.onEvent(event, payload);
       })
