@@ -1,16 +1,21 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off globalJsonInEffect:off effectTryWithoutCatch:off
 import { EnvironmentId, ProjectId, RuntimeRequestId, ThreadId } from "@t3tools/contracts";
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import type { AgentAwarenessThread } from "../orchestration-v2/ProjectionStore.ts";
+import { OrchestratorV2 } from "../orchestration-v2/Orchestrator.ts";
+import { ManagedProjectFolders } from "../project/ManagedProjectFolders.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
 import { bridgeRpcError } from "./XtworkImBridgeHost.ts";
-import { dispatchIdentity, inboundMessage, sameAudience } from "./XtworkImDispatch.ts";
+import { dispatchIdentity, inboundMessage, makeDispatcher, sameAudience } from "./XtworkImDispatch.ts";
 import { imToolAllowed, runImTool } from "./XtworkImMcp.ts";
 import { XtworkImMemory } from "./XtworkImMemory.ts";
 import {
@@ -905,5 +910,183 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         expect(turn3Check.policyChanged).toBe(true);
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
     );
+  });
+
+  it("rejects replayed known delivery keys when bindingId is supplied without matching leaderId and bindingEpoch (S6)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xtwork-s6-replay-"));
+    const memory = new XtworkImMemory(dir);
+    const fakeDeps = Layer.mergeAll(
+      NodeFileSystem.layer,
+      NodeSqliteClient.layer({ filename: ":memory:" }),
+      Layer.succeed(OrchestratorV2, {
+        getThreadRecords: () => Effect.succeed({ runs: [], messages: [] }),
+        dispatch: () => Effect.succeed({}),
+      } as never),
+      Layer.succeed(ManagedProjectFolders, {
+        ensure: () => Effect.succeed(ProjectId.make("proj-1")),
+      } as never),
+      Layer.succeed(ServerSettingsService, {
+        getSettings: Effect.succeed({}),
+      } as never),
+    );
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const leaders = yield* makeLeaderStore();
+        yield* leaders.ensureDefaultLeader();
+        const binding = yield* leaders.ensureBinding("conn-feishu", DEFAULT_LEADER_ID);
+        const dispatcher = yield* makeDispatcher(dir, memory, leaders);
+
+        const inbound = inboundMessage({
+          connectionId: "conn-feishu",
+          platformMsgId: "pm-replay-1",
+          chatId: "chat-dm",
+          chatKind: "dm",
+          senderRole: "owner",
+          leaderId: binding.leaderId,
+          bindingId: binding.bindingId,
+          bindingEpoch: binding.epoch,
+        });
+        const storedCtx = normalizeExecutionContext({
+          source: "im",
+          leaderId: binding.leaderId,
+          bindingId: binding.bindingId,
+          bindingEpoch: binding.epoch,
+          connectionId: "conn-feishu",
+          chatId: "chat-dm",
+          chatKind: "dm",
+          senderRole: "owner",
+          replyAudience: "owner_dm",
+          isolatedWorkspaceRoot: dir,
+          companionScope: "private",
+        });
+        // Seed existing committed delivery row under `inbound.key`
+        yield* sql`INSERT INTO xtwork_im_delivery (key, thread_id, message_id, context_json, payload_json, settled)
+          VALUES (${inbound.key}, 'xtwork-im-dm-replay', 'msg-1', ${JSON.stringify(storedCtx)}, ${JSON.stringify(inbound)}, 0)`;
+
+        // Replaying the SAME key with bindingId but OMITTED leaderId/bindingEpoch MUST be rejected BEFORE dedupe!
+        const missingFields = yield* dispatcher
+          .accept({
+            connectionId: "conn-feishu",
+            platformMsgId: "pm-replay-1",
+            chatId: "chat-dm",
+            chatKind: "dm",
+            senderRole: "owner",
+            bindingId: binding.bindingId,
+          })
+          .pipe(Effect.result);
+        expect(missingFields._tag).toBe("Failure");
+        if (missingFields._tag === "Failure") {
+          expect(missingFields.failure.message).toContain("mismatched Leader binding tuple");
+        }
+
+        // Replaying the SAME key with mismatched epoch MUST also be rejected!
+        const wrongEpoch = yield* dispatcher
+          .accept({
+            connectionId: "conn-feishu",
+            platformMsgId: "pm-replay-1",
+            chatId: "chat-dm",
+            chatKind: "dm",
+            senderRole: "owner",
+            leaderId: binding.leaderId,
+            bindingId: binding.bindingId,
+            bindingEpoch: 99,
+          })
+          .pipe(Effect.result);
+        expect(wrongEpoch._tag).toBe("Failure");
+      }).pipe(Effect.provide(fakeDeps)),
+    );
+  });
+
+  it("shares one final operationKey across liveFinish and fallback reply and clears cached ACK on dropped send response (S17)", async () => {
+    const inbound = inboundMessage({
+      connectionId: "conn-feishu",
+      platformMsgId: "pm-s17-drop",
+      messageId: "m-s17-drop",
+      chatId: "chat-1",
+      chatKind: "dm",
+      senderRole: "owner",
+    });
+    const threadId = "xtwork-im-dm-s17";
+    const userMessageId = `xtwork-im:${hashArgs(inbound.key)}`;
+    const settledKeys: string[] = [];
+    const opKeysSeen: Array<{ method: string; operationKey: unknown }> = [];
+    let platformSendCount = 0;
+    let bridgeCommittedKey: string | null = null;
+    let dropFirstReplyResponse = true;
+
+    const fakeHost = {
+      available: true,
+      async request(method: string, params?: Record<string, unknown>) {
+        if (method === "inbound.ack") {
+          return { message: { state: bridgeCommittedKey ? "replied" : "delivered" } };
+        }
+        if (method === "messages.liveStart") {
+          return { supported: true, liveId: "live-1" };
+        }
+        if (method === "messages.liveFinish") {
+          opKeysSeen.push({ method, operationKey: params?.operationKey });
+          // Simulate bridge committing liveFinish on platform, THEN dropping the RPC response!
+          platformSendCount++;
+          bridgeCommittedKey = String(params?.operationKey ?? "");
+          throw new Error("The IM bridge disconnected.");
+        }
+        if (method === "messages.reply") {
+          opKeysSeen.push({ method, operationKey: params?.operationKey });
+          const opKey = String(params?.operationKey ?? "");
+          if (bridgeCommittedKey === opKey) {
+            return { result: { kind: "sent", platformId: "live-out-1" }, deduplicated: true };
+          }
+          platformSendCount++;
+          bridgeCommittedKey = opKey;
+          if (dropFirstReplyResponse) {
+            dropFirstReplyResponse = false;
+            throw new Error("The IM bridge disconnected.");
+          }
+          return { result: { kind: "sent", platformId: "out-1" } };
+        }
+        if (method === "inbound.settle") {
+          return { moved: true, message: { state: "replied" } };
+        }
+        return {};
+      },
+    };
+
+    let runStatus = "running";
+    const fakeDispatch = {
+      orchestrator: {
+        getThreadRecords: () =>
+          Effect.succeed({
+            runs: [{ id: "run-s17-1", userMessageId, status: runStatus }],
+            messages: [{ runId: "run-s17-1", role: "assistant", text: "Final output" }],
+          }),
+      },
+      settle: (key: string) =>
+        Effect.sync(() => {
+          settledKeys.push(key);
+        }),
+    } as never;
+
+    const { sync } = makeDeliverySync(fakeHost, fakeDispatch, () => false);
+    const row = {
+      key: inbound.key,
+      threadId,
+      contextJson: "{}",
+      payloadJson: JSON.stringify(inbound),
+    };
+
+    // Tick 1 (running): starts live card
+    await Effect.runPromise(sync(row));
+    // Tick 2 (completed): liveFinish commits then drops response -> fallback reply uses SAME operationKey -> deduplicated!
+    runStatus = "completed";
+    await Effect.runPromise(sync(row));
+
+    expect(platformSendCount).toBe(1);
+    expect(settledKeys).toEqual([inbound.key]);
+    expect(opKeysSeen).toEqual([
+      { method: "messages.liveFinish", operationKey: `${inbound.key}:final` },
+      { method: "messages.reply", operationKey: `${inbound.key}:final` },
+    ]);
   });
 });

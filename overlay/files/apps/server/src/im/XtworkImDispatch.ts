@@ -216,44 +216,64 @@ export const makeDispatcher = Effect.fnUntraced(function* (
     const commandId = CommandId.make(inbound.key);
     const [previous] = yield* stored(inbound.key);
 
-    // S6: Resolve and verify the ENTIRE historical binding tuple (connectionId, leaderId, bindingId, bindingEpoch)
-    // as ONE atomic unit so pre-sync or replayed rows can NEVER cross into a newer Leader binding!
+    // S6: Validate any supplied binding tuple UNCONDITIONALLY BEFORE the dedupe path so even
+    // replayed delivery keys with missing/mismatched `leaderId` or `bindingEpoch` are rejected!
     let binding: LeaderBindingRecord | undefined;
-    if (!previous) {
-      if (inbound.bindingId) {
-        const stamped = yield* leaders.getBindingById(inbound.bindingId);
-        if (
-          !stamped ||
-          stamped.connectionId !== inbound.connectionId ||
-          inbound.leaderId === undefined ||
-          stamped.leaderId !== inbound.leaderId ||
-          inbound.bindingEpoch === undefined ||
-          stamped.epoch !== inbound.bindingEpoch
-        ) {
-          return yield* imError("Rejected IM dispatch with mismatched Leader binding tuple.");
-        }
-        binding = stamped;
-      } else if (inbound.leaderId !== undefined || inbound.bindingEpoch !== undefined) {
-        const expectedLeader = inbound.leaderId ?? DEFAULT_LEADER_ID;
-        const expectedEpoch = inbound.bindingEpoch ?? 1;
-        const historical = yield* leaders.findBindingByTuple(
-          inbound.connectionId,
-          expectedLeader,
-          expectedEpoch,
-        );
-        if (historical) {
-          binding = historical;
-        } else if (expectedEpoch === 1 && !(yield* leaders.hasAnyBindingForConnection(inbound.connectionId))) {
-          binding = yield* leaders.ensureBinding(inbound.connectionId, expectedLeader);
-        } else {
-          return yield* imError("Rejected IM dispatch whose stamped historical binding tuple does not exist.");
-        }
-      } else {
-        binding = yield* leaders.ensureBinding(inbound.connectionId, DEFAULT_LEADER_ID);
+    const prevContext = previous ? contextOf(previous) : undefined;
+    if (inbound.bindingId) {
+      const stamped = yield* leaders.getBindingById(inbound.bindingId);
+      if (
+        !stamped ||
+        stamped.connectionId !== inbound.connectionId ||
+        inbound.leaderId === undefined ||
+        stamped.leaderId !== inbound.leaderId ||
+        inbound.bindingEpoch === undefined ||
+        stamped.epoch !== inbound.bindingEpoch
+      ) {
+        return yield* imError("Rejected IM dispatch with mismatched Leader binding tuple.");
       }
+      if (
+        prevContext &&
+        ((prevContext.leaderId ?? DEFAULT_LEADER_ID) !== stamped.leaderId ||
+          (prevContext.bindingId != null && prevContext.bindingId !== stamped.bindingId) ||
+          (prevContext.bindingEpoch != null && prevContext.bindingEpoch !== stamped.epoch))
+      ) {
+        return yield* imError("Rejected replayed IM dispatch whose binding tuple conflicts with stored delivery.");
+      }
+      binding = stamped;
+    } else if (inbound.leaderId !== undefined || inbound.bindingEpoch !== undefined) {
+      const expectedLeader = inbound.leaderId ?? DEFAULT_LEADER_ID;
+      const expectedEpoch = inbound.bindingEpoch ?? 1;
+      const historical = yield* leaders.findBindingByTuple(
+        inbound.connectionId,
+        expectedLeader,
+        expectedEpoch,
+      );
+      if (historical) {
+        binding = historical;
+      } else if (!previous && expectedEpoch === 1 && !(yield* leaders.hasAnyBindingForConnection(inbound.connectionId))) {
+        binding = yield* leaders.ensureBinding(inbound.connectionId, expectedLeader);
+      } else if (
+        previous &&
+        (prevContext?.leaderId ?? DEFAULT_LEADER_ID) === expectedLeader &&
+        (prevContext?.bindingEpoch == null || prevContext.bindingEpoch === expectedEpoch)
+      ) {
+        // Stored delivery already matches the historical tuple (e.g. legacy pre-sync delivery).
+      } else {
+        return yield* imError("Rejected IM dispatch whose stamped historical binding tuple does not exist.");
+      }
+      if (
+        prevContext &&
+        ((prevContext.leaderId ?? DEFAULT_LEADER_ID) !== expectedLeader ||
+          (prevContext.bindingEpoch != null && prevContext.bindingEpoch !== expectedEpoch))
+      ) {
+        return yield* imError("Rejected replayed IM dispatch whose historical tuple conflicts with stored delivery.");
+      }
+    } else if (!previous) {
+      binding = yield* leaders.ensureBinding(inbound.connectionId, DEFAULT_LEADER_ID);
     }
-    const activeLeaderId = previous
-      ? (contextOf(previous).leaderId ?? DEFAULT_LEADER_ID)
+    const activeLeaderId = prevContext
+      ? (prevContext.leaderId ?? DEFAULT_LEADER_ID)
       : (binding?.leaderId ?? DEFAULT_LEADER_ID);
 
     // If this is a brand-new trigger (not an already-accepted replay) and its Leader is paused,

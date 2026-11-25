@@ -813,4 +813,254 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
       // store already closed by bridge.shutdown()
     }
   });
+
+  it("deduplicates final sends across liveFinish/reply (S17), isolates Leader pause across rebind (S18), and scopes DM /stop pointers to current binding (S19)", async () => {
+    const store = new Store(":memory:");
+    const secrets = memorySecrets();
+    const notifications: RpcNotification[] = [];
+    const mock = createMockChannel({ platform: "feishu", trust: "org", onboardOwnerId: "owner-1" });
+    const bridge = new ImBridge({
+      store,
+      secrets,
+      channels: { feishu: mock.channel },
+      notify: (n) => notifications.push(n),
+      sleepCheckIntervalMs: 0,
+    });
+    try {
+      await bridge.start();
+      // Onboard + connect live feishu connection
+      const started = await bridge.handleRequest({
+        id: 1,
+        method: "onboarding.start",
+        params: { platform: "feishu", mode: "qr" },
+      });
+      assert.equal(started.ok, true);
+      await new Promise((r) => setTimeout(r, 30));
+      const conn = store.connections()[0]!;
+      assert.equal(conn.lifecycleState, "active");
+
+      // Bind to Leader A (epoch 1)
+      store.syncConnectionBinding({
+        connectionId: conn.id,
+        leaderId: "leader-a",
+        bindingId: "bind-a-1",
+        bindingEpoch: 1,
+        leaderPaused: false,
+      });
+
+      // S17: Live finish + fallback reply sharing ONE operationKey MUST send only once!
+      const msg1 = store.ingestInbound(conn.id, "org", {
+        platformId: "s17-m1",
+        chat: { platformId: "dm-owner", kind: "dm" },
+        sender: { id: "owner-1", name: "Owner", isBot: false },
+        text: "summarize report",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_100_000,
+      });
+      assert.equal(msg1.kind, "dispatch");
+      store.moveInbound([msg1.message.id], "deliver");
+      const liveStart = await bridge.handleRequest({
+        id: 2,
+        method: "messages.liveStart",
+        params: { chatId: msg1.chat.id, replyTo: msg1.message.id, initial: "Working..." },
+      });
+      assert.equal(liveStart.ok, true);
+      const liveId = (liveStart.ok ? (liveStart.result as { liveId: string }).liveId : "");
+      const sharedOpKey = `${msg1.message.idempotencyKey}:final`;
+      const fin = await bridge.handleRequest({
+        id: 3,
+        method: "messages.liveFinish",
+        params: { liveId, markdown: "Final answer!", operationKey: sharedOpKey },
+      });
+      assert.equal(fin.ok, true);
+      assert.equal(mock.sent.length, 0);
+      assert.equal(mock.liveUpdates.filter((u) => u.startsWith("fin:")).length, 1);
+
+      // Simulate dropped RPC response -> fallback messages.reply with SAME operationKey MUST NOT send a second message!
+      const fallback = await bridge.handleRequest({
+        id: 4,
+        method: "messages.reply",
+        params: { messageId: msg1.message.id, text: "Final answer!", operationKey: sharedOpKey },
+      });
+      assert.equal(fallback.ok, true);
+      assert.equal(mock.sent.length, 0);
+      if (fallback.ok) {
+        assert.equal((fallback.result as { deduplicated?: boolean }).deduplicated, true);
+      }
+
+      // Also test direct messages.reply retry with same operationKey sends only ONCE!
+      const msg2 = store.ingestInbound(conn.id, "org", {
+        platformId: "s17-m2",
+        chat: { platformId: "dm-owner", kind: "dm" },
+        sender: { id: "owner-1", name: "Owner", isBot: false },
+        text: "second task",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_101_000,
+      });
+      assert.equal(msg2.kind, "dispatch");
+      store.moveInbound([msg2.message.id], "deliver");
+      const replyOpKey = `${msg2.message.idempotencyKey}:final`;
+      const firstReply = await bridge.handleRequest({
+        id: 5,
+        method: "messages.reply",
+        params: { messageId: msg2.message.id, text: "Done!", operationKey: replyOpKey },
+      });
+      assert.equal(firstReply.ok, true);
+      assert.equal(mock.sent.length, 1);
+      const retryReply = await bridge.handleRequest({
+        id: 6,
+        method: "messages.reply",
+        params: { messageId: msg2.message.id, text: "Done!", operationKey: replyOpKey },
+      });
+      assert.equal(retryReply.ok, true);
+      assert.equal(mock.sent.length, 1);
+
+      // S18: Rebind from active Leader A to PAUSED Leader B -> A's queued trigger & paused backlog MUST NOT be blocked by B's pause!
+      const msgAQueued = store.ingestInbound(conn.id, "org", {
+        platformId: "s18-a-queued",
+        chat: { platformId: "dm-owner", kind: "dm" },
+        sender: { id: "owner-1", name: "Owner", isBot: false },
+        text: "queued for A",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_102_000,
+      });
+      assert.equal(msgAQueued.kind, "dispatch");
+      const msgABacklog = store.ingestInbound(conn.id, "org", {
+        platformId: "s18-a-backlog",
+        chat: { platformId: "dm-owner", kind: "dm" },
+        sender: { id: "owner-1", name: "Owner", isBot: false },
+        text: "backlog for A",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_103_000,
+      });
+      assert.equal(msgABacklog.kind, "dispatch");
+      store.moveInbound([msgABacklog.message.id], "pause");
+
+      // Rebind conn to PAUSED Leader B (epoch 2)
+      store.syncConnectionBinding({
+        connectionId: conn.id,
+        leaderId: "leader-b",
+        bindingId: "bind-b-2",
+        bindingEpoch: 2,
+        leaderPaused: true,
+      });
+      const msgBPaused = store.ingestInbound(conn.id, "org", {
+        platformId: "s18-b-paused",
+        chat: { platformId: "dm-owner", kind: "dm" },
+        sender: { id: "owner-1", name: "Owner", isBot: false },
+        text: "paused for B",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_104_000,
+      });
+      assert.equal(msgBPaused.kind, "paused_pending");
+
+      // Startup recovery (`listUnackedTriggers`) STILL returns A's queued message even while B is paused!
+      const unacked = store.listUnackedTriggers(conn.id);
+      assert.equal(unacked.some((m) => m.id === msgAQueued.message.id), true);
+      assert.equal(unacked.some((m) => m.id === msgBPaused.message.id), false);
+
+      // Manual replay of A's backlog SUCCEEDS while B is paused, whereas B's backlog is skipped!
+      notifications.length = 0;
+      const replayA = await bridge.handleRequest({
+        id: 7,
+        method: "paused.decide",
+        params: { messageIds: [msgABacklog.message.id], decision: "replay", leaderId: "leader-a" },
+      });
+      assert.equal(replayA.ok, true);
+      if (replayA.ok) {
+        assert.equal((replayA.result as { count: number }).count, 1);
+      }
+      const replayB = await bridge.handleRequest({
+        id: 8,
+        method: "paused.decide",
+        params: { messageIds: [msgBPaused.message.id], decision: "replay", leaderId: "leader-b" },
+      });
+      assert.equal(replayB.ok, true);
+      if (replayB.ok) {
+        assert.equal((replayB.result as { count: number; skippedIds: string[] }).count, 0);
+        assert.deepEqual((replayB.result as { skippedIds: string[] }).skippedIds, [msgBPaused.message.id]);
+      }
+
+      // S19: Resume Leader B, ACK B's DM (`thread-B`), then a delayed ACK from A (`thread-A`) arrives ->
+      // A's delayed ACK MUST stay on A's message row and NEVER overwrite B's chat pointer or hijack `/stop`!
+      store.syncConnectionBinding({
+        connectionId: conn.id,
+        leaderId: "leader-b",
+        bindingId: "bind-b-2",
+        bindingEpoch: 2,
+        leaderPaused: false,
+      });
+      const msgBActive = store.ingestInbound(conn.id, "org", {
+        platformId: "s19-b-active",
+        chat: { platformId: "dm-owner", kind: "dm" },
+        sender: { id: "owner-1", name: "Owner", isBot: false },
+        text: "run for B",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_105_000,
+      });
+      assert.equal(msgBActive.kind, "dispatch");
+      store.ackInbound(
+        { idempotencyKey: msgBActive.message.idempotencyKey! },
+        { t3ThreadId: "thread-B", t3TurnId: "run-B-1" },
+      );
+      assert.equal(store.chat(msgBActive.chat.id)?.threadId, "thread-B");
+
+      // Delayed ACK for historical Leader A message arrives AFTER rebind to B!
+      const ackedA = store.ackInbound(
+        { idempotencyKey: msgAQueued.message.idempotencyKey! },
+        { t3ThreadId: "thread-A", t3TurnId: "run-A-1" },
+      );
+      assert.equal(ackedA?.t3ThreadId, "thread-A");
+      assert.equal(store.chat(msgBActive.chat.id)?.threadId, "thread-B");
+
+      // Owner sends `/stop` -> MUST emit `threadId: "thread-B"` (NOT `"thread-A"`)!
+      notifications.length = 0;
+      await mock.events!.onMessage({
+        platformId: "s19-stop-1",
+        chat: { platformId: "dm-owner", kind: "dm" },
+        sender: { id: "owner-1", name: "Owner", isBot: false },
+        text: "/stop",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_106_000,
+      });
+      const stops = notifications.filter((n) => n.method === "inbound.stop");
+      assert.equal(stops.length, 1);
+      assert.equal(stops[0]!.params.threadId, "thread-B");
+      assert.equal(stops[0]!.params.leaderId, "leader-b");
+      assert.equal(stops[0]!.params.bindingEpoch, 2);
+
+      // Rebind to Leader C (epoch 3) before C ACKs anything -> stale pointer cleared, `/stop` emits `threadId: null`!
+      store.syncConnectionBinding({
+        connectionId: conn.id,
+        leaderId: "leader-c",
+        bindingId: "bind-c-3",
+        bindingEpoch: 3,
+        leaderPaused: false,
+      });
+      notifications.length = 0;
+      await mock.events!.onMessage({
+        platformId: "s19-stop-2",
+        chat: { platformId: "dm-owner", kind: "dm" },
+        sender: { id: "owner-1", name: "Owner", isBot: false },
+        text: "/stop",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_107_000,
+      });
+      const stopsAfterC = notifications.filter((n) => n.method === "inbound.stop");
+      assert.equal(stopsAfterC.length, 1);
+      assert.equal(stopsAfterC[0]!.params.threadId, null);
+
+      await bridge.shutdown();
+    } finally {
+      // store closed by bridge.shutdown()
+    }
+  });
 });

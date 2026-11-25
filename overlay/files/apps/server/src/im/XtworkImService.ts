@@ -228,6 +228,9 @@ export const makeDeliverySync = (
     const alreadyReplied = hasReplySucceeded(run.id);
     if (isTerminal(run.status)) {
       const finalText = text || current?.text || "";
+      // S17: One idempotent operationKey shared by liveFinish AND fallback messages.reply so a
+      // dropped RPC response after bridge commits a send NEVER triggers a duplicate reply!
+      const finalOperationKey = `${inbound.key}:final`;
       let replied = alreadyReplied;
       let sendOutcome: "not_needed" | DeliverySendOutcome = alreadyReplied ? "sent" : "not_needed";
       if (!alreadyReplied && current?.liveId) {
@@ -237,7 +240,7 @@ export const makeDeliverySync = (
             {
               liveId: current.liveId,
               markdown: finalText,
-              operationKey: `${inbound.key}:finish`,
+              operationKey: finalOperationKey,
             },
             signal,
           ),
@@ -256,7 +259,7 @@ export const makeDeliverySync = (
               {
                 messageId: inbound.messageId,
                 text: finalText,
-                operationKey: `${inbound.key}:reply`,
+                operationKey: finalOperationKey,
               },
               signal,
             ),
@@ -276,7 +279,7 @@ export const makeDeliverySync = (
             {
               messageId: inbound.messageId,
               text: finalText,
-              operationKey: `${inbound.key}:reply`,
+              operationKey: finalOperationKey,
             },
             signal,
           ),
@@ -287,9 +290,10 @@ export const makeDeliverySync = (
             : classifyDeliverySendOutcome(undefined, replyRes.failure);
         replied = sendOutcome === "sent";
       }
-      // S3: Keep temporary send failures (e.g. CONNECTION_OFFLINE, rate_limited, network) pending
-      // for retry — NEVER falsely mark them replied or settle them locally!
+      // S3/S17: Keep temporary send failures (e.g. CONNECTION_OFFLINE, dropped response, network)
+      // pending for retry and drop cached ACK so the next tick re-checks bridge state!
       if (sendOutcome === "temporary_failure") {
+        ackedInBridge.delete(inbound.key);
         if (!replied && current?.liveId) {
           live.delete(inbound.key);
         }
@@ -556,11 +560,28 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
     }
     if (payload.senderRole !== "owner" && payload.verifiedOwner !== true) return;
     if (typeof payload.connectionId !== "string" || typeof payload.chatId !== "string") return;
-    const explicitThread = typeof payload.threadId === "string" && leaders.isProtectedThreadSync(payload.threadId)
+    const activeBinding = yield* leaders.activeBindingForConnection(payload.connectionId).pipe(
+      Effect.orElseSucceed(() => undefined),
+    );
+    const rawExplicitThread = typeof payload.threadId === "string" && leaders.isProtectedThreadSync(payload.threadId)
       ? payload.threadId
       : undefined;
-    const candidates = explicitThread
-      ? [{ threadId: explicitThread }]
+    // S19: Verify an explicit thread pointer matches the connection's CURRENT binding before trusting it!
+    let verifiedExplicitThread: string | undefined;
+    if (rawExplicitThread) {
+      const ctx = yield* dispatch.firstContext(ThreadId.make(rawExplicitThread));
+      const bindingMatches =
+        ctx !== undefined &&
+        ctx.connectionId === payload.connectionId &&
+        ctx.chatId === payload.chatId &&
+        (activeBinding === undefined ||
+          ((ctx.leaderId ?? DEFAULT_LEADER_ID) === activeBinding.leaderId &&
+            (ctx.bindingEpoch == null || ctx.bindingEpoch === activeBinding.epoch) &&
+            (ctx.bindingId == null || ctx.bindingId === activeBinding.bindingId)));
+      if (bindingMatches) verifiedExplicitThread = rawExplicitThread;
+    }
+    const candidates = verifiedExplicitThread
+      ? [{ threadId: verifiedExplicitThread }]
       : yield* dispatch.unsettledForChat(payload.connectionId, payload.chatId);
     const interrupted = new Set<string>();
     for (const candidate of candidates) {
@@ -569,6 +590,13 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
       const threadId = ThreadId.make(candidate.threadId);
       const context = yield* dispatch.firstContext(threadId);
       if (context === undefined || context.connectionId !== payload.connectionId || context.chatId !== payload.chatId) continue;
+      if (
+        activeBinding !== undefined &&
+        ((context.leaderId ?? DEFAULT_LEADER_ID) !== activeBinding.leaderId ||
+          (context.bindingEpoch != null && context.bindingEpoch !== activeBinding.epoch))
+      ) {
+        continue;
+      }
       const { runs } = yield* dispatch.orchestrator.getThreadRecords(threadId, ["runs"], { runStatuses: activeStatuses });
       const run = runs.at(-1);
       if (run === undefined) continue;

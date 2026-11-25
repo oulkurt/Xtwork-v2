@@ -62,6 +62,9 @@ export interface Chat {
   readonly parentId: string | null;
   readonly followUp: boolean;
   readonly threadId: string | null;
+  readonly threadLeaderId: string | null;
+  readonly threadBindingId: string | null;
+  readonly threadBindingEpoch: number | null;
   readonly peerId: string | null;
   readonly createdAt: number;
   readonly updatedAt: number;
@@ -201,6 +204,9 @@ CREATE TABLE IF NOT EXISTS chats (
   parent_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
   follow_up INTEGER NOT NULL DEFAULT 0,
   thread_id TEXT,
+  thread_leader_id TEXT,
+  thread_binding_id TEXT,
+  thread_binding_epoch INTEGER,
   peer_id TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -305,7 +311,7 @@ export class Store {
   private migrate(): void {
     const row = this.db.prepare("PRAGMA user_version").get() as Row;
     const version = Number(row.user_version ?? 0);
-    if (version >= 4) return;
+    if (version >= 5) return;
     this.db.exec("BEGIN");
     try {
       if (version < 1) {
@@ -323,6 +329,16 @@ export class Store {
         }
         if (!connCols.includes("binding_epoch")) {
           this.db.exec("ALTER TABLE connections ADD COLUMN binding_epoch INTEGER NOT NULL DEFAULT 1");
+        }
+        const chatCols = (this.db.prepare("PRAGMA table_info(chats)").all() as Row[]).map((c) => String(c.name));
+        if (!chatCols.includes("thread_leader_id")) {
+          this.db.exec("ALTER TABLE chats ADD COLUMN thread_leader_id TEXT");
+        }
+        if (!chatCols.includes("thread_binding_id")) {
+          this.db.exec("ALTER TABLE chats ADD COLUMN thread_binding_id TEXT");
+        }
+        if (!chatCols.includes("thread_binding_epoch")) {
+          this.db.exec("ALTER TABLE chats ADD COLUMN thread_binding_epoch INTEGER");
         }
         const msgCols = (this.db.prepare("PRAGMA table_info(messages)").all() as Row[]).map((c) => String(c.name));
         if (!msgCols.includes("leader_id")) {
@@ -343,7 +359,7 @@ export class Store {
            WHERE direction = 'in' AND (leader_id IS NULL OR binding_epoch IS NULL)`,
         );
       }
-      this.db.exec("PRAGMA user_version = 4");
+      this.db.exec("PRAGMA user_version = 5");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -601,8 +617,41 @@ export class Store {
     return this.chat(id);
   }
 
-  setChatThreadId(id: string, threadId: string | null): void {
-    this.stmt("UPDATE chats SET thread_id = ?, updated_at = ? WHERE id = ?").run(threadId, this.now(), id);
+  setChatThreadId(
+    id: string,
+    threadId: string | null,
+    binding?: { readonly leaderId: string; readonly bindingId: string | null; readonly bindingEpoch: number },
+  ): void {
+    this.stmt(
+      `UPDATE chats
+       SET thread_id = ?, thread_leader_id = ?, thread_binding_id = ?, thread_binding_epoch = ?, updated_at = ?
+       WHERE id = ?`,
+    ).run(
+      threadId,
+      threadId === null ? null : (binding?.leaderId ?? null),
+      threadId === null ? null : (binding?.bindingId ?? null),
+      threadId === null ? null : (binding?.bindingEpoch ?? null),
+      this.now(),
+      id,
+    );
+  }
+
+  /** Clear cached chat thread pointers on a connection that no longer match the active binding (S19). */
+  clearStaleChatThreadPointers(
+    connectionId: string,
+    binding: { readonly leaderId: string; readonly bindingId: string | null; readonly bindingEpoch: number },
+  ): void {
+    this.stmt(
+      `UPDATE chats
+       SET thread_id = NULL, thread_leader_id = NULL, thread_binding_id = NULL, thread_binding_epoch = NULL, updated_at = ?
+       WHERE connection_id = ?
+         AND thread_id IS NOT NULL
+         AND (
+           thread_leader_id IS NOT ?
+           OR thread_binding_epoch IS NOT ?
+           OR (thread_binding_id IS NOT NULL AND ? IS NOT NULL AND thread_binding_id != ?)
+         )`,
+    ).run(this.now(), connectionId, binding.leaderId, binding.bindingEpoch, binding.bindingId, binding.bindingId);
   }
 
   /** Whether this chat or its parent group is explicitly blocked. */
@@ -1159,26 +1208,52 @@ export class Store {
     return { chat, contact };
   }
 
+  /** Look up an outbound message previously recorded under an idempotent operationKey (S17). */
+  findOutboundByOperationKey(operationKey: string): Message | undefined {
+    const namespaced = `out:${operationKey}`;
+    const row = this.stmt("SELECT * FROM messages WHERE direction = 'out' AND idempotency_key = ?").get(namespaced) as Row | undefined;
+    return row ? toMessage(row) : undefined;
+  }
+
+  /** Reset a previously failed outbound operation row to pending before retrying under the same operationKey (S17). */
+  resetOutboundForRetry(id: string, body: string, attachments?: readonly Omit<Attachment, "id">[]): Message {
+    const nextAttachments = (attachments ?? []).map((a) => ({ ...a, id: this.mintFileId() }));
+    this.stmt("UPDATE messages SET state = 'pending', body = ?, attachments = ? WHERE id = ? AND direction = 'out'").run(
+      body,
+      nextAttachments.length ? JSON.stringify(nextAttachments) : null,
+      id,
+    );
+    const updated = this.message(id) as Message;
+    const chat = this.chat(updated.chatId);
+    if (chat && chat.access !== "blocked") {
+      this.indexMessageInFts(id, body);
+    }
+    return updated;
+  }
+
   insertOutbound(input: {
     readonly connectionId: string;
     readonly chatId: string;
     readonly body: string;
     readonly replyTo?: string | null;
+    readonly operationKey?: string | null;
     readonly notice?: boolean;
     readonly attachments?: readonly Omit<Attachment, "id">[];
   }): Message {
     const id = this.mint("messages", "m", 5);
     const attachments = (input.attachments ?? []).map((a) => ({ ...a, id: this.mintFileId() }));
+    const idempotencyKey = input.operationKey ? `out:${input.operationKey}` : null;
     this.db
       .prepare(
         `INSERT INTO messages
-          (id, connection_id, chat_id, direction, body, attachments, reply_to, triggers, state, notice, created_at)
-         VALUES (?, ?, ?, 'out', ?, ?, ?, 0, 'pending', ?, ?)`,
+          (id, connection_id, chat_id, direction, idempotency_key, body, attachments, reply_to, triggers, state, notice, created_at)
+         VALUES (?, ?, ?, 'out', ?, ?, ?, ?, 0, 'pending', ?, ?)`,
       )
       .run(
         id,
         input.connectionId,
         input.chatId,
+        idempotencyKey,
         input.body,
         attachments.length ? JSON.stringify(attachments) : null,
         input.replyTo ?? null,
@@ -1256,8 +1331,22 @@ export class Store {
          WHERE id = ?`,
       ).run(ack.t3ThreadId, ack.t3TurnId, t, msg.id);
       const chat = this.chat(msg.chatId);
-      if (chat && (chat.kind === "dm" || chat.kind === "thread")) {
-        this.setChatThreadId(chat.id, ack.t3ThreadId);
+      const conn = this.connection(msg.connectionId);
+      // S19: Always persist the ACK on the message row, but ONLY update the chat's live
+      // thread pointer when the message belongs to the connection's CURRENT active binding!
+      const msgLeaderId = msg.leaderId ?? "leader-default";
+      const msgBindingEpoch = msg.bindingEpoch ?? 1;
+      const matchesCurrentBinding =
+        conn !== undefined &&
+        msgLeaderId === conn.leaderId &&
+        msgBindingEpoch === conn.bindingEpoch &&
+        (conn.bindingId === null || msg.bindingId === null || msg.bindingId === conn.bindingId);
+      if (chat && conn && matchesCurrentBinding && (chat.kind === "dm" || chat.kind === "thread")) {
+        this.setChatThreadId(chat.id, ack.t3ThreadId, {
+          leaderId: conn.leaderId,
+          bindingId: conn.bindingId,
+          bindingEpoch: conn.bindingEpoch,
+        });
       }
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1268,8 +1357,10 @@ export class Store {
   }
 
   /**
-   * ADR-011 Invariant #7: Return ONLY gate-approved unacked `received` / `delivered` trigger
-   * messages on active, non-paused connections. NEVER returns `held`, `blocked`, or `ignored`.
+   * ADR-011 Invariant #7 & ADR-013 S18: Return gate-approved unacked `received` / `delivered`
+   * trigger messages on active, non-paused connections. Apply `n.leader_paused` ONLY to rows
+   * owned by the connection's current Leader (`n.leader_id`) so historical messages for an active
+   * prior Leader are still delivered to T3 (which enforces that Leader's own pause state).
    */
   listUnackedTriggers(connectionId?: string): Message[] {
     const scope = connectionId ? "AND m.connection_id = ?" : "";
@@ -1283,7 +1374,7 @@ export class Store {
         AND m.acked_at IS NULL
         AND n.lifecycle_state = 'active'
         AND n.paused = 0
-        AND n.leader_paused = 0
+        AND (n.leader_paused = 0 OR COALESCE(m.leader_id, 'leader-default') != n.leader_id)
         ${scope}
       ORDER BY m.created_at ASC, m.rowid ASC
     `;
@@ -1542,14 +1633,29 @@ export class Store {
     readonly bindingEpoch: number;
     readonly leaderPaused: boolean;
   }): Connection | undefined {
+    const prev = this.connection(input.connectionId);
     const updated = this.updateConnection(input.connectionId, {
       leaderId: input.leaderId,
       bindingId: input.bindingId,
       bindingEpoch: input.bindingEpoch,
       leaderPaused: input.leaderPaused,
     });
-    if (updated && input.leaderPaused) {
-      this.pauseConnectionMessages(updated.id, input.leaderId);
+    if (updated) {
+      const bindingChanged =
+        !prev ||
+        prev.leaderId !== updated.leaderId ||
+        prev.bindingId !== updated.bindingId ||
+        prev.bindingEpoch !== updated.bindingEpoch;
+      if (bindingChanged) {
+        this.clearStaleChatThreadPointers(updated.id, {
+          leaderId: updated.leaderId,
+          bindingId: updated.bindingId,
+          bindingEpoch: updated.bindingEpoch,
+        });
+      }
+      if (input.leaderPaused) {
+        this.pauseConnectionMessages(updated.id, input.leaderId);
+      }
     }
     return updated;
   }
@@ -1669,6 +1775,9 @@ function toChat(r: Row): Chat {
     parentId: str(r.parent_id),
     followUp: Number(r.follow_up) === 1,
     threadId: str(r.thread_id),
+    threadLeaderId: str(r.thread_leader_id),
+    threadBindingId: str(r.thread_binding_id),
+    threadBindingEpoch: r.thread_binding_epoch == null ? null : Number(r.thread_binding_epoch),
     peerId: str(r.peer_id),
     createdAt: Number(r.created_at),
     updatedAt: Number(r.updated_at),

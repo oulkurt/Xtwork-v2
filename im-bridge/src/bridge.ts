@@ -187,6 +187,7 @@ export class ImBridge {
   private readonly links = new Map<string, ManagedLink>();
   private readonly onboardings = new Map<string, ActiveOnboarding>();
   private readonly liveReplies = new Map<string, { readonly live: LiveReply; readonly connectionId: string; readonly chatId: string; readonly replyTo: string }>();
+  private readonly inflightOperations = new Map<string, Promise<unknown>>();
 
   private sleepTimer: NodeJS.Timeout | undefined;
   private lastClockTickAt: number;
@@ -831,8 +832,12 @@ export class ImBridge {
         skippedIds.push(id);
         continue;
       }
-      // S5: Validate active/unpaused connection state BEFORE transitioning out of `paused_pending`.
-      if (conn.lifecycleState !== "active" || conn.paused || conn.leaderPaused) {
+      // S5/S18: Validate active/unpaused connection state BEFORE transitioning out of `paused_pending`.
+      // Apply `conn.leaderPaused` ONLY to rows owned by the connection's current Leader (`conn.leaderId`)
+      // so a paused newer Leader B never blocks manual replay of active prior Leader A's backlog.
+      const msgLeaderId = msg.leaderId ?? "leader-default";
+      const blockedByCurrentLeaderPause = conn.leaderPaused && msgLeaderId === conn.leaderId;
+      if (conn.lifecycleState !== "active" || conn.paused || blockedByCurrentLeaderPause) {
         skippedIds.push(id);
         continue;
       }
@@ -1053,82 +1058,148 @@ export class ImBridge {
 
   // ------------------------------------------------------------------ messages
 
+  /** S17: Check whether an idempotent outbound operationKey already reached `sent` or `uncertain`. */
+  private recordedOutboundResponse(operationKey: string, replyToId?: string | null) {
+    const existing = this.store.findOutboundByOperationKey(operationKey);
+    if (!existing) return undefined;
+    if (existing.state === "sent" || existing.state === "uncertain") {
+      if (replyToId && this.store.message(replyToId)) {
+        this.store.moveInbound([replyToId], "reply");
+      }
+      const result: SendResult =
+        existing.state === "sent"
+          ? { kind: "sent", platformId: existing.platformMsgId ?? existing.id }
+          : { kind: "uncertain" };
+      return { message: existing, result, deduplicated: true };
+    }
+    return undefined;
+  }
+
+  /** S17: Serialize concurrent retries sharing the same outbound operationKey in-process. */
+  private async runIdempotentSend<T>(operationKey: string | undefined, work: () => Promise<T>): Promise<T> {
+    if (!operationKey) return work();
+    const pending = this.inflightOperations.get(operationKey);
+    if (pending) return (await pending) as T;
+    const promise = work();
+    this.inflightOperations.set(operationKey, promise);
+    try {
+      return await promise;
+    } finally {
+      if (this.inflightOperations.get(operationKey) === promise) {
+        this.inflightOperations.delete(operationKey);
+      }
+    }
+  }
+
   private async handleMessagesReply(params: Record<string, unknown>) {
     const messageId = reqStr(params, "messageId");
     const text = reqStr(params, "text");
-    const target = this.store.message(messageId);
-    if (!target) throw new BridgeError("MESSAGE_NOT_FOUND", `Message not found: ${messageId}`);
-    const chat = this.store.chat(target.chatId);
-    if (!chat) throw new BridgeError("CHAT_NOT_FOUND", `Chat not found: ${target.chatId}`);
-    const live = this.requireActiveChat(chat);
+    const operationKey = optStr(params, "operationKey");
+    return this.runIdempotentSend(operationKey, async () => {
+      if (operationKey) {
+        const recorded = this.recordedOutboundResponse(operationKey, messageId);
+        if (recorded) return recorded;
+      }
+      const target = this.store.message(messageId);
+      if (!target) throw new BridgeError("MESSAGE_NOT_FOUND", `Message not found: ${messageId}`);
+      const chat = this.store.chat(target.chatId);
+      if (!chat) throw new BridgeError("CHAT_NOT_FOUND", `Chat not found: ${target.chatId}`);
+      const live = this.requireActiveChat(chat);
 
-    const outRecord = this.store.insertOutbound({
-      connectionId: chat.connectionId,
-      chatId: chat.id,
-      body: text,
-      replyTo: target.id,
+      const existing = operationKey ? this.store.findOutboundByOperationKey(operationKey) : undefined;
+      const outRecord = existing
+        ? this.store.resetOutboundForRetry(existing.id, text)
+        : this.store.insertOutbound({
+            connectionId: chat.connectionId,
+            chatId: chat.id,
+            body: text,
+            replyTo: target.id,
+            operationKey: operationKey ?? null,
+          });
+
+      const outbound: OutboundMessage = {
+        chat: toChatRef(chat, this.store),
+        text,
+        ...(target.platformMsgId ? { replyTo: target.platformMsgId } : {}),
+        ...(Array.isArray(params.files) ? { files: params.files as OutboundMessage["files"] } : {}),
+        ...(Array.isArray(params.mentions) ? { mentions: params.mentions as readonly Mention[] } : {}),
+        ...(params.inThread ? { inThread: params.inThread as { readonly title: string } } : {}),
+        ...(params.inChat === true ? { inChat: true } : {}),
+      };
+
+      let result: SendResult;
+      try {
+        result = await sendWithRetry(live, outbound);
+      } catch (error) {
+        this.store.setOutboundResult(outRecord.id, "failed", null);
+        throw error;
+      }
+      this.store.setOutboundResult(
+        outRecord.id,
+        result.kind === "sent" ? "sent" : result.kind === "uncertain" ? "uncertain" : "failed",
+        result.kind === "sent" ? result.platformId : null,
+      );
+      if (result.kind === "sent" || result.kind === "uncertain") {
+        this.store.moveInbound([target.id], "reply");
+      }
+      return { message: this.store.message(outRecord.id), result };
     });
-
-    const outbound: OutboundMessage = {
-      chat: toChatRef(chat, this.store),
-      text,
-      ...(target.platformMsgId ? { replyTo: target.platformMsgId } : {}),
-      ...(Array.isArray(params.files) ? { files: params.files as OutboundMessage["files"] } : {}),
-      ...(Array.isArray(params.mentions) ? { mentions: params.mentions as readonly Mention[] } : {}),
-      ...(params.inThread ? { inThread: params.inThread as { readonly title: string } } : {}),
-      ...(params.inChat === true ? { inChat: true } : {}),
-    };
-
-    const result = await sendWithRetry(live, outbound);
-    this.store.setOutboundResult(
-      outRecord.id,
-      result.kind === "sent" ? "sent" : result.kind === "uncertain" ? "uncertain" : "failed",
-      result.kind === "sent" ? result.platformId : null,
-    );
-    if (result.kind === "sent" || result.kind === "uncertain") {
-      this.store.moveInbound([target.id], "reply");
-    }
-    return { message: this.store.message(outRecord.id), result };
   }
 
   private async handleMessagesSend(params: Record<string, unknown>) {
     const chatId = reqStr(params, "chatId");
     const text = reqStr(params, "text");
-    const chat = this.store.chat(chatId);
-    if (!chat) throw new BridgeError("CHAT_NOT_FOUND", `Chat not found: ${chatId}`);
-    const live = this.requireActiveChat(chat);
-
+    const operationKey = optStr(params, "operationKey");
     const replyToId = optStr(params, "replyTo");
-    const replyTarget = replyToId ? this.store.message(replyToId) : undefined;
+    return this.runIdempotentSend(operationKey, async () => {
+      if (operationKey) {
+        const recorded = this.recordedOutboundResponse(operationKey, replyToId);
+        if (recorded) return recorded;
+      }
+      const chat = this.store.chat(chatId);
+      if (!chat) throw new BridgeError("CHAT_NOT_FOUND", `Chat not found: ${chatId}`);
+      const live = this.requireActiveChat(chat);
 
-    const outRecord = this.store.insertOutbound({
-      connectionId: chat.connectionId,
-      chatId: chat.id,
-      body: text,
-      replyTo: replyTarget?.id ?? null,
+      const replyTarget = replyToId ? this.store.message(replyToId) : undefined;
+      const existing = operationKey ? this.store.findOutboundByOperationKey(operationKey) : undefined;
+      const outRecord = existing
+        ? this.store.resetOutboundForRetry(existing.id, text)
+        : this.store.insertOutbound({
+            connectionId: chat.connectionId,
+            chatId: chat.id,
+            body: text,
+            replyTo: replyTarget?.id ?? null,
+            operationKey: operationKey ?? null,
+          });
+
+      const outbound: OutboundMessage = {
+        chat: toChatRef(chat, this.store),
+        text,
+        ...(replyTarget?.platformMsgId ? { replyTo: replyTarget.platformMsgId } : replyToId ? { replyTo: replyToId } : {}),
+        ...(Array.isArray(params.files) ? { files: params.files as OutboundMessage["files"] } : {}),
+        ...(Array.isArray(params.mentions) ? { mentions: params.mentions as readonly Mention[] } : {}),
+        ...(params.inThread ? { inThread: params.inThread as { readonly title: string } } : {}),
+        ...(params.inChat === true ? { inChat: true } : {}),
+      };
+
+      let result: SendResult;
+      try {
+        result = await sendWithRetry(live, outbound);
+      } catch (error) {
+        this.store.setOutboundResult(outRecord.id, "failed", null);
+        throw error;
+      }
+      this.store.setOutboundResult(
+        outRecord.id,
+        result.kind === "sent" ? "sent" : result.kind === "uncertain" ? "uncertain" : "failed",
+        result.kind === "sent" ? result.platformId : null,
+      );
+      if (result.kind === "sent" || result.kind === "uncertain") {
+        if (replyTarget) this.store.moveInbound([replyTarget.id], "reply");
+        else this.store.settleChatOnSend(chat.id);
+      }
+      return { message: this.store.message(outRecord.id), result };
     });
-
-    const outbound: OutboundMessage = {
-      chat: toChatRef(chat, this.store),
-      text,
-      ...(replyTarget?.platformMsgId ? { replyTo: replyTarget.platformMsgId } : replyToId ? { replyTo: replyToId } : {}),
-      ...(Array.isArray(params.files) ? { files: params.files as OutboundMessage["files"] } : {}),
-      ...(Array.isArray(params.mentions) ? { mentions: params.mentions as readonly Mention[] } : {}),
-      ...(params.inThread ? { inThread: params.inThread as { readonly title: string } } : {}),
-      ...(params.inChat === true ? { inChat: true } : {}),
-    };
-
-    const result = await sendWithRetry(live, outbound);
-    this.store.setOutboundResult(
-      outRecord.id,
-      result.kind === "sent" ? "sent" : result.kind === "uncertain" ? "uncertain" : "failed",
-      result.kind === "sent" ? result.platformId : null,
-    );
-    if (result.kind === "sent" || result.kind === "uncertain") {
-      if (replyTarget) this.store.moveInbound([replyTarget.id], "reply");
-      else this.store.settleChatOnSend(chat.id);
-    }
-    return { message: this.store.message(outRecord.id), result };
   }
 
   private async handleLiveStart(params: Record<string, unknown>) {
@@ -1166,24 +1237,49 @@ export class ImBridge {
   private async handleLiveFinish(params: Record<string, unknown>) {
     const liveId = reqStr(params, "liveId");
     const markdown = reqStr(params, "markdown");
+    const operationKey = optStr(params, "operationKey");
     const mentions = Array.isArray(params.mentions) ? (params.mentions as readonly Mention[]) : undefined;
-    const entry = this.liveReplies.get(liveId);
-    if (!entry) throw new BridgeError("LIVE_NOT_FOUND", `Live reply not found: ${liveId}`);
-    this.liveReplies.delete(liveId);
-    const result = await entry.live.finish(markdown, mentions);
-    if (result.kind === "sent") {
-      const out = this.store.insertOutbound({
-        connectionId: entry.connectionId,
-        chatId: entry.chatId,
-        body: markdown,
-        replyTo: this.store.message(entry.replyTo)?.id ?? null,
-      });
-      this.store.setOutboundResult(out.id, "sent", result.platformId);
-      if (this.store.message(entry.replyTo)) {
-        this.store.moveInbound([entry.replyTo], "reply");
+    return this.runIdempotentSend(operationKey, async () => {
+      const existingEntry = this.liveReplies.get(liveId);
+      if (operationKey) {
+        const recorded = this.recordedOutboundResponse(operationKey, existingEntry?.replyTo);
+        if (recorded) {
+          this.liveReplies.delete(liveId);
+          return recorded;
+        }
       }
-    }
-    return { result };
+      if (!existingEntry) throw new BridgeError("LIVE_NOT_FOUND", `Live reply not found: ${liveId}`);
+      this.liveReplies.delete(liveId);
+      const replyTargetId = this.store.message(existingEntry.replyTo)?.id ?? null;
+      const existingOut = operationKey ? this.store.findOutboundByOperationKey(operationKey) : undefined;
+      const outRecord = existingOut
+        ? this.store.resetOutboundForRetry(existingOut.id, markdown)
+        : this.store.insertOutbound({
+            connectionId: existingEntry.connectionId,
+            chatId: existingEntry.chatId,
+            body: markdown,
+            replyTo: replyTargetId,
+            operationKey: operationKey ?? null,
+          });
+      let result: SendResult;
+      try {
+        result = await existingEntry.live.finish(markdown, mentions);
+      } catch (error) {
+        this.store.setOutboundResult(outRecord.id, "failed", null);
+        throw error;
+      }
+      this.store.setOutboundResult(
+        outRecord.id,
+        result.kind === "sent" ? "sent" : result.kind === "uncertain" ? "uncertain" : "failed",
+        result.kind === "sent" ? result.platformId : null,
+      );
+      if (result.kind === "sent" || result.kind === "uncertain") {
+        if (replyTargetId) {
+          this.store.moveInbound([replyTargetId], "reply");
+        }
+      }
+      return { message: this.store.message(outRecord.id), result };
+    });
   }
 
   private async handleMessagesReact(params: Record<string, unknown>) {
@@ -1458,13 +1554,24 @@ export class ImBridge {
         return;
       }
       case "stop": {
+        // S19: Only emit chat.threadId if its stored binding matches the connection's CURRENT binding!
+        const pointerMatchesCurrentBinding =
+          outcome.chat.threadId !== null &&
+          outcome.chat.threadLeaderId === conn.leaderId &&
+          outcome.chat.threadBindingEpoch === conn.bindingEpoch &&
+          (outcome.chat.threadBindingId === null ||
+            conn.bindingId === null ||
+            outcome.chat.threadBindingId === conn.bindingId);
         this.emit({
           method: "inbound.stop",
           params: {
             connectionId: conn.id,
             platform: conn.platform,
             chatId: outcome.chat.id,
-            threadId: outcome.chat.threadId,
+            threadId: pointerMatchesCurrentBinding ? outcome.chat.threadId : null,
+            leaderId: conn.leaderId,
+            bindingId: conn.bindingId,
+            bindingEpoch: conn.bindingEpoch,
             messageId: outcome.message.id,
             platformMsgId: outcome.message.platformMsgId,
             senderId: outcome.message.senderId,
