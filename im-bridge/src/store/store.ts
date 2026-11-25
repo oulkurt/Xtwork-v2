@@ -1215,7 +1215,7 @@ export class Store {
       return { kind: "stop", message: this.message(id)!, chat, contact };
     }
 
-    const deferredByPause = isTrigger && conn.leaderPaused;
+    const deferredByPause = isTrigger && (conn.leaderPaused || this.getLeaderPaused(conn.leaderId));
     const state: InboundState = !isTrigger ? "ignored" : deferredByPause ? "paused_pending" : "received";
     const idempotencyKey = isTrigger ? makeIdempotencyKey(connectionId, msg.platformId) : null;
     // S24: Persist the Leader's observed pause_generation the moment the message first becomes

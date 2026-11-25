@@ -1511,6 +1511,17 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         expect(latestB?.status).toBe("paused");
         expect(latestB?.pauseGeneration).toBe(1);
         expect(latestB?.pauseVersion).toBe(1);
+
+        // S29b (avatar fallback): Passing blank/whitespace avatar `{ avatar: " " }` resets badge to the
+        // first character of the stored name while still preserving `status` / `pauseVersion`!
+        const leaderC = yield* leaders.createLeader({ name: "Alice", avatar: "★" });
+        expect(leaderC.avatar).toBe("★");
+        const pausedC = yield* leaders.updateLeader(leaderC.id, { status: "paused" });
+        expect(pausedC?.pauseVersion).toBe(1);
+        const resetAvatarC = yield* leaders.updateLeader(leaderC.id, { avatar: "   " });
+        expect(resetAvatarC?.avatar).toBe("A");
+        expect(resetAvatarC?.status).toBe("paused");
+        expect(resetAvatarC?.pauseVersion).toBe(1);
       }).pipe(Effect.provide(sqlLayer)),
     );
   });

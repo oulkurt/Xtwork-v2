@@ -414,12 +414,11 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     const trimmedName = patch.name !== undefined ? patch.name.trim() : "";
     const updateName = trimmedName.length > 0 ? 1 : 0;
     const trimmedAvatar = patch.avatar !== undefined ? patch.avatar.trim() : "";
-    const derivedAvatar = trimmedAvatar
-      ? trimmedAvatar.slice(0, 8)
-      : updateName === 1
-        ? (Array.from(trimmedName)[0] || "L").slice(0, 8)
-        : "";
-    const updateAvatar = patch.avatar !== undefined && derivedAvatar.length > 0 ? 1 : 0;
+    const hasAvatarExplicit = patch.avatar !== undefined && trimmedAvatar.length > 0 ? 1 : 0;
+    const explicitAvatar = hasAvatarExplicit === 1 ? Array.from(trimmedAvatar).slice(0, 8).join("") : "";
+    // S29b: When caller passes a blank/whitespace avatar (`{ avatar: " " }`), atomically fall back
+    // to the first character of the resulting (or stored) name in SQL without clobbering status!
+    const resetAvatarToNameInitial = patch.avatar !== undefined && trimmedAvatar.length === 0 ? 1 : 0;
     const updateRole = patch.role !== undefined ? 1 : 0;
     const updateStatus = patch.status !== undefined ? 1 : 0;
     // S23: Advance pause_generation whenever a Leader pauses so in-flight dispatches started
@@ -435,7 +434,14 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     const [row] = yield* sql<LeaderRow>`
       UPDATE xtwork_leaders SET
         name = CASE WHEN ${updateName} = 1 THEN ${trimmedName} ELSE name END,
-        avatar = CASE WHEN ${updateAvatar} = 1 THEN ${derivedAvatar} ELSE avatar END,
+        avatar = CASE
+          WHEN ${hasAvatarExplicit} = 1 THEN ${explicitAvatar}
+          WHEN ${resetAvatarToNameInitial} = 1 THEN COALESCE(
+            NULLIF(substr(CASE WHEN ${updateName} = 1 THEN ${trimmedName} ELSE name END, 1, 1), ''),
+            avatar
+          )
+          ELSE avatar
+        END,
         role = CASE WHEN ${updateRole} = 1 THEN ${patch.role ?? ""} ELSE role END,
         status = CASE WHEN ${updateStatus} = 1 THEN ${patch.status ?? "active"} ELSE status END,
         pause_generation = pause_generation + ${advancePauseGeneration},

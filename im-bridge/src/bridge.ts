@@ -689,10 +689,32 @@ export class ImBridge {
   private handleSetLeaderPaused(params: Record<string, unknown>) {
     const paused = Boolean(params.paused);
     const filterLeaderId = optStr(params, "leaderId");
+    const pauseGeneration =
+      typeof params.pauseGeneration === "number" && Number.isInteger(params.pauseGeneration) && params.pauseGeneration >= 0
+        ? params.pauseGeneration
+        : undefined;
+    const pauseVersion =
+      typeof params.pauseVersion === "number" && Number.isInteger(params.pauseVersion) && params.pauseVersion >= 0
+        ? params.pauseVersion
+        : undefined;
+    const pausePatch = {
+      paused,
+      ...(pauseGeneration !== undefined ? { pauseGeneration } : {}),
+      ...(pauseVersion !== undefined ? { pauseVersion } : {}),
+    };
+    const leaderStateCache = new Map<string, ReturnType<Store["setLeaderPauseState"]>>();
+    const reconcileLeader = (leaderId: string) => {
+      let state = leaderStateCache.get(leaderId);
+      if (!state) {
+        state = this.store.setLeaderPauseState(leaderId, pausePatch);
+        leaderStateCache.set(leaderId, state);
+      }
+      return state;
+    };
     if (filterLeaderId) {
-      this.store.setLeaderPauseState(filterLeaderId, { paused });
+      reconcileLeader(filterLeaderId);
     } else if (!Array.isArray(params.connectionIds)) {
-      this.store.setLeaderPauseState("leader-default", { paused });
+      reconcileLeader("leader-default");
     }
     const connectionIds = Array.isArray(params.connectionIds)
       ? params.connectionIds.filter((id): id is string => typeof id === "string" && id.length > 0)
@@ -703,17 +725,32 @@ export class ImBridge {
       if (!conn) continue;
       // S14: Never overwrite pause state for a connection currently bound to a different Leader.
       if (filterLeaderId && conn.leaderId !== filterLeaderId) continue;
-      const next = this.store.updateConnection(conn.id, { leaderPaused: paused })!;
-      if (!filterLeaderId) {
-        this.store.setLeaderPauseState(next.leaderId, { paused });
-      }
-      if (paused) {
+      // S29c: Always honor the store's authoritative monotonic pause state (never write a rejected
+      // unversioned flag directly to the connection!).
+      const leaderState = reconcileLeader(conn.leaderId);
+      const effectivePaused = leaderState.paused;
+      const next =
+        conn.leaderPaused === effectivePaused
+          ? conn
+          : this.store.updateConnection(conn.id, { leaderPaused: effectivePaused })!;
+      if (effectivePaused) {
         this.store.pauseConnectionMessages(conn.id, next.leaderId);
       }
-      this.emitConnectionState(next);
+      if (conn.leaderPaused !== next.leaderPaused || leaderState.updatedConnectionIds.includes(conn.id)) {
+        this.emitConnectionState(next);
+      }
       updated.push(sanitizeConnection(next));
     }
-    return { paused, connections: updated, pausedPending: this.handlePausedList({ connectionIds }).items };
+    const authoritativePaused = filterLeaderId
+      ? this.store.getLeaderPaused(filterLeaderId)
+      : updated.length > 0
+        ? updated.every((c) => c.leaderPaused === true)
+        : this.store.getLeaderPaused("leader-default");
+    return {
+      paused: authoritativePaused,
+      connections: updated,
+      pausedPending: this.handlePausedList({ connectionIds }).items,
+    };
   }
 
   private handleSyncBindings(params: Record<string, unknown>) {

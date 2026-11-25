@@ -1732,6 +1732,30 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
         assert.equal(storeB.getLeaderPauseState("leader-default").pauseVersion, 3);
         assert.equal(storeB.connection(connA.id)?.leaderPaused, true);
 
+        // (3) Legacy `connections.setLeaderPaused({ paused: false })` MUST ALSO honor the store's
+        // authoritative versioned pause state and keep inbound messages deferred in `paused_pending`!
+        const legacyUnpauseResp = await bridgeB.handleRequest({
+          id: 1101,
+          method: "connections.setLeaderPaused",
+          params: { connectionIds: [connA.id], paused: false },
+        });
+        assert.equal(legacyUnpauseResp.ok, true);
+        if (legacyUnpauseResp.ok) {
+          assert.equal((legacyUnpauseResp.result as { paused: boolean }).paused, true);
+        }
+        assert.equal(storeB.getLeaderPaused("leader-default"), true);
+        assert.equal(storeB.connection(connA.id)?.leaderPaused, true);
+        const stillPausedInbound = storeB.ingestInbound(connA.id, "org", {
+          platformId: "s29c-legacy-rpc-still-paused",
+          chat: { platformId: "dm-owner", kind: "dm" },
+          sender: { id: "owner-1", name: "Owner", isBot: false },
+          text: "must stay paused after legacy setLeaderPaused",
+          attachments: [],
+          addressedToBot: true,
+          sentAt: 1_700_000_305_000,
+        });
+        assert.equal(stillPausedInbound.kind, "paused_pending");
+
         // S29d: Resume to (gen=2, ver=4); ingest/pause a row, then send a STALE Replay carrying
         // `pauseVersion: 2, pauseGeneration: 1` -> MUST skip cleanly (`count: 0`, row stays in `paused_pending`)!
         assert.equal(storeB.message(nullGenMsg.message.id)?.state, "paused_pending");
