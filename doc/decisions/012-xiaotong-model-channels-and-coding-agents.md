@@ -1,8 +1,8 @@
 # ADR-012 · M1 重构：内置助手「小瞳」、多渠道模型平面、六大编码 Agent 一键安装与 Coding Agent 委派
 
 - **Date** 2026-11-25
-- **Status** Accepted（演进并细化 [ADR-004](004-general-task-experience.md)、[ADR-008](008-model-gateway.md)、[ADR-009](009-default-pi-runtime.md)，协同 [ADR-011](011-mingle-im-bridge.md)）
-- **Evidence** Confirmed · 2026-11-25 项目负责人确认采用「小瞳」命名并批准本方案；代码约束核对自 Electron 版 [`xiaotong_work`](file:///Users/mizu/Downloads/02-Projects/xiaotong_work)（Pi `0.87.1`）、锁定上游 `t3code@3ce21458`、随包 Pi `1.5.2` 及官方 ACP Registry（`v1.0.0`），并经 Claude Opus 5.5 架构审查修订定稿。
+- **Status** Accepted（演进并细化 [ADR-004](004-general-task-experience.md)、[ADR-008](008-model-gateway.md)、[ADR-009](009-default-pi-runtime.md)，协同 [ADR-011](011-mingle-im-bridge.md)；M1b-Gate 1 已于 [PR #24](https://github.com/oulkurt/Xtwork-v2/pull/24) 合入 `main`，M1c-Gate 1 已于 [PR #26](https://github.com/oulkurt/Xtwork-v2/pull/26) 合入 `main`；M1b-Gate 2 与 M1c-Gate 2 在途）
+- **Evidence** Confirmed · 2026-11-25 项目负责人确认采用「小瞳」命名并批准本方案；代码约束核对自 Electron 版 `xiaotong_work`（历史参考仓库，Pi `0.87.1`）、锁定上游 `t3code@3ce21458`、随包 Pi `1.5.2` 及官方 ACP Registry（`v1.0.0`），并经 Claude Opus 5.5 架构审查修订定稿。
 
 > **证据分层约定**：文中引用的供应商契约与 OIDC 协议来自 Electron 版 `xiaotong_work`（Pi `0.87.1`）；T3/Pi 约束经 `t3code@3ce21458` 与随包 Pi `1.5.2` 源码静态核实；六款外部编码 Agent 的官方安装命令、`dsh --profile acp` 真实行为及新链路端到端表现均属**待实跑验证项**，验收通过前不计入已确认能力。
 
@@ -10,7 +10,7 @@
 
 在 [PR #19](https://github.com/oulkurt/Xtwork-v2/pull/19) 与 [PR #20](https://github.com/oulkurt/Xtwork-v2/pull/20) 落地后，M1 桌面版已完成默认简体中文（`zh`/`en` 双语）、普通模式内置浏览器（`ServerBrowser`）、免项目草稿与开发者功能开关。但既有 M1 规划（[ADR-004](004-general-task-experience.md)、[ADR-008](008-model-gateway.md)、[ADR-009](009-default-pi-runtime.md)）存在三处与实际使用场景不匹配的收敛假设：
 
-1. **内置助手命名与模型供给过窄**：随包 Pi 实例（`xtworkPi`）目前命名为「内置助手」，仅通过单路由本机代理（`runtime/gateway.ts` 的 `POST /v1/chat/completions` + 固定启动参数 `--provider xtwork --model standard`）暴露单个 `xtwork/standard` 模型，尚不支持团队成员已习惯的企业微信公司渠道登录与多模型供应商自带 Key / 订阅登录。参考 Electron 版 [`xiaotong_work`](file:///Users/mizu/Downloads/02-Projects/xiaotong_work)，成员生产环境已使用：
+1. **内置助手命名与模型供给过窄**：随包 Pi 实例（`xtworkPi`）目前命名为「内置助手」，仅通过单路由本机代理（`runtime/gateway.ts` 的 `POST /v1/chat/completions` + 固定启动参数 `--provider xtwork --model standard`）暴露单个 `xtwork/standard` 模型，尚不支持团队成员已习惯的企业微信公司渠道登录与多模型供应商自带 Key / 订阅登录。参考 Electron 版 `xiaotong_work`（历史参考仓库），成员生产环境已使用：
    - **公司团队渠道（`xiaotong-work-team`）**：Keycloak OIDC + PKCE（`S256`，`kc_idp_hint=wecom-web`）企业微信扫码登录 → JWKS 校验 `id_token` → `/api/oauth/exchange/keycloak` 换取个人长效 `sk-` Key → 同步 `/v1/models`（默认 `deepseek-flash` 等）；
    - **19 类成员渠道（`ProviderType`）**：覆盖 Anthropic、OpenAI、OpenAI Responses 格式、ChatGPT 订阅（Codex）、GitHub Copilot 订阅、xAI 订阅（Grok）、DeepSeek、Google、Kimi API、Kimi Coding Plan、智谱 AI、智谱 Coding Plan、智谱 Coding Plan 团队版、火山引擎 API、MiniMax（API & 编程包）、通义千问、通义千问 Token Plan、小米 MiMo（API）、小米 MiMo Token Plan（以及自定义兼容端点）。
 2. **外部编码 Provider 被开发者开关隐藏且缺少开箱安装体验**：当前实现在普通模式下隐藏了 `/settings/providers` 及全部外部 Provider。实际用户希望直接看到并选用 **Claude Code、Codex、Kimi Code、Qoder、Codebuddy Code、DeepSeek Harness**，并在未安装时点击「一键安装」按官方命令完成安装。

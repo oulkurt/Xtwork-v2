@@ -10,7 +10,7 @@
 - `todo__complete` 完成或重新打开待办。
 - `todo__delete` 删除待办。
 - 待办工具和面板使用同一份插件存储，宿主重启后仍可读回。
-- MCP 工具只在本机对话会话中可调用。禁用 `todo` 后不会注册工具，也不会接受调用。
+- MCP 工具须绑定对话会话调用：桌面本机对话可调用已启用的插件工具，IM / 受保护线程通过 `XtworkImMcp.ts` 白名单开放 `todo__*` 并按 `scope`（`current` 群共享 / `private` Owner 私有）隔离；禁用 `todo` 后不会注册工具，也不会接受调用。
 - Pi 在同一个 MCP 会话重发同一条 JSON-RPC 请求时，`todo__create` 返回原来的待办。T3 将会话、工具名和请求 ID 转成 `context.operationKey`。待办用这个键生成记录 ID，只写一次。新请求可以创建同名待办。
 
 ## 待办对话通路
@@ -27,7 +27,7 @@ Pi：通过 todo__list 读取该待办
 
 - 本阶段承诺待办的创建、查询、修改、完成和删除。提醒、日程和 Obsidian 工具后续接入。
 - 去重适用于带 MCP 会话 ID 的请求重发。重连后的新请求和模型重新发起的调用各算一次新操作。
-- `confirm: true` 工具暂时不会加载，因为 MCP 确认卡片和拒绝后的恢复流程还没有接通。
+- `confirm: true` 工具的注册与审批边界：Go 宿主（`plugin-host/host.go`）与 T3 MCP 桥（`XtworkPluginMcp.ts`）均会注册声明了 `confirm: true` 的工具；调用时 Go 宿主强制校验 `call.Approved`，T3 MCP 桥经 `pluginNeedsApproval()` 触发审批并交由 `XtworkIm.approvals.require()` 挂起等待批准（当前审批入口呈现在桌面 IM / Leader 审批面板，纯桌面聊天时间线内的通用 MCP 确认卡片与拒绝恢复交互仍待补齐）。
 - 工具调用结果向 MCP 返回文本。对象结果也会作为结构化 JSON 返回。
 
 ## 验证

@@ -84,9 +84,9 @@ Electron 版的做法（`apps/desktop/src/backend/DesktopBackendConfiguration.ts
 mygo 外壳的做法：
 - 打包一份独立的 Node。版本满足服务端 `engines`（`^22.16 || ^23.11 || >=24.10`），规划基线用上游根目录锁定的 [Node 26.13.1](https://nodejs.org/en/blog/release/v26.13.1)。
 - 用 Go `os/exec` 启动 `node <server>/dist/bin.mjs --bootstrap-fd 0`。立即向 stdin 写一行 `DesktopBackendBootstrap` JSON，然后关闭输入。这个传输在上游 WSL 启动路径已有先例，计划在 macOS 和 Windows 原生打包分别验证。POSIX 可用 fd 3。Windows 的 Go `ExtraFiles` 无法传递 fd 3。[上游 stdin 参数](https://github.com/pingdotgg/t3code/blob/3ce2145864f1e8b822cc8dff9c8cfdf39d9e450b/apps/desktop/src/backend/DesktopBackendConfiguration.ts#L741-L754) · [服务端读取](https://github.com/pingdotgg/t3code/blob/3ce2145864f1e8b822cc8dff9c8cfdf39d9e450b/apps/server/src/bootstrap.ts#L74-L145)
-- 环境变量：`T3CODE_TELEMETRY_ENABLED=false`；插件宿主与随包 Pi 启动器路径，以及数据目录。
+- 环境变量：`T3CODE_TELEMETRY_ENABLED=false`、`XTWORK_DATA_DIR`、`XTWORK_BRAND_CONFIG`、`XTWORK_PI_BINARY`、`XTWORK_PLUGIN_HOST_BIN`、`XTWORK_PLUGINS_DIR`，以及 `im-bridge` 绝对路径（`XTWORK_IM_BRIDGE_ENTRY`、`XTWORK_IM_DATA_DIR`、`XTWORK_COMPANION_DIR`，见 `shell/config.go`）。
 - 监管：健康检查；崩溃后指数退避重启；标准输出和错误写入数据目录下的日志文件。
-- 退出：在 `App.OnBeforeQuit` 里请求服务端优雅关闭（服务端负责关闭 Pi RPC 会话、模型网关和插件宿主），超时后再结束我们自己启动的进程。只结束自己记录过 PID 的进程。
+- 退出：在 `App.OnBeforeQuit` 里请求服务端优雅关闭（服务端负责关闭 Pi RPC 会话、`im-bridge` 长连接、模型网关和插件宿主），超时后再结束我们自己启动的进程。只结束自己记录过 PID 的进程。
 
 为什么不用上游的单文件可执行（`build:exe`）：
 - 上游说明：“The binary still resolves native packages from a node_modules tree beside it.”（`apps/server/scripts/cli.ts:184`）。单文件也省不掉 node_modules。
@@ -112,7 +112,7 @@ mygo 外壳的做法：
 | 开机自启 | `App.SetOpenAtLogin`、`OpenAtLogin`、`WasOpenedAtLogin` |
 | 选择目录 | `mygo.Dialog.Open`、`OpenDialogOptions{Directory: true}` |
 | 深链接 | 打包配置 `urlSchemes`、`App.OnOpenURL` |
-| 系统凭据 | `mygo.Secrets` 支持 Set/Get/Delete。由受信 Go 代码持有，前端使用产品自己的设置接口 |
+| 系统凭据 | `mygo.Secrets` 仅单项上限 2560 字节，**不用于模型渠道与 IM 凭据**；模型与 IM 凭据统一由 Node 侧单一硬化共享 OS SecretStore（`im-bridge/src/platform/secrets.ts` + `runtime/secretStore.ts`）保存，见 [ADR-012](../decisions/012-xiaotong-model-channels-and-coding-agents.md) |
 | 托盘与角标 | `mygo.MenuItem`、`App.SetBadgeCount` |
 
 [原生能力](https://github.com/egoist/mygo/blob/v0.10.0/docs/native.md) · [应用与深链接](https://github.com/egoist/mygo/blob/v0.10.0/docs/app.md) · [应用资源布局](https://github.com/egoist/mygo/blob/v0.10.0/docs/distribution.md#platform-resources)
@@ -136,4 +136,4 @@ mygo 外壳的做法：
 | Windows | exe + 安装器 | 无 cgo，可在 Linux CI 上构建；代码签名方案【待定】 |
 | Linux | 可执行文件、deb、rpm、压缩包 | 首发是否包含 Linux【待定 Q-12】 |
 
-安装包内容：外壳、Node、服务端产物与 node_modules（含平台原生包）、界面静态文件、锁定的 Pi 包和启动器、插件宿主、内置插件、全部许可文件。
+安装包内容：外壳、Node（含 `npm`/`npx`，PR #26 已随包打包）、服务端产物与 node_modules（含平台原生包）、界面静态文件、锁定的 Pi 包和启动器、`im-bridge` 服务、插件宿主、内置插件、全部许可文件。

@@ -10,7 +10,7 @@ node scripts/build-desktop.mjs --skip-dmg
 open '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'
 ```
 
-省略 `--skip-dmg` 可生成 DMG。独立 Node、T3 服务端及前端、Pi 和 moejs 插件宿主一起打包。Pi 通过随包启动器复用 Node。mygo 在本机启动服务端，用同源 WebView 加载界面。应用数据在 `~/Library/Application Support/Xtwork-v2`。用 `XTWORK_DATA_DIR` 可指定独立测试目录。
+省略 `--skip-dmg` 可生成 DMG。独立 Node（含随包 `npm`/`npx`）、T3 服务端及前端、Pi、moejs 插件宿主和 `im-bridge` 远程连接服务一起打包。Pi 与 `im-bridge` 通过随包 Node 运行。mygo 在本机启动服务端，用同源 WebView 加载界面。应用数据在 `~/Library/Application Support/Xtwork-v2`。用 `XTWORK_DATA_DIR` 可指定独立测试目录。
 
 ## 通用任务首页
 
@@ -20,15 +20,35 @@ open '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'
 
 桌面界面默认使用简体中文，可在「设置 → 通用 → 显示 → 语言」中切换为 English（当前仅保留简体中文与 English 两种语言）。
 
-「设置 → 通用 → 开发者功能」默认关闭，设置由本机服务端保存。普通模式保留内置浏览器、本地文件夹、改动对比和检查点、用量、待办、定时任务、技能和外观。输入框只有内置助手的标准模型可用时会收起模型选择器。普通模式新建定时任务使用所选文件夹和内置助手，编辑已有任务会保留它原来的工作区和模型。
+「设置 → 通用 → 开发者功能」默认关闭，设置由本机服务端保存。普通模式保留内置浏览器、`/settings/providers` 六大外部编码 Agent 卡片与受控一键安装底座（[PR #26](https://github.com/oulkurt/Xtwork-v2/pull/26)）、本地文件夹、改动对比和检查点、用量、待办、定时任务、技能和外观。输入框只有内置助手的标准模型可用时会收起模型选择器。普通模式新建定时任务使用所选文件夹和内置助手，编辑已有任务会保留它原来的工作区和模型。
 
-开启后，终端、分支与工作树、编辑器、克隆和外部运行时恢复显示。Pull requests 和 Issues 可从「设置 → 通用 → 开发者功能」或 `⌘K` 打开。侧栏底部提供待办、设置和用量入口。内置浏览器由本机服务端浏览器提供；mygo 不提供手机配对、SSH、WSL、Tailscale、服务端暴露、CLI 安装和 SnapShot。
+开启后，终端、分支与工作树、编辑器、克隆和其他上游非核心外部运行时（Cursor / Grok / Fx / OpenCode / Antigravity / Kiro / Muse）恢复显示。Pull requests 和 Issues 可从「设置 → 通用 → 开发者功能」或 `⌘K` 打开。侧栏底部提供待办、设置和用量入口。内置浏览器由本机服务端浏览器提供；mygo 不提供手机配对、SSH、WSL、Tailscale、服务端暴露、CLI 安装和 SnapShot。
 
-## 测试模型
+## 测试模型与模型平面底座
 
-新对话默认选内置助手。T3 通过 `provider-pi` 和 stdio RPC 启动随包 Pi。`runtime/pi/models.json` 指向服务端本机网关。网关将 `standard` 映射到内测模型。Pi 会话保存在 `runtime/pi/sessions`，桌面服务进程以应用数据目录内的 `workspace` 为工作目录。默认上游是 `http://127.0.0.1:3425/v1` 的 Magpie，默认模型是 `our-free-model/hy4-flash-free`。
+新对话默认选内置助手「**小瞳**」（实例 `xtworkPi`，[PR #24](https://github.com/oulkurt/Xtwork-v2/pull/24) 已由旧默认名「内置助手」平滑迁为「小瞳」）。T3 通过 `provider-pi` 和 stdio RPC 启动随包 Pi `1.5.2`。
 
-在终端设置 `XTWORK_MODEL_UPSTREAM_MODEL=auto/deepseek-v4.1-flash`，再直接运行 `.app/Contents/MacOS/` 下的可执行文件，可用 Magpie 的 DeepSeek 线路。`XTWORK_MODEL_UPSTREAM_URL` 可指定其它 Chat Completions 服务，`XTWORK_MODEL_UPSTREAM_KEY_FILE` 可指向只供服务端读取的密钥文件。凭据和一次性网关令牌保存在进程侧。
+PR #24（M1b-Gate 1）已在 `main` 落地模型平面底座：
+- `runtime/gateway.ts` 升级为保协议多协议 Proxy-Only 本机反向代理；在 M1b-Gate 2 接入渠道配置前，桌面启动（`030-pi-default.patch`）默认不传渠道列表（零渠道空列表态），仅在显式设置 `XTWORK_DEV_FALLBACK=1` 或任意一个 `XTWORK_MODEL_UPSTREAM_*` 环境变量时激活单路由开发兜底（`xtwork/standard` → 默认 `http://127.0.0.1:3425/v1` 的 Magpie `our-free-model/hy4-flash-free`）；
+- `runtime/oauthProxy.ts` 提供 Codex / GitHub Copilot / xAI OAuth 订阅的 Proxy-Only 窄适配；
+- `runtime/secretStore.ts` 复用 `im-bridge/src/platform/secrets.ts` 的单一硬化 OS SecretStore（`app.xtwork.model-channels` 命名空间，零明文回退、删除回读验证与并发代际栅栏）；
+- `overlay/patches/042-m1b-live-refresh.patch` 为活跃 Pi `1.5.2` 会话提供模型目录热刷新。
+
+Pi 会话保存在 `runtime/pi/sessions`，桌面服务进程以应用数据目录内的 `workspace` 为工作目录。首次本地预览可运行 `open -n --env XTWORK_DEV_FALLBACK=1 '.build/desktop-dist/darwin-arm64/小瞳 Work v2.app'` 连接 Magpie 默认线路；切到 DeepSeek 线路可传 `XTWORK_MODEL_UPSTREAM_MODEL=auto/deepseek-v4.1-flash`（直接运行 `.app/Contents/MacOS/` 下可执行文件或 `open -n --env ...`）。`XTWORK_MODEL_UPSTREAM_URL` 可指定其它 Chat Completions 服务，`XTWORK_MODEL_UPSTREAM_KEY_FILE` 可指向只供服务端读取的密钥文件。凭据和一次性网关令牌保存在进程侧。
+
+## 远程连接（`im-bridge`）与 Leader 控制面
+
+PR #15–#18、[PR #21](https://github.com/oulkurt/Xtwork-v2/pull/21) 与 [PR #25](https://github.com/oulkurt/Xtwork-v2/pull/25) 已在 `main` 合入独立 Node `im-bridge` 远程连接服务（基于 `earayu/Mingle@006220e8` MIT 渠道层）、侧栏镭射卡 UI 与 [ADR-013](decisions/013-leader-supervisory-threads.md) Leader 主管 Slice 1：
+- **打包与启动**：`scripts/build-desktop.mjs` 将 `im-bridge/` 打入 `.app/Contents/Resources/im-bridge/`，`shell/config.go` 向 T3 传入绝对路径 `XTWORK_IM_BRIDGE_ENTRY`、`XTWORK_IM_DATA_DIR`（`<数据目录>/im`）与 `XTWORK_COMPANION_DIR`（`<数据目录>/companion`，启动时幂等迁移至 `companion/leaders/<leaderId>/`）；未绑定任何平台时零外网长连接、零后台轮询。
+- **渠道与 UI**：设置侧栏提供独立的「远程连接」入口（`/settings/remote-connections`）及飞书、个人微信（iLink）、企业微信三张 3D 镭射翻转卡片，支持扫码/凭据接入与 `pairing` 认领码流程；主侧栏普通列表上方固定渲染 Leader 主管槽位（`LeaderSidebarSlot.tsx` + `LeaderSupervisoryBar.tsx`），展示跨任务状态、Needs You 审批聚合与暂停/恢复重投控制。
+- **安全边界与按 Run 策略**：`overlay/patches/034-im-bridge.patch`、`035-pi-im-security-hook.patch`、`043-leader-policy-and-sidebar.patch` 与 `overlay/files/apps/server/src/im/`（含 `XtworkLeaderStore.ts`、`XtworkLeaderAwareness.ts`）落实按 run 持久化 fail-closed 策略（`xtwork_run_policies`）、隔离任务目录、Pi 原生目录外只读/写入与 `bash` 拦截、私有/群作用域待办与记忆隔离，以及暂停期间的 `paused_pending` 积压与恢复重投。
+- **待完成项**：飞书/企微/个人微信三平台真机闭环与合规边界、飞书卡片审批（Q-09）以及 Leader Stage 2/3（Q-13）仍按 [远程连接规划](plan/07-远程连接插件.md) 与 [ADR-013](decisions/013-leader-supervisory-threads.md) 验收。
+
+离线单元与集成测试：
+
+```sh
+cd im-bridge && npm test
+```
 
 ## 待办插件
 

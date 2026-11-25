@@ -1,7 +1,7 @@
 # ADR-009 · 内置 Pi 作为默认助手
 
 - **Date** 2026-11-20
-- **Status** Accepted，替代 [ADR-002](002-default-dim-runtime.md)
+- **Status** Accepted，替代 [ADR-002](002-default-dim-runtime.md)（2026-11-25 由 [ADR-012](012-xiaotong-model-channels-and-coding-agents.md) 定名「小瞳」并演进为多渠道模型平面与编码委派）
 - **Evidence** Confirmed · 项目负责人于 2026-11-20 在本次架构讨论中确认 Pi 并退出 Dim Agent Alpha。
 
 ## Context
@@ -29,3 +29,11 @@ Dim Alpha 已验证 v2 桌面底座。现场继续维护 Dim 的生态接入、A
 ## Migration Implications
 
 旧 Alpha 的内置实例保留为停用的 `xtworkDim` 记录，Pi 使用 `xtworkPi`。设置迁移更新仍指向旧内置实例的默认项。历史对话与待办复用 T3 和 Go 宿主已有的存储，原生会话文件各自保留。 [迁移规则](../plan/03-内置运行时-Pi.md#3-原有-alpha-数据) · [ADR-007](007-plugin-contract.md)
+
+## Related Decisions
+
+- [ADR-002 · 内置 Rust 版 Dim（已替代）](002-default-dim-runtime.md)
+- [ADR-008 · 正式模型网关](008-model-gateway.md)
+- [ADR-012 · M1 重构：小瞳多渠道模型平面与 6 大编码 Agent 委派](012-xiaotong-model-channels-and-coding-agents.md)
+- [ADR-013 · Leader 主管与按 Run Fail-Closed 策略](013-leader-supervisory-threads.md)
+- [决策索引](../../DECISIONS.md)
