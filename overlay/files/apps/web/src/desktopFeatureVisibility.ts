@@ -22,7 +22,7 @@ export function isXtworkDesktop(): boolean {
 }
 
 export function isDesktopShortcutVisible(command: string, developerFeatures: boolean): boolean {
-  if (command.startsWith("preview.") || command.startsWith("snapShot.")) return false;
+  if (command === "preview.find" || command.startsWith("snapShot.")) return false;
   if (developerFeatures) return true;
   return !(
     /^(?:terminal\.|script\.|projectScript\.|provider\.|pullRequest\.)/.test(command) ||
@@ -64,10 +64,8 @@ export function showAssistantModelPicker(
 
 const unsupportedSettingsPaths = new Set([
   "/settings/access",
-  "/settings/browser",
   "/settings/connections",
   "/settings/devices",
-  "/settings/integrations",
   "/settings/snap-shot",
 ]);
 
@@ -78,6 +76,8 @@ const developerSettingsPaths = new Set([
 ]);
 
 const unsupportedSettingIds = new Set([
+  "browser-recording-key-presses",
+  "browser-recording-mouse-presses",
   "cli-command",
   "linked-environments",
   "mobile-app",
