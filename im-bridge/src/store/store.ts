@@ -311,7 +311,7 @@ export class Store {
   private migrate(): void {
     const row = this.db.prepare("PRAGMA user_version").get() as Row;
     const version = Number(row.user_version ?? 0);
-    if (version >= 5) return;
+    if (version >= 6) return;
     this.db.exec("BEGIN");
     try {
       if (version < 1) {
@@ -358,8 +358,42 @@ export class Store {
                binding_epoch = COALESCE(binding_epoch, 1)
            WHERE direction = 'in' AND (leader_id IS NULL OR binding_epoch IS NULL)`,
         );
+        // S20: Backfill existing chat thread pointers from their acknowledged message (or default
+        // Leader epoch 1) so upgrading an ADR-011 DB preserves DM/thread pointers across the
+        // initial default-binding sync while still clearing them on rebind to another Leader.
+        this.db.exec(
+          `UPDATE chats
+           SET thread_leader_id = COALESCE(
+                 thread_leader_id,
+                 (SELECT COALESCE(m.leader_id, 'leader-default')
+                  FROM messages m
+                  WHERE m.chat_id = chats.id AND m.t3_thread_id = chats.thread_id
+                  ORDER BY COALESCE(m.acked_at, m.created_at) DESC, m.rowid DESC
+                  LIMIT 1),
+                 'leader-default'
+               ),
+               thread_binding_id = COALESCE(
+                 thread_binding_id,
+                 (SELECT m.binding_id
+                  FROM messages m
+                  WHERE m.chat_id = chats.id AND m.t3_thread_id = chats.thread_id
+                  ORDER BY COALESCE(m.acked_at, m.created_at) DESC, m.rowid DESC
+                  LIMIT 1)
+               ),
+               thread_binding_epoch = COALESCE(
+                 thread_binding_epoch,
+                 (SELECT COALESCE(m.binding_epoch, 1)
+                  FROM messages m
+                  WHERE m.chat_id = chats.id AND m.t3_thread_id = chats.thread_id
+                  ORDER BY COALESCE(m.acked_at, m.created_at) DESC, m.rowid DESC
+                  LIMIT 1),
+                 1
+               )
+           WHERE thread_id IS NOT NULL
+             AND (thread_leader_id IS NULL OR thread_binding_epoch IS NULL)`,
+        );
       }
-      this.db.exec("PRAGMA user_version = 5");
+      this.db.exec("PRAGMA user_version = 6");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -636,11 +670,12 @@ export class Store {
     );
   }
 
-  /** Clear cached chat thread pointers on a connection that no longer match the active binding (S19). */
+  /** Clear cached chat thread pointers on a connection that no longer match the active binding (S19/S20). */
   clearStaleChatThreadPointers(
     connectionId: string,
     binding: { readonly leaderId: string; readonly bindingId: string | null; readonly bindingEpoch: number },
   ): void {
+    const now = this.now();
     this.stmt(
       `UPDATE chats
        SET thread_id = NULL, thread_leader_id = NULL, thread_binding_id = NULL, thread_binding_epoch = NULL, updated_at = ?
@@ -651,7 +686,19 @@ export class Store {
            OR thread_binding_epoch IS NOT ?
            OR (thread_binding_id IS NOT NULL AND ? IS NOT NULL AND thread_binding_id != ?)
          )`,
-    ).run(this.now(), connectionId, binding.leaderId, binding.bindingEpoch, binding.bindingId, binding.bindingId);
+    ).run(now, connectionId, binding.leaderId, binding.bindingEpoch, binding.bindingId, binding.bindingId);
+    // S20: Stamp the initial concrete bindingId onto preserved pre-sync pointers whose leaderId+epoch match.
+    if (binding.bindingId !== null) {
+      this.stmt(
+        `UPDATE chats
+         SET thread_binding_id = ?, updated_at = ?
+         WHERE connection_id = ?
+           AND thread_id IS NOT NULL
+           AND thread_leader_id = ?
+           AND thread_binding_epoch = ?
+           AND thread_binding_id IS NULL`,
+      ).run(binding.bindingId, now, connectionId, binding.leaderId, binding.bindingEpoch);
+    }
   }
 
   /** Whether this chat or its parent group is explicitly blocked. */

@@ -276,15 +276,6 @@ export const makeDispatcher = Effect.fnUntraced(function* (
       ? (prevContext.leaderId ?? DEFAULT_LEADER_ID)
       : (binding?.leaderId ?? DEFAULT_LEADER_ID);
 
-    // If this is a brand-new trigger (not an already-accepted replay) and its Leader is paused,
-    // refuse starting a new turn so caller can durably defer it into `paused_pending` (S4).
-    if (!previous) {
-      const leader = yield* leaders.getLeader(activeLeaderId);
-      if (leader?.status === "paused") {
-        return yield* imError(`${LEADER_PAUSED_ERROR}: Leader is currently paused; new IM tasks are deferred.`);
-      }
-    }
-
     const requestedThread = typeof payload.threadId === "string" && payload.threadId.length > 0
       ? ThreadId.make(payload.threadId)
       : undefined;
@@ -306,6 +297,13 @@ export const makeDispatcher = Effect.fnUntraced(function* (
       }
     }
     if (!turnId) {
+      // S4/S21: Whenever no committed run exists yet (including replays after an earlier failed
+      // dispatch that saved a delivery row without committing a run), enforce the target Leader's
+      // pause state BEFORE creating a new turn!
+      const leader = yield* leaders.getLeader(activeLeaderId);
+      if (leader?.status === "paused") {
+        return yield* imError(`${LEADER_PAUSED_ERROR}: Leader is currently paused; new IM tasks are deferred.`);
+      }
       const current = yield* settings.getSettings;
       if (settings.bundledPi === undefined || current.providerInstances[PI_INSTANCE_ID]?.driver !== PI_DRIVER ||
           current.providerInstances[PI_INSTANCE_ID]?.enabled === false) {

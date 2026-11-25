@@ -1058,10 +1058,24 @@ export class ImBridge {
 
   // ------------------------------------------------------------------ messages
 
-  /** S17: Check whether an idempotent outbound operationKey already reached `sent` or `uncertain`. */
+  /**
+   * S17: Check whether an idempotent outbound operationKey already reached `sent`, `uncertain`,
+   * or a recovered `pending` state from a crash after provider acceptance before result persistence.
+   */
   private recordedOutboundResponse(operationKey: string, replyToId?: string | null) {
     const existing = this.store.findOutboundByOperationKey(operationKey);
     if (!existing) return undefined;
+    if (existing.state === "pending") {
+      // `runIdempotentSend` serializes live in-process calls via `inflightOperations`, so a
+      // persisted `pending` row here means an earlier process died mid-send before persisting the
+      // outcome. Treat it as `uncertain` instead of risking a duplicate send!
+      this.store.setOutboundResult(existing.id, "uncertain", existing.platformMsgId);
+      const promoted = this.store.message(existing.id) ?? { ...existing, state: "uncertain" as const };
+      if (replyToId && this.store.message(replyToId)) {
+        this.store.moveInbound([replyToId], "reply");
+      }
+      return { message: promoted, result: { kind: "uncertain" as const }, deduplicated: true };
+    }
     if (existing.state === "sent" || existing.state === "uncertain") {
       if (replyToId && this.store.message(replyToId)) {
         this.store.moveInbound([replyToId], "reply");

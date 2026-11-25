@@ -588,4 +588,73 @@ describe("SQLite store invariants (ADR-011 S5/S6)", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("backfills legacy ADR-011 DM thread pointers on upgrade and preserves them across initial default-binding sync (S20)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "xtwork-im-s20-"));
+    const dbPath = join(dir, "im.sqlite");
+    try {
+      // Simulate an ADR-011 DB where DM chat already has thread_id and an acked message, before thread_* columns existed
+      const initial = new Store(dbPath);
+      const conn = initial.createConnection({
+        platform: "feishu",
+        secretRef: null,
+        lifecycleState: "active",
+        ownerId: "owner_1",
+      });
+      const dm = initial.ingestInbound(
+        conn.id,
+        "public",
+        msg({
+          platformId: "legacy_dm_1",
+          chat: { platformId: "dm_owner", kind: "dm" },
+          sender: { id: "owner_1", name: "Owner", isBot: false },
+          text: "remember this dm",
+        }),
+      );
+      assert.equal(dm.kind, "dispatch");
+      initial.ackInbound({ idempotencyKey: dm.message.idempotencyKey! }, { t3ThreadId: "xtwork-im-dm-legacy", t3TurnId: "run-1" });
+      initial.close();
+
+      // Strip Leader-era pointer ownership columns to reproduce an ADR-011 pre-upgrade database
+      const raw = new DatabaseSync(dbPath);
+      raw.exec("UPDATE messages SET leader_id = NULL, binding_id = NULL, binding_epoch = NULL");
+      raw.exec("UPDATE chats SET thread_leader_id = NULL, thread_binding_id = NULL, thread_binding_epoch = NULL");
+      raw.exec("PRAGMA user_version = 1");
+      raw.close();
+
+      const upgraded = new Store(dbPath);
+      try {
+        const beforeSync = upgraded.chat(dm.chat.id);
+        assert.equal(beforeSync?.threadId, "xtwork-im-dm-legacy");
+        assert.equal(beforeSync?.threadLeaderId, "leader-default");
+        assert.equal(beforeSync?.threadBindingEpoch, 1);
+
+        // Initial default-binding sync MUST preserve the existing DM thread pointer and stamp bindingId
+        upgraded.syncConnectionBinding({
+          connectionId: conn.id,
+          leaderId: "leader-default",
+          bindingId: "bind-default-1",
+          bindingEpoch: 1,
+          leaderPaused: false,
+        });
+        const afterDefaultSync = upgraded.chat(dm.chat.id);
+        assert.equal(afterDefaultSync?.threadId, "xtwork-im-dm-legacy");
+        assert.equal(afterDefaultSync?.threadBindingId, "bind-default-1");
+
+        // Rebinding to Leader B (epoch 2) MUST clear the stale pointer
+        upgraded.syncConnectionBinding({
+          connectionId: conn.id,
+          leaderId: "leader-b",
+          bindingId: "bind-b-2",
+          bindingEpoch: 2,
+          leaderPaused: false,
+        });
+        assert.equal(upgraded.chat(dm.chat.id)?.threadId, null);
+      } finally {
+        upgraded.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

@@ -917,6 +917,43 @@ describe("JSONL IPC daemon & ImBridge end-to-end", () => {
       assert.equal(retryReply.ok, true);
       assert.equal(mock.sent.length, 1);
 
+      // S17: Recovered `pending` outbound row (crash after provider accepted liveFinish before result persistence)
+      // MUST be promoted to `uncertain` on retry via messages.reply and NEVER send a second message!
+      const msgCrash = store.ingestInbound(conn.id, "org", {
+        platformId: "s17-crash-pending",
+        chat: { platformId: "dm-owner", kind: "dm" },
+        sender: { id: "owner-1", name: "Owner", isBot: false },
+        text: "crash mid-finish",
+        attachments: [],
+        addressedToBot: true,
+        sentAt: 1_700_000_101_500,
+      });
+      assert.equal(msgCrash.kind, "dispatch");
+      store.moveInbound([msgCrash.message.id], "deliver");
+      const crashOpKey = `${msgCrash.message.idempotencyKey}:final`;
+      const pendingOut = store.insertOutbound({
+        connectionId: conn.id,
+        chatId: msgCrash.chat.id,
+        body: "Already sent before crash",
+        replyTo: msgCrash.message.id,
+        operationKey: crashOpKey,
+      });
+      assert.equal(pendingOut.state, "pending");
+      const recoveredRetry = await bridge.handleRequest({
+        id: 601,
+        method: "messages.reply",
+        params: { messageId: msgCrash.message.id, text: "Already sent before crash", operationKey: crashOpKey },
+      });
+      assert.equal(recoveredRetry.ok, true);
+      assert.equal(mock.sent.length, 1);
+      if (recoveredRetry.ok) {
+        const res = recoveredRetry.result as { deduplicated?: boolean; result?: { kind?: string } };
+        assert.equal(res.deduplicated, true);
+        assert.equal(res.result?.kind, "uncertain");
+      }
+      assert.equal(store.message(pendingOut.id)?.state, "uncertain");
+      assert.equal(store.message(msgCrash.message.id)?.state, "replied");
+
       // S18: Rebind from active Leader A to PAUSED Leader B -> A's queued trigger & paused backlog MUST NOT be blocked by B's pause!
       const msgAQueued = store.ingestInbound(conn.id, "org", {
         platformId: "s18-a-queued",

@@ -995,6 +995,28 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
           })
           .pipe(Effect.result);
         expect(wrongEpoch._tag).toBe("Failure");
+
+        // S21: When a prior failed dispatch left a delivery row WITHOUT committing a run,
+        // rebinding to Leader B and pausing Leader A MUST refuse starting a new run on replay!
+        yield* leaders.createLeader({ id: "leader-b", name: "Leader B" });
+        yield* leaders.rebindConnection("conn-feishu", "leader-b");
+        yield* leaders.updateLeader(DEFAULT_LEADER_ID, { status: "paused" });
+        const pausedReplay = yield* dispatcher
+          .accept({
+            connectionId: "conn-feishu",
+            platformMsgId: "pm-replay-1",
+            chatId: "chat-dm",
+            chatKind: "dm",
+            senderRole: "owner",
+            leaderId: binding.leaderId,
+            bindingId: binding.bindingId,
+            bindingEpoch: binding.epoch,
+          })
+          .pipe(Effect.result);
+        expect(pausedReplay._tag).toBe("Failure");
+        if (pausedReplay._tag === "Failure") {
+          expect(pausedReplay.failure.message).toContain("LEADER_PAUSED");
+        }
       }).pipe(Effect.provide(fakeDeps)),
     );
   });
