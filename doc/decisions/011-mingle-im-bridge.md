@@ -1,7 +1,7 @@
 # ADR-011 · 基于 Mingle 渠道层与伴侣范式的内置 IM 远程连接服务
 
 - **Date** 2026-11-24
-- **Status** Accepted
+- **Status** Accepted（基础底座与三平台适配器已于 [PR #15](https://github.com/oulkurt/Xtwork-v2/pull/15)–[PR #18](https://github.com/oulkurt/Xtwork-v2/pull/18)、[PR #21](https://github.com/oulkurt/Xtwork-v2/pull/21) 合入 `main`；2026-11-25 由 [ADR-013](013-leader-supervisory-threads.md) 演进：统一归属 Leader 主管、目录迁至 `companion/leaders/<leaderId>/`、群分享收紧为按条快照审批、按 run 持久化 fail-closed 策略）
 - **Evidence** Confirmed · 2026-11-24 项目负责人确认方向，并经 Gemini 4 Neon 与 GPT-6.2 Sol 五轮联合架构与安全评审；代码基准核对自 `earayu/Mingle@006220e8`（MIT）与锁定上游 `t3code@3ce2145`
 
 ## Context

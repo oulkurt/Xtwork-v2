@@ -1,7 +1,7 @@
 # ADR-004 · 默认首页面向通用任务
 
 - **Date** 2026-11-19
-- **Status** Accepted
+- **Status** Accepted（2026-11-25 局部修订：[PR #20](https://github.com/oulkurt/Xtwork-v2/pull/20) 恢复内置浏览器至普通模式；[ADR-012](012-xiaotong-model-channels-and-coding-agents.md) 确认普通模式保留 6 大编码 Agent 一键安装与委派并收口 Q-02）
 - **Evidence** Confirmed
 
 ## Context
@@ -15,7 +15,7 @@ T3 的上游界面以代码协作为主。v2 规划和交互原型把对话作�
 ## Considered Alternatives
 
 - 保留上游项目和开发功能优先的入口布局，这是 T3 的现有基线。
-- 通用任务优先，开发者入口归入设置。从当前记录可以核实首页与 PR、Issues 的范围。 [侧栏守卫参考](../plan/附录-已核实事实.md#3-t3-code) · [候选入口清单](../plan/08-通用任务化改造.md#3-受开关控制的入口候选清单待定-q-02)
+- 通用任务优先，开发者入口归入设置。从当前记录可以核实首页与 PR、Issues 的范围。 [侧栏守卫参考](../plan/附录-已核实事实.md#3-t3-code) · [入口清单](../plan/08-通用任务化改造.md#3-受开关控制的入口清单已定-q-02见-pr-1920-与-adr-012)
 
 ## Decision
 
@@ -33,4 +33,6 @@ T3 的上游界面以代码协作为主。v2 规划和交互原型把对话作�
 
 - [ADR-001 · 桌面与服务端边界](001-desktop-architecture.md)
 - [ADR-003 · 内置插件](003-bundled-plugins.md)
+- [ADR-012 · 小瞳多渠道模型平面与 6 大编码 Agent 委派](012-xiaotong-model-channels-and-coding-agents.md)（局部修订普通模式入口与 Q-02 范围）
+- [ADR-013 · Leader 主管与侧栏固定入口](013-leader-supervisory-threads.md)
 - [决策索引](../../DECISIONS.md)
