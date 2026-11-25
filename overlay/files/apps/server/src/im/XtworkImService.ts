@@ -19,7 +19,7 @@ import { PI_INSTANCE_ID } from "../xtwork/bundledPiSettings.ts";
 import { MODEL_PROVIDER, STANDARD_MODEL } from "../xtwork/gateway.ts";
 import { bridgeOptions, type BridgePayload, isRecord, XtworkImBridgeHost } from "./XtworkImBridgeHost.ts";
 import { activeStatuses, decodeInbound, isTerminal, makeDispatcher, type ImDispatcher } from "./XtworkImDispatch.ts";
-import { XtworkImMemory, memoryScope } from "./XtworkImMemory.ts";
+import { MAX_COMPANION_FILE_BYTES, XtworkImMemory, memoryScope } from "./XtworkImMemory.ts";
 import {
   DEFAULT_LEADER_ID,
   containsLeaderPausedError,
@@ -899,17 +899,31 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
     if (writing && segments.length === 1) {
       const name = typeof params.name === "string" ? params.name : "";
       if (!name.trim()) return failure("请填写 Leader 名字。", 400);
+      const roleText = typeof params.role === "string" ? params.role : undefined;
+      if (roleText !== undefined && Buffer.byteLength(roleText, "utf8") > MAX_COMPANION_FILE_BYTES) {
+        return failure("角色说明不能超过 64 KiB。", 400);
+      }
+      const newLeaderId = `leader-${randomUUID().slice(0, 8)}`;
+      if (service.memory && roleText) {
+        const writeRole = yield* tryWork(() => service.memory!.write("role", roleText, undefined, newLeaderId)).pipe(
+          Effect.result,
+        );
+        if (writeRole._tag === "Failure") {
+          return failure(writeRole.failure.message, 400);
+        }
+      }
       const created = yield* service.leaders
         .createLeader({
+          id: newLeaderId,
           name,
           ...(typeof params.avatar === "string" ? { avatar: params.avatar } : {}),
-          ...(typeof params.role === "string" ? { role: params.role } : {}),
+          ...(roleText !== undefined ? { role: roleText } : {}),
         })
-        .pipe(Effect.mapError((cause) => imError(cause)));
-      if (service.memory && created.role) {
-        yield* tryWork(() => service.memory!.write("role", created.role, undefined, created.id)).pipe(Effect.ignore);
+        .pipe(Effect.mapError((cause) => imError(cause)), Effect.result);
+      if (created._tag === "Failure") {
+        return failure(created.failure.message, 400);
       }
-      return response({ leader: created });
+      return response({ leader: created.success });
     }
 
     const leaderId = segments[1] ?? DEFAULT_LEADER_ID;
@@ -971,6 +985,12 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
     }
 
     if (writing && subAction === "update") {
+      const roleText = typeof params.role === "string" ? params.role : undefined;
+      if (roleText !== undefined && Buffer.byteLength(roleText, "utf8") > MAX_COMPANION_FILE_BYTES) {
+        return failure("角色说明不能超过 64 KiB。", 400);
+      }
+      const existing = yield* service.leaders.getLeader(leaderId);
+      if (!existing) return failure("找不到对应的 Leader。", 404);
       const awarenessScope = isRecord(params.awarenessScope)
         ? ({
             kind:
@@ -984,18 +1004,23 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
               : [],
           } satisfies AwarenessScope)
         : undefined;
+      // Write runtime ROLE.md BEFORE committing to SQLite so file-write errors fail closed
+      // and never leave the database and ROLE.md out of sync!
+      if (roleText !== undefined && service.memory) {
+        const writeRole = yield* tryWork(() => service.memory!.write("role", roleText, undefined, existing.id)).pipe(
+          Effect.result,
+        );
+        if (writeRole._tag === "Failure") {
+          return failure(writeRole.failure.message, 400);
+        }
+      }
       const updated = yield* service.leaders.updateLeader(leaderId, {
         ...(typeof params.name === "string" ? { name: params.name } : {}),
         ...(typeof params.avatar === "string" ? { avatar: params.avatar } : {}),
-        ...(typeof params.role === "string" ? { role: params.role } : {}),
+        ...(roleText !== undefined ? { role: roleText } : {}),
         ...(awarenessScope ? { awarenessScope } : {}),
       });
       if (!updated) return failure("找不到对应的 Leader。", 404);
-      if (typeof params.role === "string" && service.memory) {
-        yield* tryWork(() => service.memory!.write("role", params.role as string, undefined, updated.id)).pipe(
-          Effect.ignore,
-        );
-      }
       return response({ leader: updated });
     }
 
@@ -1173,10 +1198,18 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
     const memory = service.memory;
     const leaderId = typeof params.leaderId === "string" ? params.leaderId : DEFAULT_LEADER_ID;
     if (writing && typeof params.text !== "string") return failure("需要角色说明文本。", 400);
-    return yield* tryWork(async () => {
+    if (writing && typeof params.text === "string" && Buffer.byteLength(params.text, "utf8") > MAX_COMPANION_FILE_BYTES) {
+      return failure("角色说明不能超过 64 KiB。", 400);
+    }
+    const roleResult = yield* tryWork(async () => {
       if (typeof params.text === "string" && writing) await memory.write("role", params.text, undefined, leaderId);
       return { text: await memory.read("role", undefined, leaderId) };
-    }).pipe(Effect.match({ onSuccess: (value) => response(value), onFailure: (error) => failure(error.message, 400) }));
+    }).pipe(Effect.result);
+    if (roleResult._tag === "Failure") return failure(roleResult.failure.message, 400);
+    if (writing && typeof params.text === "string" && service.leaders) {
+      yield* service.leaders.updateLeader(leaderId, { role: params.text }).pipe(Effect.ignore);
+    }
+    return response(roleResult.success);
   }
   const method = writing ? writeMethods.has(action) ? action : undefined : readMethods.get(action);
   if (method === undefined) return failure("找不到远程连接操作。", 404);

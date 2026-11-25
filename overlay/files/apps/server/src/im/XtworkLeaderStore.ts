@@ -237,6 +237,26 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   )`;
   yield* sql`CREATE INDEX IF NOT EXISTS idx_xtwork_leader_bindings_conn
     ON xtwork_leader_bindings(connection_id, active)`;
+  // Ensure at most one active binding exists per connection before creating the partial unique index.
+  yield* sql`UPDATE xtwork_leader_bindings
+    SET active = 0, unbound_at = COALESCE(unbound_at, ${Date.now()})
+    WHERE active = 1
+      AND binding_id NOT IN (
+        SELECT b1.binding_id
+        FROM xtwork_leader_bindings b1
+        WHERE b1.active = 1
+          AND NOT EXISTS (
+            SELECT 1 FROM xtwork_leader_bindings b2
+            WHERE b2.connection_id = b1.connection_id
+              AND b2.active = 1
+              AND (b2.epoch > b1.epoch OR (b2.epoch = b1.epoch AND b2.rowid > b1.rowid))
+          )
+      )`;
+  yield* sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_xtwork_leader_bindings_one_active
+    ON xtwork_leader_bindings(connection_id)
+    WHERE active = 1`;
+  yield* sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_xtwork_leader_bindings_conn_epoch
+    ON xtwork_leader_bindings(connection_id, epoch)`;
 
   yield* sql`CREATE TABLE IF NOT EXISTS xtwork_run_policies (
     policy_id TEXT PRIMARY KEY,
@@ -480,24 +500,28 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     const existing = yield* activeBindingForConnection(connectionId);
     if (existing) return existing;
     const leader = (yield* getLeader(preferredLeaderId)) ?? (yield* ensureDefaultLeader());
-    const [maxRow] = yield* sql<{ readonly maxEpoch: number | null }>`
-      SELECT MAX(epoch) AS "maxEpoch" FROM xtwork_leader_bindings WHERE connection_id = ${connectionId}
-    `;
-    const epoch = Number(maxRow?.maxEpoch ?? 0) + 1;
     const bindingId = `bind-${randomUUID().slice(0, 12)}`;
     const now = Date.now();
-    yield* sql`INSERT INTO xtwork_leader_bindings (
-      binding_id, leader_id, connection_id, epoch, active, created_at, unbound_at
-    ) VALUES (${bindingId}, ${leader.id}, ${connectionId}, ${epoch}, 1, ${now}, ${null})`;
-    return {
-      bindingId,
-      leaderId: leader.id,
-      connectionId,
-      epoch,
-      active: true,
-      createdAt: now,
-      unboundAt: null,
-    } satisfies LeaderBindingRecord;
+    // Enforce single active binding atomically inside a transaction backed by SQLite partial unique index;
+    // concurrent racers silently ignore conflict and return the single winning binding!
+    yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const insideExisting = yield* activeBindingForConnection(connectionId);
+          if (insideExisting) return;
+          const [maxRow] = yield* sql<{ readonly maxEpoch: number | null }>`
+            SELECT MAX(epoch) AS "maxEpoch" FROM xtwork_leader_bindings WHERE connection_id = ${connectionId}
+          `;
+          const epoch = Number(maxRow?.maxEpoch ?? 0) + 1;
+          yield* sql`INSERT OR IGNORE INTO xtwork_leader_bindings (
+            binding_id, leader_id, connection_id, epoch, active, created_at, unbound_at
+          ) VALUES (${bindingId}, ${leader.id}, ${connectionId}, ${epoch}, 1, ${now}, ${null})`;
+        }),
+      )
+      .pipe(Effect.ignore);
+    const resolved = yield* activeBindingForConnection(connectionId);
+    if (resolved) return resolved;
+    return yield* imError("Failed to create active Leader binding.");
   });
 
   /**
@@ -509,28 +533,32 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     if (!leader || leader.status === "archived") {
       return undefined;
     }
-    const existing = yield* activeBindingForConnection(connectionId);
-    if (existing && existing.leaderId === leader.id) return existing;
     const now = Date.now();
-    yield* sql`UPDATE xtwork_leader_bindings SET active = 0, unbound_at = ${now}
-      WHERE connection_id = ${connectionId} AND active = 1`;
-    const [maxRow] = yield* sql<{ readonly maxEpoch: number | null }>`
-      SELECT MAX(epoch) AS "maxEpoch" FROM xtwork_leader_bindings WHERE connection_id = ${connectionId}
-    `;
-    const epoch = Number(maxRow?.maxEpoch ?? 0) + 1;
     const bindingId = `bind-${randomUUID().slice(0, 12)}`;
-    yield* sql`INSERT INTO xtwork_leader_bindings (
-      binding_id, leader_id, connection_id, epoch, active, created_at, unbound_at
-    ) VALUES (${bindingId}, ${leader.id}, ${connectionId}, ${epoch}, 1, ${now}, ${null})`;
-    return {
-      bindingId,
-      leaderId: leader.id,
-      connectionId,
-      epoch,
-      active: true,
-      createdAt: now,
-      unboundAt: null,
-    } satisfies LeaderBindingRecord;
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const existing = yield* activeBindingForConnection(connectionId);
+        if (existing && existing.leaderId === leader.id) return existing;
+        yield* sql`UPDATE xtwork_leader_bindings SET active = 0, unbound_at = ${now}
+          WHERE connection_id = ${connectionId} AND active = 1`;
+        const [maxRow] = yield* sql<{ readonly maxEpoch: number | null }>`
+          SELECT MAX(epoch) AS "maxEpoch" FROM xtwork_leader_bindings WHERE connection_id = ${connectionId}
+        `;
+        const epoch = Number(maxRow?.maxEpoch ?? 0) + 1;
+        yield* sql`INSERT INTO xtwork_leader_bindings (
+          binding_id, leader_id, connection_id, epoch, active, created_at, unbound_at
+        ) VALUES (${bindingId}, ${leader.id}, ${connectionId}, ${epoch}, 1, ${now}, ${null})`;
+        return {
+          bindingId,
+          leaderId: leader.id,
+          connectionId,
+          epoch,
+          active: true,
+          createdAt: now,
+          unboundAt: null,
+        } satisfies LeaderBindingRecord;
+      }),
+    );
   });
 
   const getBindingById = (bindingId: string) =>

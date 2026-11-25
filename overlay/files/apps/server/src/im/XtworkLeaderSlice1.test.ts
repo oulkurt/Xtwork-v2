@@ -1,17 +1,22 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off globalJsonInEffect:off effectTryWithoutCatch:off
-import { EnvironmentId, ProjectId, RuntimeRequestId, ThreadId } from "@t3tools/contracts";
+import { AuthOrchestrationOperateScope, AuthOrchestrationReadScope, EnvironmentId, ProjectId, RuntimeRequestId, ThreadId } from "@t3tools/contracts";
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Etag from "effect/http/Etag";
+import * as HttpPlatform from "effect/http/HttpPlatform";
+import * as HttpRouter from "effect/http/HttpRouter";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
+import { EnvironmentAuth } from "../auth/EnvironmentAuth.ts";
 import type { AgentAwarenessThread } from "../orchestration-v2/ProjectionStore.ts";
 import { OrchestratorV2 } from "../orchestration-v2/Orchestrator.ts";
 import { ManagedProjectFolders } from "../project/ManagedProjectFolders.ts";
@@ -34,7 +39,7 @@ import {
   type Execution,
   type TurnExecutionContext,
 } from "./XtworkImSecurity.ts";
-import { classifyDeliverySendOutcome, makeBridgeEventHandler, makeDeliverySync } from "./XtworkImService.ts";
+import { XtworkIm, classifyDeliverySendOutcome, makeBridgeEventHandler, makeDeliverySync, route as xtworkImRoute } from "./XtworkImService.ts";
 import { buildOwnerNeedsYou, buildScopedAwareness, redactDiagnosticText } from "./XtworkLeaderAwareness.ts";
 import { makeLeaderStore } from "./XtworkLeaderStore.ts";
 
@@ -1522,6 +1527,139 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
         expect(resetAvatarC?.avatar).toBe("A");
         expect(resetAvatarC?.status).toBe("paused");
         expect(resetAvatarC?.pauseVersion).toBe(1);
+      }).pipe(Effect.provide(sqlLayer)),
+    );
+  });
+
+  it("serializes concurrent ensureBinding with a single active SQLite binding and keeps role DB + ROLE.md consistent on size/write errors", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "xtwork-capy-fixes-"));
+    const memory = new XtworkImMemory(join(dir, "companion"));
+    const sqlLayer = NodeSqliteClient.layer({ filename: ":memory:" });
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const leaders = yield* makeLeaderStore();
+
+        // 1. Concurrent ensureBinding calls MUST converge to ONE single active binding row and identical bindingId.
+        const racers = yield* Effect.all(
+          Array.from({ length: 10 }, () => leaders.ensureBinding("conn-race-1", DEFAULT_LEADER_ID)),
+          { concurrency: "unbounded" },
+        );
+        const uniqueIds = new Set(racers.map((b) => b.bindingId));
+        expect(uniqueIds.size).toBe(1);
+        expect(racers.every((b) => b.epoch === 1 && b.active)).toBe(true);
+        const [counts] = yield* sql<{ readonly total: number; readonly activeCount: number }>`
+          SELECT COUNT(*) AS "total", SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS "activeCount"
+          FROM xtwork_leader_bindings
+          WHERE connection_id = ${"conn-race-1"}
+        `;
+        expect(Number(counts?.total)).toBe(1);
+        expect(Number(counts?.activeCount)).toBe(1);
+
+        // Partial unique index physically blocks a second active binding for the same connection!
+        const dupInsert = yield* sql`
+          INSERT INTO xtwork_leader_bindings (
+            binding_id, leader_id, connection_id, epoch, active, created_at, unbound_at
+          ) VALUES (${"bind-illegal-dup"}, ${DEFAULT_LEADER_ID}, ${"conn-race-1"}, ${2}, 1, ${1_700_000_000_000}, ${null})
+        `.pipe(Effect.result);
+        expect(dupInsert._tag).toBe("Failure");
+
+        // 2. HTTP create/update role validation (>64 KiB) & ROLE.md write-failure propagation keep DB and disk consistent!
+        let failRoleWrite = false;
+        const guardedMemory = {
+          read: memory.read.bind(memory),
+          write: async (scope: Parameters<XtworkImMemory["write"]>[0], text: string, note?: string, leaderId?: string) => {
+            if (scope === "role" && failRoleWrite) {
+              throw new Error("Simulated disk write error");
+            }
+            return memory.write(scope, text, note, leaderId);
+          },
+          writeSharedSnapshot: memory.writeSharedSnapshot.bind(memory),
+          ensureMigrated: memory.ensureMigrated.bind(memory),
+        } as unknown as XtworkImMemory;
+
+        const imServiceLayer = Layer.succeed(XtworkIm, {
+          memory: guardedMemory,
+          approvals: new ImApprovals(),
+          leaders,
+          markReplySucceeded: () => {},
+          hasReplySucceeded: () => false,
+          eventsSince: () => [],
+        });
+        const authLayer = Layer.succeed(EnvironmentAuth, {
+          authenticateHttpRequest: () =>
+            Effect.succeed({
+              sessionId: "test-session",
+              subject: "desktop-bootstrap",
+              method: "bearer-access-token",
+              scopes: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+            }),
+        } as never);
+
+        const appLayer = Layer.mergeAll(
+          xtworkImRoute.pipe(Layer.provide(imServiceLayer)),
+          authLayer,
+        ).pipe(
+          Layer.provide(HttpPlatform.layer),
+          Layer.provide(Etag.layerWeak),
+          Layer.provide(NodeServices.layer),
+        );
+        const { handler, dispose } = HttpRouter.toWebHandler(appLayer, { disableLogger: true });
+        try {
+          const postJson = (path: string, body: Record<string, unknown>) =>
+            handler(
+              new Request(`http://localhost${path}`, {
+                method: "POST",
+                headers: {
+                  authorization: "Bearer test-token",
+                  "content-type": "application/json",
+                },
+                body: JSON.stringify(body),
+              }),
+            );
+
+          // Valid update writes BOTH SQLite and ROLE.md
+          const okUpdate = yield* Effect.promise(() =>
+            postJson(`/api/xtwork/im/leaders/${DEFAULT_LEADER_ID}/update`, { role: "Initial role" }),
+          );
+          expect(okUpdate.status).toBe(200);
+          expect((yield* leaders.getLeader(DEFAULT_LEADER_ID))?.role).toBe("Initial role");
+          expect(yield* Effect.promise(() => memory.read("role", undefined, DEFAULT_LEADER_ID))).toBe("Initial role");
+
+          // Oversized role (65,537 bytes > 64 KiB, fits inside 80 KiB HTTP body limit) MUST fail 400 on BOTH update and create!
+          const oversizedRole = "x".repeat(65_537);
+          const badUpdate = yield* Effect.promise(() =>
+            postJson(`/api/xtwork/im/leaders/${DEFAULT_LEADER_ID}/update`, { role: oversizedRole }),
+          );
+          expect(badUpdate.status).toBe(400);
+          expect((yield* leaders.getLeader(DEFAULT_LEADER_ID))?.role).toBe("Initial role");
+          expect(yield* Effect.promise(() => memory.read("role", undefined, DEFAULT_LEADER_ID))).toBe("Initial role");
+
+          const leadersBefore = yield* leaders.listLeaders();
+          const badCreate = yield* Effect.promise(() =>
+            postJson("/api/xtwork/im/leaders", { name: "Oversized Leader", role: oversizedRole }),
+          );
+          expect(badCreate.status).toBe(400);
+          expect((yield* leaders.listLeaders()).length).toBe(leadersBefore.length);
+
+          // Disk write error on ROLE.md MUST propagate 400 and leave SQLite + ROLE.md unchanged!
+          failRoleWrite = true;
+          const ioErrUpdate = yield* Effect.promise(() =>
+            postJson(`/api/xtwork/im/leaders/${DEFAULT_LEADER_ID}/update`, { role: "Should not commit" }),
+          );
+          expect(ioErrUpdate.status).toBe(400);
+          expect((yield* leaders.getLeader(DEFAULT_LEADER_ID))?.role).toBe("Initial role");
+          expect(yield* Effect.promise(() => memory.read("role", undefined, DEFAULT_LEADER_ID))).toBe("Initial role");
+
+          const ioErrCreate = yield* Effect.promise(() =>
+            postJson("/api/xtwork/im/leaders", { name: "IO Err Leader", role: "Should not commit" }),
+          );
+          expect(ioErrCreate.status).toBe(400);
+          expect((yield* leaders.listLeaders()).length).toBe(leadersBefore.length);
+        } finally {
+          yield* Effect.promise(() => dispose());
+        }
       }).pipe(Effect.provide(sqlLayer)),
     );
   });

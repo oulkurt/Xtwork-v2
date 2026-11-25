@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { DEFAULT_LEADER_ID, scopedPath, type CompanionScope, type MemoryScope } from "./XtworkImSecurity.ts";
 
+export const MAX_COMPANION_FILE_BYTES = 65_536;
+
 export function memoryScope(value: unknown): MemoryScope {
   if (value === "role" || value === "private") return value;
   if (typeof value === "string" && /^group:[a-zA-Z0-9_-]{1,160}$/u.test(value)) {
@@ -127,7 +129,7 @@ export class XtworkImMemory {
   }
 
   async write(scope: MemoryScope, text: string, note?: string, leaderId = DEFAULT_LEADER_ID) {
-    if (Buffer.byteLength(text) > 65_536) throw new Error("Companion files must fit within 64 KiB.");
+    if (Buffer.byteLength(text) > MAX_COMPANION_FILE_BYTES) throw new Error("Companion files must fit within 64 KiB.");
     const path = await this.path(scope, note, leaderId);
     await mkdir(dirname(path), { recursive: true, mode: 0o700 });
     const temp = join(dirname(path), `.${randomUUID()}.tmp`);
