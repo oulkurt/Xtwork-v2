@@ -4,6 +4,7 @@ import {
   ProviderInstanceId,
   type CodingAgentBlockedReason,
   type CodingAgentSetting,
+  type CodingAgentTurnOverride,
   type EnvironmentId,
   type OrchestrationV2TurnItem,
   type ProviderInstanceConfig,
@@ -93,6 +94,9 @@ function useIsZh(localeOverride?: string): boolean {
 }
 
 function isUpdateRequiredSnapshot(provider: ServerProvider): boolean {
+  if (provider.versionAdvisory?.status === "behind_latest") {
+    return true;
+  }
   if (
     provider.compatibilityAdvisory?.status === "unsupported" ||
     provider.compatibilityAdvisory?.status === "broken"
@@ -641,7 +645,12 @@ export interface CodingAgentBlockedActionCardProps {
   readonly blocked: CodingAgentBlockedPayload;
   readonly environmentId: EnvironmentId;
   readonly onOpenProviderSettings?: ((instanceId: ProviderInstanceId) => void) | undefined;
-  readonly onFallbackToBuiltIn?: ((instruction: string) => Promise<void> | void) | undefined;
+  readonly onFallbackToBuiltIn?:
+    | ((
+        instruction: string,
+        options?: { readonly codingAgentOverride?: CodingAgentTurnOverride },
+      ) => Promise<void> | void)
+    | undefined;
   readonly locale?: string | undefined;
   readonly className?: string | undefined;
 }
@@ -683,6 +692,7 @@ export function CodingAgentBlockedActionCard({
     try {
       await onFallbackToBuiltIn(
         isZh ? ONE_TURN_BUILTIN_XIAOTONG_PROMPT_ZH : ONE_TURN_BUILTIN_XIAOTONG_PROMPT_EN,
+        { codingAgentOverride: "builtin_once" },
       );
       setFallbackState("sent");
     } catch {

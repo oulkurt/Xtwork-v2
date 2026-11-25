@@ -2,8 +2,10 @@
 import {
   DEFAULT_CODING_AGENT_SETTING,
   PROVIDER_DISPLAY_NAMES,
+  ThreadId,
   type CodingAgentBlockedReason,
   type CodingAgentSetting,
+  type CodingAgentTurnOverride,
   type OrchestratorMcpTarget,
   type ProviderInstanceConfig,
   type ProviderInstanceId,
@@ -11,6 +13,8 @@ import {
   type ServerSettings,
   resolveProviderInstanceEnabled,
 } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import { isImThread, type TurnExecutionContext } from "../im/XtworkImSecurity.ts";
 import { PI_INSTANCE_ID } from "./bundledPiSettings.ts";
@@ -22,6 +26,7 @@ import {
 } from "./codingAgentSeed.ts";
 
 export const CODING_AGENT_UNAVAILABLE_CODE = "coding_agent_unavailable" as const;
+export const CODING_AGENT_BUILTIN_ONCE_CODE = "coding_agent_builtin_once" as const;
 export const IM_DELEGATION_DENIED_CODE = "delegation_denied_in_im" as const;
 
 export const ONE_TURN_BUILTIN_XIAOTONG_INSTRUCTION_ZH =
@@ -48,6 +53,8 @@ const KNOWN_PROVISIONABLE_INSTANCE_IDS: ReadonlySet<string> = new Set([
   DEEPSEEK_HARNESS_INSTANCE_ID,
 ]);
 
+const MAX_ANCESTRY_HOPS = 64;
+
 export interface CodingAgentUnavailableResult {
   readonly blocked: true;
   readonly code: typeof CODING_AGENT_UNAVAILABLE_CODE;
@@ -59,10 +66,25 @@ export interface CodingAgentUnavailableResult {
   readonly message: string;
 }
 
+export interface CodingAgentBuiltinOnceBlockedResult {
+  readonly blocked: true;
+  readonly code: typeof CODING_AGENT_BUILTIN_ONCE_CODE;
+  readonly message: string;
+}
+
+export interface CodingAgentRemoteBlockedResult {
+  readonly blocked: true;
+  readonly code: "invalid_request";
+  readonly instanceId: ProviderInstanceId;
+  readonly displayName: string;
+  readonly message: string;
+}
+
 export interface ImDelegationBlockedResult {
   readonly blocked: true;
   readonly code: typeof IM_DELEGATION_DENIED_CODE;
   readonly reason: string;
+  readonly blockedAncestorThreadId?: string;
   readonly message: string;
 }
 
@@ -84,6 +106,8 @@ export type CodingAgentReadiness =
 
 export type ResolveCodingAgentTargetResult =
   | { readonly kind: "passthrough" }
+  | { readonly kind: "builtin_once"; readonly result: CodingAgentBuiltinOnceBlockedResult }
+  | { readonly kind: "remote_blocked"; readonly result: CodingAgentRemoteBlockedResult }
   | { readonly kind: "blocked"; readonly result: CodingAgentUnavailableResult }
   | {
       readonly kind: "routed";
@@ -110,6 +134,16 @@ export type DelegationWorkspaceValidation =
         | "commit_outside_project";
       readonly workspaceKind: DelegationWorkspaceKind;
       readonly isScratch: boolean;
+      readonly message: string;
+    };
+
+export type HandoffBriefSectionKey = "goal" | "constraints" | "files";
+
+export type HandoffBriefValidation =
+  | { readonly valid: true }
+  | {
+      readonly valid: false;
+      readonly missingSections: ReadonlyArray<HandoffBriefSectionKey>;
       readonly message: string;
     };
 
@@ -162,7 +196,11 @@ function isProvisionableInstance(
   if (provider?.setup?.canInstall === true) return true;
   const driver = provider?.driver ?? instanceConfig?.driver;
   if (driver === "claudeAgent" || driver === "codex") return true;
-  if (driver === "acpRegistry" && instanceConfig?.config && typeof instanceConfig.config === "object") {
+  if (
+    driver === "acpRegistry" &&
+    instanceConfig?.config &&
+    typeof instanceConfig.config === "object"
+  ) {
     const config = instanceConfig.config as Record<string, unknown>;
     if (
       config.source !== "local" &&
@@ -196,6 +234,9 @@ function detectsUpdateRequired(
     requestedModel !== undefined &&
     provider.updateRequiredModels?.some((candidate) => candidate.slug === requestedModel)
   ) {
+    return true;
+  }
+  if (provider.versionAdvisory?.status === "behind_latest") {
     return true;
   }
   if (
@@ -288,15 +329,22 @@ export function assessCodingAgentReadiness(input: {
   }
 
   if (detectsUpdateRequired(provider, input.requestedModel)) {
+    const advisory = provider.versionAdvisory;
+    const versionDetail =
+      advisory?.status === "behind_latest" && advisory.latestVersion
+        ? ` (latest v${advisory.latestVersion}${advisory.currentVersion ? `, installed v${advisory.currentVersion}` : ""})`
+        : "";
     return makeBlocked(
       "update_required",
-      provider.message ??
-        `Configured Coding Agent "${displayName}" (${instanceId}) requires a confirmed update in Settings → Providers before running.`,
+      advisory?.message ??
+        provider.message ??
+        `Configured Coding Agent "${displayName}" (${instanceId}) requires a confirmed update${versionDetail} in Settings → Providers before running.`,
       {
         canInstall:
           canInstall ||
           provider.setup?.canInstall === true ||
-          provider.versionAdvisory?.canInstallVersion === true,
+          advisory?.canUpdate === true ||
+          advisory?.canInstallVersion === true,
       },
     );
   }
@@ -341,13 +389,16 @@ export function assessCodingAgentReadiness(input: {
 
 /**
  * Deterministic target resolution for `delegate_task` when built-in「小瞳」(`xtworkPi`)
- * runs with `codingAgent.mode === "provider"` (ADR-012 §5.1).
+ * runs with `codingAgent.mode === "provider"` or a server-side `builtin_once` turn override (ADR-012 §5.1).
  *
- * Never silently switches to another external Coding Agent and never triggers installs.
+ * Never silently switches to another external Coding Agent, never lets remote environment
+ * delegation bypass the configured local Coding Agent, and never triggers silent installs.
  */
 export function resolveCodingAgentTarget(input: {
   readonly codingAgent: CodingAgentSetting | undefined;
   readonly callerInstanceId: ProviderInstanceId;
+  readonly codingAgentOverride?: CodingAgentTurnOverride | undefined;
+  readonly isRemoteEnvironmentTarget?: boolean | undefined;
   readonly requestedTarget?: OrchestratorMcpTarget | undefined;
   readonly requestedRole?: string | undefined;
   readonly providers: ReadonlyArray<ServerProvider>;
@@ -358,14 +409,30 @@ export function resolveCodingAgentTarget(input: {
   if (input.callerInstanceId !== PI_INSTANCE_ID) {
     return { kind: "passthrough" };
   }
+
+  // Server-side one-turn override (`[仅本次改用内置小瞳]`): deterministically block delegation
+  // on this single turn so built-in 小瞳 handles the task directly without mutating global settings.
+  if (input.codingAgentOverride === "builtin_once") {
+    return {
+      kind: "builtin_once",
+      result: {
+        blocked: true,
+        code: CODING_AGENT_BUILTIN_ONCE_CODE,
+        message:
+          "This turn is locked to built-in 小瞳 (`codingAgentOverride: 'builtin_once'`). Complete the task directly on the current built-in model without calling `delegate_task`; your global Coding Agent setting remains unchanged for subsequent turns.",
+      },
+    };
+  }
+
   const normalized = normalizeCodingAgentSetting(input.codingAgent);
   if (normalized.mode !== "provider") {
     return { kind: "passthrough" };
   }
 
-  // Allow an explicit non-coding general/research subagent on built-in `xtworkPi`,
-  // while keeping all omitted or external-provider delegations strictly locked to `codingAgent.instanceId`.
+  // Allow an explicit non-coding local general/research subagent on built-in `xtworkPi`,
+  // while keeping all remote, omitted, or external-provider delegations strictly locked to `codingAgent.instanceId`.
   if (
+    input.isRemoteEnvironmentTarget !== true &&
     input.requestedTarget?.providerInstanceId === PI_INSTANCE_ID &&
     input.requestedTarget.driverKind === undefined &&
     (input.requestedRole === "general" || input.requestedRole === "research")
@@ -401,14 +468,26 @@ export function resolveCodingAgentTarget(input: {
     return { kind: "blocked", result: readiness.blocked };
   }
 
+  // Remote environment delegation must NEVER bypass the configured local Coding Agent or
+  // silently route to another provider/machine.
+  if (input.isRemoteEnvironmentTarget === true) {
+    return {
+      kind: "remote_blocked",
+      result: {
+        blocked: true,
+        code: "invalid_request",
+        instanceId: lockedInstanceId,
+        displayName: readiness.displayName,
+        message: `Remote environment delegation is blocked while local Coding Agent "${readiness.displayName}" (${lockedInstanceId}) is configured. Omit target.environmentId to delegate locally to "${readiness.displayName}", or switch Coding Agent to auto in Settings → Providers.`,
+      },
+    };
+  }
+
   const sanitizedOptions = requestedExternalMismatch ? undefined : input.requestedTarget?.options;
   const target: OrchestratorMcpTarget = {
     ...(input.requestedTarget?.projectId === undefined
       ? {}
       : { projectId: input.requestedTarget.projectId }),
-    ...(input.requestedTarget?.environmentId === undefined
-      ? {}
-      : { environmentId: input.requestedTarget.environmentId }),
     providerInstanceId: lockedInstanceId,
     ...(requestedModel === undefined ? {} : { model: requestedModel }),
     ...(sanitizedOptions === undefined ? {} : { options: sanitizedOptions }),
@@ -425,7 +504,8 @@ export function resolveCodingAgentTarget(input: {
 
 /**
  * ADR-012 §5.4 hard-deny guard: ANY IM-originated thread, protected Xtwork thread,
- * or `group` / `owner_dm` IM execution context is strictly forbidden from delegating
+ * or `group` / `owner_dm` IM execution context — including any prefixless derived child thread
+ * descending from an IM/protected ancestor — is strictly forbidden from delegating
  * to external Coding CLIs even when desktop `codingAgent.mode === "provider"` is set.
  */
 export function isExternalDelegationBlockedForThread(input: {
@@ -435,56 +515,229 @@ export function isExternalDelegationBlockedForThread(input: {
     | Pick<TurnExecutionContext, "source" | "replyAudience">
     | null
     | undefined;
+  readonly ancestorThreadIds?: ReadonlyArray<string> | undefined;
+  readonly isAncestorProtected?: ((ancestorThreadId: string) => boolean) | undefined;
+  readonly getAncestorExecutionContext?:
+    | ((ancestorThreadId: string) => Pick<TurnExecutionContext, "source" | "replyAudience"> | null | undefined)
+    | undefined;
 }): ExternalDelegationThreadCheck {
-  const threadId = input.threadId?.trim();
-  const isImById = Boolean(threadId && isImThread(threadId));
-  const isImSource = input.executionContext?.source === "im";
-  const isGroupAudience = input.executionContext?.replyAudience === "group";
-  const isImAudience =
-    input.executionContext?.replyAudience === "group" ||
-    input.executionContext?.replyAudience === "owner_dm";
+  const checkSingle = (
+    candidateId: string | null | undefined,
+    isProtected: boolean,
+    executionContext: Pick<TurnExecutionContext, "source" | "replyAudience"> | null | undefined,
+  ): ImDelegationBlockedResult | null => {
+    const trimmed = candidateId?.trim();
+    const isImById = Boolean(trimmed && isImThread(trimmed));
+    const isImSource = executionContext?.source === "im";
+    const isGroupAudience = executionContext?.replyAudience === "group";
+    const isImAudience =
+      executionContext?.replyAudience === "group" ||
+      executionContext?.replyAudience === "owner_dm";
 
-  if (!isImById && input.isProtectedThread !== true && !isImSource && !isImAudience) {
-    return { blocked: false };
+    if (!isImById && !isProtected && !isImSource && !isImAudience) {
+      return null;
+    }
+
+    const reason = isGroupAudience
+      ? "group_audience_forbidden"
+      : isImById || isImSource || isImAudience
+        ? "im_thread_forbidden"
+        : "protected_thread_forbidden";
+
+    return {
+      blocked: true,
+      code: IM_DELEGATION_DENIED_CODE,
+      reason,
+      message:
+        "External Coding Agent delegation is blocked for IM and group turns (ADR-012 §5.4). Complete the task directly with built-in 小瞳 or start external Coding Agent delegation from the desktop app.",
+    };
+  };
+
+  const direct = checkSingle(
+    input.threadId,
+    input.isProtectedThread === true,
+    input.executionContext,
+  );
+  if (direct !== null) {
+    return direct;
   }
 
-  const reason = isGroupAudience
-    ? "group_audience_forbidden"
-    : isImById || isImSource || isImAudience
-      ? "im_thread_forbidden"
-      : "protected_thread_forbidden";
+  if (input.ancestorThreadIds) {
+    const seen = new Set<string>();
+    const selfId = input.threadId?.trim();
+    if (selfId) seen.add(selfId);
+    for (const rawAncestorId of input.ancestorThreadIds) {
+      const ancestorId = rawAncestorId.trim();
+      if (ancestorId.length === 0 || seen.has(ancestorId)) continue;
+      seen.add(ancestorId);
+      const ancestorResult = checkSingle(
+        ancestorId,
+        input.isAncestorProtected?.(ancestorId) === true,
+        input.getAncestorExecutionContext?.(ancestorId),
+      );
+      if (ancestorResult !== null) {
+        return {
+          ...ancestorResult,
+          blockedAncestorThreadId: ancestorId,
+        };
+      }
+    }
+  }
 
-  return {
-    blocked: true,
-    code: IM_DELEGATION_DENIED_CODE,
-    reason,
-    message:
-      "External Coding Agent delegation is blocked for IM and group turns (ADR-012 §5.4). Complete the task directly with built-in 小瞳 or start external Coding Agent delegation from the desktop app.",
-  };
+  return { blocked: false };
 }
 
-function isPathInsideOrEqual(candidate: string | null | undefined, root: string | null | undefined): boolean {
-  if (!candidate || !root) return false;
-  const resolvedCandidate = NodePath.resolve(candidate);
-  const resolvedRoot = NodePath.resolve(root);
-  const rel = NodePath.relative(resolvedRoot, resolvedCandidate);
+export interface ThreadLineageRef {
+  readonly parentThreadId?: ThreadId | null | undefined;
+  readonly rootThreadId?: ThreadId | null | undefined;
+}
+
+/**
+ * Walks `parentThreadId` (and `rootThreadId`) ancestry with cycle detection to enforce
+ * ADR-012 §5.4 IM/group hard-deny on prefixless derived subagent/forked threads.
+ */
+export const checkExternalDelegationAncestry = Effect.fn(
+  "codingAgentDelegation.checkExternalDelegationAncestry",
+)(function* (input: {
+  readonly threadId?: string | null | undefined;
+  readonly initialLineage?: ThreadLineageRef | null | undefined;
+  readonly isProtectedThread: (threadId: string) => boolean;
+  readonly getProtectedContext?:
+    | ((threadId: string) => Pick<TurnExecutionContext, "source" | "replyAudience"> | undefined)
+    | undefined;
+  readonly executionContext?:
+    | Pick<TurnExecutionContext, "source" | "replyAudience">
+    | null
+    | undefined;
+  readonly loadThreadLineage: (
+    threadId: ThreadId,
+  ) => Effect.Effect<ThreadLineageRef | null>;
+}): Effect.fn.Return<ExternalDelegationThreadCheck> {
+  const currentId = input.threadId?.trim();
+  const direct = isExternalDelegationBlockedForThread({
+    threadId: currentId,
+    isProtectedThread: currentId ? input.isProtectedThread(currentId) : false,
+    executionContext:
+      input.executionContext ?? (currentId ? input.getProtectedContext?.(currentId) : undefined),
+  });
+  if (direct.blocked) {
+    return direct;
+  }
+
+  const visited = new Set<string>();
+  if (currentId) {
+    visited.add(currentId);
+  }
+
+  const queue: Array<string> = [];
+  const enqueue = (candidate: string | null | undefined) => {
+    const trimmed = candidate?.trim();
+    if (trimmed && !visited.has(trimmed)) {
+      queue.push(trimmed);
+    }
+  };
+
+  if (input.initialLineage !== undefined) {
+    enqueue(input.initialLineage?.parentThreadId);
+    enqueue(input.initialLineage?.rootThreadId);
+  } else if (currentId) {
+    const selfLineage = yield* input.loadThreadLineage(ThreadId.make(currentId));
+    enqueue(selfLineage?.parentThreadId);
+    enqueue(selfLineage?.rootThreadId);
+  }
+
+  let hops = 0;
+  while (queue.length > 0 && hops < MAX_ANCESTRY_HOPS) {
+    const ancestorId = queue.shift()!;
+    if (visited.has(ancestorId)) continue;
+    visited.add(ancestorId);
+    hops += 1;
+
+    const ancestorCheck = isExternalDelegationBlockedForThread({
+      threadId: ancestorId,
+      isProtectedThread: input.isProtectedThread(ancestorId),
+      executionContext: input.getProtectedContext?.(ancestorId),
+    });
+    if (ancestorCheck.blocked) {
+      return {
+        ...ancestorCheck,
+        blockedAncestorThreadId: ancestorId,
+      };
+    }
+
+    const ancestorLineage = yield* input.loadThreadLineage(ThreadId.make(ancestorId));
+    enqueue(ancestorLineage?.parentThreadId);
+    enqueue(ancestorLineage?.rootThreadId);
+  }
+
+  return { blocked: false };
+});
+
+/**
+ * Canonicalizes a filesystem path via `fs.realpathSync`, falling back to canonicalizing
+ * the nearest existing ancestor and re-joining remaining path segments when the leaf
+ * does not exist yet. Closes symlink traversal bypasses for `scratch/` detection.
+ */
+export function canonicalizeFilesystemPath(targetPath: string): string {
+  const resolved = NodePath.resolve(targetPath);
+  const realpath = NodeFS.realpathSync.native ?? NodeFS.realpathSync;
+  try {
+    return realpath(resolved);
+  } catch {
+    const trailingSegments: Array<string> = [];
+    let current = resolved;
+    while (true) {
+      const parent = NodePath.dirname(current);
+      if (parent === current) {
+        return resolved;
+      }
+      trailingSegments.unshift(NodePath.basename(current));
+      current = parent;
+      try {
+        const canonicalAncestor = realpath(current);
+        return NodePath.join(canonicalAncestor, ...trailingSegments);
+      } catch {
+        // Continue walking up to the nearest existing ancestor.
+      }
+    }
+  }
+}
+
+function isRelativeInsideOrEqual(candidate: string, root: string): boolean {
+  const rel = NodePath.relative(root, candidate);
   return (
     rel === "" ||
     (!NodePath.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${NodePath.sep}`))
   );
 }
 
+function isPathInsideOrEqual(
+  candidate: string | null | undefined,
+  root: string | null | undefined,
+): boolean {
+  if (!candidate || !root) return false;
+  const resolvedCandidate = NodePath.resolve(candidate);
+  const resolvedRoot = NodePath.resolve(root);
+  if (isRelativeInsideOrEqual(resolvedCandidate, resolvedRoot)) {
+    return true;
+  }
+  const canonicalCandidate = canonicalizeFilesystemPath(candidate);
+  const canonicalRoot = canonicalizeFilesystemPath(root);
+  return isRelativeInsideOrEqual(canonicalCandidate, canonicalRoot);
+}
+
 function looksLikeScratchWorkspacePath(workspacePath: string | null | undefined): boolean {
   if (!workspacePath) return false;
-  const normalized = NodePath.resolve(workspacePath).replaceAll("\\", "/");
-  return normalized.endsWith("/scratch") || normalized.includes("/scratch/");
+  const check = (value: string) => {
+    const normalized = value.replaceAll("\\", "/");
+    return normalized.endsWith("/scratch") || normalized.includes("/scratch/");
+  };
+  return check(NodePath.resolve(workspacePath)) || check(canonicalizeFilesystemPath(workspacePath));
 }
 
 /**
- * ADR-012 §5.2 workspace contract:
- * - `isolation: "shared"` (or omitted) works on Git repos, non-Git folders, and project-less `scratch/`.
- * - `isolation: "worktree"` requires a valid non-scratch Git repository with a valid HEAD commit;
- *   refuses non-Git folders and `scratch/` with clear actionable guidance to retry with `isolation: "shared"`.
+ * ADR-012 §5.2 workspace contract: `shared` works everywhere; `worktree` requires
+ * a non-scratch Git repo with a valid HEAD (canonicalizing symlinked `scratch/`).
  */
 export function validateDelegationWorkspace(input: {
   readonly isolation: "shared" | "worktree" | undefined;
@@ -563,29 +816,145 @@ export function validateDelegationWorkspace(input: {
   };
 }
 
+interface BriefSectionRule {
+  readonly key: HandoffBriefSectionKey;
+  readonly label: string;
+  readonly headingPatterns: ReadonlyArray<RegExp>;
+}
+
+const BRIEF_SECTION_RULES: ReadonlyArray<BriefSectionRule> = [
+  {
+    key: "goal",
+    label: "Goal & Acceptance Criteria (目标与验收标准)",
+    headingPatterns: [
+      /(?:^|\b)(?:goal|objective|acceptance(?:\s+criteria)?|success\s+criteria|expected\s+result)(?:\b|$)/iu,
+      /目标|验收|验收标准|完成标准|预期结果/u,
+    ],
+  },
+  {
+    key: "constraints",
+    label: "Constraints & Scope (约束与范围)",
+    headingPatterns: [
+      /(?:^|\b)(?:constraints?|scope|boundar(?:y|ies)|non-?goals?|guardrails?|rules?)(?:\b|$)/iu,
+      /约束|范围|边界|限制|禁止|不要修改|不改/u,
+    ],
+  },
+  {
+    key: "files",
+    label: "File/Attachment Paths (相关文件与路径)",
+    headingPatterns: [
+      /(?:^|\b)(?:files?|paths?|attachments?|file\/attachment\s+paths?|target\s+files?|relevant\s+files?|workspace\s+paths?)(?:\b|$)/iu,
+      /文件路径|相关文件|涉及文件|文件|路径|附件|目录/u,
+    ],
+  },
+];
+
+/**
+ * Extracts structured section heading/label candidates from a handoff brief line.
+ * Requires markdown headings (`# ...`), numbered/bulleted labels (`1. Label: ...`, `- **Label**: ...`),
+ * XML-like tags (`<goal>`), or explicit `Label:` / `Label：` lines — bare prose sentences do not satisfy it.
+ */
+function extractSectionHeaderText(rawLine: string): string | null {
+  const line = rawLine.trim();
+  if (line.length === 0) return null;
+
+  // Markdown heading: ## Goal & Acceptance Criteria
+  const mdHeading = /^#{1,6}\s+(.+)$/u.exec(line);
+  if (mdHeading?.[1]) {
+    return mdHeading[1].replaceAll(/[*_`]/gu, "").trim();
+  }
+
+  // XML/bracket tag: <goal> or [Goal]
+  const tagHeading = /^(?:<([a-zA-Z_\u4e00-\u9fff][a-zA-Z0-9_\-\s\u4e00-\u9fff]{1,40})>|\[([^\]]{2,48})\])$/u.exec(
+    line,
+  );
+  if (tagHeading?.[1] || tagHeading?.[2]) {
+    return (tagHeading[1] ?? tagHeading[2] ?? "").trim();
+  }
+
+  // Strip optional list marker (`1.`, `1)`, `-`, `*`, `•`) and bold/backtick wrappers.
+  const withoutList = line.replace(/^(?:\d+[.)]\s+|[-*•]\s+)/u, "").trim();
+
+  // Explicit `Label: ...` or `Label：...` (label portion up to 60 chars before colon)
+  const colonMatch = /^([^*`:\uFF1A]{2,60}?)(?:\*{1,2})?\s*[:\uFF1A]/u.exec(
+    withoutList.replace(/^\*{1,2}/u, ""),
+  );
+  if (colonMatch?.[1]) {
+    return colonMatch[1].replaceAll(/[*_`]/gu, "").trim();
+  }
+
+  // Bold standalone heading line: **Constraints & Scope**
+  const boldHeading = /^\*\*([^*]{2,60})\*\*$/u.exec(withoutList);
+  if (boldHeading?.[1]) {
+    return boldHeading[1].trim();
+  }
+
+  return null;
+}
+
+/**
+ * Server-side validation of the ADR-012 §5.3 structured handoff brief when built-in「小瞳」
+ * delegates coding work to an external Coding Agent under `codingAgent.mode === "provider"`.
+ * Accepts both English and Chinese section headings/labels.
+ */
+export function validateCodingAgentHandoffBrief(task: string): HandoffBriefValidation {
+  const found = new Set<HandoffBriefSectionKey>();
+  for (const line of task.split(/\r?\n/u)) {
+    const header = extractSectionHeaderText(line);
+    if (!header) continue;
+    for (const rule of BRIEF_SECTION_RULES) {
+      if (found.has(rule.key)) continue;
+      if (rule.headingPatterns.some((pattern) => pattern.test(header))) {
+        found.add(rule.key);
+      }
+    }
+  }
+
+  const missing = BRIEF_SECTION_RULES.filter((rule) => !found.has(rule.key));
+  if (missing.length === 0) {
+    return { valid: true };
+  }
+
+  const missingLabels = missing.map((rule) => rule.label).join(", ");
+  return {
+    valid: false,
+    missingSections: missing.map((rule) => rule.key),
+    message: `Delegated Coding Agent handoff brief is incomplete (ADR-012 §5.3). Because the child starts with no parent chat history, include structured sections for: ${missingLabels}. Retry delegate_task with explicit headings/labels for each missing section.`,
+  };
+}
+
 /**
  * Generates concise runtime delegation instructions for built-in「小瞳」(`xtworkPi`)
- * ONLY on non-IM desktop turns when `codingAgent.mode === "provider"` (ADR-012 §5.1–§5.4).
+ * ONLY on non-IM desktop turns when `codingAgent.mode === "provider"` and no one-turn
+ * `builtin_once` override is active (ADR-012 §5.1–§5.4).
  */
 export function buildCodingAgentDelegationInstructions(input: {
   readonly codingAgent: CodingAgentSetting | undefined;
   readonly callerInstanceId: ProviderInstanceId;
+  readonly codingAgentOverride?: CodingAgentTurnOverride | undefined;
   readonly threadId?: string | null | undefined;
   readonly isProtectedThread?: boolean | undefined;
   readonly executionContext?:
     | Pick<TurnExecutionContext, "source" | "replyAudience">
     | null
     | undefined;
+  readonly ancestorThreadIds?: ReadonlyArray<string> | undefined;
+  readonly isAncestorProtected?: ((ancestorThreadId: string) => boolean) | undefined;
   readonly displayName?: string | undefined;
   readonly workspaceKind?: DelegationWorkspaceKind | undefined;
 }): string {
   if (input.callerInstanceId !== PI_INSTANCE_ID) {
     return "";
   }
+  if (input.codingAgentOverride === "builtin_once") {
+    return "";
+  }
   const threadGuard = isExternalDelegationBlockedForThread({
     threadId: input.threadId,
     isProtectedThread: input.isProtectedThread,
     executionContext: input.executionContext,
+    ancestorThreadIds: input.ancestorThreadIds,
+    isAncestorProtected: input.isAncestorProtected,
   });
   if (threadGuard.blocked) {
     return "";
@@ -611,11 +980,11 @@ export function buildCodingAgentDelegationInstructions(input: {
     "<coding_agent_delegation>",
     `The user selected external Coding Agent "${displayName}" (${normalized.instanceId}) for coding tasks.`,
     "- Keep general Q&A, todos, schedules, notes, plugins, and browser research inside built-in 小瞳 (do not delegate those).",
-    `- For coding, debugging, refactoring, test fixes, or repository modifications, delegate via \`delegate_task\` with ${targetSpec}. Never silently substitute a different external Coding Agent.`,
-    "- Exception: if the user explicitly asks in this turn to use built-in 小瞳 directly for this turn only, handle the task directly without calling `delegate_task`.",
+    `- For coding, debugging, refactoring, test fixes, or repository modifications, delegate via \`delegate_task\` with ${targetSpec}. Never silently substitute a different external Coding Agent or remote environment.`,
+    "- Exception: if the user explicitly triggers the one-turn built-in 小瞳 fallback, handle the task directly without calling `delegate_task`.",
     "- If `delegate_task` returns `coding_agent_unavailable`, stop and report the reason concisely without trying another external agent (the user can click the inline Install/Sign-in or one-turn built-in 小瞳 buttons).",
     `- Workspace rule: ${workspaceHint}`,
-    "- Because `delegate_task` starts a child without parent chat history or attachments, structure every `task` brief with these 5 sections:",
+    "- Because `delegate_task` starts a child without parent chat history or attachments, structure every `task` brief with these 5 sections (Goal, Constraints, and File Paths are enforced server-side):",
     "  1. Goal & Acceptance Criteria: exact objective and how to verify success.",
     "  2. Constraints & Scope: boundaries, untouched files, and uncommitted-change rules.",
     "  3. File/Attachment Paths: exact workspace-relative or absolute paths for relevant files and attachments.",

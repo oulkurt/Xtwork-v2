@@ -3,6 +3,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type CodingAgentSetting,
+  type CodingAgentTurnOverride,
   type OrchestrationV2TurnItem,
   type ProviderInstanceConfig,
   type ServerProvider,
@@ -81,8 +82,18 @@ function makeFixtureProviders(): ReadonlyArray<ServerProvider> {
     }),
     makeProvider(codebuddyId, "acpRegistry", {
       displayName: "Codebuddy Code",
-      installed: false,
-      status: "warning",
+      installed: true,
+      status: "ready",
+      versionAdvisory: {
+        status: "behind_latest",
+        currentVersion: "1.0.0",
+        latestVersion: "1.2.0",
+        updateCommand: null,
+        canUpdate: true,
+        canInstallVersion: true,
+        checkedAt: "2026-11-25T00:00:00.000Z",
+        message: "Codebuddy Code 1.2.0 is available.",
+      },
     }),
     makeProvider(deepseekId, "acpRegistry", {
       displayName: "DeepSeek Harness",
@@ -131,6 +142,7 @@ describe("CodingAgentSettingsSection", () => {
     await expect.element(page.getByTestId(`coding-agent-option-${codexId}`)).toMatchTextContent(/需登录/);
     await expect.element(page.getByTestId(`coding-agent-option-${kimiId}`)).toMatchTextContent(/未安装/);
     await expect.element(page.getByTestId(`coding-agent-option-${qoderId}`)).toMatchTextContent(/已禁用/);
+    await expect.element(page.getByTestId(`coding-agent-option-${codebuddyId}`)).toMatchTextContent(/需确认更新/);
     expect(page.getByTestId(`coding-agent-option-${xtworkPiId}`).query()).toBeNull();
 
     await userEvent.click(page.getByTestId(`coding-agent-option-${claudeId}`));
@@ -213,7 +225,12 @@ describe("CodingAgentBlockedActionCard", () => {
     expect(blocked?.reason).toBe("not_installed");
 
     const onOpenProviderSettings = vi.fn<(instanceId: ProviderInstanceId) => void>();
-    const onFallbackToBuiltIn = vi.fn<(instruction: string) => Promise<void>>(async () => {});
+    const onFallbackToBuiltIn = vi.fn<
+      (
+        instruction: string,
+        options?: { readonly codingAgentOverride?: CodingAgentTurnOverride },
+      ) => Promise<void>
+    >(async () => {});
 
     await using screen = await render(
       <CodingAgentBlockedActionCard
@@ -237,7 +254,9 @@ describe("CodingAgentBlockedActionCard", () => {
     expect(onOpenProviderSettings).toHaveBeenCalledWith(kimiId);
 
     await userEvent.click(screen.getByTestId("coding-agent-action-fallback-builtin"));
-    expect(onFallbackToBuiltIn).toHaveBeenCalledWith(ONE_TURN_BUILTIN_XIAOTONG_PROMPT_ZH);
+    expect(onFallbackToBuiltIn).toHaveBeenCalledWith(ONE_TURN_BUILTIN_XIAOTONG_PROMPT_ZH, {
+      codingAgentOverride: "builtin_once",
+    });
     await expect
       .element(screen.getByTestId("coding-agent-action-fallback-builtin"))
       .toBeDisabled();

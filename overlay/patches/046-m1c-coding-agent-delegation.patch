@@ -1,5 +1,5 @@
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
-index 8dcd025c..d842586e 100644
+index 8dcd025c..55ea810b 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.ts
 +++ b/apps/server/src/mcp/OrchestratorMcpService.ts
 @@ -1,5 +1,6 @@
@@ -9,22 +9,24 @@ index 8dcd025c..d842586e 100644
    type RunId,
    isProviderAvailable,
    MessageId,
-@@ -116,7 +117,14 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+@@ -116,7 +117,16 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
  import { isSnoozed } from "../orchestration-v2/ThreadSettlementService.ts";
  import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
  import * as ProjectService from "../project/ProjectService.ts";
 +import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
  import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 +import { isProtectedXtworkThread } from "../im/XtworkImService.ts";
++import { PI_INSTANCE_ID } from "../xtwork/bundledPiSettings.ts";
 +import {
-+  isExternalDelegationBlockedForThread,
++  checkExternalDelegationAncestry,
 +  resolveCodingAgentTarget,
++  validateCodingAgentHandoffBrief,
 +  validateDelegationWorkspace,
 +} from "../xtwork/codingAgentDelegation.ts";
  import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
  import * as ServerSettings from "../serverSettings.ts";
  import {
-@@ -1273,6 +1281,9 @@ const make = Effect.gen(function* () {
+@@ -1273,6 +1283,9 @@ const make = Effect.gen(function* () {
    const providerAdapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
    const scheduledTasks = yield* ScheduledTaskService.ScheduledTaskService;
    const projects = yield* ProjectService.ProjectService;
@@ -34,14 +36,25 @@ index 8dcd025c..d842586e 100644
    const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
    const gitDriver = yield* GitVcsDriver.GitVcsDriver;
    const serverSettings = yield* ServerSettings.ServerSettingsService;
-@@ -2677,6 +2688,18 @@ const make = Effect.gen(function* () {
+@@ -2677,10 +2690,129 @@ const make = Effect.gen(function* () {
        };
      }),
      delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
-+      const imDelegationBlock = isExternalDelegationBlockedForThread({
++      const loadLineageForAncestry = (tid: ThreadId) =>
++        threadManagement.getThreadShell(tid).pipe(
++          Effect.map((shell) => shell?.lineage ?? null),
++          Effect.catchCause(() =>
++            threadManagement.getThreadRecords(tid, []).pipe(
++              Effect.map((records) => records.thread.lineage ?? null),
++              Effect.catchCause(() => Effect.succeed(null)),
++            ),
++          ),
++        );
++      const imDelegationBlock = yield* checkExternalDelegationAncestry({
 +        threadId: callerScope.thread?.threadId,
-+        isProtectedThread: isProtectedXtworkThread(callerScope.thread?.threadId),
++        isProtectedThread: (tid) => isProtectedXtworkThread(tid),
 +        executionContext: callerScope.imExecution?.context,
++        loadThreadLineage: loadLineageForAncestry,
 +      });
 +      if (imDelegationBlock.blocked) {
 +        return yield* new OrchestratorMcpFailure({
@@ -53,7 +66,107 @@ index 8dcd025c..d842586e 100644
        const environmentId =
          input.target === undefined
            ? undefined
-@@ -2724,9 +2747,56 @@ const make = Effect.gen(function* () {
+           : PeerForwarding.remoteTarget(callerScope, input.target.environmentId);
++      const isRemoteEnvironmentTarget =
++        input.target !== undefined && environmentId !== undefined;
++
++      // Enforce one-turn `builtin_once` override and configured local Coding Agent policy BEFORE
++      // remote forwarding so remote delegation can never bypass readiness or no-fallback rules.
++      const activeTurnCodingAgentOverride =
++        callerScope.thread?.providerInstanceId === PI_INSTANCE_ID
++          ? yield* threadManagement
++              .getThreadRecords(callerScope.thread.threadId, ["runs"], {
++                runStatuses: ThreadManagementService.ACTIVE_RUN_STATUSES,
++              })
++              .pipe(
++                Effect.flatMap((records) => {
++                  const activeRun = records.runs
++                    .filter(ThreadManagementService.isActiveRun)
++                    .toSorted((left, right) => right.ordinal - left.ordinal)[0];
++                  if (activeRun?.userMessageId === undefined) {
++                    return Effect.undefined;
++                  }
++                  return threadManagement
++                    .getMessagesById(callerScope.thread!.threadId, [activeRun.userMessageId])
++                    .pipe(
++                      Effect.map(
++                        (messages) =>
++                          messages.get(activeRun.userMessageId)?.context?.codingAgentOverride,
++                      ),
++                    );
++                }),
++                Effect.catchCause(() => Effect.undefined),
++              )
++          : undefined;
++
++      if (
++        callerScope.thread?.providerInstanceId === PI_INSTANCE_ID &&
++        activeTurnCodingAgentOverride === "builtin_once"
++      ) {
++        const overrideCheck = resolveCodingAgentTarget({
++          codingAgent: undefined,
++          callerInstanceId: PI_INSTANCE_ID,
++          codingAgentOverride: "builtin_once",
++          providers: [],
++        });
++        if (overrideCheck.kind === "builtin_once") {
++          return yield* new OrchestratorMcpFailure({
++            code: overrideCheck.result.code,
++            blocked: overrideCheck.result.blocked,
++            message: overrideCheck.result.message,
++          });
++        }
++      }
++
++      if (
++        callerScope.thread?.providerInstanceId === PI_INSTANCE_ID &&
++        isRemoteEnvironmentTarget
++      ) {
++        const currentSettings = yield* serverSettings.getSettings.pipe(
++          Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
++        );
++        const providers = yield* loadProviders;
++        const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
++        const remoteResolution = resolveCodingAgentTarget({
++          codingAgent: currentSettings.codingAgent,
++          callerInstanceId: PI_INSTANCE_ID,
++          codingAgentOverride: activeTurnCodingAgentOverride,
++          isRemoteEnvironmentTarget: true,
++          requestedTarget: input.target,
++          requestedRole: input.role,
++          providers,
++          providerInstances: currentSettings.providerInstances,
++          orchestrationCapableInstanceIds,
++        });
++        if (remoteResolution.kind === "blocked") {
++          const blocked = remoteResolution.result;
++          return yield* new OrchestratorMcpFailure({
++            code: blocked.code,
++            blocked: blocked.blocked,
++            reason: blocked.reason,
++            instanceId: blocked.instanceId,
++            displayName: blocked.displayName,
++            canInstall: blocked.canInstall,
++            canLogin: blocked.canLogin,
++            message: blocked.message,
++          });
++        }
++        if (remoteResolution.kind === "remote_blocked") {
++          const blocked = remoteResolution.result;
++          return yield* new OrchestratorMcpFailure({
++            code: blocked.code,
++            blocked: blocked.blocked,
++            instanceId: blocked.instanceId,
++            displayName: blocked.displayName,
++            message: blocked.message,
++          });
++        }
++      }
++
+       if (input.target !== undefined && environmentId !== undefined) {
+         yield* requireCapability(callerScope);
+         const scope = yield* requireThreadScope(callerScope, "delegate_task");
+@@ -2724,9 +2856,68 @@ const make = Effect.gen(function* () {
          operation: "delegate-task",
        });
        const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
@@ -79,6 +192,7 @@ index 8dcd025c..d842586e 100644
 +        const codingAgentResolution = resolveCodingAgentTarget({
 +          codingAgent: currentSettings.codingAgent,
 +          callerInstanceId: scope.thread.providerInstanceId,
++          codingAgentOverride: activeTurnCodingAgentOverride,
 +          requestedTarget: input.target,
 +          requestedRole: input.role,
 +          providers,
@@ -87,6 +201,13 @@ index 8dcd025c..d842586e 100644
 +          isEnabledForProject: (candidateId) =>
 +            candidateId === lockedInstanceId ? lockedProjectEnabled : true,
 +        });
++        if (codingAgentResolution.kind === "builtin_once") {
++          return yield* new OrchestratorMcpFailure({
++            code: codingAgentResolution.result.code,
++            blocked: codingAgentResolution.result.blocked,
++            message: codingAgentResolution.result.message,
++          });
++        }
 +        if (codingAgentResolution.kind === "blocked") {
 +          const blocked = codingAgentResolution.result;
 +          return yield* new OrchestratorMcpFailure({
@@ -101,6 +222,10 @@ index 8dcd025c..d842586e 100644
 +          });
 +        }
 +        if (codingAgentResolution.kind === "routed") {
++          const briefCheck = validateCodingAgentHandoffBrief(input.task);
++          if (!briefCheck.valid) {
++            return yield* failure("invalid_request", briefCheck.message);
++          }
 +          effectiveTarget = codingAgentResolution.target;
 +        }
 +      }
@@ -111,7 +236,7 @@ index 8dcd025c..d842586e 100644
          providers,
          skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
        });
-@@ -2742,30 +2812,79 @@ const make = Effect.gen(function* () {
+@@ -2742,30 +2933,79 @@ const make = Effect.gen(function* () {
        let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
        if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
          const project = yield* requireProject(parent.thread.projectId);
@@ -208,10 +333,10 @@ index 8dcd025c..d842586e 100644
          workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
        }
 diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
-index 605f56f0..fadb4741 100644
+index 605f56f0..73953ea5 100644
 --- a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 +++ b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
-@@ -1,9 +1,21 @@
+@@ -1,9 +1,22 @@
  import { modelSelectionsEqual } from "@t3tools/shared/model";
 -import { recordXtworkNativeThreadPolicy, resolveXtworkProviderPolicy } from "../im/XtworkImService.ts";
 +import {
@@ -222,6 +347,7 @@ index 605f56f0..fadb4741 100644
 +import { PI_INSTANCE_ID } from "../xtwork/bundledPiSettings.ts";
 +import {
 +  buildCodingAgentDelegationInstructions,
++  checkExternalDelegationAncestry,
 +  resolveCodingAgentDisplayName,
 +  validateDelegationWorkspace,
 +} from "../xtwork/codingAgentDelegation.ts";
@@ -234,7 +360,7 @@ index 605f56f0..fadb4741 100644
    PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
    latestProviderTurnForAttempt,
    type OrchestrationV2DomainEvent,
-@@ -244,6 +256,10 @@ export const layer: Layer.Layer<
+@@ -244,6 +257,10 @@ export const layer: Layer.Layer<
      const fileSystem = yield* FileSystem.FileSystem;
      const path = yield* Path.Path;
      const projects = yield* ProjectService.ProjectService;
@@ -245,13 +371,15 @@ index 605f56f0..fadb4741 100644
      const providerAuth = yield* ProviderAuthService.ProviderAuthService;
      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
      const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
-@@ -975,6 +991,68 @@ export const layer: Layer.Layer<
+@@ -975,6 +992,86 @@ export const layer: Layer.Layer<
          restartCancelledWork.length === 0
            ? ""
            : restartCancelledBackgroundWorkNote(restartCancelledWork);
 +      const codingAgentInstructions = yield* Effect.gen(function* () {
++        const turnCodingAgentOverride = providerMessage.context?.codingAgentOverride;
 +        if (
 +          run.modelSelection.instanceId !== PI_INSTANCE_ID ||
++          turnCodingAgentOverride === "builtin_once" ||
 +          goalCommand ||
 +          isCompactionCommandMessage(providerMessage) ||
 +          providerMessage.text.trimStart().startsWith("/") ||
@@ -263,6 +391,21 @@ index 605f56f0..fadb4741 100644
 +          Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
 +        );
 +        if (settings.codingAgent.mode !== "provider") {
++          return "";
++        }
++        const ancestryGuard = yield* checkExternalDelegationAncestry({
++          threadId: projection.thread.id,
++          initialLineage: projection.thread.lineage,
++          isProtectedThread: (tid) =>
++            (tid === projection.thread.id && xtworkPolicy.protected) ||
++            isProtectedXtworkThread(tid),
++          loadThreadLineage: (tid) =>
++            projectionStore.getThreadShell(tid).pipe(
++              Effect.map((shell) => shell?.lineage ?? null),
++              Effect.catchCause(() => Effect.succeed(null)),
++            ),
++        });
++        if (ancestryGuard.blocked) {
 +          return "";
 +        }
 +        const project = yield* projects
@@ -301,6 +444,7 @@ index 605f56f0..fadb4741 100644
 +        return buildCodingAgentDelegationInstructions({
 +          codingAgent: settings.codingAgent,
 +          callerInstanceId: run.modelSelection.instanceId,
++          codingAgentOverride: turnCodingAgentOverride,
 +          threadId: projection.thread.id,
 +          isProtectedThread:
 +            xtworkPolicy.protected || isProtectedXtworkThread(projection.thread.id),
@@ -314,7 +458,7 @@ index 605f56f0..fadb4741 100644
        const tokenCap = yield* handoffTokenCapConfig.pipe(
          Effect.orElseSucceed(() => DEFAULT_HANDOFF_TOKEN_CAP),
        );
-@@ -1932,7 +2010,12 @@ export const layer: Layer.Layer<
+@@ -1932,7 +2029,12 @@ export const layer: Layer.Layer<
              sideChatHandoff === undefined || compact || goalCommand
                ? ""
                : sideChatHandoff.summaryText;
@@ -328,7 +472,7 @@ index 605f56f0..fadb4741 100644
              .filter((part) => part !== "")
              .join("\n\n");
            const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
-@@ -2024,6 +2107,7 @@ export const layer: Layer.Layer<
+@@ -2024,6 +2126,7 @@ export const layer: Layer.Layer<
          retryHandoff.attachments.length === 0 &&
          sideChatHandoff === undefined &&
          restartNote === "" &&
@@ -361,6 +505,77 @@ index 30fa1fc3..7b5aec0d 100644
      Effect.mapError(
        (cause) =>
          new ServerSettingsError({
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index b984a694..3e68135e 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -71,6 +71,7 @@ import {
+   AuthPreviewOperateScope,
+   AuthTerminalOperateScope,
+   type AssistantCitation,
++  type CodingAgentTurnOverride,
+   type ResponseContextRecord,
+   type ChatFileAttachment,
+   isProviderNativeSubagentThread,
+@@ -1941,7 +1942,10 @@ export default function ChatView(props: ChatViewProps) {
+     scheduleComposerFocusStable();
+   };
+   const insertArtifactTemplateStable = useStableCallback(insertArtifactTemplate);
+-  const sendAppMessage = async (text: string) => {
++  const sendAppMessage = async (
++    text: string,
++    options?: { readonly codingAgentOverride?: CodingAgentTurnOverride },
++  ) => {
+     if (!isServerThread || activeThreadId === null) {
+       throw new Error(gt("Messages from apps need a started thread."));
+     }
+@@ -1949,7 +1953,21 @@ export default function ChatView(props: ChatViewProps) {
+       environmentId,
+       input: {
+         threadId: activeThreadId,
+-        message: { messageId: newMessageId(), role: "user", text, attachments: [] },
++        message: {
++          messageId: newMessageId(),
++          role: "user",
++          text,
++          attachments: [],
++          ...(options?.codingAgentOverride === undefined
++            ? {}
++            : {
++                context: {
++                  version: 1 as const,
++                  codingAgentOverride: options.codingAgentOverride,
++                  records: [],
++                },
++              }),
++        },
+         runtimeMode,
+         interactionMode: DEFAULT_INTERACTION_MODE,
+         dispatchMode: "queue",
+diff --git a/apps/web/src/components/chat/MessagesTimeline.tsx b/apps/web/src/components/chat/MessagesTimeline.tsx
+index c730075b..43c072f1 100644
+--- a/apps/web/src/components/chat/MessagesTimeline.tsx
++++ b/apps/web/src/components/chat/MessagesTimeline.tsx
+@@ -13,6 +13,7 @@ import type { WorktreeSetupSnapshot } from "@t3tools/contracts";
+ import { deriveTimelineMinimapItems } from "./timelineMinimapItems";
+ import {
+   type AssistantCitation,
++  type CodingAgentTurnOverride,
+   type EnvironmentId,
+   type MessageId,
+   type OrchestrationV2TurnItem,
+@@ -294,7 +295,10 @@ interface MessagesTimelineProps {
+   availableRevertTurnCounts?: ReadonlySet<number> | undefined;
+   onRevertToTurnCount: (targetTurnCount: number, messageId: MessageId) => void;
+   onUseArtifactTemplate?: (template: CodexArtifactTemplate) => void;
+-  onSendAppMessage?: (text: string) => Promise<void>;
++  onSendAppMessage?: (
++    text: string,
++    options?: { readonly codingAgentOverride?: CodingAgentTurnOverride },
++  ) => Promise<void>;
+   onRunShellCommand?: (command: string) => void;
+   isRevertingCheckpoint: boolean;
+   onImageExpand: (preview: ExpandedImagePreview) => void;
 diff --git a/apps/web/src/components/chat/TimelineWorkEntryRow.tsx b/apps/web/src/components/chat/TimelineWorkEntryRow.tsx
 index 82121c37..c6f3fdb1 100644
 --- a/apps/web/src/components/chat/TimelineWorkEntryRow.tsx
@@ -396,6 +611,31 @@ index 82121c37..c6f3fdb1 100644
    const childThreadId =
      item?.type === "notification" ? notificationChildThreadId(item.source) : undefined;
    if (item?.type !== "notification" || childThreadId === undefined) {
+diff --git a/apps/web/src/components/chat/timelineRowContext.ts b/apps/web/src/components/chat/timelineRowContext.ts
+index 6a298fd6..05b503cf 100644
+--- a/apps/web/src/components/chat/timelineRowContext.ts
++++ b/apps/web/src/components/chat/timelineRowContext.ts
+@@ -1,5 +1,6 @@
+ import type { ToolCallDiffTarget } from "../../diffPanelStore";
+ import type {
++  CodingAgentTurnOverride,
+   ProviderApprovalDecision,
+   ResponseContextRecord,
+   RuntimeRequestId,
+@@ -65,7 +66,12 @@ export interface TimelineRowSharedState {
+   activeThreadEnvironmentId: EnvironmentId;
+   onRevertToTurnCount: (targetTurnCount: number, messageId: MessageId) => void;
+   onUseArtifactTemplate: (template: CodexArtifactTemplate) => void;
+-  onSendAppMessage: ((text: string) => Promise<void>) | undefined;
++  onSendAppMessage:
++    | ((
++        text: string,
++        options?: { readonly codingAgentOverride?: CodingAgentTurnOverride },
++      ) => Promise<void>)
++    | undefined;
+   onAppFullscreenChange: (rowId: string, fullscreen: boolean) => void;
+   onRunShellCommand: ((command: string) => void) | undefined;
+   findActive: boolean;
 diff --git a/apps/web/src/components/settings/ProviderSettingsPanel.tsx b/apps/web/src/components/settings/ProviderSettingsPanel.tsx
 index 501d05d7..fe6007e4 100644
 --- a/apps/web/src/components/settings/ProviderSettingsPanel.tsx
@@ -465,8 +705,27 @@ index 1384922a..53ff48a5 100644
    {
      id: "providers",
      title: msg("Providers"),
+diff --git a/packages/contracts/src/composerContext.ts b/packages/contracts/src/composerContext.ts
+index 9884284b..82af5fcd 100644
+--- a/packages/contracts/src/composerContext.ts
++++ b/packages/contracts/src/composerContext.ts
+@@ -311,10 +311,14 @@ export const GuestMessageAttribution = Schema.Struct({
+ });
+ export type GuestMessageAttribution = typeof GuestMessageAttribution.Type;
+ 
++export const CodingAgentTurnOverride = Schema.Literals(["builtin_once"]);
++export type CodingAgentTurnOverride = typeof CodingAgentTurnOverride.Type;
++
+ /** Structured context riding on a user message. Undecodable records are dropped, not fatal. */
+ export const OrchestrationMessageContext = Schema.Struct({
+   version: Schema.Literal(1),
+   guest: Schema.optional(GuestMessageAttribution),
++  codingAgentOverride: Schema.optional(CodingAgentTurnOverride),
+   records: Schema.Array(Schema.Unknown)
+     .check(
+       Schema.isMaxLength(COMPOSER_CONTEXT_MAX_RECORDS),
 diff --git a/packages/contracts/src/orchestratorMcp.ts b/packages/contracts/src/orchestratorMcp.ts
-index d7c60774..d1b2dd3a 100644
+index d7c60774..eb3c0cdd 100644
 --- a/packages/contracts/src/orchestratorMcp.ts
 +++ b/packages/contracts/src/orchestratorMcp.ts
 @@ -940,6 +940,16 @@ export const OrchestratorMcpDeleteScheduledTaskResult = Schema.Struct({
@@ -486,11 +745,12 @@ index d7c60774..d1b2dd3a 100644
  export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFailure>()(
    "OrchestratorMcpFailure",
    {
-@@ -960,7 +970,15 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
+@@ -960,7 +970,16 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
        "orchestration_error",
        "thread_credential_required",
        "target_required",
 +      "coding_agent_unavailable",
++      "coding_agent_builtin_once",
 +      "delegation_denied_in_im",
      ]),
      message: Schema.String,

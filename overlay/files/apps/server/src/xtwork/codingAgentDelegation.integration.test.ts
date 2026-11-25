@@ -17,6 +17,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  type CodingAgentTurnOverride,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2Subagent,
@@ -26,6 +27,7 @@ import {
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as AcpRegistrySupport from "@t3tools/provider-acp-registry/server/AcpRegistrySupport";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -35,6 +37,10 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import { McpSchema, McpServer } from "effect/ai";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import * as ServerConfig from "../config.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
@@ -73,10 +79,35 @@ import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts"
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { PI_DRIVER, PI_INSTANCE_ID } from "./bundledPiSettings.ts";
 import {
+  CODING_AGENT_BUILTIN_ONCE_CODE,
   CODING_AGENT_UNAVAILABLE_CODE,
   IM_DELEGATION_DENIED_CODE,
+  assessCodingAgentReadiness,
 } from "./codingAgentDelegation.ts";
 import { KIMI_CODE_INSTANCE_ID } from "./codingAgentSeed.ts";
+import {
+  InstallConsentStore,
+  XtworkInstallConsent,
+  acpConsentGateLayer,
+  makeXtworkInstallConsentService,
+} from "./installConsent.ts";
+
+const STRUCTURED_BRIEF_EN = [
+  "1. Goal & Acceptance Criteria: Fix the auth test failure and ensure unit tests pass.",
+  "2. Constraints & Scope: Only edit auth module files; do not touch database migrations.",
+  "3. File/Attachment Paths: apps/server/src/auth.ts, apps/server/src/auth.test.ts",
+  "4. Privacy/Secret Redaction: Exclude unrelated chat history and secrets.",
+  "5. Verification Summary: Report edited files and test output.",
+].join("\n");
+
+const STRUCTURED_BRIEF_ZH = [
+  "## 目标与验收标准",
+  "在当前 scratch 目录创建 script.py 并验证运行输出正确。",
+  "## 约束与范围",
+  "仅修改 scratch 目录下的脚本，不修改其他项目文件。",
+  "## 相关文件路径",
+  "script.py",
+].join("\n");
 
 const claudeId = ProviderInstanceId.make("claudeAgent");
 const codexId = ProviderInstanceId.make("codex");
@@ -307,7 +338,7 @@ describe("M1c-Gate 2 integration: deterministic routing, workspace contract, can
         yield* Effect.gen(function* () {
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
           const result = yield* service.delegateTask(makeScope(), {
-            task: "Fix auth test failure",
+            task: STRUCTURED_BRIEF_EN,
             target: { providerInstanceId: codexId, model: "gpt-5.4" },
             mode: "async",
             clientRequestId: "m1c-routed-1",
@@ -720,7 +751,7 @@ describe("M1c-Gate 2 integration: deterministic routing, workspace contract, can
           // 1. isolation: "worktree" on scratch/ is cleanly refused WITHOUT calling git!
           const scratchWorktreeErr = yield* mcp
             .delegateTask(makeScope(), {
-              task: "Write script.py",
+              task: STRUCTURED_BRIEF_ZH,
               isolation: "worktree",
               mode: "async",
               clientRequestId: "scratch-worktree-refuse",
@@ -733,7 +764,7 @@ describe("M1c-Gate 2 integration: deterministic routing, workspace contract, can
 
           // 2. isolation: "shared" on scratch/ first-message delegation succeeds cleanly!
           const sharedDelegation = yield* mcp.delegateTask(makeScope(), {
-            task: "Write script.py in the current scratch folder",
+            task: STRUCTURED_BRIEF_ZH,
             isolation: "shared",
             mode: "async",
             clientRequestId: "scratch-shared-ok",
@@ -760,7 +791,7 @@ describe("M1c-Gate 2 integration: deterministic routing, workspace contract, can
           // 4. Non-Git folder also cleanly refuses isolation: "worktree" with shared guidance!
           const nonGitWorktreeErr = yield* mcp
             .delegateTask(makeScope({ threadId: nonGitThreadId }), {
-              task: "Edit README.md",
+              task: STRUCTURED_BRIEF_EN,
               isolation: "worktree",
               mode: "async",
               clientRequestId: "non-git-worktree-refuse",
@@ -870,7 +901,7 @@ describe("M1c-Gate 2 integration: deterministic routing, workspace contract, can
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
           const waiting = yield* service
             .delegateTask(makeScope(), {
-              task: "Run tests requiring command approval",
+              task: STRUCTURED_BRIEF_EN,
               mode: "wait",
               clientRequestId: "m1c-approval-wait",
             })
@@ -980,7 +1011,7 @@ describe("M1c-Gate 2 integration: deterministic routing, workspace contract, can
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
           const waiting = yield* service
             .delegateTask(makeScope(), {
-              task: "Refactor flaky component",
+              task: STRUCTURED_BRIEF_EN,
               mode: "wait",
               clientRequestId: "m1c-crash-wait",
             })
@@ -1364,6 +1395,1087 @@ describe("M1c-Gate 2 integration: deterministic routing, workspace contract, can
         });
         expect(imTurn).toHaveLength(1);
         expect(imTurn[0]).not.toContain("<coding_agent_delegation>");
+      }),
+  );
+
+  it.effect(
+    "blocks remote delegation bypass when xtworkPi has a configured local Coding Agent (ready or unready)",
+    () =>
+      Effect.gen(function* () {
+        const remoteEnvId = EnvironmentId.make("env:remote-vps");
+        const readyPi = makeProvider(PI_INSTANCE_ID, "pi", "xtwork/standard", {
+          displayName: "小瞳",
+        });
+        const readyCodex = makeProvider(codexId, "codex", "gpt-5.4", { displayName: "Codex" });
+        const readyClaude = makeProvider(claudeId, "claudeAgent", "claude-sonnet-4-6", {
+          displayName: "Claude Code",
+        });
+        const uninstalledClaude = makeProvider(claudeId, "claudeAgent", "claude-sonnet-4-6", {
+          displayName: "Claude Code",
+          installed: false,
+          status: "warning",
+        });
+
+        const runRemoteAttempt = (providers: ReadonlyArray<ServerProvider>) =>
+          Effect.gen(function* () {
+            let remoteCalls = 0;
+            const deps = Layer.mergeAll(
+              NodeServices.layer,
+              NodeCrypto.layer,
+              Layer.mock(ThreadManagementService.ThreadManagementService)({
+                getThreadShell: () =>
+                  Effect.succeed({
+                    id: parentThreadId,
+                    lineage: { parentThreadId: null, rootThreadId: parentThreadId },
+                  } as never),
+                getThreadRecords: () => Effect.succeed(makeParentProjection()),
+                getMessagesById: () => Effect.succeed(new Map()),
+              }),
+              ServerSettings.layerTest({
+                codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+              }),
+              Layer.mock(ProviderRegistry.ProviderRegistry)({
+                getProviders: Effect.succeed(providers),
+              }),
+              makeAdapterRegistryLayer([PI_INSTANCE_ID, claudeId, codexId]),
+              Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+              Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+              Layer.mock(ProjectService.ProjectService)({}),
+              Layer.mock(SecretRequests.SecretRequests)({}),
+              Layer.mock(RemoteDelegation.RemoteDelegation)({
+                delegate: () =>
+                  Effect.sync(() => {
+                    remoteCalls += 1;
+                    return { taskId };
+                  }),
+              }),
+              Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+            );
+
+            const error = yield* Effect.gen(function* () {
+              const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+              return yield* service
+                .delegateTask(makeScope(), {
+                  task: STRUCTURED_BRIEF_EN,
+                  target: { environmentId: remoteEnvId, providerInstanceId: codexId },
+                  mode: "async",
+                  clientRequestId: "remote-bypass-attempt",
+                })
+                .pipe(Effect.flip);
+            }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(deps))));
+
+            expect(remoteCalls).toBe(0);
+            return error;
+          });
+
+        const readyErr = yield* runRemoteAttempt([readyPi, readyClaude, readyCodex]);
+        expect(readyErr.code).toBe("invalid_request");
+        expect(readyErr.blocked).toBe(true);
+        expect(readyErr.instanceId).toBe(claudeId);
+        expect(readyErr.message).toContain("Remote environment delegation is blocked");
+
+        const unreadyErr = yield* runRemoteAttempt([readyPi, uninstalledClaude, readyCodex]);
+        expect(unreadyErr.code).toBe(CODING_AGENT_UNAVAILABLE_CODE);
+        expect(unreadyErr.blocked).toBe(true);
+        expect(unreadyErr.reason).toBe("not_installed");
+        expect(unreadyErr.instanceId).toBe(claudeId);
+      }),
+  );
+
+  it.effect(
+    "walks parentThreadId ancestry in BOTH OrchestratorMcpService and ProviderTurnStartService to hard-deny prefixless derived IM/group children",
+    () =>
+      Effect.gen(function* () {
+        const imGroupRoot = ThreadId.make("xtwork-im-group-team-42");
+        const midDerived = ThreadId.make("derived-mid-3141");
+        const leafDerived = ThreadId.make("derived-subagent-9821");
+
+        const shells = new Map<ThreadId, { readonly lineage: { readonly parentThreadId: ThreadId | null; readonly rootThreadId: ThreadId } }>([
+          [leafDerived, { lineage: { parentThreadId: midDerived, rootThreadId: imGroupRoot } }],
+          [midDerived, { lineage: { parentThreadId: imGroupRoot, rootThreadId: imGroupRoot } }],
+          [imGroupRoot, { lineage: { parentThreadId: null, rootThreadId: imGroupRoot } }],
+        ]);
+
+        // 1. OrchestratorMcpService.delegateTask hard-denies prefixless derived child!
+        let dispatchCount = 0;
+        const mcpDeps = Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (tid) => Effect.succeed((shells.get(tid) ?? null) as never),
+            getThreadRecords: (tid) => Effect.succeed(makeParentProjection({ threadId: tid })),
+            dispatch: () =>
+              Effect.sync(() => {
+                dispatchCount += 1;
+                return { sequence: 1, storedEvents: [] } as never;
+              }),
+          }),
+          ServerSettings.layerTest({
+            codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+          }),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([
+              makeProvider(PI_INSTANCE_ID, "pi", "xtwork/standard"),
+              makeProvider(claudeId, "claudeAgent", "claude-sonnet-4-6"),
+            ]),
+          }),
+          makeAdapterRegistryLayer([PI_INSTANCE_ID, claudeId]),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const err = yield* service
+            .delegateTask(makeScope({ threadId: leafDerived }), {
+              task: STRUCTURED_BRIEF_EN,
+              target: { providerInstanceId: claudeId },
+            })
+            .pipe(Effect.flip);
+          expect(err.code).toBe(IM_DELEGATION_DENIED_CODE);
+          expect(err.blocked).toBe(true);
+          expect(dispatchCount).toBe(0);
+        }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(mcpDeps))));
+
+        // 2. ProviderTurnStartService walks parentThreadId ancestry and omits delegation instructions!
+        const sentPrompts = yield* Ref.make<Array<string>>([]);
+        const runId = RunId.make("run:derived-im-child");
+        const attemptId = RunAttemptId.make("attempt:derived-im-child");
+        const rootNodeId = NodeId.make("node:derived-im-child");
+        const providerThreadId = ProviderThreadId.make("pt:derived-im-child");
+        const providerSessionId = ProviderSessionId.make("ps:derived-im-child");
+        const messageId = MessageId.make("msg:derived-im-child");
+        const checkpointScopeId = CheckpointScopeId.make("cp:derived-im-child");
+        const now = DateTime.makeUnsafe("2026-11-25T08:00:00Z");
+
+        const run = {
+          id: runId,
+          threadId: leafDerived,
+          ordinal: 1,
+          status: "starting" as const,
+          rootNodeId,
+          activeAttemptId: attemptId,
+          providerThreadId,
+          providerInstanceId: PI_INSTANCE_ID,
+          userMessageId: messageId,
+          modelSelection: { instanceId: PI_INSTANCE_ID, model: "xtwork/standard" },
+          requestedAt: now,
+          startedAt: null,
+          completedAt: null,
+        };
+        const providerThread = {
+          id: providerThreadId,
+          driver: PI_DRIVER,
+          providerInstanceId: PI_INSTANCE_ID,
+          providerSessionId,
+          appThreadId: leafDerived,
+          ownerNodeId: null,
+          nativeThreadRef: null,
+          status: "not_loaded" as const,
+          firstRunOrdinal: null,
+          lastRunOrdinal: null,
+          handoffIds: [],
+          forkedFrom: null,
+          contextUsage: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+        // Note: intentionally set rootThreadId to null so the test proves parentThreadId multi-hop walk!
+        const projection = {
+          thread: {
+            id: leafDerived,
+            projectId,
+            title: "Derived Subagent",
+            modelSelection: { instanceId: PI_INSTANCE_ID, model: "xtwork/standard" },
+            runtimeMode: "full-access" as const,
+            interactionMode: "default" as const,
+            worktreePath: null,
+            branch: null,
+            activeProviderThreadId: providerThreadId,
+            lineage: {
+              parentThreadId: midDerived,
+              relationshipToParent: "subagent",
+              sideChat: false,
+            },
+          },
+          runs: [run],
+          nodes: [{ id: rootNodeId, runId, checkpointScopeId, status: "starting" }],
+          attempts: [
+            { id: attemptId, runId, providerThreadId, status: "starting", attemptOrdinal: 1 },
+          ],
+          providerThreads: [providerThread],
+          providerSessions: [],
+          providerTurns: [],
+          messages: [
+            {
+              id: messageId,
+              text: "Refactor src/app.ts",
+              attachments: [],
+              createdBy: "user",
+              creationSource: "web",
+            },
+          ],
+          checkpointScopes: [{ id: checkpointScopeId }],
+          contextHandoffs: [],
+          contextTransfers: [],
+          turnItems: [],
+          subagents: [],
+          hasConversation: false,
+        } as unknown as OrchestrationV2ThreadProjection;
+
+        let currentStatus: "starting" | "running" = "starting";
+        const turnStartLayer = ProviderTurnStartService.layer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              NodeServices.layer,
+              NodeCrypto.layer,
+              IdAllocator.layer,
+              Layer.mock(ServerConfig.ServerConfig)({
+                baseDir: "/tmp/xtwork-ancestry-test",
+                worktreesDir: "/tmp/wt",
+              } as never),
+              ServerSettings.layerTest({
+                codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+              }),
+              Layer.mock(EventSink.EventSinkV2)({
+                writeIfRunCurrent: () =>
+                  Effect.sync(() => {
+                    currentStatus = "running";
+                    return { committed: true, sequence: 1, storedEvents: [] } as never;
+                  }),
+                write: () => Effect.succeed({ sequence: 2, storedEvents: [] } as never),
+              }),
+              Layer.mock(ProviderUsageAnalytics.ProviderTurnAnalytics)({
+                runSettled: () => Effect.void,
+              }),
+              Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
+              Layer.mock(GitWorkflow.GitWorkflowService)({}),
+              Layer.mock(ProjectService.ProjectService)({
+                getById: () =>
+                  Effect.succeedSome({
+                    id: projectId,
+                    title: "Repo",
+                    workspaceRoot: "/tmp/repo",
+                  } as unknown as Project),
+              }),
+              Layer.mock(ProviderAuthService.ProviderAuthService)({}),
+              Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                getThreadShell: (tid) =>
+                  Effect.succeed(
+                    (tid === midDerived
+                      ? { lineage: { parentThreadId: imGroupRoot } }
+                      : tid === imGroupRoot
+                        ? { lineage: { parentThreadId: null } }
+                        : null) as never,
+                  ),
+                getThreadRecords: () => Effect.succeed(projection as never),
+                getTurnStartContext: () => Effect.succeed(projection as never),
+                getRuntimeRecoveryProjection: () => Effect.succeed(projection as never),
+                getTurnStartHistory: () => Effect.succeed([]),
+                getRun: () => Effect.sync(() => ({ ...run, status: currentStatus }) as never),
+              }),
+              Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+                open: () =>
+                  Effect.succeed({
+                    driver: PI_DRIVER,
+                    providerSession: {
+                      id: providerSessionId,
+                      capabilities: {
+                        turns: { supportsNativeGoals: false },
+                        threads: { canForkWhileSourceRunning: false },
+                        checkpointing: { providerCanRollbackConversation: false },
+                      },
+                    },
+                    ensureThread: () => Effect.succeed(providerThread),
+                    startTurn: (turnInput: { readonly message: { readonly text: string } }) =>
+                      Ref.update(sentPrompts, (list) => [...list, turnInput.message.text]),
+                  } as never),
+                isLive: () => Effect.succeed(false),
+                get: () => Effect.succeedNone,
+              }),
+              Layer.mock(RunExecutionService.RunExecutionServiceV2)({
+                forkBaseline: () => Effect.succeed(undefined as never),
+                startRootRun: (input) =>
+                  input.session
+                    .startTurn({
+                      appThread: input.appThread,
+                      providerThread: input.providerThread,
+                      message: input.message,
+                      modelSelection: input.modelSelection,
+                      runtimePolicy: input.runtimePolicy,
+                      attemptId: input.attemptId,
+                    } as never)
+                    .pipe(Effect.orDie),
+              }),
+              Layer.mock(RuntimePolicy.RuntimePolicyV2)({
+                resolve: () =>
+                  Effect.succeed({
+                    cwd: "/tmp/repo",
+                    runtimeMode: "full-access",
+                    interactionMode: "default",
+                  } as never),
+              }),
+              Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({
+                allocate: () => Effect.succeed(1),
+              }),
+            ),
+          ),
+        );
+
+        yield* Effect.gen(function* () {
+          const turnStart = yield* ProviderTurnStartService.ProviderTurnStartServiceV2;
+          yield* turnStart.start({ threadId: leafDerived, runId });
+        }).pipe(Effect.provide(turnStartLayer));
+
+        const prompts = yield* Ref.get(sentPrompts);
+        expect(prompts).toHaveLength(1);
+        expect(prompts[0]).not.toContain("<coding_agent_delegation>");
+      }),
+  );
+
+  it.effect(
+    "enforces deterministic server-side one-turn codingAgentOverride: 'builtin_once' in ProviderTurnStartService & OrchestratorMcpService, then resumes provider mode on the next turn without mutating global settings",
+    () =>
+      Effect.gen(function* () {
+        const turn1MsgId = MessageId.make("msg:builtin-once-turn-1");
+        const turn2MsgId = MessageId.make("msg:normal-turn-2");
+        const threadId = ThreadId.make("thread:builtin-once-e2e");
+        const readyPi = makeProvider(PI_INSTANCE_ID, "pi", "xtwork/standard");
+        const readyClaude = makeProvider(claudeId, "claudeAgent", "claude-sonnet-4-6");
+
+        // Part A: ProviderTurnStartService omits <coding_agent_delegation> on Turn 1 (builtin_once),
+        // then resumes injecting <coding_agent_delegation> on Turn 2 (normal turn).
+        const runTurnPrompt = (override?: CodingAgentTurnOverride) =>
+          Effect.gen(function* () {
+            const sentPrompts = yield* Ref.make<Array<string>>([]);
+            const runId = RunId.make(`run:override-${override ?? "none"}`);
+            const attemptId = RunAttemptId.make(`attempt:override-${override ?? "none"}`);
+            const rootNodeId = NodeId.make(`node:override-${override ?? "none"}`);
+            const providerThreadId = ProviderThreadId.make(`pt:override-${override ?? "none"}`);
+            const providerSessionId = ProviderSessionId.make(`ps:override-${override ?? "none"}`);
+            const msgId = override ? turn1MsgId : turn2MsgId;
+            const checkpointScopeId = CheckpointScopeId.make(`cp:override-${override ?? "none"}`);
+            const now = DateTime.makeUnsafe("2026-11-25T08:00:00Z");
+
+            const run = {
+              id: runId,
+              threadId,
+              ordinal: override ? 1 : 2,
+              status: "starting" as const,
+              rootNodeId,
+              activeAttemptId: attemptId,
+              providerThreadId,
+              providerInstanceId: PI_INSTANCE_ID,
+              userMessageId: msgId,
+              modelSelection: { instanceId: PI_INSTANCE_ID, model: "xtwork/standard" },
+              requestedAt: now,
+              startedAt: null,
+              completedAt: null,
+            };
+            const providerThread = {
+              id: providerThreadId,
+              driver: PI_DRIVER,
+              providerInstanceId: PI_INSTANCE_ID,
+              providerSessionId,
+              appThreadId: threadId,
+              ownerNodeId: null,
+              nativeThreadRef: null,
+              status: "not_loaded" as const,
+              firstRunOrdinal: null,
+              lastRunOrdinal: null,
+              handoffIds: [],
+              forkedFrom: null,
+              contextUsage: null,
+              createdAt: now,
+              updatedAt: now,
+            };
+            const projection = {
+              thread: {
+                id: threadId,
+                projectId,
+                title: "Desktop Thread",
+                modelSelection: { instanceId: PI_INSTANCE_ID, model: "xtwork/standard" },
+                runtimeMode: "full-access" as const,
+                interactionMode: "default" as const,
+                worktreePath: null,
+                branch: null,
+                activeProviderThreadId: providerThreadId,
+                lineage: { parentThreadId: null, relationshipToParent: null, sideChat: false },
+              },
+              runs: [run],
+              nodes: [{ id: rootNodeId, runId, checkpointScopeId, status: "starting" }],
+              attempts: [
+                { id: attemptId, runId, providerThreadId, status: "starting", attemptOrdinal: 1 },
+              ],
+              providerThreads: [providerThread],
+              providerSessions: [],
+              providerTurns: [],
+              messages: [
+                {
+                  id: msgId,
+                  text: "Fix src/auth.ts",
+                  attachments: [],
+                  createdBy: "user",
+                  creationSource: "web",
+                  ...(override
+                    ? { context: { version: 1 as const, codingAgentOverride: override, records: [] } }
+                    : {}),
+                },
+              ],
+              checkpointScopes: [{ id: checkpointScopeId }],
+              contextHandoffs: [],
+              contextTransfers: [],
+              turnItems: [],
+              subagents: [],
+              hasConversation: false,
+            } as unknown as OrchestrationV2ThreadProjection;
+
+            let currentStatus: "starting" | "running" = "starting";
+            const settingsLayer = ServerSettings.layerTest({
+              codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+            });
+            const layer = ProviderTurnStartService.layer.pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  NodeServices.layer,
+                  NodeCrypto.layer,
+                  IdAllocator.layer,
+                  Layer.mock(ServerConfig.ServerConfig)({
+                    baseDir: "/tmp/xtwork-override-test",
+                    worktreesDir: "/tmp/wt",
+                  } as never),
+                  settingsLayer,
+                  Layer.mock(EventSink.EventSinkV2)({
+                    writeIfRunCurrent: () =>
+                      Effect.sync(() => {
+                        currentStatus = "running";
+                        return { committed: true, sequence: 1, storedEvents: [] } as never;
+                      }),
+                    write: () => Effect.succeed({ sequence: 2, storedEvents: [] } as never),
+                  }),
+                  Layer.mock(ProviderUsageAnalytics.ProviderTurnAnalytics)({
+                    runSettled: () => Effect.void,
+                  }),
+                  Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
+                  Layer.mock(GitWorkflow.GitWorkflowService)({}),
+                  Layer.mock(ProjectService.ProjectService)({
+                    getById: () =>
+                      Effect.succeedSome({
+                        id: projectId,
+                        title: "Repo",
+                        workspaceRoot: "/tmp/repo",
+                      } as unknown as Project),
+                  }),
+                  Layer.mock(ProviderAuthService.ProviderAuthService)({}),
+                  Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                    getThreadShell: () => Effect.succeed(null),
+                    getThreadRecords: () => Effect.succeed(projection as never),
+                    getTurnStartContext: () => Effect.succeed(projection as never),
+                    getRuntimeRecoveryProjection: () => Effect.succeed(projection as never),
+                    getTurnStartHistory: () => Effect.succeed([]),
+                    getRun: () => Effect.sync(() => ({ ...run, status: currentStatus }) as never),
+                  }),
+                  Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+                    open: () =>
+                      Effect.succeed({
+                        driver: PI_DRIVER,
+                        providerSession: {
+                          id: providerSessionId,
+                          capabilities: {
+                            turns: { supportsNativeGoals: false },
+                            threads: { canForkWhileSourceRunning: false },
+                            checkpointing: { providerCanRollbackConversation: false },
+                          },
+                        },
+                        ensureThread: () => Effect.succeed(providerThread),
+                        startTurn: (turnInput: { readonly message: { readonly text: string } }) =>
+                          Ref.update(sentPrompts, (list) => [...list, turnInput.message.text]),
+                      } as never),
+                    isLive: () => Effect.succeed(false),
+                    get: () => Effect.succeedNone,
+                  }),
+                  Layer.mock(RunExecutionService.RunExecutionServiceV2)({
+                    forkBaseline: () => Effect.succeed(undefined as never),
+                    startRootRun: (input) =>
+                      input.session
+                        .startTurn({
+                          appThread: input.appThread,
+                          providerThread: input.providerThread,
+                          message: input.message,
+                          modelSelection: input.modelSelection,
+                          runtimePolicy: input.runtimePolicy,
+                          attemptId: input.attemptId,
+                        } as never)
+                        .pipe(Effect.orDie),
+                  }),
+                  Layer.mock(RuntimePolicy.RuntimePolicyV2)({
+                    resolve: () =>
+                      Effect.succeed({
+                        cwd: "/tmp/repo",
+                        runtimeMode: "full-access",
+                        interactionMode: "default",
+                      } as never),
+                  }),
+                  Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({
+                    allocate: () => Effect.succeed(1),
+                  }),
+                ),
+              ),
+            );
+
+            yield* Effect.gen(function* () {
+              const turnStart = yield* ProviderTurnStartService.ProviderTurnStartServiceV2;
+              yield* turnStart.start({ threadId, runId });
+            }).pipe(Effect.provide(layer));
+
+            return (yield* Ref.get(sentPrompts))[0] ?? "";
+          });
+
+        const turn1Prompt = yield* runTurnPrompt("builtin_once");
+        expect(turn1Prompt).not.toContain("<coding_agent_delegation>");
+        const turn2Prompt = yield* runTurnPrompt(undefined);
+        expect(turn2Prompt).toContain("<coding_agent_delegation>");
+
+        // Part B: OrchestratorMcpService rejects delegate_task on Turn 1 (builtin_once),
+        // then routes normally to claudeAgent on Turn 2 while global settings.codingAgent stays unchanged!
+        let activeMessageId = turn1MsgId;
+        let dispatchCount = 0;
+        const messagesById = new Map<MessageId, { readonly id: MessageId; readonly context?: { readonly version: 1; readonly codingAgentOverride?: CodingAgentTurnOverride; readonly records: ReadonlyArray<never> } }>([
+          [
+            turn1MsgId,
+            {
+              id: turn1MsgId,
+              context: { version: 1, codingAgentOverride: "builtin_once", records: [] },
+            },
+          ],
+          [turn2MsgId, { id: turn2MsgId }],
+        ]);
+        const taskRecord = {
+          id: taskId,
+          threadId,
+          runId: parentRunId,
+          parentNodeId,
+          origin: "app_owned",
+          providerInstanceId: claudeId,
+          driver: "claudeAgent",
+          childThreadId,
+          model: "claude-sonnet-4-6",
+          status: "running",
+          result: null,
+        };
+        const childProjection = {
+          thread: {
+            id: childThreadId,
+            title: "Child",
+            modelSelection: { instanceId: claudeId, model: "claude-sonnet-4-6" },
+            lineage: { parentThreadId: threadId, relationshipToParent: "subagent" },
+          },
+          runs: [{ id: childRunId, ordinal: 1, status: "running", rootNodeId: childNodeId }],
+          nodes: [{ id: childNodeId, runId: childRunId }],
+          subagents: [],
+          providerThreads: [],
+          providerTurns: [],
+          runtimeRequests: [],
+          contextTransfers: [],
+          messages: [],
+          turnItems: [],
+        } as unknown as OrchestrationV2ThreadProjection;
+
+        const settingsLayer = ServerSettings.layerTest({
+          codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+        });
+        const mcpDeps = Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          settingsLayer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            hasReceipt: () => Effect.succeed(false),
+            isProviderInstanceEnabledForProject: () => Effect.succeed(true),
+            getThreadShell: () =>
+              Effect.succeed({
+                id: threadId,
+                lineage: { parentThreadId: null, rootThreadId: threadId },
+              } as never),
+            getMessagesById: (_tid, ids) =>
+              Effect.sync(() => {
+                const map = new Map<MessageId, unknown>();
+                for (const id of ids) {
+                  const found = messagesById.get(id);
+                  if (found) map.set(id, found);
+                }
+                return map as never;
+              }),
+            getThreadRecords: (tid) =>
+              Effect.sync(() =>
+                tid === threadId
+                  ? ({
+                      ...makeParentProjection({ threadId, subagents: [taskRecord] }),
+                      runs: [
+                        {
+                          id: parentRunId,
+                          ordinal: activeMessageId === turn1MsgId ? 1 : 2,
+                          status: "running",
+                          rootNodeId: parentNodeId,
+                          providerInstanceId: PI_INSTANCE_ID,
+                          userMessageId: activeMessageId,
+                        },
+                      ],
+                    } as unknown as OrchestrationV2ThreadProjection)
+                  : childProjection,
+              ),
+            delegatedTaskResultPending: () => Effect.succeed(false),
+            dispatch: () =>
+              Effect.sync(() => {
+                dispatchCount += 1;
+                return {
+                  sequence: 1,
+                  storedEvents: [{ event: { type: "subagent.updated", payload: taskRecord } }],
+                } as never;
+              }),
+          }),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([readyPi, readyClaude]),
+          }),
+          makeAdapterRegistryLayer([PI_INSTANCE_ID, claudeId]),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const settingsSvc = yield* ServerSettings.ServerSettingsService;
+
+          // Turn 1: builtin_once deterministically blocks delegate_task!
+          const turn1Err = yield* service
+            .delegateTask(makeScope({ threadId }), {
+              task: STRUCTURED_BRIEF_EN,
+              target: { providerInstanceId: claudeId },
+              mode: "async",
+              clientRequestId: "builtin-once-t1",
+            })
+            .pipe(Effect.flip);
+          expect(turn1Err.code).toBe(CODING_AGENT_BUILTIN_ONCE_CODE);
+          expect(turn1Err.blocked).toBe(true);
+          expect(dispatchCount).toBe(0);
+
+          // Global setting was NOT mutated!
+          const currentSettings = yield* settingsSvc.getSettings;
+          expect(currentSettings.codingAgent).toEqual({
+            mode: "provider",
+            instanceId: claudeId,
+            model: "claude-sonnet-4-6",
+          });
+
+          // Turn 2: normal turn resumes deterministic delegation to claudeAgent!
+          activeMessageId = turn2MsgId;
+          const turn2Result = yield* service.delegateTask(makeScope({ threadId }), {
+            task: STRUCTURED_BRIEF_EN,
+            mode: "async",
+            clientRequestId: "builtin-once-t2",
+          });
+          expect(turn2Result.providerInstanceId).toBe(claudeId);
+          expect(dispatchCount).toBe(1);
+        }).pipe(
+          Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provideMerge(mcpDeps))),
+        );
+      }),
+  );
+
+  it.effect(
+    "enforces structured handoff brief sections, real versionAdvisory behind_latest, real InstallConsentStore gate, and real temp Git/non-Git/symlinked scratch workspaces",
+    () =>
+      Effect.gen(function* () {
+        const tmpRoot = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "xtwork-m1c-real-"));
+        try {
+          // 1. Real temp Git repo (valid HEAD), 0-commit unborn Git repo, non-Git folder, and symlinked scratch/!
+          const gitWithHeadDir = NodePath.join(tmpRoot, "git-with-head");
+          const gitUnbornDir = NodePath.join(tmpRoot, "git-unborn");
+          const plainNonGitDir = NodePath.join(tmpRoot, "plain-folder");
+          const realScratchRoot = NodePath.join(tmpRoot, "t3-data", "scratch");
+          const symlinkToScratch = NodePath.join(tmpRoot, "project-link");
+
+          NodeFS.mkdirSync(gitWithHeadDir, { recursive: true });
+          NodeFS.mkdirSync(gitUnbornDir, { recursive: true });
+          NodeFS.mkdirSync(plainNonGitDir, { recursive: true });
+          NodeFS.mkdirSync(realScratchRoot, { recursive: true });
+          NodeFS.symlinkSync(realScratchRoot, symlinkToScratch, "dir");
+
+          NodeChildProcess.execFileSync("git", ["init", "-q"], { cwd: gitWithHeadDir });
+          NodeChildProcess.execFileSync("git", ["config", "user.email", "test@xtwork.local"], {
+            cwd: gitWithHeadDir,
+          });
+          NodeChildProcess.execFileSync("git", ["config", "user.name", "Xtwork Test"], {
+            cwd: gitWithHeadDir,
+          });
+          NodeFS.writeFileSync(NodePath.join(gitWithHeadDir, "README.md"), "hello\n");
+          NodeChildProcess.execFileSync("git", ["add", "README.md"], { cwd: gitWithHeadDir });
+          NodeChildProcess.execFileSync("git", ["commit", "-q", "-m", "init"], {
+            cwd: gitWithHeadDir,
+          });
+          NodeChildProcess.execFileSync("git", ["init", "-q"], { cwd: gitUnbornDir });
+
+          // Real Git rev-parse HEAD runner backing GitVcsDriver.resolveCommit!
+          const realGitResolveCommit = (cwd: string, revision: string) =>
+            Effect.try({
+              try: () => ({
+                commitSha: NodeChildProcess.execFileSync("git", ["rev-parse", "--verify", revision], {
+                  cwd,
+                  encoding: "utf8",
+                  stdio: ["ignore", "pipe", "pipe"],
+                }).trim(),
+              }),
+              catch: (err) =>
+                new GitCommandError({
+                  operation: "rev-parse",
+                  command: `git rev-parse --verify ${revision}`,
+                  cwd,
+                  detail: err instanceof Error ? err.message : String(err),
+                }),
+            });
+
+          const projGitHead = ProjectId.make("project:real-git-head");
+          const projGitUnborn = ProjectId.make("project:real-git-unborn");
+          const projPlain = ProjectId.make("project:real-plain");
+          const projSymlinkScratch = ProjectId.make("project:real-symlink-scratch");
+          const thGitHead = ThreadId.make("thread:real-git-head");
+          const thGitUnborn = ThreadId.make("thread:real-git-unborn");
+          const thPlain = ThreadId.make("thread:real-plain");
+          const thSymlink = ThreadId.make("thread:real-symlink");
+
+          const projectsById = new Map<ProjectId, Project>([
+            [
+              projGitHead,
+              { id: projGitHead, title: "Git Head Repo", workspaceRoot: gitWithHeadDir } as Project,
+            ],
+            [
+              projGitUnborn,
+              {
+                id: projGitUnborn,
+                title: "Git Unborn Repo",
+                workspaceRoot: gitUnbornDir,
+              } as Project,
+            ],
+            [
+              projPlain,
+              { id: projPlain, title: "Plain Non-Git", workspaceRoot: plainNonGitDir } as Project,
+            ],
+            [
+              projSymlinkScratch,
+              {
+                id: projSymlinkScratch,
+                title: "Symlinked Scratch",
+                workspaceRoot: symlinkToScratch,
+              } as Project,
+            ],
+          ]);
+
+          const threadToProject = new Map<ThreadId, ProjectId>([
+            [thGitHead, projGitHead],
+            [thGitUnborn, projGitUnborn],
+            [thPlain, projPlain],
+            [thSymlink, projSymlinkScratch],
+          ]);
+
+          const readyPi = makeProvider(PI_INSTANCE_ID, "pi", "xtwork/standard");
+          const readyClaude = makeProvider(claudeId, "claudeAgent", "claude-sonnet-4-6");
+          let dispatchCount = 0;
+          const makeChildProj = (tid: ThreadId) =>
+            ({
+              thread: {
+                id: childThreadId,
+                title: "Child",
+                modelSelection: { instanceId: claudeId, model: "claude-sonnet-4-6" },
+                lineage: { parentThreadId: tid, relationshipToParent: "subagent" },
+              },
+              runs: [{ id: childRunId, ordinal: 1, status: "running", rootNodeId: childNodeId }],
+              nodes: [{ id: childNodeId, runId: childRunId }],
+              subagents: [],
+              providerThreads: [],
+              providerTurns: [],
+              runtimeRequests: [],
+              contextTransfers: [],
+              messages: [],
+              turnItems: [],
+            }) as unknown as OrchestrationV2ThreadProjection;
+
+          const makeTaskRec = (tid: ThreadId) => ({
+            id: taskId,
+            threadId: tid,
+            runId: parentRunId,
+            parentNodeId,
+            origin: "app_owned",
+            providerInstanceId: claudeId,
+            driver: "claudeAgent",
+            childThreadId,
+            model: "claude-sonnet-4-6",
+            status: "running",
+            result: null,
+          });
+
+          const realFsDeps = Layer.mergeAll(
+            NodeServices.layer,
+            NodeCrypto.layer,
+            ServerSettings.layerTest({
+              codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+            }),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({
+              getProviders: Effect.succeed([readyPi, readyClaude]),
+            }),
+            makeAdapterRegistryLayer([PI_INSTANCE_ID, claudeId]),
+            Layer.mock(ProjectService.ProjectService)({
+              getById: (id) => {
+                const found = projectsById.get(id);
+                return found ? Effect.succeedSome(found) : Effect.succeedNone;
+              },
+            }),
+            Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+              namedProjectsRoot: NodePath.join(tmpRoot, "projects"),
+              scratchRoot: Effect.succeedSome(realScratchRoot),
+              // Intentionally false for symlink project to prove realpathSync canonicalization catches it!
+              isScratchProject: () => Effect.succeed(false),
+            }),
+            Layer.mock(GitVcsDriver.GitVcsDriver)({
+              resolveCommit: ({ cwd, revision }) => realGitResolveCommit(cwd, revision),
+            }),
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              hasReceipt: () => Effect.succeed(false),
+              isProviderInstanceEnabledForProject: () => Effect.succeed(true),
+              getThreadShell: (tid) =>
+                Effect.succeed({
+                  id: tid,
+                  lineage: { parentThreadId: null, rootThreadId: tid },
+                } as never),
+              getMessagesById: () => Effect.succeed(new Map()),
+              getThreadRecords: (tid) =>
+                Effect.sync(() =>
+                  tid === childThreadId
+                    ? makeChildProj(thGitHead)
+                    : makeParentProjection({
+                        threadId: tid,
+                        projectId: threadToProject.get(tid) ?? projGitHead,
+                        subagents: [makeTaskRec(tid)],
+                      }),
+                ),
+              delegatedTaskResultPending: () => Effect.succeed(false),
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  dispatchCount += 1;
+                  const parentTid =
+                    command.type === "delegated_task.request" ? command.parentThreadId : thGitHead;
+                  return {
+                    sequence: dispatchCount,
+                    storedEvents: [{ event: { type: "subagent.updated", payload: makeTaskRec(parentTid) } }],
+                  } as never;
+                }),
+            }),
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          );
+
+          yield* Effect.gen(function* () {
+            const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+
+            // A. Bare free-form brief MUST be rejected server-side with missing sections!
+            const bareErr = yield* mcp
+              .delegateTask(makeScope({ threadId: thGitHead }), {
+                task: "Fix auth test failure",
+                mode: "async",
+                clientRequestId: "brief-bare-reject",
+              })
+              .pipe(Effect.flip);
+            expect(bareErr.code).toBe("invalid_request");
+            expect(bareErr.message).toContain("Goal & Acceptance Criteria");
+            expect(bareErr.message).toContain("Constraints & Scope");
+            expect(bareErr.message).toContain("File/Attachment Paths");
+            expect(dispatchCount).toBe(0);
+
+            // B. Real Git repo WITH commit allows isolation: "worktree"!
+            const validWorktree = yield* mcp.delegateTask(makeScope({ threadId: thGitHead }), {
+              task: STRUCTURED_BRIEF_EN,
+              isolation: "worktree",
+              mode: "async",
+              clientRequestId: "real-git-head-wt",
+            });
+            expect(validWorktree.providerInstanceId).toBe(claudeId);
+            expect(dispatchCount).toBe(1);
+
+            // C. Real 0-commit unborn Git repo refuses isolation: "worktree"!
+            const unbornErr = yield* mcp
+              .delegateTask(makeScope({ threadId: thGitUnborn }), {
+                task: STRUCTURED_BRIEF_EN,
+                isolation: "worktree",
+                mode: "async",
+                clientRequestId: "real-git-unborn-wt",
+              })
+              .pipe(Effect.flip);
+            expect(unbornErr.code).toBe("invalid_request");
+            expect(unbornErr.message).toContain('isolation: "shared"');
+
+            // D. Real non-Git directory refuses isolation: "worktree"!
+            const plainErr = yield* mcp
+              .delegateTask(makeScope({ threadId: thPlain }), {
+                task: STRUCTURED_BRIEF_EN,
+                isolation: "worktree",
+                mode: "async",
+                clientRequestId: "real-plain-wt",
+              })
+              .pipe(Effect.flip);
+            expect(plainErr.code).toBe("invalid_request");
+            expect(plainErr.message).toContain('isolation: "shared"');
+
+            // E. Real symlinked scratch/ workspace refuses isolation: "worktree" even though isScratchProject is false!
+            const symlinkErr = yield* mcp
+              .delegateTask(makeScope({ threadId: thSymlink }), {
+                task: STRUCTURED_BRIEF_EN,
+                isolation: "worktree",
+                mode: "async",
+                clientRequestId: "real-symlink-scratch-wt",
+              })
+              .pipe(Effect.flip);
+            expect(symlinkErr.code).toBe("invalid_request");
+            expect(symlinkErr.message).toContain("scratch/");
+            expect(symlinkErr.message).toContain('isolation: "shared"');
+            expect(dispatchCount).toBe(1);
+          }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(realFsDeps))));
+
+          // 2. Real InstallConsentStore + AcpInstallConsentGate + versionAdvisory behind_latest!
+          const consentBaseDir = NodePath.join(tmpRoot, "consent-home");
+          const consentStore = new InstallConsentStore(consentBaseDir);
+          const consentKey = {
+            instanceId: String(kimiId),
+            source: "acp-registry",
+            version: "1.0.0",
+            distribution: "npx",
+            installDir: NodePath.join(consentBaseDir, "acp", "kimi-code"),
+            artifactSpec: "@kimi/acp@1.0.0",
+          };
+          const consentLayer = acpConsentGateLayer.pipe(
+            Layer.provide(
+              Layer.succeed(XtworkInstallConsent, makeXtworkInstallConsentService(consentBaseDir)),
+            ),
+          );
+
+          // Unconsented -> AcpInstallConsentGate returns false -> provider snapshot is unprepared -> blocked not_installed!
+          const hasConsentBefore = yield* Effect.gen(function* () {
+            const gate = yield* AcpRegistrySupport.AcpInstallConsentGate;
+            return yield* gate.hasConsent(consentKey);
+          }).pipe(Effect.provide(consentLayer));
+          expect(hasConsentBefore).toBe(false);
+
+          const unconsentedProvider = makeProvider(kimiId, "acpRegistry", "default", {
+            displayName: "Kimi Code",
+            installed: hasConsentBefore,
+            status: hasConsentBefore ? "ready" : "warning",
+            message: "ACP Registry agent 'kimi-code' has not been installed on this environment.",
+          });
+          const unconsentedReadiness = assessCodingAgentReadiness({
+            instanceId: kimiId,
+            providers: [unconsentedProvider],
+          });
+          expect(unconsentedReadiness.ready).toBe(false);
+          if (!unconsentedReadiness.ready) {
+            expect(unconsentedReadiness.blocked.reason).toBe("not_installed");
+            expect(unconsentedReadiness.blocked.canInstall).toBe(true);
+          }
+
+          // Grant consent for v1.0.0, then check v2.0.0 -> AcpInstallConsentGate rejects v2.0.0 -> update_required!
+          consentStore.grantConsent(consentKey);
+          const hasV1Consent = yield* Effect.gen(function* () {
+            const gate = yield* AcpRegistrySupport.AcpInstallConsentGate;
+            return yield* gate.hasConsent(consentKey);
+          }).pipe(Effect.provide(consentLayer));
+          const hasV2Consent = yield* Effect.gen(function* () {
+            const gate = yield* AcpRegistrySupport.AcpInstallConsentGate;
+            return yield* gate.hasConsent({
+              ...consentKey,
+              version: "2.0.0",
+              artifactSpec: "@kimi/acp@2.0.0",
+            });
+          }).pipe(Effect.provide(consentLayer));
+          expect(hasV1Consent).toBe(true);
+          expect(hasV2Consent).toBe(false);
+
+          // Provider with versionAdvisory.status === "behind_latest" blocks delegate_task with update_required BEFORE dispatch!
+          const behindClaude = makeProvider(claudeId, "claudeAgent", "claude-sonnet-4-6", {
+            displayName: "Claude Code",
+            installed: true,
+            status: "ready",
+            version: "1.0.0",
+            versionAdvisory: {
+              status: "behind_latest",
+              currentVersion: "1.0.0",
+              latestVersion: "2.0.0",
+              updateCommand: null,
+              canUpdate: true,
+              canInstallVersion: true,
+              checkedAt: "2026-11-25T00:00:00.000Z",
+              message: "Claude Code v2.0.0 update is available.",
+            },
+          });
+          let behindDispatchCount = 0;
+          const behindDeps = Layer.mergeAll(
+            NodeServices.layer,
+            NodeCrypto.layer,
+            ServerSettings.layerTest({
+              codingAgent: { mode: "provider", instanceId: claudeId, model: "claude-sonnet-4-6" },
+            }),
+            Layer.mock(ProviderRegistry.ProviderRegistry)({
+              getProviders: Effect.succeed([readyPi, behindClaude]),
+            }),
+            makeAdapterRegistryLayer([PI_INSTANCE_ID, claudeId]),
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              hasReceipt: () => Effect.succeed(false),
+              isProviderInstanceEnabledForProject: () => Effect.succeed(true),
+              getThreadShell: () =>
+                Effect.succeed({
+                  id: parentThreadId,
+                  lineage: { parentThreadId: null, rootThreadId: parentThreadId },
+                } as never),
+              getMessagesById: () => Effect.succeed(new Map()),
+              getThreadRecords: () => Effect.succeed(makeParentProjection()),
+              dispatch: () =>
+                Effect.sync(() => {
+                  behindDispatchCount += 1;
+                  return { sequence: 1, storedEvents: [] } as never;
+                }),
+            }),
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+            Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+            Layer.mock(ProjectService.ProjectService)({}),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          );
+
+          yield* Effect.gen(function* () {
+            const mcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+            const err = yield* mcp
+              .delegateTask(makeScope(), {
+                task: STRUCTURED_BRIEF_EN,
+                mode: "async",
+                clientRequestId: "version-advisory-behind",
+              })
+              .pipe(Effect.flip);
+            expect(err.code).toBe(CODING_AGENT_UNAVAILABLE_CODE);
+            expect(err.blocked).toBe(true);
+            expect(err.reason).toBe("update_required");
+            expect(err.canInstall).toBe(true);
+            expect(err.message).toContain("2.0.0");
+            expect(behindDispatchCount).toBe(0);
+          }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(behindDeps))));
+        } finally {
+          NodeFS.rmSync(tmpRoot, { recursive: true, force: true });
+        }
       }),
   );
 });

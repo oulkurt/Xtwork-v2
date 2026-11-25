@@ -1,26 +1,36 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import {
   CodingAgentSetting,
   DEFAULT_CODING_AGENT_SETTING,
   DEFAULT_SERVER_SETTINGS,
+  OrchestrationMessageContext,
   ProviderDriverKind,
   ProviderInstanceId,
   ServerSettings,
   ServerSettingsPatch,
+  ThreadId,
   type ServerProvider,
 } from "@t3tools/contracts";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
+import { describe, expect, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { describe, expect, it } from "vite-plus/test";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import { desktopContext, type TurnExecutionContext } from "../im/XtworkImSecurity.ts";
 import { PI_INSTANCE_ID } from "./bundledPiSettings.ts";
 import {
+  CODING_AGENT_BUILTIN_ONCE_CODE,
   CODING_AGENT_UNAVAILABLE_CODE,
   IM_DELEGATION_DENIED_CODE,
   assessCodingAgentReadiness,
   buildCodingAgentDelegationInstructions,
+  checkExternalDelegationAncestry,
   isExternalDelegationBlockedForThread,
   normalizeCodingAgentSetting,
   resolveCodingAgentTarget,
+  validateCodingAgentHandoffBrief,
   validateDelegationWorkspace,
 } from "./codingAgentDelegation.ts";
 import { KIMI_CODE_INSTANCE_ID } from "./codingAgentSeed.ts";
@@ -30,6 +40,7 @@ const codexId = ProviderInstanceId.make("codex");
 const kimiId = KIMI_CODE_INSTANCE_ID;
 const decodeServerSettings = Schema.decodeSync(ServerSettings);
 const decodeCodingAgentSetting = Schema.decodeUnknownSync(CodingAgentSetting);
+const decodeMessageContext = Schema.decodeUnknownSync(OrchestrationMessageContext);
 
 function makeProvider(
   instanceId: ProviderInstanceId,
@@ -469,5 +480,233 @@ describe("buildCodingAgentDelegationInstructions (ADR-012 §5.3)", () => {
         isProtectedThread: true,
       }),
     ).toBe("");
+
+    expect(
+      buildCodingAgentDelegationInstructions({
+        codingAgent: { mode: "provider", instanceId: claudeId },
+        callerInstanceId: PI_INSTANCE_ID,
+        codingAgentOverride: "builtin_once",
+        threadId: "thread:desktop-1",
+      }),
+    ).toBe("");
+  });
+});
+
+describe("Sol Round 1 regression guards", () => {
+  it("blocks remote environment targets when xtworkPi has a configured local Coding Agent", () => {
+    const readyClaude = makeProvider(claudeId, "claudeAgent", { displayName: "Claude Code" });
+    const readyCodex = makeProvider(codexId, "codex", { displayName: "Codex" });
+
+    const remoteWhenReady = resolveCodingAgentTarget({
+      codingAgent: { mode: "provider", instanceId: claudeId },
+      callerInstanceId: PI_INSTANCE_ID,
+      isRemoteEnvironmentTarget: true,
+      requestedTarget: {
+        environmentId: "env:remote-box" as never,
+        providerInstanceId: codexId,
+      },
+      providers: [readyClaude, readyCodex],
+    });
+    expect(remoteWhenReady.kind).toBe("remote_blocked");
+    if (remoteWhenReady.kind === "remote_blocked") {
+      expect(remoteWhenReady.result.blocked).toBe(true);
+      expect(remoteWhenReady.result.instanceId).toBe(claudeId);
+      expect(remoteWhenReady.result.message).toContain("Remote environment delegation is blocked");
+    }
+
+    const uninstalledClaude = makeProvider(claudeId, "claudeAgent", {
+      displayName: "Claude Code",
+      installed: false,
+      status: "warning",
+    });
+    const remoteWhenUninstalled = resolveCodingAgentTarget({
+      codingAgent: { mode: "provider", instanceId: claudeId },
+      callerInstanceId: PI_INSTANCE_ID,
+      isRemoteEnvironmentTarget: true,
+      requestedTarget: {
+        environmentId: "env:remote-box" as never,
+        providerInstanceId: codexId,
+      },
+      providers: [uninstalledClaude, readyCodex],
+    });
+    expect(remoteWhenUninstalled.kind).toBe("blocked");
+    if (remoteWhenUninstalled.kind === "blocked") {
+      expect(remoteWhenUninstalled.result.code).toBe(CODING_AGENT_UNAVAILABLE_CODE);
+      expect(remoteWhenUninstalled.result.reason).toBe("not_installed");
+    }
+  });
+
+  it("blocks delegation deterministically when codingAgentOverride === 'builtin_once' and round-trips context schema", () => {
+    const ctx = decodeMessageContext({
+      version: 1,
+      codingAgentOverride: "builtin_once",
+      records: [],
+    });
+    expect(ctx.codingAgentOverride).toBe("builtin_once");
+
+    const resolved = resolveCodingAgentTarget({
+      codingAgent: { mode: "provider", instanceId: claudeId },
+      callerInstanceId: PI_INSTANCE_ID,
+      codingAgentOverride: "builtin_once",
+      requestedTarget: { providerInstanceId: claudeId },
+      providers: [makeProvider(claudeId, "claudeAgent")],
+    });
+    expect(resolved.kind).toBe("builtin_once");
+    if (resolved.kind === "builtin_once") {
+      expect(resolved.result.code).toBe(CODING_AGENT_BUILTIN_ONCE_CODE);
+      expect(resolved.result.blocked).toBe(true);
+    }
+  });
+
+  it.effect(
+    "walks parentThreadId ancestry with cycle protection for prefixless derived IM/group children",
+    () =>
+      Effect.gen(function* () {
+        const derivedChild = ThreadId.make("derived-subagent-9821");
+        const middleThread = ThreadId.make("derived-mid-5510");
+        const imRoot = ThreadId.make("xtwork-im-group-team-1");
+        const cycleA = ThreadId.make("desktop-cycle-a");
+        const cycleB = ThreadId.make("desktop-cycle-b");
+
+        const parents = new Map<ThreadId, ThreadId | null>([
+          [derivedChild, middleThread],
+          [middleThread, imRoot],
+          [imRoot, null],
+          [cycleA, cycleB],
+          [cycleB, cycleA],
+        ]);
+
+        const derivedCheck = yield* checkExternalDelegationAncestry({
+          threadId: derivedChild,
+          isProtectedThread: () => false,
+          loadThreadLineage: (tid) => Effect.succeed({ parentThreadId: parents.get(tid) ?? null }),
+        });
+        expect(derivedCheck).toMatchObject({
+          blocked: true,
+          code: IM_DELEGATION_DENIED_CODE,
+          blockedAncestorThreadId: imRoot,
+        });
+
+        const cycleCheck = yield* checkExternalDelegationAncestry({
+          threadId: cycleA,
+          isProtectedThread: () => false,
+          loadThreadLineage: (tid) => Effect.succeed({ parentThreadId: parents.get(tid) ?? null }),
+        });
+        expect(cycleCheck).toEqual({ blocked: false });
+      }),
+  );
+
+  it("canonicalizes symlinked scratch/ paths via realpathSync and refuses isolation: 'worktree'", () => {
+    const tmpRoot = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "xtwork-symlink-scratch-"));
+    try {
+      const scratchRoot = NodePath.join(tmpRoot, "t3", "scratch");
+      const scratchSession = NodePath.join(scratchRoot, "2026-11-25-session");
+      NodeFS.mkdirSync(scratchSession, { recursive: true });
+      const symlinkPath = NodePath.join(tmpRoot, "project-link");
+      NodeFS.symlinkSync(scratchRoot, symlinkPath, "dir");
+
+      const directSymlink = validateDelegationWorkspace({
+        isolation: "worktree",
+        projectWorkspaceRoot: symlinkPath,
+        parentWorktreePath: null,
+        isScratchProject: false,
+        scratchRoot,
+        hasValidGitHead: true,
+      });
+      expect(directSymlink.allowed).toBe(false);
+      if (!directSymlink.allowed) {
+        expect(directSymlink.reason).toBe("scratch_worktree_unsupported");
+        expect(directSymlink.isScratch).toBe(true);
+      }
+
+      // Non-existent descendant through symlink still canonicalizes via nearest existing ancestor.
+      const nonExistentThroughSymlink = validateDelegationWorkspace({
+        isolation: "worktree",
+        projectWorkspaceRoot: NodePath.join(symlinkPath, "future-sub-session"),
+        parentWorktreePath: null,
+        isScratchProject: false,
+        scratchRoot,
+        hasValidGitHead: true,
+      });
+      expect(nonExistentThroughSymlink.allowed).toBe(false);
+      if (!nonExistentThroughSymlink.allowed) {
+        expect(nonExistentThroughSymlink.reason).toBe("scratch_worktree_unsupported");
+      }
+    } finally {
+      NodeFS.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks provider with versionAdvisory.status === 'behind_latest' as update_required before dispatch", () => {
+    const behindProvider = makeProvider(claudeId, "claudeAgent", {
+      displayName: "Claude Code",
+      installed: true,
+      status: "ready",
+      version: "1.0.0",
+      versionAdvisory: {
+        status: "behind_latest",
+        currentVersion: "1.0.0",
+        latestVersion: "2.0.0",
+        updateCommand: "npm install -g @anthropic-ai/claude-code@latest",
+        canUpdate: true,
+        canInstallVersion: true,
+        checkedAt: "2026-11-25T00:00:00.000Z",
+        message: "Claude Code 2.0.0 is available.",
+      },
+    });
+    const readiness = assessCodingAgentReadiness({
+      instanceId: claudeId,
+      providers: [behindProvider],
+    });
+    expect(readiness.ready).toBe(false);
+    if (!readiness.ready) {
+      expect(readiness.blocked.code).toBe(CODING_AGENT_UNAVAILABLE_CODE);
+      expect(readiness.blocked.reason).toBe("update_required");
+      expect(readiness.blocked.canInstall).toBe(true);
+      expect(readiness.blocked.message).toContain("2.0.0");
+    }
+  });
+
+  it("enforces ADR-012 §5.3 structured handoff brief sections (EN & ZH) and rejects bare free-form tasks", () => {
+    const bare = validateCodingAgentHandoffBrief("Fix auth test failure");
+    expect(bare.valid).toBe(false);
+    if (!bare.valid) {
+      expect(bare.missingSections).toEqual(["goal", "constraints", "files"]);
+    }
+
+    // Prose casually mentioning keywords without section headers/labels must still fail.
+    const proseOnly = validateCodingAgentHandoffBrief(
+      "Please fix the file in scope so we reach our goal quickly.",
+    );
+    expect(proseOnly.valid).toBe(false);
+
+    const partial = validateCodingAgentHandoffBrief(
+      "1. Goal & Acceptance Criteria: Fix auth test.\n2. Constraints & Scope: Touch auth only.",
+    );
+    expect(partial.valid).toBe(false);
+    if (!partial.valid) {
+      expect(partial.missingSections).toEqual(["files"]);
+    }
+
+    const validEn = validateCodingAgentHandoffBrief(
+      [
+        "1. Goal & Acceptance Criteria: Fix auth test failure and pass pnpm test.",
+        "2. Constraints & Scope: Only edit auth.ts; keep migrations untouched.",
+        "3. File/Attachment Paths: apps/server/src/auth.ts, apps/server/src/auth.test.ts",
+      ].join("\n"),
+    );
+    expect(validEn).toEqual({ valid: true });
+
+    const validZh = validateCodingAgentHandoffBrief(
+      [
+        "## 目标与验收标准",
+        "修复认证单测失败并确保测试通过。",
+        "## 约束与范围",
+        "仅修改认证相关代码，不改动数据库迁移。",
+        "## 相关文件路径",
+        "apps/server/src/auth.ts",
+      ].join("\n"),
+    );
+    expect(validZh).toEqual({ valid: true });
   });
 });
