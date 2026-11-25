@@ -25,6 +25,7 @@
 | [ADR-010](doc/decisions/010-plugin-v2-runtime.md) | 插件 v2 采用单一目录与功能/外观双轨运行时，功能视图复用 `AppRouteModal`。 | Confirmed |
 | [ADR-011](doc/decisions/011-mingle-im-bridge.md) | 复用 Mingle（MIT）渠道层与状态机，在 T3 侧以独立 Node `im-bridge` 提供内置 IM 远程连接服务，首发飞书/微信/企微，第一版开放私聊与群聊 `@`，对齐 Mingle 伴侣范式并以危险工具 Owner 批准和提示词注入四层防御守住安全边界。 | Confirmed |
 | [ADR-012](doc/decisions/012-xiaotong-model-channels-and-coding-agents.md) | M1 桌面版采用「模型平面 + 运行时平面 + 委派路由」双平面架构：内置助手定名「小瞳」并经 Proxy-Only 保协议网关与单一硬化 OS SecretStore 接入企业微信公司渠道 + 19 类成员供应商；普通模式保留 6 大外部编码 Agent（Claude Code / Codex / Kimi Code / Qoder / Codebuddy Code / DeepSeek Harness）与服务端统一授权一键安装，并经 T3 `delegate_task` 提供 Coding Agent 委派（IM/群聊首版硬拒绝）。 | Confirmed |
+| [ADR-013](doc/decisions/013-leader-supervisory-threads.md) | 以 T3 托管的一等 `Leader`（Captain 式控制面）统一绑定所有远程 IM 连接，在桌面侧栏顶部提供独立 `local_only` 固定主管入口与受众过滤的 Needs You 主动感知；执行策略在 Pi 启动前按 run 持久化并 fail-closed，目录演进为 `companion/leaders/<leaderId>/`，群分享收紧为内容快照审批，首发拒绝任意环境变量注入。 | Confirmed |
 
 ## 技术基线与契约
 
@@ -53,6 +54,7 @@ Pi 的桌面预览结果记录在实现说明。Windows、正式模型授权与�
 | Q-09 | IM 平台内卡片审批的开放范围与防重体验（危险操作必须由 Owner 批准已在 ADR-011 确认）。 | Unknown · 飞书卡片待真机验收 | [ADR-007](doc/decisions/007-plugin-contract.md) · [ADR-011](doc/decisions/011-mingle-im-bridge.md) |
 | Q-10 | 第三方插件分发和插件工坊的范围、时点与信任要求。 | Unknown | [ADR-007](doc/decisions/007-plugin-contract.md) |
 | Q-12 | 首发平台、架构与正式制品范围。 | Unknown · macOS arm64 有预览证据 | [ADR-001](doc/decisions/001-desktop-architecture.md) |
+| Q-13 | Leader Stage 2/3 排期细节：多 Leader 复杂换绑 UI、外部会话扫描交接 UI 与非 Pi 远程运行时逐个验收时点（核心实体模型、安全契约与暂停/快照分享边界已在 ADR-013 确认）。 | Confirmed · 核心边界已定，后续交互排期待验证 | [ADR-013](doc/decisions/013-leader-supervisory-threads.md) · [ADR-011](doc/decisions/011-mingle-im-bridge.md) |
 | PD-01 | 冻结 v2 插件契约、授权与存储兼容边界。 | Unknown · 公开契约尚未冻结，有预览实现 | [ADR-007](doc/decisions/007-plugin-contract.md) |
 | PD-02 | 验收正式模型网关的实跑表现（方向已在 ADR-012 确认：Proxy-Only 多协议网关 + 企业微信 OIDC + 19 类供应商，待 M1b-Gate 1 探针通过）。 | Confirmed 方向 · 待 M1b 实跑验收 | [ADR-008](doc/decisions/008-model-gateway.md) · [ADR-012](doc/decisions/012-xiaotong-model-channels-and-coding-agents.md) |
 | PD-03 | 免项目对话的默认位置与并发隔离规则。 | Unknown · 共享 scratch 是规划候选 | [ADR-004](doc/decisions/004-general-task-experience.md) |
