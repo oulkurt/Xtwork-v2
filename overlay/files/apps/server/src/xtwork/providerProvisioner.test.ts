@@ -1193,4 +1193,125 @@ describe("providerProvisioner", () => {
     expect(failed.error).toContain("[REDACTED]");
     expect(failed.message).toContain("[REDACTED]");
   });
+
+  it("stages managed npm upgrades and preserves previous runtime when cancelled during verification", async () => {
+    let resolveVerifyStarted!: () => void;
+    const verifyStarted = new Promise<void>((resolve) => {
+      resolveVerifyStarted = resolve;
+    });
+
+    const { baseDir, provisioner } = createHarness({
+      runCommand: ({ args }) => {
+        const prefixDir = args[args.indexOf("--prefix") + 1]!;
+        writeExecutable(
+          NodePath.join(prefixDir, "node_modules", ".bin", "dsh"),
+          "#!/bin/sh\necho '2.0.0-new'\n",
+        );
+        return { promise: Promise.resolve({ exitCode: 0, signal: null }), cancel: () => {} };
+      },
+      probeVersion: (execPath, _env, signal) => {
+        if (!execPath.includes(".staging-")) {
+          return Promise.resolve("1.0.0");
+        }
+        return new Promise<string | null>((resolve) => {
+          resolveVerifyStarted();
+          signal?.addEventListener("abort", () => resolve(null), { once: true });
+        });
+      },
+    });
+
+    // Pre-populate an existing v1.0.0 managed installation at tools/deepseek-harness.
+    const liveDir = NodePath.join(baseDir, "tools", "deepseek-harness");
+    const liveBin = NodePath.join(liveDir, "node_modules", ".bin", "dsh");
+    writeExecutable(liveBin, "#!/bin/sh\necho '1.0.0-old'\n");
+
+    const plan = await Effect.runPromise(provisioner.getPlan(DEEPSEEK_HARNESS_INSTANCE_ID));
+    const started = await Effect.runPromise(
+      provisioner.startInstall({
+        instanceId: DEEPSEEK_HARNESS_INSTANCE_ID,
+        mode: "app-managed",
+        consent: { confirmed: true, ...plan.selectedOption.consentKey },
+      }),
+    );
+
+    await verifyStarted;
+    await Effect.runPromise(
+      provisioner.cancelInstall(DEEPSEEK_HARNESS_INSTANCE_ID, started.operationId!),
+    );
+    const done = await waitForPhase(
+      () => Effect.runPromise(provisioner.getStatus(DEEPSEEK_HARNESS_INSTANCE_ID)),
+      ["cancelled", "succeeded", "failed"],
+    );
+    expect(done.phase).toBe("cancelled");
+    // Previous v1.0.0 binary MUST remain completely untouched and staging dir must be removed!
+    expect(NodeFs.readFileSync(liveBin, "utf8")).toContain("1.0.0-old");
+    const leftovers = NodeFs.readdirSync(NodePath.join(baseDir, "tools")).filter((f) =>
+      f.includes(".staging-"),
+    );
+    expect(leftovers).toEqual([]);
+  });
+
+  it("fails managed npm verification when executable probe returns null even if package.json exists", async () => {
+    const { baseDir, provisioner, upsertedInstances } = createHarness({
+      runCommand: ({ args }) => {
+        const prefixDir = args[args.indexOf("--prefix") + 1]!;
+        writeExecutable(NodePath.join(prefixDir, "node_modules", ".bin", "dsh"), "#!/bin/sh\nexit 1\n");
+        const pkgDir = NodePath.join(prefixDir, "node_modules", "@deepseek-ai", "dsh");
+        NodeFs.mkdirSync(pkgDir, { recursive: true });
+        NodeFs.writeFileSync(NodePath.join(pkgDir, "package.json"), JSON.stringify({ version: "1.4.2" }));
+        return { promise: Promise.resolve({ exitCode: 0, signal: null }), cancel: () => {} };
+      },
+      probeVersion: async () => null,
+    });
+
+    const plan = await Effect.runPromise(provisioner.getPlan(DEEPSEEK_HARNESS_INSTANCE_ID));
+    await Effect.runPromise(
+      provisioner.startInstall({
+        instanceId: DEEPSEEK_HARNESS_INSTANCE_ID,
+        mode: "app-managed",
+        consent: { confirmed: true, ...plan.selectedOption.consentKey },
+      }),
+    );
+    const done = await waitForPhase(
+      () => Effect.runPromise(provisioner.getStatus(DEEPSEEK_HARNESS_INSTANCE_ID)),
+      ["failed", "succeeded"],
+    );
+    expect(done.phase).toBe("failed");
+    expect(done.error).toContain("--version did not succeed");
+    expect(upsertedInstances).toHaveLength(0);
+    expect(NodeFs.existsSync(NodePath.join(baseDir, "tools", "deepseek-harness"))).toBe(false);
+  });
+
+  it("records terminal failed state instead of hanging when an unexpected filesystem defect occurs during receipt write", async () => {
+    const { baseDir, provisioner } = createHarness({
+      runCommand: ({ args }) => {
+        const prefixDir = args[args.indexOf("--prefix") + 1]!;
+        writeExecutable(NodePath.join(prefixDir, "node_modules", ".bin", "dsh"));
+        return { promise: Promise.resolve({ exitCode: 0, signal: null }), cancel: () => {} };
+      },
+    });
+
+    // Make provisioner-receipts.json a non-empty directory so atomic rename in upsertReceipt throws EISDIR/ENOTEMPTY!
+    const receiptsDirObstacle = NodePath.join(baseDir, "tools", "provisioner-receipts.json");
+    NodeFs.mkdirSync(receiptsDirObstacle, { recursive: true });
+    NodeFs.writeFileSync(NodePath.join(receiptsDirObstacle, "blocker"), "x");
+
+    const plan = await Effect.runPromise(provisioner.getPlan(DEEPSEEK_HARNESS_INSTANCE_ID));
+    await Effect.runPromise(
+      provisioner.startInstall({
+        instanceId: DEEPSEEK_HARNESS_INSTANCE_ID,
+        mode: "app-managed",
+        consent: { confirmed: true, ...plan.selectedOption.consentKey },
+      }),
+    );
+    const done = await waitForPhase(
+      () => Effect.runPromise(provisioner.getStatus(DEEPSEEK_HARNESS_INSTANCE_ID)),
+      ["failed", "succeeded", "cancelled"],
+    );
+    expect(done.phase).toBe("failed");
+    expect(done.error).toBeTruthy();
+    expect(done.finishedAt).toBeTruthy();
+    // Staged directory must also have been rolled back cleanly!
+    expect(NodeFs.existsSync(NodePath.join(baseDir, "tools", "deepseek-harness"))).toBe(false);
+  });
 });

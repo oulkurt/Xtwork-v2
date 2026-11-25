@@ -11,6 +11,7 @@ import {
 import * as AcpRegistrySupport from "@t3tools/provider-acp-registry/server/AcpRegistrySupport";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as ByteSize from "effect/ByteSize";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -1862,148 +1863,67 @@ export function makeProviderProvisioner(
         return;
       }
 
-      const existedBefore = NodeFs.existsSync(input.installDir);
-      NodeFs.mkdirSync(input.installDir, { recursive: true, mode: 0o700 });
-      const args = [
-        "install",
-        "--prefix",
-        input.installDir,
-        "--no-audit",
-        "--no-fund",
-        input.pinnedPackageSpec,
-      ];
-      appendLog(input.instanceId, `$ ${npmPath} ${args.join(" ")}`);
-
-      // S5: separate bounded line buffers per stream so split secrets are redacted across chunk boundaries.
-      const stdoutBuf = createRedactingLineBuffer((line) =>
-        appendCleanLogLine(input.instanceId, line),
-      );
-      const stderrBuf = createRedactingLineBuffer((line) =>
-        appendCleanLogLine(input.instanceId, line),
-      );
-      const handle = runCommand({
-        command: npmPath,
-        args,
-        env,
-        onOutput: (chunk) => stdoutBuf.push(chunk),
-        onStdout: (chunk) => stdoutBuf.push(chunk),
-        onStderr: (chunk) => stderrBuf.push(chunk),
-      });
-      const op = activeOps.get(input.instanceId);
-      if (op && op.operationId === input.operationId) {
-        op.cancel = () => {
-          op.abortController.abort();
-          handle.cancel();
-        };
-        if (op.cancelled) {
-          op.abortController.abort();
-          handle.cancel();
+      const parentDir = NodePath.dirname(input.installDir);
+      NodeFs.mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+      const stagingDir = `${input.installDir}.staging-${input.operationId}`;
+      const cleanupStaging = () => {
+        try {
+          NodeFs.rmSync(stagingDir, { recursive: true, force: true });
+        } catch {
+          // best-effort cleanup
         }
-      }
+      };
+      cleanupStaging();
+      NodeFs.mkdirSync(stagingDir, { recursive: true, mode: 0o700 });
 
-      const result = yield* Effect.tryPromise(() => handle.promise).pipe(
-        Effect.match({
-          onSuccess: (value) => ({ ok: true as const, value }),
-          onFailure: (error) => ({ ok: false as const, error }),
-        }),
-      );
-      stdoutBuf.flush();
-      stderrBuf.flush();
+      return yield* Effect.gen(function* () {
+        const args = [
+          "install",
+          "--prefix",
+          stagingDir,
+          "--no-audit",
+          "--no-fund",
+          input.pinnedPackageSpec,
+        ];
+        appendLog(input.instanceId, `$ ${npmPath} ${args.join(" ")}`);
 
-      if (isOpCancelled(input.instanceId, input.operationId)) {
-        if (!existedBefore) {
-          NodeFs.rmSync(input.installDir, { recursive: true, force: true });
-        }
-        setState(input.instanceId, (prev) => ({
-          ...prev,
-          phase: "cancelled",
-          message: "Installation cancelled.",
-          finishedAt: new Date().toISOString(),
-        }));
-        return;
-      }
-
-      if (!result.ok || result.value.exitCode !== 0) {
-        if (!existedBefore) {
-          NodeFs.rmSync(input.installDir, { recursive: true, force: true });
-        }
-        const detail = !result.ok
-          ? result.error instanceof Error
-            ? result.error.message
-            : "Failed to run npm install."
-          : `npm install exited with code ${result.value.exitCode}.`;
-        setState(input.instanceId, (prev) => ({
-          ...prev,
-          phase: "failed",
-          error: detail,
-          message: detail,
-          finishedAt: new Date().toISOString(),
-        }));
-        return;
-      }
-
-      setState(input.instanceId, (prev) => ({
-        ...prev,
-        phase: "verifying",
-        message: `Verifying ${input.binaryName} executable…`,
-      }));
-
-      const binName = deps.platform === "win32" ? `${input.binaryName}.cmd` : input.binaryName;
-      const managedBin = NodePath.join(input.installDir, "node_modules", ".bin", binName);
-      if (!isExecutableFile(managedBin, deps.platform)) {
-        if (!existedBefore) {
-          NodeFs.rmSync(input.installDir, { recursive: true, force: true });
-        }
-        setState(input.instanceId, (prev) => ({
-          ...prev,
-          phase: "failed",
-          error: `Installed ${input.pinnedPackageSpec}, but '${binName}' was not found at ${managedBin}.`,
-          message: "Verification failed.",
-          finishedAt: new Date().toISOString(),
-        }));
-        return;
-      }
-
-      // S4: Pass AbortSignal into verification so cancellation interrupts probing immediately.
-      const signal = activeOps.get(input.instanceId)?.abortController.signal;
-      const probedVersion = yield* Effect.promise(() => probeVersion(managedBin, env, signal));
-
-      // S4: Check cancellation BEFORE committing receipts, wiring settings, or reporting succeeded.
-      if (isOpCancelled(input.instanceId, input.operationId)) {
-        if (!existedBefore) {
-          NodeFs.rmSync(input.installDir, { recursive: true, force: true });
-        }
-        setState(input.instanceId, (prev) => ({
-          ...prev,
-          phase: "cancelled",
-          message: "Installation cancelled.",
-          finishedAt: new Date().toISOString(),
-        }));
-        return;
-      }
-
-      const installedVersion =
-        probedVersion ?? readInstalledNpmPackageVersion(input.installDir, input.packageName);
-      if (probedVersion === null && installedVersion === null) {
-        if (!existedBefore) {
-          NodeFs.rmSync(input.installDir, { recursive: true, force: true });
-        }
-        setState(input.instanceId, (prev) => ({
-          ...prev,
-          phase: "failed",
-          error: `${input.binaryName} --version did not succeed after installation.`,
-          message: "Verification failed.",
-          finishedAt: new Date().toISOString(),
-        }));
-        return;
-      }
-
-      const commitOp = activeOps.get(input.instanceId);
-      const runCommit = Effect.gen(function* () {
-        if (isOpCancelled(input.instanceId, input.operationId)) {
-          if (!existedBefore) {
-            NodeFs.rmSync(input.installDir, { recursive: true, force: true });
+        // S5: separate bounded line buffers per stream so split secrets are redacted across chunk boundaries.
+        const stdoutBuf = createRedactingLineBuffer((line) =>
+          appendCleanLogLine(input.instanceId, line),
+        );
+        const stderrBuf = createRedactingLineBuffer((line) =>
+          appendCleanLogLine(input.instanceId, line),
+        );
+        const handle = runCommand({
+          command: npmPath,
+          args,
+          env,
+          onOutput: (chunk) => stdoutBuf.push(chunk),
+          onStdout: (chunk) => stdoutBuf.push(chunk),
+          onStderr: (chunk) => stderrBuf.push(chunk),
+        });
+        const op = activeOps.get(input.instanceId);
+        if (op && op.operationId === input.operationId) {
+          op.cancel = () => {
+            op.abortController.abort();
+            handle.cancel();
+          };
+          if (op.cancelled) {
+            op.abortController.abort();
+            handle.cancel();
           }
+        }
+
+        const result = yield* Effect.tryPromise(() => handle.promise).pipe(
+          Effect.match({
+            onSuccess: (value) => ({ ok: true as const, value }),
+            onFailure: (error) => ({ ok: false as const, error }),
+          }),
+        );
+        stdoutBuf.flush();
+        stderrBuf.flush();
+
+        if (isOpCancelled(input.instanceId, input.operationId)) {
           setState(input.instanceId, (prev) => ({
             ...prev,
             phase: "cancelled",
@@ -2012,33 +1932,16 @@ export function makeProviderProvisioner(
           }));
           return;
         }
-        // S4: Past point-of-no-return under commitSemaphore; cancelInstall waits for this critical section
-        // and observes committed=true rather than deleting the binary that settings now references.
-        if (commitOp && commitOp.operationId === input.operationId) {
-          commitOp.committing = true;
-        }
 
-        const wireResult = yield* input.wireInstance(managedBin).pipe(
-          Effect.match({
-            onSuccess: () => ({ ok: true as const }),
-            onFailure: (error) => ({ ok: false as const, error }),
-          }),
-        );
-        if (!wireResult.ok) {
-          if (commitOp && commitOp.operationId === input.operationId) {
-            commitOp.committing = false;
-          }
-          const detail = redactSecrets(
-            wireResult.error instanceof Error
-              ? wireResult.error.message
-              : `Failed to save provider settings for '${input.instanceId}'.`,
-          );
-          appendLog(input.instanceId, detail);
+        if (!result.ok || result.value.exitCode !== 0) {
+          const detail = !result.ok
+            ? result.error instanceof Error
+              ? result.error.message
+              : "Failed to run npm install."
+            : `npm install exited with code ${result.value.exitCode}.`;
           setState(input.instanceId, (prev) => ({
             ...prev,
             phase: "failed",
-            installedVersion,
-            executablePath: managedBin,
             error: detail,
             message: detail,
             finishedAt: new Date().toISOString(),
@@ -2046,49 +1949,210 @@ export function makeProviderProvisioner(
           return;
         }
 
-        upsertReceipt(deps.baseDir, {
-          instanceId: input.instanceId,
-          agentKind: input.agentKind,
-          mode: "app-managed",
-          source: input.option.consentKey.source,
-          version: installedVersion ?? input.option.consentKey.version,
-          distribution: input.option.consentKey.distribution,
-          installDir: input.installDir,
-          executablePath: managedBin,
-          installedAt: new Date().toISOString(),
+        setState(input.instanceId, (prev) => ({
+          ...prev,
+          phase: "verifying",
+          message: `Verifying ${input.binaryName} executable…`,
+        }));
+
+        const binName = deps.platform === "win32" ? `${input.binaryName}.cmd` : input.binaryName;
+        const stagedBin = NodePath.join(stagingDir, "node_modules", ".bin", binName);
+        const managedBin = NodePath.join(input.installDir, "node_modules", ".bin", binName);
+        if (!isExecutableFile(stagedBin, deps.platform)) {
+          setState(input.instanceId, (prev) => ({
+            ...prev,
+            phase: "failed",
+            error: `Installed ${input.pinnedPackageSpec}, but '${binName}' was not found at ${stagedBin}.`,
+            message: "Verification failed.",
+            finishedAt: new Date().toISOString(),
+          }));
+          return;
+        }
+
+        // S4: Pass AbortSignal into verification so cancellation interrupts probing immediately.
+        const signal = activeOps.get(input.instanceId)?.abortController.signal;
+        const probedVersion = yield* Effect.promise(() => probeVersion(stagedBin, env, signal));
+
+        // S4: Check cancellation BEFORE activating staged runtime, committing receipts, or wiring settings.
+        if (isOpCancelled(input.instanceId, input.operationId)) {
+          setState(input.instanceId, (prev) => ({
+            ...prev,
+            phase: "cancelled",
+            message: "Installation cancelled.",
+            finishedAt: new Date().toISOString(),
+          }));
+          return;
+        }
+
+        // Require a successful executable probe; package.json metadata must never substitute for launch verification.
+        if (probedVersion === null) {
+          setState(input.instanceId, (prev) => ({
+            ...prev,
+            phase: "failed",
+            error: `${input.binaryName} --version did not succeed after installation.`,
+            message: "Verification failed.",
+            finishedAt: new Date().toISOString(),
+          }));
+          return;
+        }
+        const installedVersion =
+          probedVersion || readInstalledNpmPackageVersion(stagingDir, input.packageName);
+
+        const commitOp = activeOps.get(input.instanceId);
+        const runCommit = Effect.gen(function* () {
+          if (isOpCancelled(input.instanceId, input.operationId)) {
+            setState(input.instanceId, (prev) => ({
+              ...prev,
+              phase: "cancelled",
+              message: "Installation cancelled.",
+              finishedAt: new Date().toISOString(),
+            }));
+            return;
+          }
+          // S4: Past point-of-no-return under commitSemaphore; cancelInstall waits for this critical section
+          // and observes committed=true rather than deleting the binary that settings now references.
+          if (commitOp && commitOp.operationId === input.operationId) {
+            commitOp.committing = true;
+          }
+
+          const backupDir = `${input.installDir}.prev-${input.operationId}`;
+          let movedExistingToBackup = false;
+          let activatedStaging = false;
+          const rollbackSwap = () => {
+            if (activatedStaging) {
+              try {
+                NodeFs.rmSync(input.installDir, { recursive: true, force: true });
+              } catch {
+                // ignore
+              }
+            }
+            if (movedExistingToBackup && NodeFs.existsSync(backupDir)) {
+              try {
+                NodeFs.renameSync(backupDir, input.installDir);
+              } catch {
+                // ignore
+              }
+            }
+          };
+
+          try {
+            if (NodeFs.existsSync(input.installDir)) {
+              NodeFs.rmSync(backupDir, { recursive: true, force: true });
+              NodeFs.renameSync(input.installDir, backupDir);
+              movedExistingToBackup = true;
+            }
+            NodeFs.renameSync(stagingDir, input.installDir);
+            activatedStaging = true;
+          } catch (swapError) {
+            rollbackSwap();
+            if (commitOp && commitOp.operationId === input.operationId) {
+              commitOp.committing = false;
+            }
+            const detail = redactSecrets(
+              swapError instanceof Error
+                ? swapError.message
+                : `Failed to activate managed runtime at '${input.installDir}'.`,
+            );
+            appendLog(input.instanceId, detail);
+            setState(input.instanceId, (prev) => ({
+              ...prev,
+              phase: "failed",
+              error: detail,
+              message: detail,
+              finishedAt: new Date().toISOString(),
+            }));
+            return;
+          }
+
+          const wireResult = yield* input.wireInstance(managedBin).pipe(
+            Effect.match({
+              onSuccess: () => ({ ok: true as const }),
+              onFailure: (error) => ({ ok: false as const, error }),
+            }),
+          );
+          if (!wireResult.ok) {
+            rollbackSwap();
+            if (commitOp && commitOp.operationId === input.operationId) {
+              commitOp.committing = false;
+            }
+            const detail = redactSecrets(
+              wireResult.error instanceof Error
+                ? wireResult.error.message
+                : `Failed to save provider settings for '${input.instanceId}'.`,
+            );
+            appendLog(input.instanceId, detail);
+            setState(input.instanceId, (prev) => ({
+              ...prev,
+              phase: "failed",
+              installedVersion,
+              executablePath: managedBin,
+              error: detail,
+              message: detail,
+              finishedAt: new Date().toISOString(),
+            }));
+            return;
+          }
+
+          try {
+            upsertReceipt(deps.baseDir, {
+              instanceId: input.instanceId,
+              agentKind: input.agentKind,
+              mode: "app-managed",
+              source: input.option.consentKey.source,
+              version: installedVersion ?? input.option.consentKey.version,
+              distribution: input.option.consentKey.distribution,
+              installDir: input.installDir,
+              executablePath: managedBin,
+              installedAt: new Date().toISOString(),
+            });
+          } catch (receiptError) {
+            rollbackSwap();
+            if (commitOp && commitOp.operationId === input.operationId) {
+              commitOp.committing = false;
+            }
+            throw receiptError;
+          }
+
+          if (movedExistingToBackup) {
+            try {
+              NodeFs.rmSync(backupDir, { recursive: true, force: true });
+            } catch {
+              // best-effort cleanup of old backup
+            }
+          }
+
+          if (commitOp && commitOp.operationId === input.operationId) {
+            commitOp.committed = true;
+            commitOp.committing = false;
+          }
+
+          appendLog(
+            input.instanceId,
+            `Verified ${input.binaryName}${installedVersion ? ` v${installedVersion}` : ""} at ${managedBin}`,
+          );
+          setState(input.instanceId, (prev) => ({
+            ...prev,
+            phase: "succeeded",
+            installedVersion,
+            executablePath: managedBin,
+            error: null,
+            message: `Installed ${input.binaryName}${installedVersion ? ` v${installedVersion}` : ""}.`,
+            finishedAt: new Date().toISOString(),
+          }));
         });
 
         if (commitOp && commitOp.operationId === input.operationId) {
-          commitOp.committed = true;
-          commitOp.committing = false;
+          yield* commitOp.commitSemaphore.withPermits(1)(runCommit);
+        } else {
+          yield* runCommit;
         }
 
-        appendLog(
-          input.instanceId,
-          `Verified ${input.binaryName}${installedVersion ? ` v${installedVersion}` : ""} at ${managedBin}`,
-        );
-        setState(input.instanceId, (prev) => ({
-          ...prev,
-          phase: "succeeded",
-          installedVersion,
-          executablePath: managedBin,
-          error: null,
-          message: `Installed ${input.binaryName}${installedVersion ? ` v${installedVersion}` : ""}.`,
-          finishedAt: new Date().toISOString(),
-        }));
-      });
-
-      if (commitOp && commitOp.operationId === input.operationId) {
-        yield* commitOp.commitSemaphore.withPermits(1)(runCommit);
-      } else {
-        yield* runCommit;
-      }
-
-      if (getOrInitState(input.instanceId).phase === "succeeded") {
-        yield* deps
-          .refreshProviderInstance(ProviderInstanceId.make(input.instanceId))
-          .pipe(Effect.ignore);
-      }
+        if (getOrInitState(input.instanceId).phase === "succeeded") {
+          yield* deps
+            .refreshProviderInstance(ProviderInstanceId.make(input.instanceId))
+            .pipe(Effect.ignore);
+        }
+      }).pipe(Effect.ensuring(Effect.sync(cleanupStaging)));
     });
 
   const runVendorScriptInstall = (input: {
@@ -2938,6 +3002,33 @@ export function makeProviderProvisioner(
 
         yield* Effect.forkDetach(
           workflow.pipe(
+            Effect.catchCause((cause) =>
+              Effect.sync(() => {
+                const current = states.get(request.instanceId);
+                if (
+                  current &&
+                  current.operationId === operationId &&
+                  (current.phase === "installing" || current.phase === "verifying")
+                ) {
+                  const squashed = Cause.squash(cause);
+                  const rawDetail =
+                    squashed instanceof Error
+                      ? squashed.message
+                      : typeof squashed === "string"
+                        ? squashed
+                        : Cause.pretty(cause).split("\n")[0] ?? "Unexpected installation failure.";
+                  const detail = redactSecrets(rawDetail || "Unexpected installation failure.");
+                  appendLog(request.instanceId, detail);
+                  setState(request.instanceId, (prev) => ({
+                    ...prev,
+                    phase: "failed",
+                    error: detail,
+                    message: detail,
+                    finishedAt: new Date().toISOString(),
+                  }));
+                }
+              }),
+            ),
             Effect.ensuring(
               Effect.sync(() => {
                 if (activeOps.get(request.instanceId)?.operationId === operationId) {

@@ -193,6 +193,7 @@ export function XtworkProviderProvisioningSection({
   const [confirmOpen, setConfirmOpen] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const lastTerminalPhaseRef = useRef<ProvisionerPhase | null>(null);
+  const planScopeAbortRef = useRef<AbortController | null>(null);
 
   const activeState = status ?? plan?.state ?? null;
   const isInstalling =
@@ -214,6 +215,8 @@ export function XtworkProviderProvisioningSection({
   };
 
   // Load initial plan on mount / instance change / mode change.
+  // Keep `planScopeAbortRef` alive across `isInstalling` transitions so terminal plan refreshes
+  // are never aborted when polling ends!
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads install plan from server for selected instance and mode
   useEffect(() => {
     if (typeof window === "undefined" || !window.desktopBridge) {
@@ -221,6 +224,7 @@ export function XtworkProviderProvisioningSection({
       return;
     }
     const controller = new AbortController();
+    planScopeAbortRef.current = controller;
     setLoading(true);
     void loadPlan(selectedMode, controller.signal)
       .catch((cause) => {
@@ -231,7 +235,12 @@ export function XtworkProviderProvisioningSection({
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
       });
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      if (planScopeAbortRef.current === controller) {
+        planScopeAbortRef.current = null;
+      }
+    };
   }, [instanceId, selectedMode]);
 
   // Poll live status & logs while installing or verifying.
@@ -255,8 +264,11 @@ export function XtworkProviderProvisioningSection({
         ) {
           if (lastTerminalPhaseRef.current !== nextStatus.phase) {
             lastTerminalPhaseRef.current = nextStatus.phase;
-            await loadPlan(selectedMode, controller.signal).catch(() => undefined);
-            if (nextStatus.phase === "succeeded") {
+            // Use the mount/instance-scoped signal (NOT the polling effect's controller) because
+            // setStatus(nextStatus) flips isInstalling=false and aborts the polling controller!
+            const refreshSignal = planScopeAbortRef.current?.signal;
+            await loadPlan(selectedMode, refreshSignal).catch(() => undefined);
+            if (!refreshSignal?.aborted && nextStatus.phase === "succeeded") {
               onProvisioned?.();
             }
           }
