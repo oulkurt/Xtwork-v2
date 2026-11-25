@@ -1539,7 +1539,28 @@ describe("ADR-013 Slice 1: Leader security, persistence, awareness, and isolatio
     await Effect.runPromise(
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
+        // Pre-seed duplicate active/epoch rows from a pre-fix race to verify upgrade migration succeeds cleanly!
+        yield* sql`CREATE TABLE IF NOT EXISTS xtwork_leader_bindings (
+          binding_id TEXT PRIMARY KEY,
+          leader_id TEXT NOT NULL,
+          connection_id TEXT NOT NULL,
+          epoch INTEGER NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL,
+          unbound_at INTEGER
+        )`;
+        yield* sql`INSERT INTO xtwork_leader_bindings (binding_id, leader_id, connection_id, epoch, active, created_at, unbound_at)
+          VALUES (${"bind-dup-1"}, ${DEFAULT_LEADER_ID}, ${"conn-legacy-dup"}, ${1}, 1, ${1_700_000_000_000}, ${null})`;
+        yield* sql`INSERT INTO xtwork_leader_bindings (binding_id, leader_id, connection_id, epoch, active, created_at, unbound_at)
+          VALUES (${"bind-dup-2"}, ${DEFAULT_LEADER_ID}, ${"conn-legacy-dup"}, ${1}, 1, ${1_700_000_000_001}, ${null})`;
         const leaders = yield* makeLeaderStore();
+        const [legacyCounts] = yield* sql<{ readonly total: number; readonly activeCount: number }>`
+          SELECT COUNT(*) AS "total", SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS "activeCount"
+          FROM xtwork_leader_bindings
+          WHERE connection_id = ${"conn-legacy-dup"}
+        `;
+        expect(Number(legacyCounts?.total)).toBe(1);
+        expect(Number(legacyCounts?.activeCount)).toBe(1);
 
         // 1. Concurrent ensureBinding calls MUST converge to ONE single active binding row and identical bindingId.
         const racers = yield* Effect.all(

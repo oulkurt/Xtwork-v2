@@ -237,7 +237,8 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   )`;
   yield* sql`CREATE INDEX IF NOT EXISTS idx_xtwork_leader_bindings_conn
     ON xtwork_leader_bindings(connection_id, active)`;
-  // Ensure at most one active binding exists per connection before creating the partial unique index.
+  // Ensure at most one active binding and unique (connection_id, epoch) exist before creating unique indexes
+  // (deduplicates any pre-fix race rows so store initialization never fails on upgrade).
   yield* sql`UPDATE xtwork_leader_bindings
     SET active = 0, unbound_at = COALESCE(unbound_at, ${Date.now()})
     WHERE active = 1
@@ -252,6 +253,17 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
               AND (b2.epoch > b1.epoch OR (b2.epoch = b1.epoch AND b2.rowid > b1.rowid))
           )
       )`;
+  yield* sql`DELETE FROM xtwork_leader_bindings
+    WHERE rowid NOT IN (
+      SELECT b1.rowid
+      FROM xtwork_leader_bindings b1
+      WHERE NOT EXISTS (
+        SELECT 1 FROM xtwork_leader_bindings b2
+        WHERE b2.connection_id = b1.connection_id
+          AND b2.epoch = b1.epoch
+          AND (b2.active > b1.active OR (b2.active = b1.active AND b2.rowid > b1.rowid))
+      )
+    )`;
   yield* sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_xtwork_leader_bindings_one_active
     ON xtwork_leader_bindings(connection_id)
     WHERE active = 1`;
