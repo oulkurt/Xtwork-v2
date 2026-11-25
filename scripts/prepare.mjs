@@ -49,7 +49,13 @@ const runtimeDir = join(root, "runtime");
 if (existsSync(join(runtimeDir, "gateway.ts"))) {
   const target = join(t3, "apps/server/src/xtwork");
   mkdirSync(target, { recursive: true });
-  for (const file of ["gateway.ts", "bundledPiSettings.ts", "bundledPiSettings.test.ts"]) {
+  for (const file of [
+    "secretStore.ts",
+    "oauthProxy.ts",
+    "gateway.ts",
+    "bundledPiSettings.ts",
+    "bundledPiSettings.test.ts",
+  ]) {
     cpSync(join(runtimeDir, file), join(target, file));
   }
 }

@@ -1,0 +1,182 @@
+diff --git a/apps/server/src/serverSettings.ts b/apps/server/src/serverSettings.ts
+index e06fc7e0..0897507f 100644
+--- a/apps/server/src/serverSettings.ts
++++ b/apps/server/src/serverSettings.ts
+@@ -939,7 +939,9 @@ const make = Effect.gen(function* () {
+       : { settings: folded, secretMoves: [] };
+     const settingsWithRuntime = bundledPi === undefined
+       ? sourceControlMigration.settings
+-      : seedBundledPi(sourceControlMigration.settings, !hasSettings);
++      : seedBundledPi(sourceControlMigration.settings, !hasSettings, {
++          defaultModelSlug: bundledPi.getDefaultModelSlug(),
++        });
+     const migrated = settingsFileTrusted
+       ? yield* moveInlineSettingsSecrets(settingsWithRuntime)
+       : folded;
+diff --git a/packages/provider-pi/src/server/adapter.ts b/packages/provider-pi/src/server/adapter.ts
+index 3befbaba..9ca2ee09 100644
+--- a/packages/provider-pi/src/server/adapter.ts
++++ b/packages/provider-pi/src/server/adapter.ts
+@@ -79,7 +79,11 @@ import {
+   materializePiT3McpExtension,
+   resolvePiLaunchArgs,
+ } from "./mcpInjection.ts";
+-import { PI_FILE_CHANGE_TOOLS, PI_T3_SERVICE_TIER_COMMAND } from "./mcpExtensionSource.ts";
++import {
++  PI_FILE_CHANGE_TOOLS,
++  PI_T3_SERVICE_TIER_COMMAND,
++  PI_XTWORK_RELOAD_MODELS_COMMAND,
++} from "./mcpExtensionSource.ts";
+ import { PI_STANDARD_SERVICE_TIER } from "./modelCapabilities.ts";
+ 
+ export const PI_PROVIDER = ProviderDriverKind.make("pi");
+@@ -692,6 +696,16 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+       let contextWindow: number | null = null;
+       const modelContextWindows = new Map<string, number>();
+       let discoveredModels: ReadonlyArray<unknown> | null = null;
++      const modelsJsonPath =
++        typeof options.environment.PI_CODING_AGENT_DIR === "string" &&
++        options.environment.PI_CODING_AGENT_DIR.length > 0
++          ? path.join(options.environment.PI_CODING_AGENT_DIR, "models.json")
++          : null;
++      const readModelsJsonSnapshot = () =>
++        modelsJsonPath === null
++          ? Effect.succeed(null)
++          : fileSystem.readFileString(modelsJsonPath).pipe(Effect.orElseSucceed(() => null));
++      let appliedModelsJsonSnapshot: string | null = yield* readModelsJsonSnapshot();
+       let nextPromptId = 0;
+       const pendingPromptResponses: Array<PiPromptSend & { readonly id: string }> = [];
+       const pendingCompactResponses: Array<{
+@@ -3198,8 +3212,44 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+           ),
+       );
+ 
++      const reloadLiveModels = Effect.fnUntraced(function* () {
++        const result = yield* request({
++          type: "prompt",
++          message: `/${PI_XTWORK_RELOAD_MODELS_COMMAND}`,
++        }).pipe(Effect.orElseSucceed(() => undefined));
++        if (recordString(result, "disposition") !== "handled") {
++          return false;
++        }
++        modelContextWindows.clear();
++        yield* discoverModels();
++        return true;
++      });
++
+       const applySelection = Effect.fnUntraced(function* (modelSelection: ModelSelection) {
+         const thinking = getModelSelectionStringOptionValue(modelSelection, "thinking");
++        const latestModelsJsonSnapshot = yield* readModelsJsonSnapshot();
++        let modelsReloaded = false;
++        if (
++          latestModelsJsonSnapshot !== null &&
++          latestModelsJsonSnapshot !== appliedModelsJsonSnapshot
++        ) {
++          modelsReloaded = yield* reloadLiveModels();
++          appliedModelsJsonSnapshot = latestModelsJsonSnapshot;
++          if (modelsReloaded) {
++            // Re-bind the model on the next turn so metadata edits (baseUrl/compat) for the same
++            // provider/model take effect and deleted/disabled models fail cleanly.
++            appliedModel = null;
++            if (
++              baselineModel !== null &&
++              findReportedPiModel(
++                `${baselineModel.provider}/${baselineModel.modelId}`,
++                discoveredModels,
++              ) === undefined
++            ) {
++              baselineModel = null;
++            }
++          }
++        }
+         // pi.setModel and /preset can change the model without an RPC event.
+         // Confirm cached selections against Pi before skipping them.
+         const modelCached =
+@@ -3213,6 +3263,38 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
+           appliedThinking = recordString(state, "thinkingLevel") ?? null;
+         }
+         if (modelSelection.model === PI_INHERIT_MODEL_SLUG) {
++          if (modelsReloaded) {
++            const state = yield* request({ type: "get_state" });
++            const stateModel = recordField(state, "model");
++            const activeProvider = recordString(stateModel, "provider");
++            const activeModelId = recordString(stateModel, "id");
++            const activeSlug =
++              activeProvider !== undefined && activeModelId !== undefined
++                ? `${activeProvider}/${activeModelId}`
++                : null;
++            if (
++              activeSlug === null ||
++              findReportedPiModel(activeSlug, discoveredModels) === undefined
++            ) {
++              const firstModel = Array.isArray(discoveredModels) ? discoveredModels[0] : undefined;
++              const fallbackProvider = recordString(firstModel, "provider");
++              const fallbackModelId = recordString(firstModel, "id");
++              if (fallbackProvider !== undefined && fallbackModelId !== undefined) {
++                const selectedFallback = yield* request({
++                  type: "set_model",
++                  provider: fallbackProvider,
++                  modelId: fallbackModelId,
++                });
++                baselineModel = { provider: fallbackProvider, modelId: fallbackModelId };
++                appliedThinking = null;
++                contextWindow = rememberModelContextWindow(selectedFallback);
++              } else {
++                return yield* protocolError(
++                  "No enabled models are available in 小瞳. Configure a model channel in Settings.",
++                );
++              }
++            }
++          }
+           if (appliedModel !== null && baselineModel !== null) {
+             const restoredModel = yield* request({ type: "set_model", ...baselineModel });
+             appliedThinking = null;
+diff --git a/packages/provider-pi/src/server/mcpExtensionSource.ts b/packages/provider-pi/src/server/mcpExtensionSource.ts
+index 3d151b63..bdcd86e4 100644
+--- a/packages/provider-pi/src/server/mcpExtensionSource.ts
++++ b/packages/provider-pi/src/server/mcpExtensionSource.ts
+@@ -8,6 +8,7 @@ export const T3_MCP_BEARER_ENV = "T3_MCP_BEARER_TOKEN";
+ export const T3_PI_RUNTIME_MODE_ENV = "T3_PI_RUNTIME_MODE";
+ export const T3_PI_MCP_EXTENSION_PATH_ENV = "T3_PI_MCP_EXTENSION_PATH";
+ export const PI_T3_SERVICE_TIER_COMMAND = "t3-service-tier";
++export const PI_XTWORK_RELOAD_MODELS_COMMAND = "xtwork-reload-models";
+ 
+ // These tools trigger file-change approvals, bypassed by Auto-accept edits.
+ export const PI_FILE_CHANGE_TOOLS = ["edit", "write"] as const;
+@@ -25,6 +26,7 @@ const RUNTIME_MODE_ENV = ${JSON.stringify(T3_PI_RUNTIME_MODE_ENV)};
+ const EXTENSION_PATH_ENV = ${JSON.stringify(T3_PI_MCP_EXTENSION_PATH_ENV)};
+ const ORCHESTRATION_INSTRUCTIONS = ${JSON.stringify(T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim())};
+ const SERVICE_TIER_COMMAND = ${JSON.stringify(PI_T3_SERVICE_TIER_COMMAND)};
++const RELOAD_MODELS_COMMAND = ${JSON.stringify(PI_XTWORK_RELOAD_MODELS_COMMAND)};
+ const PROTOCOL = "2025-06-18";
+ const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
+ const FILE_CHANGE_TOOLS = new Set(${JSON.stringify(PI_FILE_CHANGE_TOOLS)});
+@@ -307,6 +309,28 @@ export default async function t3McpExtension(pi: ExtensionAPI) {
+     },
+   });
+ 
++  // Reload models.json into Pi's live ModelRuntime without restarting the RPC session.
++  // When idle and the active model still exists, re-apply the refreshed definition so
++  // metadata updates (baseUrl/compat/limits) take effect on the very next turn.
++  pi.registerCommand(RELOAD_MODELS_COMMAND, {
++    description: "Reload models.json into the active Pi session model registry",
++    handler: async (_args, ctx) => {
++      await ctx.modelRegistry.refresh({ allowNetwork: false });
++      if (!ctx.isIdle()) return;
++      const current = ctx.model;
++      if (!current) return;
++      const refreshed = ctx.modelRegistry.find(current.provider, current.id);
++      if (
++        refreshed &&
++        ctx.modelRegistry
++          .getAvailable()
++          .some((candidate) => candidate.provider === current.provider && candidate.id === current.id)
++      ) {
++        await pi.setModel(refreshed);
++      }
++    },
++  });
++
+   pi.on("before_provider_request", (event, ctx) => {
+     const payload = event.payload;
+     if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return;

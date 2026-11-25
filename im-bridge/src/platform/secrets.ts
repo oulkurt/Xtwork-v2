@@ -1,44 +1,101 @@
 /**
- * OS-backed secure credential storage for IM bot credentials.
+ * OS-backed secure credential storage (shared hardened contract for IM bridge & model channels).
  *
  * Adapted from earayu/Mingle (MIT, commit 006220e880d2134665ce2745ab6233f52c8eabe9),
- * src/platform/secrets.ts.
+ * src/platform/secrets.ts, hardened per ADR-011 L4 & ADR-012 §3.1:
  *
- * ADR-011 L4 SECURITY INVARIANT:
- * Plaintext file fallback (`fileSecrets`) is EXPLICITLY REMOVED.
- * - macOS: Keychain via `/usr/bin/security -i` (stdin, chunked base64, read-back verified).
- * - Windows: DPAPI (`ProtectedData::Protect/Unprotect` CurrentUser) storing ONLY DPAPI-sealed
- *   ciphertext blobs on disk (refuses plaintext, verifies decrypt round-trip).
- * - Linux: Secret Service (`secret-tool`, probe + write + read-back verified).
- * If the OS secure store is unavailable or read-back verification fails, every operation fails
- * closed with `SecretStoreUnavailableError`. `memorySecrets()` is provided for tests only.
+ * - Plaintext file fallback (`fileSecrets`) is EXPLICITLY ABSENT (fail-closed).
+ * - Distinct error taxonomy: `missing` vs `unavailable` vs `denied` (never collapses
+ *   arbitrary non-zero OS errors into `undefined` / `missing`).
+ * - Verified `set(ref, value)` with read-back comparison.
+ * - Verified `delete(ref)`: checks command exit code AND reads back to confirm `missing`;
+ *   throws typed error if deletion fails or the secret remains readable.
+ * - Independent service namespaces (`app.xtwork.im-bridge`, `app.xtwork.model-channels`).
+ * - Concurrency fencing token (`ChannelCredentialFence`) preventing in-flight OAuth refresh
+ *   write-backs from resurrecting credentials deleted by a concurrent logout or channel removal.
  */
 
 import { execFile } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
 
-/** Where IM credentials live. Never SQLite, never logs, never plaintext files. */
+export const IM_BRIDGE_SECRET_NAMESPACE = "app.xtwork.im-bridge";
+export const MODEL_CHANNELS_SECRET_NAMESPACE = "app.xtwork.model-channels";
+
+export type SecretStoreErrorCode =
+  | "SECRET_STORE_UNAVAILABLE"
+  | "SECRET_ACCESS_DENIED"
+  | "SECRET_WRITE_VERIFY_FAILED"
+  | "SECRET_DELETE_VERIFY_FAILED"
+  | "SECRET_DECRYPT_FAILED"
+  | "INVALID_SECRET_REF"
+  | "SECRET_FENCE_STALE";
+
+export type SecretStoreFailureKind =
+  | "unavailable"
+  | "denied"
+  | "verification_failed"
+  | "invalid_ref"
+  | "stale_fence";
+
+function failureKindForCode(code: SecretStoreErrorCode): SecretStoreFailureKind {
+  switch (code) {
+    case "SECRET_STORE_UNAVAILABLE":
+      return "unavailable";
+    case "SECRET_ACCESS_DENIED":
+      return "denied";
+    case "SECRET_WRITE_VERIFY_FAILED":
+    case "SECRET_DELETE_VERIFY_FAILED":
+    case "SECRET_DECRYPT_FAILED":
+      return "verification_failed";
+    case "INVALID_SECRET_REF":
+      return "invalid_ref";
+    case "SECRET_FENCE_STALE":
+      return "stale_fence";
+  }
+}
+
+export class SecretStoreUnavailableError extends Error {
+  readonly code: SecretStoreErrorCode;
+  readonly kind: SecretStoreFailureKind;
+
+  constructor(code: SecretStoreErrorCode, message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "SecretStoreUnavailableError";
+    this.code = code;
+    this.kind = failureKindForCode(code);
+  }
+}
+
+export { SecretStoreUnavailableError as SecretStoreError };
+
+export type SecretReadResult =
+  | { readonly status: "found"; readonly value: string }
+  | { readonly status: "missing" }
+  | { readonly status: "unavailable"; readonly error: SecretStoreUnavailableError }
+  | { readonly status: "denied"; readonly error: SecretStoreUnavailableError };
+
+/** Where credentials live. Never SQLite, never logs, never plaintext files. */
 export interface SecretStore {
   get(ref: string): Promise<string | undefined>;
+  read?(ref: string): Promise<SecretReadResult>;
   set(ref: string, value: string): Promise<void>;
   delete(ref: string): Promise<void>;
 }
 
-export type SecretStoreErrorCode =
-  | "SECRET_STORE_UNAVAILABLE"
-  | "SECRET_WRITE_VERIFY_FAILED"
-  | "SECRET_DECRYPT_FAILED"
-  | "INVALID_SECRET_REF";
-
-export class SecretStoreUnavailableError extends Error {
-  readonly code: SecretStoreErrorCode;
-
-  constructor(code: SecretStoreErrorCode, message: string) {
-    super(message);
-    this.name = "SecretStoreUnavailableError";
-    this.code = code;
-  }
+export interface CommandResult {
+  readonly code: number;
+  readonly stdout: string;
+  readonly stderr?: string;
 }
 
 export type CommandRunner = (
@@ -46,26 +103,50 @@ export type CommandRunner = (
   args: string[],
   stdin: string,
   timeoutMs?: number,
-) => Promise<{ code: number; stdout: string }>;
+) => Promise<CommandResult>;
 
-const SERVICE = "app.xtwork.im-bridge";
+const DEFAULT_SERVICE = IM_BRIDGE_SECRET_NAMESPACE;
 const SECURITY = "/usr/bin/security";
 
 /** Base64 characters per Keychain item: `security -i` reads at most 4095 characters per command line. */
 const CHUNK = 3000;
 
-/** Runs a program with `stdin` and collects stdout. Never rejects. */
+/** Runs a program with `stdin` and collects stdout/stderr. Never rejects. */
 function runWith(
   file: string,
   args: string[],
   stdin: string,
   timeoutMs = 15_000,
-): Promise<{ code: number; stdout: string }> {
+): Promise<CommandResult> {
   return new Promise((resolve) => {
-    const child = execFile(file, args, { timeout: timeoutMs, windowsHide: true }, (error, stdout) => {
-      resolve({ code: error ? Number((error as { code?: unknown }).code) || 1 : 0, stdout });
+    let settled = false;
+    const finish = (result: CommandResult) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const child = execFile(
+      file,
+      args,
+      { timeout: timeoutMs, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (!error) {
+          finish({ code: 0, stdout, stderr });
+          return;
+        }
+        const errCode = (error as NodeJS.ErrnoException & { code?: unknown }).code;
+        if (errCode === "ENOENT") {
+          finish({ code: 127, stdout: stdout ?? "", stderr: stderr ?? error.message });
+          return;
+        }
+        const numeric = typeof errCode === "number" && Number.isFinite(errCode) ? errCode : 1;
+        finish({ code: numeric, stdout: stdout ?? "", stderr: stderr ?? error.message });
+      },
+    );
+    child.on("error", (err) => {
+      const errCode = (err as NodeJS.ErrnoException).code;
+      finish({ code: errCode === "ENOENT" ? 127 : 1, stdout: "", stderr: err.message });
     });
-    child.on("error", () => resolve({ code: 127, stdout: "" }));
     child.stdin?.end(stdin);
   });
 }
@@ -76,57 +157,169 @@ function validateRef(ref: string): void {
   }
 }
 
+function validateService(service: string): void {
+  if (!service || /["\\\n\r\0]/.test(service)) {
+    throw new SecretStoreUnavailableError("INVALID_SECRET_REF", "Invalid secret namespace");
+  }
+}
+
+function sanitizeErrorDetail(stderr: string | undefined): string {
+  if (!stderr) return "";
+  const compact = stderr.replace(/\s+/g, " ").trim();
+  return compact.length > 200 ? `${compact.slice(0, 200)}...` : compact;
+}
+
+const MACOS_DENIED_EXIT_CODES = new Set([36, 51, 128]);
+const MACOS_DENIED_PATTERN =
+  /user canceled|denied|interaction is not allowed|not allowed|authorization failed|errSecAuthFailed|errSecUserCanceled|errSecInteractionNotAllowed|keychain is locked/i;
+
+function isMacOsDenied(code: number, stderr?: string): boolean {
+  return MACOS_DENIED_EXIT_CODES.has(code) || Boolean(stderr && MACOS_DENIED_PATTERN.test(stderr));
+}
+
+const LINUX_DENIED_PATTERN =
+  /denied|locked|cancel|dismiss|permission|unauthorized|not authorized|authentication failed/i;
+
+function isLinuxDenied(stderr?: string): boolean {
+  return Boolean(stderr && LINUX_DENIED_PATTERN.test(stderr));
+}
+
+const WINDOWS_DENIED_PATTERN =
+  /access(?:\s+to\s+the\s+path)?\s+.*denied|unauthorized|permission|privilege/i;
+
+function isWindowsDenied(stderr?: string): boolean {
+  return Boolean(stderr && WINDOWS_DENIED_PATTERN.test(stderr));
+}
+
+function isFsPermissionError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code === "EACCES" || code === "EPERM";
+}
+
 /**
- * macOS Keychain through `/usr/bin/security -i`.
- * Secrets are passed via stdin (never argv), base64-encoded (`b64:`) or chunked (`parts:<n>`),
- * and every write is immediately read back and compared. Fails closed on any error.
+ * macOS Keychain through `/usr/bin/security`.
+ * Secrets are passed via stdin (`-i`, never argv), base64-encoded (`b64:`) or chunked (`parts:<n>`),
+ * writes are verified by read-back, deletes check exit code AND confirm `missing` via read-back,
+ * and non-`errSecItemNotFound` (44) failures are NEVER collapsed into `missing`.
  */
-export function keychainSecrets(run: CommandRunner = runWith, service = SERVICE): SecretStore {
+export function keychainSecrets(
+  run: CommandRunner = runWith,
+  service = DEFAULT_SERVICE,
+): SecretStore {
+  validateService(service);
   const quote = (value: string) => {
     validateRef(value);
     return `"${value}"`;
   };
-  const read = async (ref: string): Promise<string | undefined> => {
-    validateRef(ref);
-    const { code, stdout } = await run(SECURITY, ["find-generic-password", "-s", service, "-a", ref, "-w"], "");
-    if (code === 127) {
-      throw new SecretStoreUnavailableError(
-        "SECRET_STORE_UNAVAILABLE",
-        "macOS Keychain tool (/usr/bin/security) is unavailable",
-      );
+
+  type RawRead =
+    | { readonly status: "found"; readonly value: string }
+    | { readonly status: "missing" }
+    | { readonly status: "unavailable"; readonly error: SecretStoreUnavailableError }
+    | { readonly status: "denied"; readonly error: SecretStoreUnavailableError };
+
+  const readRaw = async (account: string): Promise<RawRead> => {
+    validateRef(account);
+    const { code, stdout, stderr } = await run(
+      SECURITY,
+      ["find-generic-password", "-s", service, "-a", account, "-w"],
+      "",
+    );
+    if (code === 0) {
+      return { status: "found", value: stdout.replace(/\n$/, "") };
     }
-    return code === 0 ? stdout.replace(/\n$/, "") : undefined;
+    if (code === 44) {
+      return { status: "missing" };
+    }
+    const detail = sanitizeErrorDetail(stderr);
+    const suffix = detail ? ` (${detail})` : ` (exit code ${code})`;
+    if (code === 127) {
+      return {
+        status: "unavailable",
+        error: new SecretStoreUnavailableError(
+          "SECRET_STORE_UNAVAILABLE",
+          "macOS Keychain tool (/usr/bin/security) is unavailable",
+        ),
+      };
+    }
+    if (isMacOsDenied(code, stderr)) {
+      return {
+        status: "denied",
+        error: new SecretStoreUnavailableError(
+          "SECRET_ACCESS_DENIED",
+          `macOS Keychain denied access to credentials${suffix}`,
+        ),
+      };
+    }
+    return {
+      status: "unavailable",
+      error: new SecretStoreUnavailableError(
+        "SECRET_STORE_UNAVAILABLE",
+        `macOS Keychain read failed${suffix}`,
+      ),
+    };
   };
+
   const parts = (stored: string | undefined) => {
     const match = stored?.match(/^parts:(\d+)$/);
     return match ? Number(match[1]) : 0;
   };
+
   const deleteCommands = (ref: string, count: number) =>
     [...Array.from({ length: count }, (_, i) => `${ref}#${i + 1}`), ref].map(
       (account) => `delete-generic-password -s ${quote(service)} -a ${quote(account)}`,
     );
 
-  const store: SecretStore = {
-    async get(ref) {
-      const stored = await read(ref);
-      if (stored === undefined) return undefined;
-      const count = parts(stored);
-      if (count > 0) {
-        let joined = "";
-        for (let i = 1; i <= count; i++) {
-          const part = await read(`${ref}#${i}`);
-          if (part === undefined) return undefined;
-          joined += part;
+  const read = async (ref: string): Promise<SecretReadResult> => {
+    const raw = await readRaw(ref);
+    if (raw.status !== "found") return raw;
+
+    const stored = raw.value;
+    const count = parts(stored);
+    if (count > 0) {
+      let joined = "";
+      for (let i = 1; i <= count; i++) {
+        const part = await readRaw(`${ref}#${i}`);
+        if (part.status === "unavailable" || part.status === "denied") {
+          return part;
         }
-        return Buffer.from(joined, "base64").toString("utf8");
+        if (part.status === "missing") {
+          return {
+            status: "unavailable",
+            error: new SecretStoreUnavailableError(
+              "SECRET_DECRYPT_FAILED",
+              `macOS Keychain chunk ${i}/${count} is missing for credential entry`,
+            ),
+          };
+        }
+        joined += part.value;
       }
-      if (stored.startsWith("b64:")) return Buffer.from(stored.slice(4), "base64").toString("utf8");
-      if (/^(?:[0-9a-f]{2})+$/i.test(stored)) return Buffer.from(stored, "hex").toString("utf8");
-      return stored;
+      return { status: "found", value: Buffer.from(joined, "base64").toString("utf8") };
+    }
+    if (stored.startsWith("b64:")) {
+      return { status: "found", value: Buffer.from(stored.slice(4), "base64").toString("utf8") };
+    }
+    if (/^(?:[0-9a-f]{2})+$/i.test(stored)) {
+      return { status: "found", value: Buffer.from(stored, "hex").toString("utf8") };
+    }
+    return { status: "found", value: stored };
+  };
+
+  const store: SecretStore = {
+    read,
+    async get(ref) {
+      const result = await read(ref);
+      if (result.status === "found") return result.value;
+      if (result.status === "missing") return undefined;
+      throw result.error;
     },
     async set(ref, value) {
       validateRef(ref);
-      const previous = parts(await read(ref));
+      const existing = await readRaw(ref);
+      if (existing.status === "unavailable" || existing.status === "denied") {
+        throw existing.error;
+      }
+      const previous = existing.status === "found" ? parts(existing.value) : 0;
       const encoded = Buffer.from(value, "utf8").toString("base64");
       const add = (account: string, data: string) =>
         `add-generic-password -s ${quote(service)} -a ${quote(account)} -U -w "${data}"`;
@@ -151,6 +344,20 @@ export function keychainSecrets(run: CommandRunner = runWith, service = SERVICE)
           "macOS Keychain tool (/usr/bin/security) is unavailable",
         );
       }
+      if (writeResult.code !== 0) {
+        const detail = sanitizeErrorDetail(writeResult.stderr);
+        const suffix = detail ? ` (${detail})` : ` (exit code ${writeResult.code})`;
+        if (isMacOsDenied(writeResult.code, writeResult.stderr)) {
+          throw new SecretStoreUnavailableError(
+            "SECRET_ACCESS_DENIED",
+            `macOS Keychain denied saving credentials${suffix}`,
+          );
+        }
+        throw new SecretStoreUnavailableError(
+          "SECRET_WRITE_VERIFY_FAILED",
+          `Could not write credentials to macOS Keychain${suffix}`,
+        );
+      }
       if ((await store.get(ref)) !== value) {
         throw new SecretStoreUnavailableError(
           "SECRET_WRITE_VERIFY_FAILED",
@@ -160,8 +367,49 @@ export function keychainSecrets(run: CommandRunner = runWith, service = SERVICE)
     },
     async delete(ref) {
       validateRef(ref);
-      const count = parts(await read(ref));
-      await run(SECURITY, ["-i"], `${deleteCommands(ref, count).join("\n")}\n`);
+      const existing = await readRaw(ref);
+      if (existing.status === "unavailable" || existing.status === "denied") {
+        throw existing.error;
+      }
+      if (existing.status === "missing") {
+        return;
+      }
+      const count = parts(existing.value);
+      const delResult = await run(SECURITY, ["-i"], `${deleteCommands(ref, count).join("\n")}\n`);
+      if (delResult.code === 127) {
+        throw new SecretStoreUnavailableError(
+          "SECRET_STORE_UNAVAILABLE",
+          "macOS Keychain tool (/usr/bin/security) is unavailable",
+        );
+      }
+      if (delResult.code !== 0) {
+        const detail = sanitizeErrorDetail(delResult.stderr);
+        const suffix = detail ? ` (${detail})` : ` (exit code ${delResult.code})`;
+        if (isMacOsDenied(delResult.code, delResult.stderr)) {
+          throw new SecretStoreUnavailableError(
+            "SECRET_ACCESS_DENIED",
+            `macOS Keychain denied deleting credentials${suffix}`,
+          );
+        }
+        throw new SecretStoreUnavailableError(
+          "SECRET_DELETE_VERIFY_FAILED",
+          `Could not delete credentials from macOS Keychain${suffix}`,
+        );
+      }
+      // Read-back confirmation: root and every chunk MUST be confirmed missing.
+      const accountsToVerify = [ref, ...Array.from({ length: count }, (_, i) => `${ref}#${i + 1}`)];
+      for (const account of accountsToVerify) {
+        const check = await readRaw(account);
+        if (check.status === "unavailable" || check.status === "denied") {
+          throw check.error;
+        }
+        if (check.status === "found") {
+          throw new SecretStoreUnavailableError(
+            "SECRET_DELETE_VERIFY_FAILED",
+            "macOS Keychain credential still present after delete verification",
+          );
+        }
+      }
     },
   };
   return store;
@@ -172,16 +420,47 @@ const DPAPI_PREFIX = "dpapi:";
 /**
  * Windows DPAPI (`CurrentUser`) credential store.
  * Ciphertext blobs are persisted in an encrypted-only blob file (strictly prefixed with `dpapi:`).
- * Never writes or reads plaintext; verifies decrypt round-trip on every write.
+ * Never writes or reads plaintext; verifies decrypt round-trip on every write and confirms
+ * removal from disk on every delete.
  */
 export function windowsSecrets(sealedBlobPath: string, run: CommandRunner = runWith): SecretStore {
   const cache = new Map<string, string>();
 
   const readSealedMap = (): Record<string, string> => {
     if (!existsSync(sealedBlobPath)) return {};
-    const parsed: unknown = JSON.parse(readFileSync(sealedBlobPath, "utf8"));
+    let raw: string;
+    try {
+      raw = readFileSync(sealedBlobPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return {};
+      if (isFsPermissionError(error)) {
+        throw new SecretStoreUnavailableError(
+          "SECRET_ACCESS_DENIED",
+          "Access denied while reading Windows DPAPI credential store file",
+          { cause: error },
+        );
+      }
+      throw new SecretStoreUnavailableError(
+        "SECRET_STORE_UNAVAILABLE",
+        "Could not read Windows DPAPI credential store file",
+        { cause: error },
+      );
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      throw new SecretStoreUnavailableError(
+        "SECRET_DECRYPT_FAILED",
+        "Corrupted DPAPI credential store file",
+        { cause: error },
+      );
+    }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new SecretStoreUnavailableError("SECRET_DECRYPT_FAILED", "Corrupted DPAPI credential store file");
+      throw new SecretStoreUnavailableError(
+        "SECRET_DECRYPT_FAILED",
+        "Corrupted DPAPI credential store file",
+      );
     }
     return parsed as Record<string, string>;
   };
@@ -195,12 +474,34 @@ export function windowsSecrets(sealedBlobPath: string, run: CommandRunner = runW
         );
       }
     }
-    mkdirSync(dirname(sealedBlobPath), { recursive: true });
-    writeFileSync(sealedBlobPath, JSON.stringify(data), { mode: 0o600 });
+    const tempPath = `${sealedBlobPath}.${randomUUID()}.tmp`;
     try {
-      chmodSync(sealedBlobPath, 0o600);
-    } catch {
-      // chmod is best-effort on Windows NTFS.
+      mkdirSync(dirname(sealedBlobPath), { recursive: true });
+      writeFileSync(tempPath, JSON.stringify(data), { mode: 0o600 });
+      try {
+        chmodSync(tempPath, 0o600);
+      } catch {
+        // chmod is best-effort on Windows NTFS.
+      }
+      renameSync(tempPath, sealedBlobPath);
+    } catch (error) {
+      try {
+        rmSync(tempPath, { force: true });
+      } catch {
+        // Ignore cleanup errors.
+      }
+      if (isFsPermissionError(error)) {
+        throw new SecretStoreUnavailableError(
+          "SECRET_ACCESS_DENIED",
+          "Access denied while writing Windows DPAPI credential store file",
+          { cause: error },
+        );
+      }
+      throw new SecretStoreUnavailableError(
+        "SECRET_WRITE_VERIFY_FAILED",
+        "Could not persist Windows DPAPI credential store file",
+        { cause: error },
+      );
     }
   };
 
@@ -210,12 +511,23 @@ export function windowsSecrets(sealedBlobPath: string, run: CommandRunner = runW
       "$b=[Convert]::FromBase64String([Console]::In.ReadToEnd().Trim());" +
       `$o=[Security.Cryptography.ProtectedData]::${op}($b,$null,'CurrentUser');` +
       "[Console]::Out.Write([Convert]::ToBase64String($o))";
-    const { code, stdout } = await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], base64);
+    const { code, stdout, stderr } = await run(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", script],
+      base64,
+    );
     const out = stdout.trim();
     if (code === 127) {
       throw new SecretStoreUnavailableError(
         "SECRET_STORE_UNAVAILABLE",
         "Windows PowerShell DPAPI runtime is unavailable",
+      );
+    }
+    if (code !== 0 && isWindowsDenied(stderr)) {
+      const detail = sanitizeErrorDetail(stderr);
+      throw new SecretStoreUnavailableError(
+        "SECRET_ACCESS_DENIED",
+        `Windows DPAPI denied access${detail ? ` (${detail})` : ""}`,
       );
     }
     if (code !== 0 || !out) {
@@ -227,23 +539,52 @@ export function windowsSecrets(sealedBlobPath: string, run: CommandRunner = runW
     return out;
   };
 
-  return {
-    async get(ref) {
-      validateRef(ref);
-      const cached = cache.get(ref);
-      if (cached !== undefined) return cached;
-      const sealed = readSealedMap()[ref];
-      if (sealed === undefined) return undefined;
-      if (!sealed.startsWith(DPAPI_PREFIX)) {
-        throw new SecretStoreUnavailableError(
+  const read = async (ref: string): Promise<SecretReadResult> => {
+    validateRef(ref);
+    const cached = cache.get(ref);
+    if (cached !== undefined) return { status: "found", value: cached };
+    let map: Record<string, string>;
+    try {
+      map = readSealedMap();
+    } catch (error) {
+      if (error instanceof SecretStoreUnavailableError) {
+        if (error.kind === "denied") return { status: "denied", error };
+        return { status: "unavailable", error };
+      }
+      throw error;
+    }
+    const sealed = map[ref];
+    if (sealed === undefined) return { status: "missing" };
+    if (!sealed.startsWith(DPAPI_PREFIX)) {
+      return {
+        status: "unavailable",
+        error: new SecretStoreUnavailableError(
           "SECRET_DECRYPT_FAILED",
           "Refusing to read unencrypted credential entry; plaintext fallback is disabled",
-        );
-      }
+        ),
+      };
+    }
+    try {
       const unsealed = await dpapi("Unprotect", sealed.slice(DPAPI_PREFIX.length));
       const value = Buffer.from(unsealed, "base64").toString("utf8");
       cache.set(ref, value);
-      return value;
+      return { status: "found", value };
+    } catch (error) {
+      if (error instanceof SecretStoreUnavailableError) {
+        if (error.kind === "denied") return { status: "denied", error };
+        return { status: "unavailable", error };
+      }
+      throw error;
+    }
+  };
+
+  return {
+    read,
+    async get(ref) {
+      const result = await read(ref);
+      if (result.status === "found") return result.value;
+      if (result.status === "missing") return undefined;
+      throw result.error;
     },
     async set(ref, value) {
       validateRef(ref);
@@ -259,6 +600,14 @@ export function windowsSecrets(sealedBlobPath: string, run: CommandRunner = runW
       }
       const next = { ...readSealedMap(), [ref]: `${DPAPI_PREFIX}${protectedB64}` };
       writeSealedMap(next);
+      // Verify entry exists on disk after write.
+      const persisted = readSealedMap()[ref];
+      if (persisted !== `${DPAPI_PREFIX}${protectedB64}`) {
+        throw new SecretStoreUnavailableError(
+          "SECRET_WRITE_VERIFY_FAILED",
+          "Windows DPAPI persisted blob verification failed",
+        );
+      }
       cache.set(ref, value);
     },
     async delete(ref) {
@@ -267,7 +616,26 @@ export function windowsSecrets(sealedBlobPath: string, run: CommandRunner = runW
       const current = readSealedMap();
       if (!(ref in current)) return;
       delete current[ref];
-      writeSealedMap(current);
+      try {
+        writeSealedMap(current);
+      } catch (error) {
+        if (error instanceof SecretStoreUnavailableError && error.code === "SECRET_ACCESS_DENIED") {
+          throw error;
+        }
+        throw new SecretStoreUnavailableError(
+          "SECRET_DELETE_VERIFY_FAILED",
+          "Could not delete credential from Windows DPAPI store file",
+          { cause: error },
+        );
+      }
+      // Read-back confirmation from disk.
+      const after = readSealedMap();
+      if (ref in after) {
+        throw new SecretStoreUnavailableError(
+          "SECRET_DELETE_VERIFY_FAILED",
+          "Windows DPAPI credential still present after delete verification",
+        );
+      }
     },
   };
 }
@@ -275,55 +643,143 @@ export function windowsSecrets(sealedBlobPath: string, run: CommandRunner = runW
 /**
  * Linux Secret Service (GNOME Keyring / KWallet) through `secret-tool`.
  *
- * ADR-011 L4: Strictly fail-closed with ZERO plaintext file fallback. If `secret-tool` or the
- * desktop Secret Service daemon is unavailable, or if write read-back verification fails, throws
- * `SecretStoreUnavailableError` explaining why binding is blocked.
+ * Strictly fail-closed with ZERO plaintext file fallback. Distinguishes `missing`
+ * (exit code 1 with empty stderr) from `denied` and `unavailable`, verifies writes
+ * via read-back, and verifies deletes via both exit code and read-back confirmation.
  */
-export function linuxSecrets(run: CommandRunner = runWith, service = SERVICE): SecretStore {
+export function linuxSecrets(
+  run: CommandRunner = runWith,
+  service = DEFAULT_SERVICE,
+): SecretStore {
+  validateService(service);
   const attrs = (ref: string) => ["service", service, "account", ref];
-  let probePromise: Promise<boolean> | undefined;
+  let probePromise: Promise<{ ok: true } | { ok: false; error: SecretStoreUnavailableError }> | undefined;
 
   const ensureKeyring = async (): Promise<void> => {
     probePromise ??= (async () => {
       const probe = "__xtwork_probe__";
       const stored = await run("secret-tool", ["store", "--label=Xtwork Probe", ...attrs(probe)], "ok", 5000);
-      if (stored.code !== 0) return false;
-      const read = await run("secret-tool", ["lookup", ...attrs(probe)], "", 5000);
+      if (stored.code !== 0) {
+        const detail = sanitizeErrorDetail(stored.stderr);
+        if (stored.code !== 127 && isLinuxDenied(stored.stderr)) {
+          return {
+            ok: false as const,
+            error: new SecretStoreUnavailableError(
+              "SECRET_ACCESS_DENIED",
+              `Linux Secret Service denied access${detail ? ` (${detail})` : ""}`,
+            ),
+          };
+        }
+        return {
+          ok: false as const,
+          error: new SecretStoreUnavailableError(
+            "SECRET_STORE_UNAVAILABLE",
+            `Linux Secret Service (secret-tool / GNOME Keyring / KWallet) is unavailable; plaintext credential fallback is disabled${detail ? ` (${detail})` : ""}`,
+          ),
+        };
+      }
+      const verify = await run("secret-tool", ["lookup", ...attrs(probe)], "", 5000);
       await run("secret-tool", ["clear", ...attrs(probe)], "", 5000);
-      return read.code === 0 && read.stdout === "ok";
+      if (verify.code === 0 && verify.stdout === "ok") {
+        return { ok: true as const };
+      }
+      return {
+        ok: false as const,
+        error: new SecretStoreUnavailableError(
+          "SECRET_STORE_UNAVAILABLE",
+          "Linux Secret Service probe failed read-back verification; plaintext credential fallback is disabled",
+        ),
+      };
     })();
-    const ok = await probePromise;
-    if (!ok) {
+    const result = await probePromise;
+    if (!result.ok) {
       probePromise = undefined;
-      throw new SecretStoreUnavailableError(
-        "SECRET_STORE_UNAVAILABLE",
-        "Linux Secret Service (secret-tool / GNOME Keyring / KWallet) is unavailable; plaintext credential fallback is disabled",
-      );
+      throw result.error;
     }
   };
 
-  return {
-    async get(ref) {
-      validateRef(ref);
+  const lookupRaw = async (ref: string): Promise<SecretReadResult> => {
+    const { code, stdout, stderr } = await run("secret-tool", ["lookup", ...attrs(ref)], "");
+    if (code === 0) {
+      return { status: "found", value: stdout };
+    }
+    const detail = sanitizeErrorDetail(stderr);
+    // `secret-tool lookup` returns exit code 1 with empty stderr when the item does not exist.
+    if (code === 1 && detail.length === 0) {
+      return { status: "missing" };
+    }
+    if (code === 127) {
+      return {
+        status: "unavailable",
+        error: new SecretStoreUnavailableError("SECRET_STORE_UNAVAILABLE", "secret-tool is unavailable"),
+      };
+    }
+    if (isLinuxDenied(stderr)) {
+      return {
+        status: "denied",
+        error: new SecretStoreUnavailableError(
+          "SECRET_ACCESS_DENIED",
+          `Linux Secret Service denied access to credentials${detail ? ` (${detail})` : ""}`,
+        ),
+      };
+    }
+    return {
+      status: "unavailable",
+      error: new SecretStoreUnavailableError(
+        "SECRET_STORE_UNAVAILABLE",
+        `Linux Secret Service lookup failed${detail ? ` (${detail})` : ` (exit code ${code})`}`,
+      ),
+    };
+  };
+
+  const read = async (ref: string): Promise<SecretReadResult> => {
+    validateRef(ref);
+    try {
       await ensureKeyring();
-      const { code, stdout } = await run("secret-tool", ["lookup", ...attrs(ref)], "");
-      if (code === 127) {
-        throw new SecretStoreUnavailableError("SECRET_STORE_UNAVAILABLE", "secret-tool is unavailable");
+    } catch (error) {
+      if (error instanceof SecretStoreUnavailableError) {
+        return error.kind === "denied"
+          ? { status: "denied", error }
+          : { status: "unavailable", error };
       }
-      return code === 0 ? stdout : undefined;
+      throw error;
+    }
+    return lookupRaw(ref);
+  };
+
+  return {
+    read,
+    async get(ref) {
+      const result = await read(ref);
+      if (result.status === "found") return result.value;
+      if (result.status === "missing") return undefined;
+      throw result.error;
     },
     async set(ref, value) {
       validateRef(ref);
       await ensureKeyring();
       const stored = await run("secret-tool", ["store", `--label=Xtwork ${ref}`, ...attrs(ref)], value);
+      if (stored.code === 127) {
+        throw new SecretStoreUnavailableError("SECRET_STORE_UNAVAILABLE", "secret-tool is unavailable");
+      }
       if (stored.code !== 0) {
+        const detail = sanitizeErrorDetail(stored.stderr);
+        if (isLinuxDenied(stored.stderr)) {
+          throw new SecretStoreUnavailableError(
+            "SECRET_ACCESS_DENIED",
+            `Linux Secret Service denied saving credentials${detail ? ` (${detail})` : ""}`,
+          );
+        }
         throw new SecretStoreUnavailableError(
           "SECRET_WRITE_VERIFY_FAILED",
-          "Could not write credentials to Linux Secret Service",
+          `Could not write credentials to Linux Secret Service${detail ? ` (${detail})` : ""}`,
         );
       }
-      const verify = await run("secret-tool", ["lookup", ...attrs(ref)], "");
-      if (verify.code !== 0 || verify.stdout !== value) {
+      const verify = await lookupRaw(ref);
+      if (verify.status === "unavailable" || verify.status === "denied") {
+        throw verify.error;
+      }
+      if (verify.status !== "found" || verify.value !== value) {
         throw new SecretStoreUnavailableError(
           "SECRET_WRITE_VERIFY_FAILED",
           "Could not verify credentials written to Linux Secret Service",
@@ -333,7 +789,34 @@ export function linuxSecrets(run: CommandRunner = runWith, service = SERVICE): S
     async delete(ref) {
       validateRef(ref);
       await ensureKeyring();
-      await run("secret-tool", ["clear", ...attrs(ref)], "");
+      const cleared = await run("secret-tool", ["clear", ...attrs(ref)], "");
+      if (cleared.code === 127) {
+        throw new SecretStoreUnavailableError("SECRET_STORE_UNAVAILABLE", "secret-tool is unavailable");
+      }
+      if (cleared.code !== 0) {
+        const detail = sanitizeErrorDetail(cleared.stderr);
+        if (isLinuxDenied(cleared.stderr)) {
+          throw new SecretStoreUnavailableError(
+            "SECRET_ACCESS_DENIED",
+            `Linux Secret Service denied deleting credentials${detail ? ` (${detail})` : ""}`,
+          );
+        }
+        throw new SecretStoreUnavailableError(
+          "SECRET_DELETE_VERIFY_FAILED",
+          `Could not delete credentials from Linux Secret Service${detail ? ` (${detail})` : ` (exit code ${cleared.code})`}`,
+        );
+      }
+      // Read-back confirmation: item MUST be confirmed missing.
+      const check = await lookupRaw(ref);
+      if (check.status === "unavailable" || check.status === "denied") {
+        throw check.error;
+      }
+      if (check.status === "found") {
+        throw new SecretStoreUnavailableError(
+          "SECRET_DELETE_VERIFY_FAILED",
+          "Linux Secret Service credential still present after delete verification",
+        );
+      }
     },
   };
 }
@@ -341,37 +824,237 @@ export function linuxSecrets(run: CommandRunner = runWith, service = SERVICE): S
 /** In-memory secret store for automated unit tests ONLY. Never used in production `defaultSecrets`. */
 export function memorySecrets(): SecretStore {
   const data = new Map<string, string>();
+  const read = async (ref: string): Promise<SecretReadResult> => {
+    validateRef(ref);
+    const val = data.get(ref);
+    return val === undefined ? { status: "missing" } : { status: "found", value: val };
+  };
   return {
+    read,
     async get(ref) {
-      return data.get(ref);
+      const result = await read(ref);
+      return result.status === "found" ? result.value : undefined;
     },
     async set(ref, value) {
+      validateRef(ref);
       data.set(ref, value);
     },
     async delete(ref) {
+      validateRef(ref);
       data.delete(ref);
     },
   };
+}
+
+export interface SecretStoreFactoryOptions {
+  readonly namespace?: string;
+  readonly windowsDpapiPath?: string;
+  readonly platform?: NodeJS.Platform;
+  readonly run?: CommandRunner;
+}
+
+/**
+ * Factory creating an OS-backed SecretStore bound to a specific namespace
+ * (e.g. `app.xtwork.im-bridge` or `app.xtwork.model-channels`).
+ * Fails closed on unsupported platforms without any plaintext file fallback.
+ */
+export function createSecretStore(options: SecretStoreFactoryOptions = {}): SecretStore {
+  const namespace = options.namespace ?? DEFAULT_SERVICE;
+  const platform = options.platform ?? process.platform;
+  const run = options.run ?? runWith;
+  validateService(namespace);
+
+  if (platform === "darwin") return keychainSecrets(run, namespace);
+  if (platform === "win32") {
+    if (!options.windowsDpapiPath) {
+      throw new SecretStoreUnavailableError(
+        "SECRET_STORE_UNAVAILABLE",
+        "Windows DPAPI store path is required",
+      );
+    }
+    return windowsSecrets(options.windowsDpapiPath, run);
+  }
+  if (platform === "linux") return linuxSecrets(run, namespace);
+  throw new SecretStoreUnavailableError(
+    "SECRET_STORE_UNAVAILABLE",
+    `Unsupported platform "${platform}" has no configured OS secure credential store; plaintext fallback is disabled`,
+  );
 }
 
 /**
  * Select the OS secure credential store for the current platform.
  * Fails closed on unsupported platforms without any plaintext file fallback.
  */
-export function defaultSecrets(windowsDpapiPath?: string, platform: NodeJS.Platform = process.platform): SecretStore {
-  if (platform === "darwin") return keychainSecrets();
-  if (platform === "win32") {
-    if (!windowsDpapiPath) {
-      throw new SecretStoreUnavailableError(
-        "SECRET_STORE_UNAVAILABLE",
-        "Windows DPAPI store path is required",
-      );
-    }
-    return windowsSecrets(windowsDpapiPath);
+export function defaultSecrets(
+  windowsDpapiPath?: string,
+  platform: NodeJS.Platform = process.platform,
+  namespace: string = DEFAULT_SERVICE,
+): SecretStore {
+  return createSecretStore({
+    ...(windowsDpapiPath !== undefined ? { windowsDpapiPath } : {}),
+    platform,
+    namespace,
+  });
+}
+
+export interface CredentialFenceLease {
+  readonly key: string;
+  readonly generation: number;
+  readonly signal: AbortSignal;
+  isCurrent(): boolean;
+  assertCurrent(): void;
+  release(): void;
+}
+
+/**
+ * Concurrency fencing guard (generation token + abort + per-key write/delete serialization).
+ *
+ * Prevents an in-flight OAuth refresh from writing stale refreshed tokens back to the OS
+ * SecretStore after a concurrent logout or channel deletion has invalidated that key.
+ */
+export class ChannelCredentialFence {
+  private readonly generations = new Map<string, number>();
+  private readonly activeControllers = new Map<string, Set<AbortController>>();
+  private readonly keyLocks = new Map<string, Promise<void>>();
+
+  generation(key: string): number {
+    return this.generations.get(key) ?? 0;
   }
-  if (platform === "linux") return linuxSecrets();
-  throw new SecretStoreUnavailableError(
-    "SECRET_STORE_UNAVAILABLE",
-    `Unsupported platform "${platform}" has no configured OS secure credential store; plaintext fallback is disabled`,
-  );
+
+  isCurrent(key: string, expectedGeneration: number): boolean {
+    return this.generation(key) === expectedGeneration;
+  }
+
+  acquire(key: string, externalSignal?: AbortSignal): CredentialFenceLease {
+    const capturedGeneration = this.generation(key);
+    const controller = new AbortController();
+    let set = this.activeControllers.get(key);
+    if (!set) {
+      set = new Set();
+      this.activeControllers.set(key, set);
+    }
+    set.add(controller);
+
+    const cleanup = () => {
+      const currentSet = this.activeControllers.get(key);
+      currentSet?.delete(controller);
+      if (currentSet && currentSet.size === 0) {
+        this.activeControllers.delete(key);
+      }
+      externalSignal?.removeEventListener("abort", onExternalAbort);
+    };
+    const onExternalAbort = () => {
+      controller.abort(externalSignal?.reason);
+      cleanup();
+    };
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort(externalSignal.reason);
+        cleanup();
+      } else {
+        externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+      }
+    }
+
+    return {
+      key,
+      generation: capturedGeneration,
+      signal: controller.signal,
+      isCurrent: () => this.generation(key) === capturedGeneration && !controller.signal.aborted,
+      assertCurrent: () => {
+        if (this.generation(key) !== capturedGeneration) {
+          throw new SecretStoreUnavailableError(
+            "SECRET_FENCE_STALE",
+            `Credential fence generation for "${key}" is stale (${capturedGeneration} !== ${this.generation(key)})`,
+          );
+        }
+      },
+      release: cleanup,
+    };
+  }
+
+  invalidate(key: string, reason = "credential invalidated"): number {
+    const next = this.generation(key) + 1;
+    this.generations.set(key, next);
+    const controllers = this.activeControllers.get(key);
+    if (controllers) {
+      this.activeControllers.delete(key);
+      const abortErr = new SecretStoreUnavailableError(
+        "SECRET_FENCE_STALE",
+        `Credential operation aborted for "${key}": ${reason}`,
+      );
+      for (const controller of controllers) {
+        controller.abort(abortErr);
+      }
+    }
+    return next;
+  }
+
+  private async runSerialized<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.keyLocks.get(key) ?? Promise.resolve();
+    let releaseLock!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const tail = previous.catch(() => undefined).then(() => gate);
+    this.keyLocks.set(key, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      releaseLock();
+      if (this.keyLocks.get(key) === tail) {
+        this.keyLocks.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Persist `value` into `store` ONLY if `expectedGeneration` still matches the key's current
+   * generation. Serialized against `deleteAndInvalidate` so late write-backs can never
+   * resurrect deleted credentials.
+   */
+  async writeIfCurrent(
+    store: SecretStore,
+    key: string,
+    ref: string,
+    value: string,
+    expectedGeneration: number,
+  ): Promise<void> {
+    await this.runSerialized(key, async () => {
+      if (!this.isCurrent(key, expectedGeneration)) {
+        throw new SecretStoreUnavailableError(
+          "SECRET_FENCE_STALE",
+          `Refused stale credential write-back for "${key}" (expected generation ${expectedGeneration}, current ${this.generation(key)})`,
+        );
+      }
+      await store.set(ref, value);
+      if (!this.isCurrent(key, expectedGeneration)) {
+        // Invalidated concurrently while `store.set` was in flight: delete immediately so
+        // the stale write cannot survive even if caller only called `invalidate()`.
+        await store.delete(ref).catch(() => undefined);
+        throw new SecretStoreUnavailableError(
+          "SECRET_FENCE_STALE",
+          `Credential for "${key}" was invalidated while write-back was in flight`,
+        );
+      }
+    });
+  }
+
+  /**
+   * Atomically bump the fencing generation (aborting all in-flight refreshes) and run a
+   * verified `store.delete(ref)` serialized after any currently running write.
+   */
+  async deleteAndInvalidate(
+    store: SecretStore,
+    key: string,
+    ref: string,
+    reason = "logout or channel deleted",
+  ): Promise<number> {
+    const nextGeneration = this.invalidate(key, reason);
+    await this.runSerialized(key, async () => {
+      await store.delete(ref);
+    });
+    return nextGeneration;
+  }
 }
