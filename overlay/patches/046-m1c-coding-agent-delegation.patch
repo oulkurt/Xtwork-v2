@@ -1,0 +1,582 @@
+diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
+index 8dcd025c..d842586e 100644
+--- a/apps/server/src/mcp/OrchestratorMcpService.ts
++++ b/apps/server/src/mcp/OrchestratorMcpService.ts
+@@ -1,5 +1,6 @@
+ import {
+   CommandId,
++  DEFAULT_SERVER_SETTINGS,
+   type RunId,
+   isProviderAvailable,
+   MessageId,
+@@ -116,7 +117,14 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+ import { isSnoozed } from "../orchestration-v2/ThreadSettlementService.ts";
+ import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
+ import * as ProjectService from "../project/ProjectService.ts";
++import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
+ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
++import { isProtectedXtworkThread } from "../im/XtworkImService.ts";
++import {
++  isExternalDelegationBlockedForThread,
++  resolveCodingAgentTarget,
++  validateDelegationWorkspace,
++} from "../xtwork/codingAgentDelegation.ts";
+ import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+ import * as ServerSettings from "../serverSettings.ts";
+ import {
+@@ -1273,6 +1281,9 @@ const make = Effect.gen(function* () {
+   const providerAdapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
+   const scheduledTasks = yield* ScheduledTaskService.ScheduledTaskService;
+   const projects = yield* ProjectService.ProjectService;
++  const managedProjects = yield* Effect.serviceOption(
++    ManagedProjectFolders.ManagedProjectFolders,
++  );
+   const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
+   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
+   const serverSettings = yield* ServerSettings.ServerSettingsService;
+@@ -2677,6 +2688,18 @@ const make = Effect.gen(function* () {
+       };
+     }),
+     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
++      const imDelegationBlock = isExternalDelegationBlockedForThread({
++        threadId: callerScope.thread?.threadId,
++        isProtectedThread: isProtectedXtworkThread(callerScope.thread?.threadId),
++        executionContext: callerScope.imExecution?.context,
++      });
++      if (imDelegationBlock.blocked) {
++        return yield* new OrchestratorMcpFailure({
++          code: imDelegationBlock.code,
++          blocked: true,
++          message: imDelegationBlock.message,
++        });
++      }
+       const environmentId =
+         input.target === undefined
+           ? undefined
+@@ -2724,9 +2747,56 @@ const make = Effect.gen(function* () {
+         operation: "delegate-task",
+       });
+       const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
++      let effectiveTarget = input.target;
++      if (!isRetryOfAcceptedDelegation) {
++        const currentSettings = yield* serverSettings.getSettings.pipe(
++          Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
++        );
++        const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
++        const lockedInstanceId =
++          currentSettings.codingAgent.mode === "provider"
++            ? currentSettings.codingAgent.instanceId
++            : undefined;
++        const lockedProjectEnabled =
++          lockedInstanceId === undefined
++            ? true
++            : yield* threadManagement
++                .isProviderInstanceEnabledForProject({
++                  projectId: parent.thread.projectId,
++                  instanceId: lockedInstanceId,
++                })
++                .pipe(Effect.mapError(threadManagementFailure));
++        const codingAgentResolution = resolveCodingAgentTarget({
++          codingAgent: currentSettings.codingAgent,
++          callerInstanceId: scope.thread.providerInstanceId,
++          requestedTarget: input.target,
++          requestedRole: input.role,
++          providers,
++          providerInstances: currentSettings.providerInstances,
++          orchestrationCapableInstanceIds,
++          isEnabledForProject: (candidateId) =>
++            candidateId === lockedInstanceId ? lockedProjectEnabled : true,
++        });
++        if (codingAgentResolution.kind === "blocked") {
++          const blocked = codingAgentResolution.result;
++          return yield* new OrchestratorMcpFailure({
++            code: blocked.code,
++            blocked: blocked.blocked,
++            reason: blocked.reason,
++            instanceId: blocked.instanceId,
++            displayName: blocked.displayName,
++            canInstall: blocked.canInstall,
++            canLogin: blocked.canLogin,
++            message: blocked.message,
++          });
++        }
++        if (codingAgentResolution.kind === "routed") {
++          effectiveTarget = codingAgentResolution.target;
++        }
++      }
+       const target = yield* resolveTargetRechecking({
+         parent,
+-        target: input.target,
++        target: effectiveTarget,
+         providers,
+         skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
+       });
+@@ -2742,30 +2812,79 @@ const make = Effect.gen(function* () {
+       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
+       if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
+         const project = yield* requireProject(parent.thread.projectId);
+-        const base = yield* gitDriver
+-          .resolveCommit({
++        const isScratchProject = Option.isSome(managedProjects)
++          ? yield* managedProjects.value
++              .isScratchProject(parent.thread.projectId)
++              .pipe(Effect.orElseSucceed(() => false))
++          : false;
++        const scratchRoot = Option.isSome(managedProjects)
++          ? Option.getOrUndefined(
++              yield* managedProjects.value.scratchRoot.pipe(
++                Effect.orElseSucceed(() => Option.none<string>()),
++              ),
++            )
++          : undefined;
++        const preGitCheck = validateDelegationWorkspace({
++          isolation: input.isolation,
++          projectWorkspaceRoot: project.workspaceRoot,
++          parentWorktreePath: parent.thread.worktreePath,
++          isScratchProject,
++          scratchRoot,
++          projectTitle: project.title,
++          hasValidGitHead: true,
++        });
++        if (!preGitCheck.allowed) {
++          return yield* failure("invalid_request", preGitCheck.message);
++        }
++        const baseResult = yield* Effect.result(
++          gitDriver.resolveCommit({
+             cwd: parent.thread.worktreePath ?? project.workspaceRoot,
+             revision: "HEAD",
+-          })
+-          .pipe(
+-            Effect.mapError(() =>
+-              failure("invalid_request", "Unable to resolve the parent checkout commit."),
+-            ),
++          }),
++        );
++        if (baseResult._tag === "Failure") {
++          const nonGitCheck = validateDelegationWorkspace({
++            isolation: input.isolation,
++            projectWorkspaceRoot: project.workspaceRoot,
++            parentWorktreePath: parent.thread.worktreePath,
++            isScratchProject,
++            scratchRoot,
++            projectTitle: project.title,
++            hasValidGitHead: false,
++          });
++          return yield* failure(
++            "invalid_request",
++            nonGitCheck.allowed
++              ? 'Isolation "worktree" requires a Git repository with a valid HEAD commit. Retry delegate_task with isolation: "shared".'
++              : nonGitCheck.message,
+           );
++        }
++        const base = baseResult.success;
+         // Launch preparation creates the worktree from the project root, so a
+         // parent checkout in another repository (such as a Git folder inside
+         // Scratch) would hand it a commit it cannot find.
+         if (parent.thread.worktreePath !== null) {
+-          yield* gitDriver
+-            .resolveCommit({ cwd: project.workspaceRoot, revision: base.commitSha })
+-            .pipe(
+-              Effect.mapError(() =>
+-                failure(
+-                  "invalid_request",
+-                  `Isolation "worktree" creates the child checkout in project "${project.title}" (${project.workspaceRoot}), which does not contain the parent checkout's commit. Use isolation "shared" to work in the parent's checkout.`,
+-                ),
+-              ),
++          const containsResult = yield* Effect.result(
++            gitDriver.resolveCommit({ cwd: project.workspaceRoot, revision: base.commitSha }),
++          );
++          if (containsResult._tag === "Failure") {
++            const outsideCheck = validateDelegationWorkspace({
++              isolation: input.isolation,
++              projectWorkspaceRoot: project.workspaceRoot,
++              parentWorktreePath: parent.thread.worktreePath,
++              isScratchProject,
++              scratchRoot,
++              projectTitle: project.title,
++              hasValidGitHead: true,
++              projectContainsHeadCommit: false,
++            });
++            return yield* failure(
++              "invalid_request",
++              outsideCheck.allowed
++                ? `Isolation "worktree" creates the child checkout in project "${project.title}" (${project.workspaceRoot}), which does not contain the parent checkout's commit. Use isolation "shared" to work in the parent's checkout.`
++                : outsideCheck.message,
+             );
++          }
+         }
+         workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
+       }
+diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
+index 605f56f0..fadb4741 100644
+--- a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
++++ b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
+@@ -1,9 +1,21 @@
+ import { modelSelectionsEqual } from "@t3tools/shared/model";
+-import { recordXtworkNativeThreadPolicy, resolveXtworkProviderPolicy } from "../im/XtworkImService.ts";
++import {
++  isProtectedXtworkThread,
++  recordXtworkNativeThreadPolicy,
++  resolveXtworkProviderPolicy,
++} from "../im/XtworkImService.ts";
++import { PI_INSTANCE_ID } from "../xtwork/bundledPiSettings.ts";
++import {
++  buildCodingAgentDelegationInstructions,
++  resolveCodingAgentDisplayName,
++  validateDelegationWorkspace,
++} from "../xtwork/codingAgentDelegation.ts";
++import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
+ import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
+ import { expandAssistantCitationsForProvider } from "@t3tools/shared/assistantCitations";
+ import {
+   CommandId,
++  DEFAULT_SERVER_SETTINGS,
+   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
+   latestProviderTurnForAttempt,
+   type OrchestrationV2DomainEvent,
+@@ -244,6 +256,10 @@ export const layer: Layer.Layer<
+     const fileSystem = yield* FileSystem.FileSystem;
+     const path = yield* Path.Path;
+     const projects = yield* ProjectService.ProjectService;
++    const managedProjects = yield* Effect.serviceOption(
++      ManagedProjectFolders.ManagedProjectFolders,
++    );
++    const serverSettings = yield* ServerSettings.ServerSettingsService;
+     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
+     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+@@ -975,6 +991,68 @@ export const layer: Layer.Layer<
+         restartCancelledWork.length === 0
+           ? ""
+           : restartCancelledBackgroundWorkNote(restartCancelledWork);
++      const codingAgentInstructions = yield* Effect.gen(function* () {
++        if (
++          run.modelSelection.instanceId !== PI_INSTANCE_ID ||
++          goalCommand ||
++          isCompactionCommandMessage(providerMessage) ||
++          providerMessage.text.trimStart().startsWith("/") ||
++          (manualResume && unsentResumeMessage === undefined)
++        ) {
++          return "";
++        }
++        const settings = yield* serverSettings.getSettings.pipe(
++          Effect.orElseSucceed(() => DEFAULT_SERVER_SETTINGS),
++        );
++        if (settings.codingAgent.mode !== "provider") {
++          return "";
++        }
++        const project = yield* projects
++          .getById(projection.thread.projectId, { includeDeleted: true })
++          .pipe(
++            Effect.map(Option.getOrUndefined),
++            Effect.orElseSucceed(() => undefined),
++          );
++        const isScratchProject = Option.isSome(managedProjects)
++          ? yield* managedProjects.value
++              .isScratchProject(projection.thread.projectId)
++              .pipe(Effect.orElseSucceed(() => false))
++          : false;
++        const scratchRoot = Option.isSome(managedProjects)
++          ? Option.getOrUndefined(
++              yield* managedProjects.value.scratchRoot.pipe(
++                Effect.orElseSucceed(() => Option.none<string>()),
++              ),
++            )
++          : undefined;
++        const hasGitMarker =
++          projection.thread.branch !== null ||
++          (resolvedRuntimePolicy.cwd !== null &&
++            (yield* fileSystem
++              .exists(path.join(resolvedRuntimePolicy.cwd, ".git"))
++              .pipe(Effect.orElseSucceed(() => false))));
++        const workspaceCheck = validateDelegationWorkspace({
++          isolation: "shared",
++          projectWorkspaceRoot: project?.workspaceRoot,
++          parentWorktreePath: projection.thread.worktreePath,
++          isScratchProject,
++          scratchRoot,
++          projectTitle: project?.title,
++          hasValidGitHead: hasGitMarker,
++        });
++        return buildCodingAgentDelegationInstructions({
++          codingAgent: settings.codingAgent,
++          callerInstanceId: run.modelSelection.instanceId,
++          threadId: projection.thread.id,
++          isProtectedThread:
++            xtworkPolicy.protected || isProtectedXtworkThread(projection.thread.id),
++          displayName: resolveCodingAgentDisplayName({
++            instanceId: settings.codingAgent.instanceId,
++            instanceConfig: settings.providerInstances[settings.codingAgent.instanceId],
++          }),
++          workspaceKind: workspaceCheck.workspaceKind,
++        });
++      });
+       const tokenCap = yield* handoffTokenCapConfig.pipe(
+         Effect.orElseSucceed(() => DEFAULT_HANDOFF_TOKEN_CAP),
+       );
+@@ -1932,7 +2010,12 @@ export const layer: Layer.Layer<
+             sideChatHandoff === undefined || compact || goalCommand
+               ? ""
+               : sideChatHandoff.summaryText;
+-          const context = [delivery.context, sideChatContext, restartNote]
++          const context = [
++            delivery.context,
++            sideChatContext,
++            restartNote,
++            codingAgentInstructions,
++          ]
+             .filter((part) => part !== "")
+             .join("\n\n");
+           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
+@@ -2024,6 +2107,7 @@ export const layer: Layer.Layer<
+         retryHandoff.attachments.length === 0 &&
+         sideChatHandoff === undefined &&
+         restartNote === "" &&
++        codingAgentInstructions === "" &&
+         !noteContinuation
+           ? session
+           : makeDeliverySession(session, startWithHandoffs);
+diff --git a/apps/server/src/serverSettings.ts b/apps/server/src/serverSettings.ts
+index 30fa1fc3..7b5aec0d 100644
+--- a/apps/server/src/serverSettings.ts
++++ b/apps/server/src/serverSettings.ts
+@@ -63,6 +63,7 @@ import {
+   planCodingAgentSeeds,
+   shouldSeedCodingAgents,
+ } from "./xtwork/codingAgentSeed.ts";
++import { normalizeCodingAgentSetting } from "./xtwork/codingAgentDelegation.ts";
+ import { startBundledPi } from "./xtwork/gateway.ts";
+ import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
+ import {
+@@ -137,7 +138,11 @@ const normalizeServerSettings = (
+     Effect.flatMap(decodeServerSettings),
+     Effect.map(foldProviderInstanceEnabledFlags),
+     Effect.map((next) => withIdleCompaction(next, globalIdleCompaction(next))),
+-    Effect.map((next) => ({ ...next, ...deriveLegacyProjectOverrides(next) })),
++    Effect.map((next) => ({
++      ...next,
++      codingAgent: normalizeCodingAgentSetting(next.codingAgent),
++      ...deriveLegacyProjectOverrides(next),
++    })),
+     Effect.mapError(
+       (cause) =>
+         new ServerSettingsError({
+diff --git a/apps/web/src/components/chat/TimelineWorkEntryRow.tsx b/apps/web/src/components/chat/TimelineWorkEntryRow.tsx
+index 82121c37..c6f3fdb1 100644
+--- a/apps/web/src/components/chat/TimelineWorkEntryRow.tsx
++++ b/apps/web/src/components/chat/TimelineWorkEntryRow.tsx
+@@ -2,6 +2,10 @@ import { isElectron } from "../../env";
+ import { usePrimaryEnvironmentId } from "../../state/environments";
+ import { readTodoCreateReceipt } from "@t3tools/shared/xtworkTodoReceipt";
+ import { TodoActionReceipt } from "../plugins/TodoActionReceipt";
++import {
++  CodingAgentBlockedActionCard,
++  readCodingAgentBlockedResult,
++} from "../settings/CodingAgentSettingsSection";
+ import { TimelinePendingApprovalRow } from "./TimelinePendingApprovalRow";
+ import { WorkLogDetails, WorkLogRow } from "./WorkLog";
+ import {
+@@ -237,6 +241,19 @@ export const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: WorkEn
+     const todo = readTodoCreateReceipt(item);
+     if (todo) return <TodoActionReceipt key={todo.id} item={todo} />;
+   }
++  const blockedCodingAgent = readCodingAgentBlockedResult(item);
++  if (blockedCodingAgent !== null) {
++    return (
++      <div className="space-y-1.5">
++        <WorkEntryLogRow {...props} />
++        <CodingAgentBlockedActionCard
++          blocked={blockedCodingAgent}
++          environmentId={ctx.activeThreadEnvironmentId}
++          onFallbackToBuiltIn={ctx.onSendAppMessage}
++        />
++      </div>
++    );
++  }
+   const childThreadId =
+     item?.type === "notification" ? notificationChildThreadId(item.source) : undefined;
+   if (item?.type !== "notification" || childThreadId === undefined) {
+diff --git a/apps/web/src/components/settings/ProviderSettingsPanel.tsx b/apps/web/src/components/settings/ProviderSettingsPanel.tsx
+index 501d05d7..fe6007e4 100644
+--- a/apps/web/src/components/settings/ProviderSettingsPanel.tsx
++++ b/apps/web/src/components/settings/ProviderSettingsPanel.tsx
+@@ -116,6 +116,7 @@ import {
+   XtworkProviderProvisioningSection,
+   isProvisionableCodingAgent,
+ } from "./XtworkProviderProvisioningSection";
++import { CodingAgentSettingsSection } from "./CodingAgentSettingsSection";
+ import { CodexSetupSection, CodexManagedRuntimeFields } from "./CodexSetupSection";
+ import { readCodexSetupMode } from "./CodexSetupSection.logic";
+ import { providerClients } from "./providerDriverMeta";
+@@ -631,6 +632,15 @@ export function EnvironmentProviderSettings({
+   const [selectedInstanceId, setSelectedInstanceId] = useState<ProviderInstanceId | null>(
+     targetInstanceId ?? null,
+   );
++  const [lastTargetInstanceId, setLastTargetInstanceId] = useState<ProviderInstanceId | undefined>(
++    targetInstanceId,
++  );
++  if (targetInstanceId !== lastTargetInstanceId) {
++    setLastTargetInstanceId(targetInstanceId);
++    if (targetInstanceId !== undefined) {
++      setSelectedInstanceId(targetInstanceId);
++    }
++  }
+   const [updatingProviderInstanceIds, setUpdatingProviderInstanceIds] = useState<
+     ReadonlySet<ProviderInstanceId>
+   >(() => new Set());
+@@ -1060,6 +1070,21 @@ export function EnvironmentProviderSettings({
+ 
+   return (
+     <>
++      <CodingAgentSettingsSection
++        codingAgent={settings.codingAgent}
++        serverProviders={serverProviders}
++        providerInstances={settings.providerInstances}
++        developerFeatures={developerFeatures}
++        readOnly={readOnly}
++        canWriteSettings={canWriteSettings}
++        onUpdateSettings={(patch) => updateSettings(patch)}
++        onSelectProviderInstance={(instanceId) => {
++          setSelectedInstanceId(instanceId);
++          document
++            .querySelector("[data-provider-detail]")
++            ?.scrollIntoView({ behavior: "smooth", block: "nearest" });
++        }}
++      />
+       <SettingsSection
+         {...searchableSetting("providers")}
+         variant="plain"
+diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
+index 1384922a..53ff48a5 100644
+--- a/apps/web/src/components/settings/settingsSearch.ts
++++ b/apps/web/src/components/settings/settingsSearch.ts
+@@ -1030,6 +1030,14 @@ export const SETTINGS_SEARCH_ITEMS = [
+     to: "/settings/snap-shot",
+     targetId: "snap-shot-enabled",
+   },
++  {
++    id: "coding-agent",
++    title: msg("Coding Agent"),
++    to: "/settings/providers",
++    searchTerms: [
++      msg("coding agent delegate claude codex kimi qoder codebuddy deepseek auto xiaotong"),
++    ],
++  },
+   {
+     id: "providers",
+     title: msg("Providers"),
+diff --git a/packages/contracts/src/orchestratorMcp.ts b/packages/contracts/src/orchestratorMcp.ts
+index d7c60774..d1b2dd3a 100644
+--- a/packages/contracts/src/orchestratorMcp.ts
++++ b/packages/contracts/src/orchestratorMcp.ts
+@@ -940,6 +940,16 @@ export const OrchestratorMcpDeleteScheduledTaskResult = Schema.Struct({
+ export type OrchestratorMcpDeleteScheduledTaskResult =
+   typeof OrchestratorMcpDeleteScheduledTaskResult.Type;
+ 
++export const CodingAgentBlockedReason = Schema.Literals([
++  "not_found",
++  "disabled",
++  "not_installed",
++  "update_required",
++  "not_authenticated",
++  "unavailable",
++]);
++export type CodingAgentBlockedReason = typeof CodingAgentBlockedReason.Type;
++
+ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFailure>()(
+   "OrchestratorMcpFailure",
+   {
+@@ -960,7 +970,15 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
+       "orchestration_error",
+       "thread_credential_required",
+       "target_required",
++      "coding_agent_unavailable",
++      "delegation_denied_in_im",
+     ]),
+     message: Schema.String,
++    blocked: Schema.optionalKey(Schema.Literal(true)),
++    reason: Schema.optionalKey(CodingAgentBlockedReason),
++    instanceId: Schema.optionalKey(ProviderInstanceId),
++    displayName: Schema.optionalKey(Schema.String),
++    canInstall: Schema.optionalKey(Schema.Boolean),
++    canLogin: Schema.optionalKey(Schema.Boolean),
+   },
+ ) {}
+diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
+index 836b473e..4eb65934 100644
+--- a/packages/contracts/src/settings.ts
++++ b/packages/contracts/src/settings.ts
+@@ -1363,6 +1363,19 @@ export const CloudSpeechCredentials = Schema.Struct({
+   openrouter: CloudSpeechCredential,
+ });
+ 
++export const CodingAgentSetting = Schema.Union([
++  Schema.Struct({
++    mode: Schema.Literal("auto"),
++  }),
++  Schema.Struct({
++    mode: Schema.Literal("provider"),
++    instanceId: ProviderInstanceId,
++    model: Schema.optionalKey(TrimmedNonEmptyString),
++  }),
++]);
++export type CodingAgentSetting = typeof CodingAgentSetting.Type;
++export const DEFAULT_CODING_AGENT_SETTING: CodingAgentSetting = { mode: "auto" };
++
+ export const ServerSettings = Schema.Struct({
+   developerFeaturesEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+   // Null means unmigrated; empty is authoritative and must not resurrect cleared preferences.
+@@ -1604,6 +1617,11 @@ export const ServerSettings = Schema.Struct({
+ 
+   /** Sent by the Usage tab with each summary request to this environment; edit in settings.json. Invalid values are ignored. */
+   usageModelFilter: ForwardCompatibleOptional(UsageModelFilter),
++
++  /** Coding Agent delegation routing target for built-in Xiaotong (ADR-012 §5.1). */
++  codingAgent: CodingAgentSetting.pipe(
++    Schema.withDecodingDefault(Effect.succeed(DEFAULT_CODING_AGENT_SETTING)),
++  ),
+ });
+ export type ServerSettings = typeof ServerSettings.Type;
+ 
+@@ -1992,6 +2010,8 @@ export const ServerSettingsPatch = Schema.Struct({
+   usageModelAliases: Schema.optionalKey(
+     Schema.Record(TrimmedNonEmptyString, Schema.NullOr(TrimmedNonEmptyString)),
+   ),
++
++  codingAgent: Schema.optionalKey(CodingAgentSetting),
+ });
+ export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
+ 
+diff --git a/packages/shared/src/serverSettings.ts b/packages/shared/src/serverSettings.ts
+index 023c6eb7..8fe569cb 100644
+--- a/packages/shared/src/serverSettings.ts
++++ b/packages/shared/src/serverSettings.ts
+@@ -408,6 +408,7 @@ export function applyServerSettingsPatch(
+     usagePriceOverrides: usagePriceOverridesPatch,
+     usageModelAliases: usageModelAliasesPatch,
+     // Entry replacement: deepMerge would keep keys the client meant to clear.
++    codingAgent: codingAgentPatch,
+     projectSettingsOverrides: projectSettingsOverridesPatch,
+     projectAgentBrowserAccessOverrides: _legacyBrowserAccess,
+     projectAutoPullOverrides: _legacyAutoPull,
+@@ -544,6 +545,20 @@ export function applyServerSettingsPatch(
+     ...(patch.providerInstances !== undefined
+       ? { providerInstances: patch.providerInstances }
+       : {}),
++    ...(codingAgentPatch !== undefined
++      ? {
++          codingAgent:
++            codingAgentPatch.mode === "provider"
++              ? {
++                  mode: "provider" as const,
++                  instanceId: codingAgentPatch.instanceId,
++                  ...(codingAgentPatch.model !== undefined
++                    ? { model: codingAgentPatch.model }
++                    : {}),
++                }
++              : { mode: "auto" as const },
++        }
++      : {}),
+     ...(patch.worktreesDirectory !== undefined &&
+     patch.worktreesDirectory !== current.worktreesDirectory
+       ? {
