@@ -230,17 +230,17 @@ const SECRET_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   ],
   [/\b(sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED_KEY]"],
   [/\b((?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g, "[REDACTED_KEY]"],
-  [/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]"],
+  [/\b(Bearer[ \t]+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]"],
   [
-    /\b(Authorization\s*[=:]\s*(?:(?:Bearer|Basic|Token)\s+)?)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+)/gi,
+    /\b(Authorization[ \t]*[=:][ \t]*(?:(?:Bearer|Basic|Token)[ \t]+)?)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+)/gi,
     "$1[REDACTED]",
   ],
   [
-    /\b((?:ANTHROPIC|OPENAI|DEEPSEEK|KIMI|API)[A-Z0-9_]*(?:KEY|TOKEN|SECRET)\s*[=:]\s*)\S+/gi,
+    /\b((?:ANTHROPIC|OPENAI|DEEPSEEK|KIMI|API)[A-Z0-9_]*(?:KEY|TOKEN|SECRET)[ \t]*[=:][ \t]*)\S+/gi,
     "$1[REDACTED]",
   ],
   [
-    /\b((?:api[_-]?key|apiKey|access[_-]?token|accessToken|refresh[_-]?token|refreshToken|client[_-]?secret|clientSecret|passwd|password|secret|token|credential)\s*[=:]\s*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+)/gi,
+    /\b((?:api[_-]?key|apiKey|access[_-]?token|accessToken|refresh[_-]?token|refreshToken|client[_-]?secret|clientSecret|passwd|password|secret|token|credential)[ \t]*[=:][ \t]*)(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+)/gi,
     "$1[REDACTED]",
   ],
 ];

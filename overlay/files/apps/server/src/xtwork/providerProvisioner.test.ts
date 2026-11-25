@@ -1138,7 +1138,7 @@ describe("providerProvisioner", () => {
       numeric_token: 9876543210,
     });
     const cleanedJson = redactSecrets(
-      `${jsonPayload} authorization: DEMO_AUTH_1 authorization="DEMO_AUTH_2" authorization='DEMO_AUTH_3'`,
+      `${jsonPayload} authorization: DEMO_AUTH_1 authorization="DEMO_AUTH_2" authorization='DEMO_AUTH_3'\nAuthorization:\nAuthorization: DEMO_MULTILINE_CRED`,
     );
     for (const leaked of [
       "json-secret-1",
@@ -1152,6 +1152,7 @@ describe("providerProvisioner", () => {
       "DEMO_AUTH_1",
       "DEMO_AUTH_2",
       "DEMO_AUTH_3",
+      "DEMO_MULTILINE_CRED",
     ]) {
       expect(cleanedJson).not.toContain(leaked);
     }
