@@ -623,6 +623,22 @@ interface GatewayRouteSnapshot {
   readonly revision: number;
   readonly channels: ReadonlyMap<string, CompiledChannel>;
   readonly devFallback: DevFallbackRoute | null;
+  readonly hasActiveChannels: boolean;
+}
+
+function hasConfiguredOrActiveChannels(channels: readonly GatewayChannelConfig[]): boolean {
+  for (const ch of channels) {
+    if (ch.id === COMPANY_CHANNEL_ID) return true;
+    if (!ch.enabled) continue;
+    for (const model of ch.models) {
+      const cleanId = stripLegacyContextSuffix(model.id);
+      const targetUpstreamId = effectiveUpstreamModelId({ ...model, id: cleanId });
+      if (model.enabled && isCopilotModelPermitted(targetUpstreamId, ch.availableModelIds)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function compileRouteSnapshot(
@@ -632,7 +648,10 @@ function compileRouteSnapshot(
   bindingIdsByChannel: ReadonlyMap<string, string>,
 ): GatewayRouteSnapshot {
   const map = new Map<string, CompiledChannel>();
+  let activeRouteCount = 0;
+  let hasCompanyChannel = false;
   for (const ch of channels) {
+    if (ch.id === COMPANY_CHANNEL_ID) hasCompanyChannel = true;
     const allModels = new Map<string, GatewayModelConfig>();
     const enabledModels = new Map<string, GatewayModelConfig>();
     for (const model of ch.models) {
@@ -647,6 +666,9 @@ function compileRouteSnapshot(
       ) {
         enabledModels.set(cleanId, normalizedModel);
       }
+    }
+    if (enabledModels.size > 0) {
+      activeRouteCount += 1;
     }
     const bindingId = ch.oauth ? bindingIdsByChannel.get(ch.id) : undefined;
     const oauthBinding: CompiledChannelOAuthBinding | undefined =
@@ -664,7 +686,16 @@ function compileRouteSnapshot(
       ...(oauthBinding !== undefined ? { oauthBinding } : {}),
     });
   }
-  return Object.freeze({ revision, channels: map, devFallback });
+  const hasActiveChannels = hasCompanyChannel || activeRouteCount > 0;
+  // Dev fallback (`XTWORK_MODEL_UPSTREAM_URL`) is ONLY enabled in true zero-channel state
+  // (no company channel logged in AND no active member channels).
+  const effectiveDevFallback = hasActiveChannels ? null : devFallback;
+  return Object.freeze({
+    revision,
+    channels: map,
+    devFallback: effectiveDevFallback,
+    hasActiveChannels,
+  });
 }
 
 /**
@@ -706,7 +737,7 @@ export function resolveFallbackModel(
       }
     }
   }
-  if (devFallbackActive) {
+  if (devFallbackActive && !hasConfiguredOrActiveChannels(channels)) {
     return formatModelSlug(MODEL_PROVIDER, STANDARD_MODEL);
   }
   return null;
@@ -768,7 +799,7 @@ export function buildPiModelsJson(
     providers[ch.id] = entry;
   }
 
-  if (Object.keys(providers).length === 0 && devFallbackActive) {
+  if (Object.keys(providers).length === 0 && devFallbackActive && !hasConfiguredOrActiveChannels(channels)) {
     providers[MODEL_PROVIDER] = {
       api: "openai-completions",
       apiKey: `$${GATEWAY_TOKEN_ENV}`,
@@ -1210,15 +1241,25 @@ async function handleGatewayRequest(
     if (!response.writableEnded) cancelUpstream();
   });
 
-  // Legacy dev/E2E fallback route (/v1/chat/completions)
+  // Legacy dev/E2E fallback route (/v1/chat/completions) — strictly disabled whenever any
+  // company or member channel is active (returns 404).
   if (parsedUrl.pathname === "/v1/chat/completions") {
     if (!snapshot.devFallback) {
-      rejectRequest(
-        response,
-        403,
-        "The Xtwork dev fallback route is disabled.",
-        "channel_disabled",
-      );
+      if (snapshot.hasActiveChannels) {
+        rejectRequest(
+          response,
+          404,
+          "The Xtwork dev fallback route is disabled while model channels are configured.",
+          "not_found",
+        );
+      } else {
+        rejectRequest(
+          response,
+          403,
+          "The Xtwork dev fallback route is disabled.",
+          "channel_disabled",
+        );
+      }
       return;
     }
     await handleLegacyDevFallback(

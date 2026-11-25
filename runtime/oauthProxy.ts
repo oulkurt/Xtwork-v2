@@ -324,6 +324,38 @@ const XAI_DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
 const XAI_DEFAULT_TOKEN_URL = "https://auth.x.ai/oauth2/token";
 const XAI_DEFAULT_LIFETIME_SECONDS = 3600;
 
+const SAFE_OAUTH_ERROR_CODE_PATTERN = /^[a-z0-9_.-]{1,64}$/i;
+
+async function extractSafeOAuthErrorCode(response: Response): Promise<string | undefined> {
+  try {
+    const raw = (await response.text()).slice(0, 4096);
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof parsed.error === "string" &&
+      SAFE_OAUTH_ERROR_CODE_PATTERN.test(parsed.error.trim())
+    ) {
+      return parsed.error.trim();
+    }
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof parsed.error === "object" &&
+      parsed.error !== null &&
+      typeof (parsed.error as Record<string, unknown>).code === "string"
+    ) {
+      const nested = String((parsed.error as Record<string, unknown>).code).trim();
+      if (SAFE_OAUTH_ERROR_CODE_PATTERN.test(nested)) {
+        return nested;
+      }
+    }
+  } catch {
+    // Non-JSON or unreadable error body: never expose raw text.
+  }
+  return undefined;
+}
+
 /**
  * Perform one xAI OAuth `refresh_token` grant (matching Pi 1.5.2 `auth/oauth/xai.js`).
  * Validates the token endpoint strictly, disables HTTP redirects (`redirect: "error"`), and
@@ -356,15 +388,13 @@ export async function refreshXaiOAuthToken(
     ...(signal ? { signal } : {}),
   });
 
-  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
   if (!response.ok) {
-    const err = typeof payload.error === "string" ? payload.error : "";
-    const desc = typeof payload.error_description === "string" ? payload.error_description : "";
-    const detail = [err, desc].filter(Boolean).join(": ");
+    const safeCode = await extractSafeOAuthErrorCode(response);
     throw new Error(
-      `xAI OAuth token refresh failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`,
+      `xAI OAuth token refresh failed (HTTP ${response.status}${safeCode ? `: ${safeCode}` : ""})`,
     );
   }
+  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
   if (typeof payload.access_token !== "string" || payload.access_token.length === 0) {
     throw new Error("Invalid xAI OAuth refresh response: missing access_token");
   }
@@ -418,9 +448,9 @@ export async function refreshCodexOAuthToken(
     ...(signal ? { signal } : {}),
   });
   if (!response.ok) {
-    const text = await response.text().catch(() => "");
+    const safeCode = await extractSafeOAuthErrorCode(response);
     throw new Error(
-      `OpenAI Codex token refresh failed (${response.status}): ${text || response.statusText}`,
+      `OpenAI Codex token refresh failed (HTTP ${response.status}${safeCode ? `: ${safeCode}` : ""})`,
     );
   }
   const json = (await response.json()) as Record<string, unknown>;
@@ -1157,6 +1187,35 @@ export class OAuthTokenManager {
         (secretRef !== undefined && stagedRecord.config.secretRef === secretRef)
       ) {
         this.secretRefStates.delete(stagedRecord.config.secretRef);
+        this.fence.invalidate(stagedRecord.fenceKey, reason);
+        for (const priorKey of stagedRecord.priorFenceKeys) {
+          this.fence.invalidate(priorKey, reason);
+        }
+      }
+    }
+  }
+
+  /**
+   * Immediately evict cached credentials & invalidate in-flight refreshes for a `secretRef`
+   * (e.g. after interactive OAuth re-login writes a new account's credentials under the same ref),
+   * without deleting the SecretStore entry. Next `getValidCredentials()` immediately reloads the new token.
+   */
+  evictSecretRef(
+    secretRef: string,
+    reason = "OAuth credentials replaced via interactive re-login",
+  ): void {
+    this.secretRefStates.delete(secretRef);
+    this.fence.invalidate(secretRefFenceKeyFor(secretRef), reason);
+    for (const rec of this.active.values()) {
+      if (rec.config.secretRef === secretRef) {
+        this.fence.invalidate(rec.fenceKey, reason);
+        for (const priorKey of rec.priorFenceKeys) {
+          this.fence.invalidate(priorKey, reason);
+        }
+      }
+    }
+    for (const stagedRecord of this.staged.values()) {
+      if (stagedRecord.config.secretRef === secretRef) {
         this.fence.invalidate(stagedRecord.fenceKey, reason);
         for (const priorKey of stagedRecord.priorFenceKeys) {
           this.fence.invalidate(priorKey, reason);

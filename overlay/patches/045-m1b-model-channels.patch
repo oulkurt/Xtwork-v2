@@ -1,0 +1,301 @@
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index afc9518b..fc4f117f 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -91,8 +91,9 @@ import * as TerminalManager from "./terminal/Manager.ts";
+ import * as McpHttpServer from "./mcp/McpHttpServer.ts";
+ import * as XtworkPlugins from "./mcp/XtworkPluginService.ts";
+ import * as XtworkIm from "./im/XtworkImService.ts";
+ import * as XtworkInstallConsent from "./xtwork/installConsent.ts";
+ import * as XtworkProviderProvisioner from "./xtwork/providerProvisioner.ts";
++import * as XtworkModelChannels from "./xtwork/modelChannelsRoutes.ts";
+ import * as PeerForwarding from "./peer/PeerForwarding.ts";
+ import * as RemoteDelegation from "./peer/RemoteDelegation.ts";
+ import * as PeerLinkRequests from "./peer/PeerLinkRequests.ts";
+@@ -870,7 +871,8 @@ const layerMakeRoutes = Layer.mergeAll(
+     ServerHttp.layerAttachmentUploadRoute,
+     XtworkPlugins.route,
+     XtworkIm.route,
+     XtworkProviderProvisioner.route,
++    XtworkModelChannels.route,
+     GuestHttp.layer,
+     DeviceHubProxy.layer,
+     ServerBrowserStream.routeLayer,
+@@ -926,9 +928,11 @@ const layerMakeRoutes = Layer.mergeAll(
+   Layer.provide(layerCommandReadiness),
+   Layer.provide(XtworkPlugins.layer),
+   Layer.provide(XtworkIm.layer),
+   Layer.provide(XtworkProviderProvisioner.layer),
+   Layer.provide(ServerHttp.layerBrowserApiCors),
+   Layer.provide(ServerHttp.layerHttpCompression),
+-);
++).pipe(
++  Layer.provide(XtworkModelChannels.layer),
++);
+ 
+ const layerMakeServer = Layer.unwrap(
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index a15da677..91767e16 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -2,6 +2,7 @@ import { registerMenuAction } from "../shortcuts/dispatcher";
+ import { useOpenInPreferredEditor } from "../editorPreferences";
+ import { useDesktopDeveloperFeatures } from "../hooks/useDeveloperFeatures";
+ import { isXtworkDesktop, resolveVisibleProviderStatuses } from "../desktopFeatureVisibility";
++import { isXtworkZeroChannelStatus } from "./chat/XtworkZeroChannelBanner";
+ import { m } from "../i18n/messages";
+ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
+ import { useGT, useMessages } from "gt-react";
+@@ -1786,7 +1787,7 @@ export default function ChatView(props: ChatViewProps) {
+   );
+   const providerStatusDismissed = useProviderStatusBannerDismissed(providerStatusDismissalKey);
+   const visibleProviderStatus =
+-    developerFeatures &&
++    (developerFeatures || isXtworkZeroChannelStatus(activeProviderStatus)) &&
+     shouldShowProviderStatusBanner(activeProviderStatus, providerStatusDismissed)
+       ? activeProviderStatus
+       : null;
+@@ -2939,7 +2940,7 @@ export default function ChatView(props: ChatViewProps) {
+         : serverConfig === null
+           ? gt("Side chats are not ready yet. Try again in a moment.")
+           : serverConfig.environment.capabilities.sideChats !== true
+-            ? gt("Update this environment's T3 Code server to use side chats.")
++            ? gt("Update this environment's 小瞳 Work server to use side chats.")
+             : sideChatsOffered && !isServerThread
+               ? gt("Side chats start after the first message.")
+               : sideChat.available &&
+diff --git a/apps/web/src/components/chat/ProviderStatusBanner.tsx b/apps/web/src/components/chat/ProviderStatusBanner.tsx
+index 6de02124..c49a1140 100644
+--- a/apps/web/src/components/chat/ProviderStatusBanner.tsx
++++ b/apps/web/src/components/chat/ProviderStatusBanner.tsx
+@@ -15,6 +15,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+ import { serverEnvironment } from "../../state/server";
+ import { useAtomCommand } from "../../state/use-atom-command";
+ import { RefreshIcon } from "../ui/refresh-icon";
++import { isXtworkZeroChannelStatus, XtworkZeroChannelBanner } from "./XtworkZeroChannelBanner";
+ 
+ function getIncompatibleVersion(status: ServerProvider) {
+   const compatibility = status.compatibilityAdvisory;
+@@ -172,6 +173,16 @@ export const ProviderStatusBanner = memo(function ProviderStatusBanner({
+     return null;
+   }
+ 
++  if (isXtworkZeroChannelStatus(status)) {
++    return (
++      <XtworkZeroChannelBanner
++        environmentId={environmentId}
++        onDismiss={onDismiss}
++        status={status}
++      />
++    );
++  }
++
+   const providerName = status.displayName?.trim() || formatProviderDriverKindLabel(status.driver);
+   const isUnauthenticated = status.status === "error" && status.auth.status === "unauthenticated";
+   const incompatible = getIncompatibleVersion(status);
+diff --git a/apps/web/src/components/settings/SettingsScopeSentence.tsx b/apps/web/src/components/settings/SettingsScopeSentence.tsx
+index 8bae8505..cf019d7d 100644
+--- a/apps/web/src/components/settings/SettingsScopeSentence.tsx
++++ b/apps/web/src/components/settings/SettingsScopeSentence.tsx
+@@ -54,6 +54,7 @@ export const SETTINGS_DEVICE_ONLY_PATHS: ReadonlySet<string> = new Set([
+   "/settings/chat",
+   "/settings/diffs",
+   "/settings/snap-shot",
++  "/settings/channels",
+   "/settings/remote-connections",
+   "/settings/connections",
+   // Access picks its environment on the page itself.
+diff --git a/apps/web/src/components/settings/SettingsSidebarNav.tsx b/apps/web/src/components/settings/SettingsSidebarNav.tsx
+index 309be445..0715d253 100644
+--- a/apps/web/src/components/settings/SettingsSidebarNav.tsx
++++ b/apps/web/src/components/settings/SettingsSidebarNav.tsx
+@@ -13,6 +13,7 @@ import {
+   ArchiveIcon,
+   FlaskConicalIcon,
+   BotIcon,
++  CpuIcon,
+   createLucideIcon,
+   CalendarClockIcon,
+   FileDiffIcon,
+@@ -101,6 +102,7 @@ const SETTINGS_SECTION_ICONS: Readonly<
+   "/settings/projects": PanelsTopLeftIcon,
+   "/settings/keybindings": KeyboardIcon,
+   "/settings/snap-shot": SnapShotIcon,
++  "/settings/channels": CpuIcon,
+   "/settings/providers": BotIcon,
+   "/settings/threads": MessagesSquareIcon,
+   "/settings/browser": GlobeIcon,
+diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
+index 1384922a..fd5b7a7c 100644
+--- a/apps/web/src/components/settings/settingsSearch.ts
++++ b/apps/web/src/components/settings/settingsSearch.ts
+@@ -27,6 +27,7 @@ export type SettingsPath =
+   | "/settings/diffs"
+   | "/settings/keybindings"
+   | "/settings/snap-shot"
++  | "/settings/channels"
+   | "/settings/providers"
+   | "/settings/threads"
+   | "/settings/browser"
+@@ -103,6 +104,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
+   "/settings/diffs": msg("Diffs & pull requests"),
+   "/settings/keybindings": msg("Keybindings"),
+   "/settings/snap-shot": msg("SnapShots"),
++  "/settings/channels": msg("Model channels"),
+   "/settings/providers": msg("Providers"),
+   "/settings/threads": msg("Threads"),
+   "/settings/browser": msg("Browser"),
+@@ -152,6 +154,7 @@ export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
+   {
+     heading: msg("Agents"),
+     paths: [
++      "/settings/channels",
+       "/settings/providers",
+       "/settings/threads",
+       "/settings/browser",
+@@ -1176,7 +1179,7 @@ export const SETTINGS_SEARCH_ITEMS = [
+   },
+   {
+     id: "pull-request-links-open-in-app",
+-    title: msg("Open pull requests in T3 Code"),
++    title: msg("Open pull requests in 小瞳 Work"),
+     to: "/settings/diffs",
+     searchTerms: [
+       `pr commit links ${SOURCE_CONTROL_HOST_LABELS} browser external click default pull request view panel`,
+@@ -1457,6 +1460,14 @@ export const SETTINGS_SEARCH_ITEMS = [
+     to: "/settings/remote-connections",
+     searchTerms: ["feishu lark wecom wechat qr im bot chat 飞书 企业微信 微信 扫码 远程连接"],
+   },
++  {
++    id: "model-channels",
++    title: msg("Model channels"),
++    to: "/settings/channels",
++    searchTerms: [
++      "wecom oidc api key oauth codex copilot grok xai anthropic openai deepseek gemini kimi zhipu minimax qwen xiaomi 模型渠道 企业微信 团队模型 订阅",
++    ],
++  },
+   {
+     id: "archive",
+     title: msg("Archived threads"),
+@@ -1479,6 +1490,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
+   "/settings/diffs": null,
+   "/settings/snap-shot": null,
+   "/settings/keybindings": null,
++  "/settings/channels": null,
+   "/settings/providers": null,
+   "/settings/threads": null,
+   "/settings/browser": null,
+diff --git a/apps/web/src/i18n/translations/zh.json b/apps/web/src/i18n/translations/zh.json
+index 79687bbe..2ba12765 100644
+--- a/apps/web/src/i18n/translations/zh.json
++++ b/apps/web/src/i18n/translations/zh.json
+@@ -1,6 +1,7 @@
+ {
+   "ec12ab09b6db5c40": "选择界面显示语言。",
+   "22b5bc4b64f18ca9": "远程连接",
++  "435c0011b2e8fea7": "模型渠道",
+   "d7e7974a9dfe58e5": "选择文件夹（按住 Shift 点击）",
+   "cf2e3864206551a5": "开发者功能",
+   "029c28229b003dbc": "显示开发者功能",
+diff --git a/apps/web/src/routeTree.gen.ts b/apps/web/src/routeTree.gen.ts
+index 41872100..6746af2a 100644
+--- a/apps/web/src/routeTree.gen.ts
++++ b/apps/web/src/routeTree.gen.ts
+@@ -46,6 +46,7 @@ import { Route as ChatSettingsDiagnosticsRouteImport } from './routes/_chat.sett
+ import { Route as ChatSettingsDevicesRouteImport } from './routes/_chat.settings.devices'
+ import { Route as ChatSettingsConnectionsRouteImport } from './routes/_chat.settings.connections'
+ import { Route as ChatSettingsChatRouteImport } from './routes/_chat.settings.chat'
++import { Route as ChatSettingsChannelsRouteImport } from './routes/_chat.settings.channels'
+ import { Route as ChatSettingsBrowserRouteImport } from './routes/_chat.settings.browser'
+ import { Route as ChatSettingsBetaRouteImport } from './routes/_chat.settings.beta'
+ import { Route as ChatSettingsArchivedRouteImport } from './routes/_chat.settings.archived'
+@@ -245,6 +246,11 @@ const ChatSettingsChatRoute = ChatSettingsChatRouteImport.update({
+   path: '/chat',
+   getParentRoute: () => ChatSettingsRoute,
+ } as any)
++const ChatSettingsChannelsRoute = ChatSettingsChannelsRouteImport.update({
++  id: '/channels',
++  path: '/channels',
++  getParentRoute: () => ChatSettingsRoute,
++} as any)
+ const ChatSettingsBrowserRoute = ChatSettingsBrowserRouteImport.update({
+   id: '/browser',
+   path: '/browser',
+@@ -309,6 +315,7 @@ export interface FileRoutesByFullPath {
+   '/settings/archived': typeof ChatSettingsArchivedRoute
+   '/settings/beta': typeof ChatSettingsBetaRoute
+   '/settings/browser': typeof ChatSettingsBrowserRoute
++  '/settings/channels': typeof ChatSettingsChannelsRoute
+   '/settings/chat': typeof ChatSettingsChatRoute
+   '/settings/connections': typeof ChatSettingsConnectionsRoute
+   '/settings/devices': typeof ChatSettingsDevicesRoute
+@@ -355,6 +362,7 @@ export interface FileRoutesByTo {
+   '/settings/archived': typeof ChatSettingsArchivedRoute
+   '/settings/beta': typeof ChatSettingsBetaRoute
+   '/settings/browser': typeof ChatSettingsBrowserRoute
++  '/settings/channels': typeof ChatSettingsChannelsRoute
+   '/settings/chat': typeof ChatSettingsChatRoute
+   '/settings/connections': typeof ChatSettingsConnectionsRoute
+   '/settings/devices': typeof ChatSettingsDevicesRoute
+@@ -403,6 +411,7 @@ export interface FileRoutesById {
+   '/_chat/settings/archived': typeof ChatSettingsArchivedRoute
+   '/_chat/settings/beta': typeof ChatSettingsBetaRoute
+   '/_chat/settings/browser': typeof ChatSettingsBrowserRoute
++  '/_chat/settings/channels': typeof ChatSettingsChannelsRoute
+   '/_chat/settings/chat': typeof ChatSettingsChatRoute
+   '/_chat/settings/connections': typeof ChatSettingsConnectionsRoute
+   '/_chat/settings/devices': typeof ChatSettingsDevicesRoute
+@@ -451,6 +460,7 @@ export interface FileRouteTypes {
+     | '/settings/archived'
+     | '/settings/beta'
+     | '/settings/browser'
++    | '/settings/channels'
+     | '/settings/chat'
+     | '/settings/connections'
+     | '/settings/devices'
+@@ -497,6 +507,7 @@ export interface FileRouteTypes {
+     | '/settings/archived'
+     | '/settings/beta'
+     | '/settings/browser'
++    | '/settings/channels'
+     | '/settings/chat'
+     | '/settings/connections'
+     | '/settings/devices'
+@@ -544,6 +555,7 @@ export interface FileRouteTypes {
+     | '/_chat/settings/archived'
+     | '/_chat/settings/beta'
+     | '/_chat/settings/browser'
++    | '/_chat/settings/channels'
+     | '/_chat/settings/chat'
+     | '/_chat/settings/connections'
+     | '/_chat/settings/devices'
+@@ -842,6 +854,13 @@ declare module '@tanstack/react-router' {
+       preLoaderRoute: typeof ChatSettingsChatRouteImport
+       parentRoute: typeof ChatSettingsRoute
+     }
++    '/_chat/settings/channels': {
++      id: '/_chat/settings/channels'
++      path: '/channels'
++      fullPath: '/settings/channels'
++      preLoaderRoute: typeof ChatSettingsChannelsRouteImport
++      parentRoute: typeof ChatSettingsRoute
++    }
+     '/_chat/settings/browser': {
+       id: '/_chat/settings/browser'
+       path: '/browser'
+@@ -908,6 +927,7 @@ interface ChatSettingsRouteChildren {
+   ChatSettingsArchivedRoute: typeof ChatSettingsArchivedRoute
+   ChatSettingsBetaRoute: typeof ChatSettingsBetaRoute
+   ChatSettingsBrowserRoute: typeof ChatSettingsBrowserRoute
++  ChatSettingsChannelsRoute: typeof ChatSettingsChannelsRoute
+   ChatSettingsChatRoute: typeof ChatSettingsChatRoute
+   ChatSettingsConnectionsRoute: typeof ChatSettingsConnectionsRoute
+   ChatSettingsDevicesRoute: typeof ChatSettingsDevicesRoute
+@@ -939,6 +959,7 @@ const ChatSettingsRouteChildren: ChatSettingsRouteChildren = {
+   ChatSettingsArchivedRoute: ChatSettingsArchivedRoute,
+   ChatSettingsBetaRoute: ChatSettingsBetaRoute,
+   ChatSettingsBrowserRoute: ChatSettingsBrowserRoute,
++  ChatSettingsChannelsRoute: ChatSettingsChannelsRoute,
+   ChatSettingsChatRoute: ChatSettingsChatRoute,
+   ChatSettingsConnectionsRoute: ChatSettingsConnectionsRoute,
+   ChatSettingsDevicesRoute: ChatSettingsDevicesRoute,

@@ -63,6 +63,10 @@ if (existsSync(join(runtimeDir, "gateway.ts"))) {
   for (const file of [
     "oauthProxy.ts",
     "gateway.ts",
+    "providerCatalog.ts",
+    "companyAuth.ts",
+    "oauthLoginFlows.ts",
+    "channelManager.ts",
     "bundledPiSettings.ts",
     "bundledPiSettings.test.ts",
   ]) {
