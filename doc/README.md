@@ -39,7 +39,7 @@ mygo 外壳管理本机 T3 Node 服务，WebView 加载服务提供的 React 界
 | 验收、风险和依据 | [10 里程碑与验收](plan/10-里程碑与验收.md) · [11 风险与待定](plan/11-风险与待定.md) · [附录 已核实事实](plan/附录-已核实事实.md) |
 | 已确认方向与待决策 | [决策索引](../DECISIONS.md) · [工程决策记录](decisions/README.md) |
 
-插件 v2 的已确认协议见 [ADR-010](decisions/010-plugin-v2-runtime.md)，基于 Mingle 渠道层与伴侣范式的 IM 远程连接服务见 [ADR-011](decisions/011-mingle-im-bridge.md)，M1 内置助手「小瞳」多渠道模型平面、六大编码 Agent 一键安装与 Coding Agent 委派架构见 [ADR-012](decisions/012-xiaotong-model-channels-and-coding-agents.md)。
+插件 v2 的已确认协议见 [ADR-010](decisions/010-plugin-v2-runtime.md)，基于 Mingle 渠道层与伴侣范式的 IM 远程连接服务见 [ADR-011](decisions/011-mingle-im-bridge.md)，M1 内置助手「小瞳」多渠道模型平面、六大编码 Agent 一键安装与 Coding Agent 委派架构见 [ADR-012](decisions/012-xiaotong-model-channels-and-coding-agents.md)，将远程连接统一归属到 Captain 式 Leader 主管、侧栏顶部固定入口与 Mingle 能力分级移植边界见 [ADR-013](decisions/013-leader-supervisory-threads.md)。
 
 历史资料见 [Dim 架构](plan/03-内置运行时-Dim.md) 和 [Dim ACP 未实施待办](plan/dim-acp-flavor-todo.md)。
 

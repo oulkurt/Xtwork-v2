@@ -138,4 +138,5 @@
 - [ADR-007 · 插件通信、授权与持久化边界](007-plugin-contract.md)
 - [ADR-009 · 默认内置运行时 Pi](009-default-pi-runtime.md)
 - [ADR-010 · 插件 v2 双轨运行时与模态承载](010-plugin-v2-runtime.md)
+- [ADR-013 · Leader（Captain 式主管实体）、侧栏置顶入口与 Mingle 能力移植边界](013-leader-supervisory-threads.md)
 - [07 远程连接插件](../plan/07-远程连接插件.md)
