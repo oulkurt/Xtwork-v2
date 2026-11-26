@@ -41,7 +41,7 @@ import {
   type ReplyAudience,
   type TurnExecutionContext,
 } from "./XtworkImSecurity.ts";
-import { makeLeaderStore, type LeaderStore, type PersistedRunPolicy, type ProviderPolicyState } from "./XtworkLeaderStore.ts";
+import { makeLeaderStore, sanitizeBindingPlatform, type LeaderStore, type PersistedRunPolicy, type ProviderPolicyState } from "./XtworkLeaderStore.ts";
 import { buildOwnerNeedsYou, redactDiagnosticText } from "./XtworkLeaderAwareness.ts";
 
 export interface XtworkPolicyHook {
@@ -408,6 +408,12 @@ export const makeDeliverySync = (
 const callHost = (host: DeliveryWorkerHost, method: string, params: BridgePayload) =>
   tryWork((signal) => host.request(method, params, signal));
 
+const isConnectionClaimed = (conn: Record<string, unknown>): boolean => {
+  if (conn.stateDetail === "disconnected") return false;
+  if (conn.lifecycleState === "pairing" || conn.lifecycleState === "idle") return false;
+  return conn.lifecycleState === "active" || (conn.lifecycleState === undefined && conn.state === "connected");
+};
+
 export const makeBridgeEventHandler = (
   host: DeliveryWorkerHost,
   dispatch: ImDispatcher,
@@ -416,8 +422,17 @@ export const makeBridgeEventHandler = (
   Effect.fnUntraced(function* ({ event, payload }: BridgeEvent) {
     if (event === "connection.state") {
       const connId = typeof payload.connectionId === "string" ? payload.connectionId : "";
+      const connPlatform = sanitizeBindingPlatform(payload.platform) ?? undefined;
+      if (connId && payload.stateDetail === "disconnected") {
+        yield* leaders.deactivateBindingOnDisconnect(connId, connPlatform, false).pipe(Effect.ignore);
+        return;
+      }
       if (connId && host.available) {
-        const binding = yield* leaders.ensureBinding(connId, DEFAULT_LEADER_ID);
+        const claimed = isConnectionClaimed(payload);
+        const binding = yield* leaders
+          .ensureBinding(connId, DEFAULT_LEADER_ID, connPlatform, claimed)
+          .pipe(Effect.orElseSucceed(() => undefined));
+        if (!binding) return;
         const ownerLeader = yield* leaders.getLeader(binding.leaderId);
         const desiredPaused = ownerLeader?.status === "paused";
         const needsSync =
@@ -605,15 +620,25 @@ const makeDeliveryWorker = (
         if (ownerRes._tag === "Failure" || !ownerRes.success) {
           continue;
         }
+        const syncedPauseVersion = ownerRes.success.pauseVersion;
         const syncRes = yield* syncLeaderStateAndBindingsToBridge(host, ownerRes.success, [binding]).pipe(Effect.result);
         const confirmed =
           syncRes._tag === "Success"
             ? extractConfirmedBindings(syncRes.success).get(binding.connectionId)
             : undefined;
-        const tupleConfirmed = confirmed !== undefined && bindingMatchesConnection(confirmed, binding);
+        const tupleConfirmed =
+          confirmed !== undefined &&
+          bindingMatchesConnection(confirmed, binding, ownerRes.success.status === "paused");
         if (tupleConfirmed) {
           const latestRes = yield* leaders.activeBindingForConnection(connectionId).pipe(Effect.result);
-          if (latestRes._tag === "Success" && latestRes.success?.bindingId === binding.bindingId) {
+          const latestOwnerRes = yield* leaders.getLeader(binding.leaderId).pipe(Effect.result);
+          if (
+            latestRes._tag === "Success" &&
+            latestRes.success?.bindingId === binding.bindingId &&
+            latestOwnerRes._tag === "Success" &&
+            latestOwnerRes.success !== undefined &&
+            syncedPauseVersion >= latestOwnerRes.success.pauseVersion
+          ) {
             pendingBindingSyncs.delete(connectionId);
           }
         }
@@ -709,7 +734,12 @@ export const layer = Layer.effect(XtworkIm, Effect.gen(function* () {
     const bindingsPayload: Array<Record<string, unknown>> = [];
     for (const conn of listed) {
       if (!isRecord(conn) || typeof conn.id !== "string") continue;
-      const binding = yield* leaders.ensureBinding(conn.id, DEFAULT_LEADER_ID);
+      const connPlatform = sanitizeBindingPlatform(conn.platform) ?? undefined;
+      const claimed = isConnectionClaimed(conn);
+      const binding = yield* leaders
+        .ensureBinding(conn.id, DEFAULT_LEADER_ID, connPlatform, claimed)
+        .pipe(Effect.orElseSucceed(() => undefined));
+      if (!binding) continue;
       const leaderRecord = leaderById.get(binding.leaderId);
       const leaderPaused = leaderRecord?.status === "paused";
       bindingsPayload.push({
@@ -861,20 +891,31 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
     ]),
   );
   const toSync: Array<Record<string, unknown>> = [];
+  const syncAttemptPauseVersionByConn = new Map<string, number>();
   for (const conn of rawConnections) {
     if (isRecord(conn) && typeof conn.id === "string") {
-      const binding = yield* service.leaders.ensureBinding(conn.id, DEFAULT_LEADER_ID).pipe(
+      const connPlatform = sanitizeBindingPlatform(conn.platform) ?? undefined;
+      const claimed = isConnectionClaimed(conn);
+      const binding = yield* service.leaders.ensureBinding(conn.id, DEFAULT_LEADER_ID, connPlatform, claimed).pipe(
         Effect.orElseSucceed(() => undefined),
       );
+      if (binding && ((connPlatform && binding.platform !== connPlatform) || (claimed && !binding.claimed))) {
+        yield* service.leaders
+          .recordBindingPlatform(conn.id, connPlatform ?? binding.platform ?? "", claimed)
+          .pipe(Effect.ignore);
+      }
       if (binding) {
         const leaderRec = leaderById.get(binding.leaderId);
         const desiredPaused = leaderRec?.status === "paused";
+        const desiredPauseVersion = leaderRec?.pauseVersion ?? 0;
         if (
           conn.leaderId !== binding.leaderId ||
           conn.bindingId !== binding.bindingId ||
           conn.bindingEpoch !== binding.epoch ||
-          Boolean(conn.leaderPaused) !== desiredPaused
+          Boolean(conn.leaderPaused) !== desiredPaused ||
+          service.pendingBindingSyncs?.has(conn.id) === true
         ) {
+          syncAttemptPauseVersionByConn.set(conn.id, desiredPauseVersion);
           toSync.push({
             connectionId: conn.id,
             leaderId: binding.leaderId,
@@ -882,13 +923,14 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
             bindingEpoch: binding.epoch,
             leaderPaused: desiredPaused,
             pauseGeneration: leaderRec?.pauseGeneration ?? 0,
-            pauseVersion: leaderRec?.pauseVersion ?? 0,
+            pauseVersion: desiredPauseVersion,
           });
         }
       }
     }
   }
   let confirmedByConnId: ReadonlyMap<string, Record<string, unknown>> = new Map();
+  let syncSucceeded = false;
   if (service.host?.available && toSync.length > 0) {
     const syncRes = yield* call(service.host, "connections.syncBindings", {
       bindings: toSync,
@@ -898,39 +940,10 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
       leaderPauseVersions,
     }).pipe(Effect.result);
     if (syncRes._tag === "Success") {
+      syncSucceeded = true;
       confirmedByConnId = extractConfirmedBindings(syncRes.success);
     }
   }
-  const refreshedBindings = yield* service.leaders.listBindings(leader.id);
-  const bindingByConnId = new Map(refreshedBindings.map((b) => [b.connectionId, b]));
-  const connections = yield* Effect.forEach(
-    rawConnections.filter((conn) => isRecord(conn) && typeof conn.id === "string" && bindingByConnId.has(conn.id)),
-    (conn) => {
-      if (!isRecord(conn) || typeof conn.id !== "string") return Effect.succeed(conn);
-      const b = bindingByConnId.get(conn.id);
-      if (!b) return Effect.succeed(conn);
-      const freshConn = confirmedByConnId.get(conn.id) ?? conn;
-      const tupleMatches = bindingMatchesConnection(freshConn, b);
-      if (tupleMatches) {
-        return clearPendingBindingSyncIfCurrent(service, b).pipe(
-          Effect.as({
-            ...freshConn,
-            syncPending: false,
-          }),
-        );
-      }
-      return markPendingBindingSyncIfCurrent(service, b).pipe(
-        Effect.as({
-          ...freshConn,
-          desiredLeaderId: b.leaderId,
-          desiredBindingId: b.bindingId,
-          desiredBindingEpoch: b.epoch,
-          syncPending: true,
-        }),
-      );
-    },
-  );
-  // S6: Query paused backlog strictly by stamped `leaderId` so rebinding preserves original Leader ownership.
   const pausedPending = service.host?.available
     ? yield* call(service.host, "paused.list", { leaderId: leader.id }).pipe(
         Effect.map((val) => (isRecord(val) && Array.isArray(val.items) ? val.items : [])),
@@ -944,18 +957,67 @@ const fetchLeaderOverview = Effect.fnUntraced(function* (service: ImService, lea
       )
     : { snapshotSequence: 0, threads: [] };
 
+  const latestLeader = (yield* service.leaders.getLeader(leader.id)) ?? leader;
+  const refreshedBindings = yield* service.leaders.listBindings(latestLeader.id);
+  const bindingByConnId = new Map(refreshedBindings.map((b) => [b.connectionId, b]));
+  const connections = yield* Effect.forEach(
+    rawConnections.filter((conn) => isRecord(conn) && typeof conn.id === "string" && bindingByConnId.has(conn.id)),
+    (conn) => {
+      if (!isRecord(conn) || typeof conn.id !== "string") return Effect.succeed(conn);
+      const b = bindingByConnId.get(conn.id);
+      if (!b) return Effect.succeed(conn);
+      const freshConn = confirmedByConnId.get(conn.id) ?? conn;
+      const syncedInThisCall = syncSucceeded && confirmedByConnId.has(conn.id);
+      const confirmedPauseVersion = syncedInThisCall
+        ? (syncAttemptPauseVersionByConn.get(conn.id) ?? leader.pauseVersion)
+        : leader.pauseVersion;
+      const hasUnconfirmedPending = !syncedInThisCall && service.pendingBindingSyncs?.has(conn.id) === true;
+      const tupleMatches =
+        !hasUnconfirmedPending &&
+        confirmedPauseVersion >= latestLeader.pauseVersion &&
+        bindingMatchesConnection(freshConn, b, latestLeader.status === "paused");
+      if (tupleMatches) {
+        return clearPendingBindingSyncIfCurrent(service, b, confirmedPauseVersion).pipe(
+          Effect.map((cleared) => ({
+            ...freshConn,
+            ...(cleared
+              ? { syncPending: false }
+              : {
+                  desiredLeaderId: b.leaderId,
+                  desiredBindingId: b.bindingId,
+                  desiredBindingEpoch: b.epoch,
+                  syncPending: true,
+                }),
+          })),
+        );
+      }
+      return markPendingBindingSyncIfCurrent(service, b, latestLeader.pauseVersion).pipe(
+        Effect.as({
+          ...freshConn,
+          desiredLeaderId: b.leaderId,
+          desiredBindingId: b.bindingId,
+          desiredBindingEpoch: b.epoch,
+          syncPending: true,
+        }),
+      );
+    },
+  );
+
   const ownerNeedsYou = buildOwnerNeedsYou({
-    caller: { ...desktopContext, leaderId: leader.id },
-    leader,
+    caller: { ...desktopContext, leaderId: latestLeader.id },
+    leader: latestLeader,
     snapshotSequence: snapshot.snapshotSequence,
     snapshotThreads: snapshot.threads,
     leaderStore: service.leaders,
     approvals: service.approvals,
   });
 
+  const boundPlatforms = yield* service.leaders.listBoundPlatforms(latestLeader.id);
+
   return {
-    leader,
+    leader: latestLeader,
     bindings: refreshedBindings,
+    boundPlatforms,
     connections,
     pausedPending,
     needsYou: ownerNeedsYou.awareness,
@@ -1014,10 +1076,12 @@ const extractConfirmedBindings = (value: unknown): ReadonlyMap<string, Record<st
 const bindingMatchesConnection = (
   conn: Record<string, unknown>,
   binding: { readonly leaderId: string; readonly bindingId: string; readonly epoch: number },
+  expectedLeaderPaused?: boolean,
 ): boolean =>
   conn.leaderId === binding.leaderId &&
   conn.bindingId === binding.bindingId &&
-  conn.bindingEpoch === binding.epoch;
+  conn.bindingEpoch === binding.epoch &&
+  (expectedLeaderPaused === undefined || Boolean(conn.leaderPaused) === expectedLeaderPaused);
 
 const serviceLeaderLocks = new WeakMap<ImService, Map<string, Semaphore.Semaphore>>();
 const serviceHighestEpochByConn = new WeakMap<ImService, Map<string, number>>();
@@ -1067,43 +1131,62 @@ const withLeaderLock = <A, E, R>(
   effect: Effect.Effect<A, E, R>,
 ): Effect.Effect<A, E, R> => withLeaderLocks(service, [leaderId], effect);
 
+const bindingSyncToken = (bindingId: string, pauseVersion: number): string =>
+  `${bindingId}@pv:${pauseVersion}`;
+
 const markPendingBindingSyncIfCurrent = Effect.fnUntraced(function* (
   service: ImService,
-  binding: { readonly connectionId: string; readonly bindingId: string; readonly epoch: number },
+  binding: { readonly connectionId: string; readonly bindingId: string; readonly leaderId?: string; readonly epoch: number },
+  expectedPauseVersion = 0,
 ) {
   if (!service.pendingBindingSyncs) return;
   if (binding.epoch < getHighestBindingEpoch(service, binding.connectionId)) return;
   if (!service.leaders) {
-    service.pendingBindingSyncs.set(binding.connectionId, binding.bindingId);
+    service.pendingBindingSyncs.set(binding.connectionId, bindingSyncToken(binding.bindingId, expectedPauseVersion));
     return;
   }
   const currentRes = yield* service.leaders.activeBindingForConnection(binding.connectionId).pipe(Effect.result);
   if (binding.epoch < getHighestBindingEpoch(service, binding.connectionId)) return;
   if (currentRes._tag === "Failure") {
-    service.pendingBindingSyncs.set(binding.connectionId, binding.bindingId);
+    service.pendingBindingSyncs.set(binding.connectionId, bindingSyncToken(binding.bindingId, expectedPauseVersion));
     return;
   }
   if (currentRes.success?.bindingId === binding.bindingId) {
-    service.pendingBindingSyncs.set(binding.connectionId, binding.bindingId);
+    const ownerRes = yield* service.leaders.getLeader(currentRes.success.leaderId).pipe(Effect.result);
+    const livePauseVersion = ownerRes._tag === "Success" ? (ownerRes.success?.pauseVersion ?? 0) : expectedPauseVersion;
+    const tokenPauseVersion = Math.max(expectedPauseVersion, livePauseVersion);
+    service.pendingBindingSyncs.set(binding.connectionId, bindingSyncToken(binding.bindingId, tokenPauseVersion));
   }
 });
 
 const clearPendingBindingSyncIfCurrent = Effect.fnUntraced(function* (
   service: ImService,
-  binding: { readonly connectionId: string; readonly bindingId: string; readonly epoch: number },
+  binding: { readonly connectionId: string; readonly bindingId: string; readonly leaderId?: string; readonly epoch: number },
+  confirmedPauseVersion?: number,
 ) {
   recordBindingEpoch(service, binding.connectionId, binding.epoch);
-  if (!service.pendingBindingSyncs) return;
   if (!service.leaders) {
-    if (service.pendingBindingSyncs.get(binding.connectionId) === binding.bindingId) {
-      service.pendingBindingSyncs.delete(binding.connectionId);
+    if (service.pendingBindingSyncs) {
+      const existingToken = service.pendingBindingSyncs.get(binding.connectionId);
+      if (existingToken === binding.bindingId || existingToken?.startsWith(`${binding.bindingId}@pv:`)) {
+        service.pendingBindingSyncs.delete(binding.connectionId);
+      }
     }
-    return;
+    return true;
   }
   const currentRes = yield* service.leaders.activeBindingForConnection(binding.connectionId).pipe(Effect.result);
-  if (currentRes._tag === "Success" && currentRes.success?.bindingId === binding.bindingId) {
-    service.pendingBindingSyncs.delete(binding.connectionId);
+  if (currentRes._tag !== "Success" || currentRes.success?.bindingId !== binding.bindingId) {
+    return false;
   }
+  const ownerRes = yield* service.leaders.getLeader(currentRes.success.leaderId).pipe(Effect.result);
+  if (ownerRes._tag !== "Success" || !ownerRes.success) {
+    return false;
+  }
+  if (confirmedPauseVersion !== undefined && confirmedPauseVersion < ownerRes.success.pauseVersion) {
+    return false;
+  }
+  service.pendingBindingSyncs?.delete(binding.connectionId);
+  return true;
 });
 
 const trySyncLeaderBindingsToBridge = Effect.fnUntraced(function* (
@@ -1119,27 +1202,31 @@ const trySyncLeaderBindingsToBridge = Effect.fnUntraced(function* (
   }
   if (!service.host?.available) {
     for (const binding of bindings) {
-      yield* markPendingBindingSyncIfCurrent(service, binding);
+      yield* markPendingBindingSyncIfCurrent(service, binding, leader.pauseVersion);
     }
     return { synced: false, confirmedByConnId: new Map<string, Record<string, unknown>>() };
   }
   const res = yield* syncLeaderStateAndBindingsToBridge(service.host, leader, bindings).pipe(Effect.result);
   if (res._tag === "Success") {
     const confirmedByConnId = extractConfirmedBindings(res.success);
+    const expectedPaused = leader.status === "paused";
     let allConfirmed = true;
     for (const binding of bindings) {
       const confirmed = confirmedByConnId.get(binding.connectionId);
-      if (confirmed !== undefined && bindingMatchesConnection(confirmed, binding)) {
-        yield* clearPendingBindingSyncIfCurrent(service, binding);
+      if (confirmed !== undefined && bindingMatchesConnection(confirmed, binding, expectedPaused)) {
+        const cleared = yield* clearPendingBindingSyncIfCurrent(service, binding, leader.pauseVersion);
+        if (!cleared) {
+          allConfirmed = false;
+        }
       } else {
         allConfirmed = false;
-        yield* markPendingBindingSyncIfCurrent(service, binding);
+        yield* markPendingBindingSyncIfCurrent(service, binding, leader.pauseVersion);
       }
     }
     return { synced: allConfirmed, confirmedByConnId };
   }
   for (const binding of bindings) {
-    yield* markPendingBindingSyncIfCurrent(service, binding);
+    yield* markPendingBindingSyncIfCurrent(service, binding, leader.pauseVersion);
   }
   return { synced: false, confirmedByConnId: new Map<string, Record<string, unknown>>() };
 });
@@ -1190,9 +1277,16 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
             return {
               leader: overview.leader,
               bindings: overview.bindings,
+              boundPlatforms: overview.boundPlatforms,
               connections: overview.connections,
               needsYouCount: overview.approvals.length + overview.pausedPending.length + nonApprovalNeedsYou,
+              startingCount: overview.needsYou.startingCount,
               runningCount: overview.needsYou.runningCount,
+              waitingCount: overview.needsYou.waitingCount,
+              failedCount: overview.needsYou.failedCount,
+              completedCount: overview.needsYou.completedCount,
+              latestCompletedKey: overview.needsYou.latestCompletedKey,
+              latestCompletedAtMs: overview.needsYou.latestCompletedAtMs,
               pendingApprovalCount: overview.approvals.length,
               pausedPendingCount: overview.pausedPending.length,
             };
@@ -1366,7 +1460,14 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
             .filter((c) => c.leaderId === existingTarget.id)
             .map((c) => c.id);
 
-          const activeBindings = yield* leadersStore.listBindings(leaderId);
+          const allActiveBindings = yield* leadersStore.listBindings(leaderId);
+          for (const binding of allActiveBindings) {
+            if (!liveBridgeConnIds.has(binding.connectionId)) {
+              service.pendingBindingSyncs?.delete(binding.connectionId);
+              yield* leadersStore.deactivateBindingOnDisconnect(binding.connectionId).pipe(Effect.ignore);
+            }
+          }
+          const activeBindings = allActiveBindings.filter((binding) => liveBridgeConnIds.has(binding.connectionId));
           if (activeBindings.length > 0) {
             if (!rebindToLeaderId) {
               return failure("该领航者仍绑定着远程连接，请先换绑或指定接管领航者后再归档。", 409);
@@ -1380,9 +1481,18 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
             }
           }
 
+          const liveConnById = new Map(liveBridgeConns.map((c) => [c.id, c]));
           const reboundBindings = [];
           for (const binding of activeBindings) {
-            const nextBinding = yield* leadersStore.rebindConnection(binding.connectionId, rebindToLeaderId!);
+            const liveConn = liveConnById.get(binding.connectionId);
+            const connPlatform = sanitizeBindingPlatform(liveConn?.platform) ?? undefined;
+            const connClaimed = liveConn ? isConnectionClaimed(liveConn) : undefined;
+            const nextBinding = yield* leadersStore.rebindConnection(
+              binding.connectionId,
+              rebindToLeaderId!,
+              connPlatform,
+              connClaimed,
+            );
             if (!nextBinding) {
               return failure("目标领航者不存在或已归档。", 400);
             }
@@ -1396,9 +1506,15 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
             ...liveBridgeConns.map((c) => c.id),
           ]);
           for (const connId of detachIds) {
+            const liveConn = liveConnById.get(connId);
+            const connPlatform = sanitizeBindingPlatform(liveConn?.platform) ?? undefined;
+            const connClaimed = liveConn ? isConnectionClaimed(liveConn) : false;
             const currentBinding =
               (yield* leadersStore.activeBindingForConnection(connId)) ??
-              (yield* leadersStore.ensureBinding(connId, DEFAULT_LEADER_ID));
+              (yield* leadersStore
+                .ensureBinding(connId, DEFAULT_LEADER_ID, connPlatform, connClaimed)
+                .pipe(Effect.orElseSucceed(() => undefined)));
+            if (!currentBinding) continue;
             recordBindingEpoch(service, currentBinding.connectionId, currentBinding.epoch);
             if (currentBinding.leaderId === existingTarget.id) {
               return failure("该领航者仍绑定着远程连接，请先换绑或指定接管领航者后再归档。", 409);
@@ -1450,6 +1566,9 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
     }
 
     if (writing && subAction === "update") {
+      if (params.name !== undefined && (typeof params.name !== "string" || params.name.trim().length === 0)) {
+        return failure("领航者名字不能为空。", 400);
+      }
       const roleText = typeof params.role === "string" ? params.role : undefined;
       if (roleText !== undefined && Buffer.byteLength(roleText, "utf8") > MAX_COMPANION_FILE_BYTES) {
         return failure("角色说明不能超过 64 KiB。", 400);
@@ -1474,8 +1593,24 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
                   : [],
               } satisfies AwarenessScope)
             : undefined;
-          const imPolicy: ImDelegationPolicy | undefined = isRecord(params.imPolicy)
-            ? sanitizeImDelegationPolicy(params.imPolicy)
+          const rawPolicy = isRecord(params.imPolicy) ? params.imPolicy : undefined;
+          const rawOwnerDm = rawPolicy && isRecord(rawPolicy.ownerDm) ? rawPolicy.ownerDm : undefined;
+          const rawGroup = rawPolicy && isRecord(rawPolicy.group) ? rawPolicy.group : undefined;
+          const imPolicy: ImDelegationPolicy | undefined = rawPolicy
+            ? sanitizeImDelegationPolicy({
+                ownerDm: rawOwnerDm
+                  ? {
+                      ...existing.imPolicy.ownerDm,
+                      ...rawOwnerDm,
+                    }
+                  : existing.imPolicy.ownerDm,
+                group: rawGroup
+                  ? {
+                      ...existing.imPolicy.group,
+                      ...rawGroup,
+                    }
+                  : existing.imPolicy.group,
+              })
             : undefined;
           if (roleText !== undefined && service.memory) {
             const writeRole = yield* tryWork(() => service.memory!.write("role", roleText, undefined, existing.id)).pipe(
@@ -1524,9 +1659,16 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
           const updated = yield* leadersStore.updateLeader(leaderId, { status: nextPaused ? "paused" : "active" });
           if (!updated) return failure("找不到对应的领航者。", 404);
           const bindings = yield* leadersStore.listBindings(updated.id);
+          for (const binding of bindings) {
+            yield* markPendingBindingSyncIfCurrent(service, binding, updated.pauseVersion);
+          }
           let pausedPending: unknown[] = [];
           if (service.host?.available) {
-            yield* syncLeaderStateAndBindingsToBridge(service.host, updated, bindings).pipe(Effect.ignore);
+            if (bindings.length > 0) {
+              yield* trySyncLeaderBindingsToBridge(service, updated, bindings).pipe(Effect.ignore);
+            } else {
+              yield* syncLeaderStateAndBindingsToBridge(service.host, updated, bindings).pipe(Effect.ignore);
+            }
             const listed = yield* call(service.host, "paused.list", { leaderId: updated.id }).pipe(
               Effect.orElseSucceed(() => ({})),
             );
@@ -1722,18 +1864,39 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
         if (!targetLeader || targetLeader.status === "archived") {
           return failure("目标领航者不存在或已归档。", 404);
         }
+        let matchedPlatform: string | undefined;
+        let matchedClaimed: boolean | undefined;
+        let bridgeVerified = false;
         if (service.host?.available) {
           const listed = yield* call(service.host, "connections.list", {}).pipe(
             Effect.map((val) => (isRecord(val) && Array.isArray(val.connections) ? val.connections : undefined)),
             Effect.orElseSucceed(() => undefined),
           );
-          if (listed !== undefined && !listed.some((conn) => isRecord(conn) && conn.id === connectionId)) {
+          if (listed !== undefined) {
+            bridgeVerified = true;
+            const matchedConn = listed.find((conn) => isRecord(conn) && conn.id === connectionId);
+            if (!matchedConn) {
+              return failure("找不到对应的远程连接。", 404);
+            }
+            matchedPlatform = isRecord(matchedConn) ? (sanitizeBindingPlatform(matchedConn.platform) ?? undefined) : undefined;
+            matchedClaimed = isRecord(matchedConn) ? isConnectionClaimed(matchedConn) : undefined;
+          }
+        }
+        if (!bridgeVerified) {
+          const existingActive = yield* leadersStore.activeBindingForConnection(connectionId);
+          if (!existingActive) {
             return failure("找不到对应的远程连接。", 404);
           }
         }
-        const binding = yield* leadersStore.rebindConnection(connectionId, targetLeader.id);
+        const binding = yield* leadersStore.rebindConnection(
+          connectionId,
+          targetLeader.id,
+          matchedPlatform,
+          matchedClaimed,
+          !bridgeVerified,
+        );
         if (!binding) {
-          return failure("目标领航者不存在或已归档。", 404);
+          return failure(bridgeVerified ? "目标领航者不存在或已归档。" : "找不到对应的远程连接。", 404);
         }
         recordBindingEpoch(service, binding.connectionId, binding.epoch);
         const freshLeader = (yield* leadersStore.getLeader(targetLeader.id)) ?? targetLeader;
@@ -1749,39 +1912,117 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
     ? { ...params, by: "owner" }
     : params;
   return yield* call(service.host, method, rpcParams).pipe(Effect.flatMap((value) => {
+    if (writing && action === "connections.disconnect" && service.leaders) {
+      const disconnectedId = (
+        isRecord(value) && typeof value.connectionId === "string"
+          ? value.connectionId
+          : typeof params.connectionId === "string"
+            ? params.connectionId
+            : ""
+      ).trim();
+      if (disconnectedId) {
+        service.pendingBindingSyncs?.delete(disconnectedId);
+        return service.leaders
+          .deactivateBindingOnDisconnect(disconnectedId)
+          .pipe(Effect.ignore, Effect.as(response(value)));
+      }
+      return Effect.succeed(response(value));
+    }
     if (!writing && action === "connections" && service.leaders && isRecord(value) && Array.isArray(value.connections)) {
       const leadersStore = service.leaders;
-      return Effect.forEach(value.connections, (conn) => {
-        if (!isRecord(conn) || typeof conn.id !== "string") return Effect.succeed(conn);
-        return Effect.gen(function* () {
-          const binding = yield* leadersStore.ensureBinding(conn.id as string, DEFAULT_LEADER_ID);
-          if (bindingMatchesConnection(conn, binding)) {
-            yield* clearPendingBindingSyncIfCurrent(service, binding);
-            return {
-              ...conn,
-              syncPending: false,
-            };
+      const rawConnections = value.connections;
+      return Effect.gen(function* () {
+        const processed = yield* Effect.forEach(rawConnections, (conn) => {
+          if (!isRecord(conn) || typeof conn.id !== "string") {
+            return Effect.succeed({ raw: conn, connId: null as string | null, bindingId: null as string | null, confirmedPauseVersion: 0, syncPending: false });
           }
-          const ownerLeader = yield* leadersStore.getLeader(binding.leaderId);
-          const syncOut = ownerLeader
-            ? yield* trySyncLeaderBindingsToBridge(service, ownerLeader, [binding])
-            : { synced: false, confirmedByConnId: new Map<string, Record<string, unknown>>() };
-          const actualConn = syncOut.confirmedByConnId.get(conn.id as string) ?? conn;
-          if (syncOut.synced && bindingMatchesConnection(actualConn, binding)) {
+          const connId = conn.id as string;
+          return Effect.gen(function* () {
+            const connPlatform = sanitizeBindingPlatform(conn.platform) ?? undefined;
+            const claimed = isConnectionClaimed(conn);
+            const binding = yield* leadersStore
+              .ensureBinding(connId, DEFAULT_LEADER_ID, connPlatform, claimed)
+              .pipe(Effect.orElseSucceed(() => undefined));
+            if (!binding) return null;
+            if ((connPlatform && binding.platform !== connPlatform) || (claimed && !binding.claimed)) {
+              yield* leadersStore.recordBindingPlatform(connId, connPlatform ?? binding.platform ?? "", claimed);
+            }
+            const ownerLeader = yield* leadersStore.getLeader(binding.leaderId);
+            const expectedPaused = ownerLeader?.status === "paused";
+            const hasPending = service.pendingBindingSyncs?.has(connId) === true;
+            if (!hasPending && ownerLeader && bindingMatchesConnection(conn, binding, expectedPaused)) {
+              const cleared = yield* clearPendingBindingSyncIfCurrent(service, binding, ownerLeader.pauseVersion);
+              const stillActive = yield* leadersStore.activeBindingForConnection(connId);
+              if (!stillActive) return null;
+              if (cleared && stillActive.bindingId === binding.bindingId) {
+                return {
+                  raw: conn,
+                  connId,
+                  bindingId: binding.bindingId,
+                  confirmedPauseVersion: ownerLeader.pauseVersion,
+                  syncPending: false,
+                };
+              }
+            }
+            const syncOut = ownerLeader
+              ? yield* trySyncLeaderBindingsToBridge(service, ownerLeader, [binding])
+              : { synced: false, confirmedByConnId: new Map<string, Record<string, unknown>>() };
+            const stillActive = yield* leadersStore.activeBindingForConnection(connId);
+            if (!stillActive) return null;
+            const latestOwner = yield* leadersStore.getLeader(stillActive.leaderId);
+            const actualConn = syncOut.confirmedByConnId.get(connId) ?? conn;
+            const syncedAndCurrent =
+              syncOut.synced &&
+              stillActive.bindingId === binding.bindingId &&
+              latestOwner !== undefined &&
+              ownerLeader !== undefined &&
+              ownerLeader.pauseVersion >= latestOwner.pauseVersion &&
+              service.pendingBindingSyncs?.has(connId) !== true &&
+              bindingMatchesConnection(actualConn, stillActive, latestOwner.status === "paused");
             return {
-              ...actualConn,
-              syncPending: false,
+              raw: actualConn,
+              connId,
+              bindingId: stillActive.bindingId,
+              confirmedPauseVersion: ownerLeader?.pauseVersion ?? 0,
+              syncPending: !syncedAndCurrent,
             };
+          }).pipe(Effect.orElseSucceed(() => null));
+        });
+        const finalSnapshots = yield* leadersStore.listActiveBindingsWithLeaderState();
+        const snapshotByConnId = new Map(finalSnapshots.map((entry) => [entry.connectionId, entry]));
+        const finalConnections: unknown[] = [];
+        for (const item of processed) {
+          if (item === null) continue;
+          if (item.connId === null) {
+            finalConnections.push(item.raw);
+            continue;
           }
-          return {
-            ...actualConn,
-            desiredLeaderId: binding.leaderId,
-            desiredBindingId: binding.bindingId,
-            desiredBindingEpoch: binding.epoch,
-            syncPending: true,
-          };
-        }).pipe(Effect.orElseSucceed(() => conn));
-      }).pipe(Effect.map((connections) => response({ ...value, connections })));
+          const stillActive = snapshotByConnId.get(item.connId);
+          if (!stillActive) continue;
+          const rawConn = isRecord(item.raw) ? item.raw : {};
+          const stillSynced =
+            !item.syncPending &&
+            stillActive.bindingId === item.bindingId &&
+            item.confirmedPauseVersion >= stillActive.leaderPauseVersion &&
+            service.pendingBindingSyncs?.has(item.connId) !== true &&
+            bindingMatchesConnection(rawConn, stillActive, stillActive.leaderStatus === "paused");
+          if (stillSynced) {
+            finalConnections.push({
+              ...rawConn,
+              syncPending: false,
+            });
+          } else {
+            finalConnections.push({
+              ...rawConn,
+              desiredLeaderId: stillActive.leaderId,
+              desiredBindingId: stillActive.bindingId,
+              desiredBindingEpoch: stillActive.epoch,
+              syncPending: true,
+            });
+          }
+        }
+        return response({ ...value, connections: finalConnections });
+      });
     }
     return Effect.succeed(response(value));
   }), Effect.catch((error) => Effect.succeed(failure(error.message, 400))));

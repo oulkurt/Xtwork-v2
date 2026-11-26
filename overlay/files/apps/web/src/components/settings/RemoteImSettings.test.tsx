@@ -68,6 +68,14 @@ describe("RemoteImSettings", () => {
         { platform: "feishu", lifecycleState: "active", state: "connected" },
       ]),
     ).toEqual({ label: "已连接 · 2", tone: "connected" });
+    expect(
+      resolveChannelStatus(
+        "feishu",
+        [{ platform: "feishu", lifecycleState: "active", state: "connected" }],
+        false,
+      ),
+    ).toEqual({ label: "无法确认在线", tone: "warning" });
+    expect(resolveChannelStatus("feishu", [], false)).toEqual({ label: "暂不可用", tone: "idle" });
   });
 
   it("maps onboarding failure codes to human-readable Chinese messages", () => {

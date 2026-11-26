@@ -330,6 +330,65 @@ try {
       Math.abs(centerY(navManageAfter) - centerY(navManageBefore)) <= 0.5,
     "Opening Navigator config drawer must not shift the topbar vertically",
   );
+  const drawerGeometry = await page.evaluate(() => {
+    const panel = document.querySelector('[data-testid="leader-config-panel"]');
+    const grid = document.querySelector('[data-testid="leader-avatar-shape-grid"]');
+    const composer =
+      document.querySelector('[data-chat-composer-stack="true"]') ??
+      document.querySelector('[data-chat-composer-overlay="true"]');
+    if (!panel || !grid) return null;
+    const panelRect = panel.getBoundingClientRect();
+    const buttons = Array.from(grid.querySelectorAll("button"));
+    const svgBoxes = buttons.map((btn) => {
+      const svg = btn.querySelector("svg");
+      const r = svg?.getBoundingClientRect();
+      return r ? { w: r.width, h: r.height } : null;
+    });
+    let maxOverlap = 0;
+    for (let i = 0; i < buttons.length; i += 1) {
+      for (let j = i + 1; j < buttons.length; j += 1) {
+        const a = buttons[i].getBoundingClientRect();
+        const b = buttons[j].getBoundingClientRect();
+        const overlapX = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+        const overlapY = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+        if (overlapX > 0 && overlapY > 0) {
+          maxOverlap = Math.max(maxOverlap, Math.min(overlapX, overlapY));
+        }
+      }
+    }
+    const selects = Array.from(panel.querySelectorAll("select"));
+    const maxSelectOverflow = selects.reduce(
+      (max, el) => Math.max(max, el.getBoundingClientRect().right - panelRect.right),
+      0,
+    );
+    const composerOverlap = composer ? panelRect.bottom - composer.getBoundingClientRect().top : 0;
+    return {
+      buttonCount: buttons.length,
+      svgBoxes,
+      maxOverlap,
+      horizontalOverflow: panel.scrollWidth - panel.clientWidth,
+      maxSelectOverflow,
+      composerOverlap,
+    };
+  });
+  assert.ok(drawerGeometry && drawerGeometry.buttonCount === 23, "Expected 23 bot shape buttons in Manage drawer");
+  assert.ok(
+    drawerGeometry.svgBoxes.every((box) => box && box.w > 0 && box.w <= 26 && box.h > 0 && box.h <= 26),
+    `Every static avatar SVG must stay within 26x26: ${JSON.stringify(drawerGeometry.svgBoxes)}`,
+  );
+  assert.ok(drawerGeometry.maxOverlap <= 0.5, `Shape buttons must not overlap (got ${drawerGeometry.maxOverlap}px)`);
+  assert.ok(
+    drawerGeometry.horizontalOverflow <= 1,
+    `Manage drawer must not overflow horizontally (got ${drawerGeometry.horizontalOverflow}px)`,
+  );
+  assert.ok(
+    drawerGeometry.maxSelectOverflow <= 1,
+    `IM policy selects must stay inside Manage drawer (got ${drawerGeometry.maxSelectOverflow}px)`,
+  );
+  assert.ok(
+    drawerGeometry.composerOverlap <= 0.5,
+    `Manage drawer must not overlap chat composer (got ${drawerGeometry.composerOverlap}px)`,
+  );
   const leaderViewText = await page.locator("body").innerText();
   assert.doesNotMatch(leaderViewText, /无文件夹|Unknown Subject|T3 Code|会话|线程/);
   await page.screenshot({ path: join(testOutput, "leader-desktop-zh.png") });
@@ -389,7 +448,7 @@ try {
   await browserUrlInput.press("Enter");
   await page.waitForFunction(
     () => {
-      const canvas = document.querySelector("canvas");
+      const canvas = document.querySelector("[data-server-browser-surface] canvas");
       if (!(canvas instanceof HTMLCanvasElement) || canvas.width === 0 || canvas.height === 0) {
         return false;
       }

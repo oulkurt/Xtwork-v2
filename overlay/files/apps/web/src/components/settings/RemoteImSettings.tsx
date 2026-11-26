@@ -42,6 +42,7 @@ type Connection = {
   claimExpiresAt?: number | null;
   leaderId?: string;
   desiredLeaderId?: string;
+  leaderPaused?: boolean;
   syncPending?: boolean;
 };
 
@@ -170,8 +171,14 @@ export function applyOnboardingEvent(
 export function resolveChannelStatus(
   platform: Channel,
   connections: readonly Connection[],
+  bridgeAvailable = true,
 ): { label: string; tone: "connected" | "warning" | "error" | "idle" } {
   const matched = connections.filter((item) => item.platform === platform);
+  if (!bridgeAvailable) {
+    return matched.length > 0
+      ? { label: "无法确认在线", tone: "warning" }
+      : { label: "暂不可用", tone: "idle" };
+  }
   if (matched.length === 0) return { label: "未连接", tone: "idle" };
 
   const transportOf = (item: Connection) => item.state ?? item.status;
@@ -280,70 +287,81 @@ export function RemoteImSettings() {
 
   async function refresh(signal?: AbortSignal) {
     const statusSeq = ++statusSeqRef.current;
-    const status = (await request("status", undefined, signal)) as { state?: string; lifecycle?: string };
-    if (signal?.aborted) return;
-    const statusState = status.state ?? status.lifecycle;
-    const online = statusState !== "starting" && statusState !== "unavailable";
-    if (statusSeq >= appliedStatusSeqRef.current) {
-      appliedStatusSeqRef.current = statusSeq;
-      setAvailable(online);
-    }
-    if (!online) return;
-    const snapshotSeq = ++snapshotSeqRef.current;
-    const hasUnboundStart = () => Object.keys(unboundStartsRef.current).length > 0;
-    const shouldPollEvents = !hasUnboundStart();
-    const [items, requests, permissions, notifications, leadersRes] = await Promise.all([
-      request("connections", undefined, signal),
-      request("access", undefined, signal),
-      request("approvals", undefined, signal),
-      shouldPollEvents ? request(`onboarding/events?after=${cursor.current}`, undefined, signal) : Promise.resolve(null),
-      request("leaders", undefined, signal).catch(() => null),
-    ]);
-    if (signal?.aborted) return;
-    if (snapshotSeq >= appliedSnapshotSeqRef.current) {
-      appliedSnapshotSeqRef.current = snapshotSeq;
-      setConnections(collection(items, "connections"));
-      const rawLeaders = collection<{ leader?: { id?: string; name?: string } }>(leadersRes, "leaders");
-      setNavigators(
-        rawLeaders
-          .map((item) => item.leader)
-          .filter((leader): leader is { id: string; name: string } => Boolean(leader?.id && leader?.name)),
-      );
-      const held = collection<Access>(requests, "held");
-      setAccess(
-        (held.length > 0 ? held : collection<Access>(requests, "requests")).filter(
-          (item) => (item.status ?? item.state ?? "held") === "held",
-        ),
-      );
-      setApprovals(collection(permissions, "approvals"));
-    }
-    // Defer consuming onboarding events and advancing the cursor whenever any active start is still unbound.
-    const incomingEvents =
-      shouldPollEvents && !hasUnboundStart()
-        ? collection<Event>(notifications, "events").filter(({ sequence }) => sequence > cursor.current)
-        : [];
-    if (incomingEvents.length > 0) {
-      const onboardingUpdates: Record<string, unknown>[] = [];
-      for (const { sequence, event, payload } of incomingEvents) {
-        cursor.current = Math.max(sequence, cursor.current);
-        if (event === "onboarding.event") onboardingUpdates.push(payload);
+    try {
+      const status = (await request("status", undefined, signal)) as { state?: string; lifecycle?: string };
+      if (signal?.aborted) return;
+      const statusState = status.state ?? status.lifecycle;
+      const online = statusState !== "starting" && statusState !== "unavailable";
+      if (!online) {
+        if (statusSeq >= appliedStatusSeqRef.current) {
+          appliedStatusSeqRef.current = statusSeq;
+          setAvailable(false);
+        }
+        return;
       }
-      if (onboardingUpdates.length > 0) {
-        setOnboardings((current) => {
-          let next = current;
-          for (const payload of onboardingUpdates) {
-            for (const platform of REMOTE_IM_CHANNEL_ORDER) {
-              const existing = next[platform];
-              if (!existing?.id) continue;
-              const updated = applyOnboardingEvent(existing, payload);
-              if (updated !== existing) {
-                next = { ...next, [platform]: updated };
+      const snapshotSeq = ++snapshotSeqRef.current;
+      const hasUnboundStart = () => Object.keys(unboundStartsRef.current).length > 0;
+      const shouldPollEvents = !hasUnboundStart();
+      const [items, requests, permissions, notifications, leadersRes] = await Promise.all([
+        request("connections", undefined, signal),
+        request("access", undefined, signal),
+        request("approvals", undefined, signal),
+        shouldPollEvents ? request(`onboarding/events?after=${cursor.current}`, undefined, signal) : Promise.resolve(null),
+        request("leaders", undefined, signal).catch(() => null),
+      ]);
+      if (signal?.aborted) return;
+      if (snapshotSeq >= appliedSnapshotSeqRef.current && statusSeq >= appliedStatusSeqRef.current) {
+        appliedStatusSeqRef.current = statusSeq;
+        appliedSnapshotSeqRef.current = snapshotSeq;
+        setAvailable(true);
+        setConnections(collection(items, "connections"));
+        const rawLeaders = collection<{ leader?: { id?: string; name?: string } }>(leadersRes, "leaders");
+        setNavigators(
+          rawLeaders
+            .map((item) => item.leader)
+            .filter((leader): leader is { id: string; name: string } => Boolean(leader?.id && leader?.name)),
+        );
+        const held = collection<Access>(requests, "held");
+        setAccess(
+          (held.length > 0 ? held : collection<Access>(requests, "requests")).filter(
+            (item) => (item.status ?? item.state ?? "held") === "held",
+          ),
+        );
+        setApprovals(collection(permissions, "approvals"));
+      }
+      const incomingEvents =
+        shouldPollEvents && !hasUnboundStart()
+          ? collection<Event>(notifications, "events").filter(({ sequence }) => sequence > cursor.current)
+          : [];
+      if (incomingEvents.length > 0) {
+        const onboardingUpdates: Record<string, unknown>[] = [];
+        for (const { sequence, event, payload } of incomingEvents) {
+          cursor.current = Math.max(sequence, cursor.current);
+          if (event === "onboarding.event") onboardingUpdates.push(payload);
+        }
+        if (onboardingUpdates.length > 0) {
+          setOnboardings((current) => {
+            let next = current;
+            for (const payload of onboardingUpdates) {
+              for (const platform of REMOTE_IM_CHANNEL_ORDER) {
+                const existing = next[platform];
+                if (!existing?.id) continue;
+                const updated = applyOnboardingEvent(existing, payload);
+                if (updated !== existing) {
+                  next = { ...next, [platform]: updated };
+                }
               }
             }
-          }
-          return next;
-        });
+            return next;
+          });
+        }
       }
+    } catch (cause) {
+      if (!signal?.aborted && statusSeq >= appliedStatusSeqRef.current) {
+        appliedStatusSeqRef.current = statusSeq;
+        setAvailable(false);
+      }
+      throw cause;
     }
   }
 
@@ -879,7 +897,7 @@ export function RemoteImSettings() {
 
         <div className="grid grid-cols-1 gap-7 pt-1 pb-4 sm:grid-cols-2 lg:grid-cols-3">
           {REMOTE_IM_CHANNEL_ORDER.map((platform) => {
-            const status = resolveChannelStatus(platform, connections);
+            const status = resolveChannelStatus(platform, connections, available !== false);
             const flipped = flippedModes[platform] !== undefined;
             const meta = REMOTE_IM_CHANNELS[platform];
             return (
@@ -907,17 +925,28 @@ export function RemoteImSettings() {
               connection.paused === true || connection.state === "paused" || connection.status === "paused";
             const state =
               lifecycle === "pairing" ? "pairing" : (connection.state ?? connection.status ?? lifecycle);
-            const statusLabel =
-              isPaused && state !== "paused"
-                ? `${REMOTE_IM_STATE_LABELS[state] ?? state} · ${REMOTE_IM_STATE_LABELS.paused}`
-                : (REMOTE_IM_STATE_LABELS[state] ?? state);
+            const transportLabel =
+              available === false
+                ? "桥接不可用 · 无法确认在线"
+                : isPaused && state !== "paused"
+                  ? `${REMOTE_IM_STATE_LABELS[state] ?? state} · ${REMOTE_IM_STATE_LABELS.paused}`
+                  : (REMOTE_IM_STATE_LABELS[state] ?? state);
+            const intakeLabel =
+              available === false
+                ? undefined
+                : connection.leaderPaused === true
+                  ? "领航者已暂停接单"
+                  : connection.syncPending === true
+                    ? "换绑同步中"
+                    : undefined;
             const action = isPaused ? "resume" : "pause";
             return id ? (
               <SettingsRow
                 key={id}
                 title={connection.name ?? REMOTE_IM_CHANNELS[connection.platform]?.name ?? "远程连接"}
                 description={[
-                  statusLabel,
+                  transportLabel,
+                  intakeLabel,
                   connection.botName,
                   connection.stateDetail,
                   connection.message,

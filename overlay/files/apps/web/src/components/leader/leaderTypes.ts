@@ -106,16 +106,27 @@ export interface LeaderConnectionSummary {
   readonly syncPending?: boolean;
 }
 
+export interface LeaderBindingSummary {
+  readonly bindingId: string;
+  readonly connectionId: string;
+  readonly epoch: number;
+  readonly platform?: string | null;
+  readonly claimed?: boolean;
+}
+
 export interface LeaderListItem {
   readonly leader: LeaderProfile;
-  readonly bindings: readonly {
-    readonly bindingId: string;
-    readonly connectionId: string;
-    readonly epoch: number;
-  }[];
+  readonly bindings: readonly LeaderBindingSummary[];
+  readonly boundPlatforms?: readonly string[];
   readonly connections: readonly LeaderConnectionSummary[];
   readonly needsYouCount: number;
   readonly runningCount: number;
+  readonly startingCount?: number;
+  readonly waitingCount?: number;
+  readonly failedCount?: number;
+  readonly completedCount?: number;
+  readonly latestCompletedKey?: string | null;
+  readonly latestCompletedAtMs?: number | null;
   readonly pendingApprovalCount: number;
   readonly pausedPendingCount: number;
 }
@@ -168,14 +179,20 @@ export interface LeaderPausedItem {
 
 export interface LeaderOverview {
   readonly leader: LeaderProfile;
+  readonly bindings?: readonly LeaderBindingSummary[];
+  readonly boundPlatforms?: readonly string[];
   readonly connections: readonly LeaderConnectionSummary[];
   readonly pausedPending: readonly LeaderPausedItem[];
   readonly needsYou: {
     readonly snapshotSequence: number;
     readonly needsYouCount: number;
     readonly runningCount: number;
+    readonly startingCount?: number;
+    readonly waitingCount?: number;
     readonly completedCount: number;
     readonly failedCount: number;
+    readonly latestCompletedKey?: string | null;
+    readonly latestCompletedAtMs?: number | null;
     readonly pendingApprovalCount: number;
     readonly threads: readonly LeaderScopedThread[];
   };

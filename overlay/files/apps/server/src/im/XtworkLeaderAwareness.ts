@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off globalDate:off globalDateInEffect:off globalJsonInEffect:off effectTryWithoutCatch:off globalErrorInEffectCatch:off globalErrorInEffectFailure:off effectFnOpportunity:off deterministicKeys:off matchBooleanToIsSuccess:off
 import { EnvironmentId } from "@t3tools/contracts";
 import { projectThreadAwarenessV2, type AgentAwarenessPhase } from "@t3tools/shared/agentAwareness";
+import * as DateTime from "effect/DateTime";
 import type { AgentAwarenessThread } from "../orchestration-v2/ProjectionStore.ts";
 import {
   DEFAULT_LEADER_ID,
@@ -29,10 +30,14 @@ export interface ScopedThreadSummary {
 export interface ScopedAwarenessView {
   readonly snapshotSequence: number;
   readonly needsYouCount: number;
+  readonly startingCount: number;
   readonly runningCount: number;
+  readonly waitingCount: number;
   readonly completedCount: number;
   readonly failedCount: number;
   readonly pendingApprovalCount: number;
+  readonly latestCompletedKey: string | null;
+  readonly latestCompletedAtMs: number | null;
   readonly threads: readonly ScopedThreadSummary[];
 }
 
@@ -120,9 +125,14 @@ export function buildScopedAwareness(input: {
   // Step 3: Project phase via T3's `projectThreadAwarenessV2` and elevate threads with pending IM approvals.
   const summaries: ScopedThreadSummary[] = [];
   let needsYouCount = 0;
+  let startingCount = 0;
   let runningCount = 0;
+  let waitingCount = 0;
   let completedCount = 0;
   let failedCount = 0;
+  let latestCompletedThreadId: string | null = null;
+  let latestCompletedRunId: string | null = null;
+  let latestCompletedAtMs: number | null = null;
 
   for (const { thread, isProtected, replyAudience } of authorizedThreads) {
     const projectTitle = projectTitleById?.get(thread.projectId) ?? "本机对话";
@@ -141,10 +151,33 @@ export function buildScopedAwareness(input: {
       pendingForThread > 0
         ? `等待批准 (${pendingForThread})`
         : (projected?.headline ?? "需要你决定");
+    const updatedAt = projected?.updatedAt ?? new Date().toISOString();
 
     if (NEEDS_YOU_PHASES.has(phase)) needsYouCount += 1;
+    if (phase === "starting") startingCount += 1;
     if (phase === "running" || phase === "starting") runningCount += 1;
-    if (phase === "completed") completedCount += 1;
+    if (phase === "waiting_for_approval" || phase === "waiting_for_input") waitingCount += 1;
+    if (phase === "completed") {
+      completedCount += 1;
+      if (thread.latestRunStopRequested !== true && thread.latestRunCompletedAt != null) {
+        const completedMs = DateTime.toEpochMillis(thread.latestRunCompletedAt);
+        const runId = thread.latestRunId ?? thread.id;
+        if (
+          latestCompletedAtMs === null ||
+          completedMs > latestCompletedAtMs ||
+          (completedMs === latestCompletedAtMs &&
+            (latestCompletedThreadId === null ||
+              thread.id > latestCompletedThreadId ||
+              (thread.id === latestCompletedThreadId &&
+                latestCompletedRunId !== null &&
+                runId > latestCompletedRunId)))
+        ) {
+          latestCompletedAtMs = completedMs;
+          latestCompletedThreadId = thread.id;
+          latestCompletedRunId = runId;
+        }
+      }
+    }
     if (phase === "failed") failedCount += 1;
 
     summaries.push({
@@ -157,12 +190,11 @@ export function buildScopedAwareness(input: {
       ...(projected?.detail ? { detail: projected.detail } : {}),
       replyAudience,
       isProtected,
-      updatedAt: projected?.updatedAt ?? new Date().toISOString(),
+      updatedAt,
       pendingApprovalCount: pendingForThread,
     });
   }
 
-  // Sort Needs You items first, then running, then newest updatedAt.
   const rank = (phase: AgentAwarenessPhase) =>
     phase === "waiting_for_approval"
       ? 0
@@ -175,13 +207,22 @@ export function buildScopedAwareness(input: {
             : 4;
   summaries.sort((a, b) => rank(a.phase) - rank(b.phase) || b.updatedAt.localeCompare(a.updatedAt));
 
+  const latestCompletedKey =
+    latestCompletedThreadId !== null && latestCompletedRunId !== null && latestCompletedAtMs !== null
+      ? `${latestCompletedThreadId}:${latestCompletedRunId}:${latestCompletedAtMs}`
+      : null;
+
   return {
     snapshotSequence,
     needsYouCount,
+    startingCount,
     runningCount,
+    waitingCount,
     completedCount,
     failedCount,
     pendingApprovalCount: approvalSummary.totalCount,
+    latestCompletedKey,
+    latestCompletedAtMs,
     threads: summaries,
   };
 }

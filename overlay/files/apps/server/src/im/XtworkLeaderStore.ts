@@ -39,10 +39,13 @@ export interface LeaderBindingRecord {
   readonly bindingId: string;
   readonly leaderId: string;
   readonly connectionId: string;
+  readonly platform: string | null;
+  readonly claimed: boolean;
   readonly epoch: number;
   readonly active: boolean;
   readonly createdAt: number;
   readonly unboundAt: number | null;
+  readonly disconnectedAt: number | null;
 }
 
 export interface PersistedRunPolicy {
@@ -83,10 +86,13 @@ type BindingRow = {
   readonly bindingId: string;
   readonly leaderId: string;
   readonly connectionId: string;
+  readonly platform: string | null;
+  readonly claimed?: number | null;
   readonly epoch: number;
   readonly active: number;
   readonly createdAt: number;
   readonly unboundAt: number | null;
+  readonly disconnectedAt?: number | null;
 };
 
 type PolicyRow = {
@@ -109,6 +115,23 @@ type ProtectedThreadRow = {
   readonly policyJson: string;
   readonly createdAt: number;
 };
+
+const BOT_AVATAR_PATTERN = /^bot:v1:[a-z0-9-]{1,32}:#(?:[0-9a-f]{3}|[0-9a-f]{6})(?::#(?:[0-9a-f]{3}|[0-9a-f]{6}))?$/i;
+
+export function sanitizeLeaderAvatar(raw: string): string {
+  const trimmed = raw.trim();
+  if (BOT_AVATAR_PATTERN.test(trimmed)) {
+    return trimmed.toLowerCase();
+  }
+  return Array.from(trimmed).slice(0, 8).join("");
+}
+
+export function sanitizeBindingPlatform(raw: unknown): string | null {
+  if (raw === "wechat" || raw === "feishu" || raw === "wecom") {
+    return raw;
+  }
+  return null;
+}
 
 const DEFAULT_AWARENESS_SCOPE: AwarenessScope = Object.freeze({
   kind: "all_local",
@@ -176,10 +199,13 @@ function rowToBinding(row: BindingRow): LeaderBindingRecord {
     bindingId: row.bindingId,
     leaderId: row.leaderId,
     connectionId: row.connectionId,
+    platform: row.platform ?? null,
+    claimed: Number(row.claimed ?? 0) === 1,
     epoch: Number(row.epoch),
     active: Number(row.active) === 1,
     createdAt: Number(row.createdAt),
     unboundAt: row.unboundAt === null ? null : Number(row.unboundAt),
+    disconnectedAt: row.disconnectedAt === null || row.disconnectedAt === undefined ? null : Number(row.disconnectedAt),
   };
 }
 
@@ -251,11 +277,24 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     binding_id TEXT PRIMARY KEY,
     leader_id TEXT NOT NULL,
     connection_id TEXT NOT NULL,
+    platform TEXT,
+    claimed INTEGER NOT NULL DEFAULT 0,
     epoch INTEGER NOT NULL,
     active INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
-    unbound_at INTEGER
+    unbound_at INTEGER,
+    disconnected_at INTEGER
   )`;
+  const bindingCols = yield* sql<{ readonly name: string }>`PRAGMA table_info(xtwork_leader_bindings)`;
+  if (!bindingCols.some((c) => c.name === "platform")) {
+    yield* sql`ALTER TABLE xtwork_leader_bindings ADD COLUMN platform TEXT`;
+  }
+  if (!bindingCols.some((c) => c.name === "claimed")) {
+    yield* sql`ALTER TABLE xtwork_leader_bindings ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0`;
+  }
+  if (!bindingCols.some((c) => c.name === "disconnected_at")) {
+    yield* sql`ALTER TABLE xtwork_leader_bindings ADD COLUMN disconnected_at INTEGER`;
+  }
   yield* sql`CREATE INDEX IF NOT EXISTS idx_xtwork_leader_bindings_conn
     ON xtwork_leader_bindings(connection_id, active)`;
   // Ensure at most one active binding and unique (connection_id, epoch) exist before creating unique indexes
@@ -452,7 +491,8 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   }) {
     const id = validateLeaderId(input.id ?? `leader-${randomUUID().slice(0, 8)}`);
     const name = input.name.trim() || "新领航者";
-    const avatar = (input.avatar?.trim() || Array.from(name)[0] || "航").slice(0, 8);
+    const sanitizedAvatar = input.avatar !== undefined ? sanitizeLeaderAvatar(input.avatar) : "";
+    const avatar = sanitizedAvatar || sanitizeLeaderAvatar(Array.from(name)[0] || "航");
     const role = input.role ?? "";
     const scope = input.awarenessScope ?? DEFAULT_AWARENESS_SCOPE;
     const imPolicy = sanitizeImDelegationPolicy(input.imPolicy);
@@ -487,7 +527,7 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     const updateName = trimmedName.length > 0 ? 1 : 0;
     const trimmedAvatar = patch.avatar !== undefined ? patch.avatar.trim() : "";
     const hasAvatarExplicit = patch.avatar !== undefined && trimmedAvatar.length > 0 ? 1 : 0;
-    const explicitAvatar = hasAvatarExplicit === 1 ? Array.from(trimmedAvatar).slice(0, 8).join("") : "";
+    const explicitAvatar = hasAvatarExplicit === 1 ? sanitizeLeaderAvatar(trimmedAvatar) : "";
     const resetAvatarToNameInitial = patch.avatar !== undefined && trimmedAvatar.length === 0 ? 1 : 0;
     const updateRole = patch.role !== undefined ? 1 : 0;
     const updateStatus = patch.status !== undefined ? 1 : 0;
@@ -543,41 +583,156 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   const activeBindingForConnection = (connectionId: string) =>
     sql<BindingRow>`
       SELECT binding_id AS "bindingId", leader_id AS "leaderId", connection_id AS "connectionId",
-        epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt"
+        platform, claimed, epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt",
+        disconnected_at AS "disconnectedAt"
       FROM xtwork_leader_bindings
       WHERE connection_id = ${connectionId} AND active = 1
       ORDER BY epoch DESC LIMIT 1
     `.pipe(Effect.map(([row]) => (row ? rowToBinding(row) : undefined)));
 
-  const ensureBinding = Effect.fnUntraced(function* (connectionId: string, preferredLeaderId = DEFAULT_LEADER_ID) {
+  const recordBindingPlatform = Effect.fnUntraced(function* (
+    connectionId: string,
+    platform: string,
+    claimed = false,
+  ) {
+    const clean = sanitizeBindingPlatform(platform);
+    const claimedInt = claimed ? 1 : 0;
+    if (!clean && claimedInt === 0) return;
+    if (clean) {
+      yield* sql`UPDATE xtwork_leader_bindings
+        SET platform = ${clean},
+          claimed = CASE WHEN claimed = 1 OR ${claimedInt} = 1 THEN 1 ELSE 0 END
+        WHERE connection_id = ${connectionId} AND active = 1
+          AND (platform IS NULL OR platform != ${clean} OR (claimed = 0 AND ${claimedInt} = 1))`;
+      return;
+    }
+    yield* sql`UPDATE xtwork_leader_bindings
+      SET claimed = 1
+      WHERE connection_id = ${connectionId} AND active = 1 AND claimed = 0`;
+  });
+
+  const deactivateBindingOnDisconnect = Effect.fnUntraced(function* (
+    connectionId: string,
+    platform?: string,
+    claimed = false,
+  ) {
+    const cleanPlatform = sanitizeBindingPlatform(platform);
+    const claimedInt = claimed ? 1 : 0;
+    const now = Date.now();
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`UPDATE xtwork_leader_bindings
+          SET active = 0,
+            unbound_at = COALESCE(unbound_at, ${now}),
+            disconnected_at = COALESCE(disconnected_at, ${now}),
+            platform = COALESCE(platform, ${cleanPlatform}),
+            claimed = CASE WHEN claimed = 1 OR ${claimedInt} = 1 THEN 1 ELSE 0 END
+          WHERE connection_id = ${connectionId} AND active = 1`;
+        const [latestRow] = yield* sql<{ readonly disconnectedAt: number | null; readonly epoch: number }>`
+          SELECT disconnected_at AS "disconnectedAt", epoch
+          FROM xtwork_leader_bindings
+          WHERE connection_id = ${connectionId}
+          ORDER BY epoch DESC LIMIT 1
+        `;
+        if (!latestRow || latestRow.disconnectedAt === null) {
+          const nextEpoch = Number(latestRow?.epoch ?? 0) + 1;
+          const tombstoneId = `bind-${randomUUID().slice(0, 12)}`;
+          yield* sql`INSERT OR IGNORE INTO xtwork_leader_bindings (
+            binding_id, leader_id, connection_id, platform, claimed, epoch, active, created_at, unbound_at, disconnected_at
+          ) VALUES (${tombstoneId}, ${DEFAULT_LEADER_ID}, ${connectionId}, ${cleanPlatform}, 0, ${nextEpoch}, 0, ${now}, ${now}, ${now})`;
+        }
+      }),
+    );
+  });
+
+  const ensureBinding = Effect.fnUntraced(function* (
+    connectionId: string,
+    preferredLeaderId = DEFAULT_LEADER_ID,
+    platform?: string,
+    claimed = false,
+  ) {
+    const cleanPlatform = sanitizeBindingPlatform(platform);
+    const claimedInt = claimed ? 1 : 0;
     const existing = yield* activeBindingForConnection(connectionId);
-    if (existing) return existing;
+    if (existing) {
+      const nextPlatform = cleanPlatform ?? existing.platform;
+      const nextClaimed = existing.claimed || claimed;
+      if (nextPlatform !== existing.platform || nextClaimed !== existing.claimed) {
+        if (cleanPlatform) {
+          yield* recordBindingPlatform(connectionId, cleanPlatform, nextClaimed);
+        } else if (nextClaimed) {
+          yield* sql`UPDATE xtwork_leader_bindings SET claimed = 1 WHERE connection_id = ${connectionId} AND active = 1 AND claimed = 0`;
+        }
+        return { ...existing, platform: nextPlatform, claimed: nextClaimed };
+      }
+      return existing;
+    }
     const leader = (yield* getLeader(preferredLeaderId)) ?? (yield* ensureDefaultLeader());
     const bindingId = `bind-${randomUUID().slice(0, 12)}`;
     const now = Date.now();
-    // Enforce single active binding atomically inside a transaction backed by SQLite partial unique index;
-    // concurrent racers silently ignore conflict and return the single winning binding!
     yield* sql
       .withTransaction(
         Effect.gen(function* () {
           const insideExisting = yield* activeBindingForConnection(connectionId);
-          if (insideExisting) return;
+          if (insideExisting) {
+            if ((cleanPlatform && insideExisting.platform !== cleanPlatform) || (claimedInt === 1 && !insideExisting.claimed)) {
+              yield* sql`UPDATE xtwork_leader_bindings
+                SET platform = COALESCE(${cleanPlatform}, platform),
+                  claimed = CASE WHEN claimed = 1 OR ${claimedInt} = 1 THEN 1 ELSE 0 END
+                WHERE connection_id = ${connectionId} AND active = 1`;
+            }
+            return;
+          }
           const [maxRow] = yield* sql<{ readonly maxEpoch: number | null }>`
             SELECT MAX(epoch) AS "maxEpoch" FROM xtwork_leader_bindings WHERE connection_id = ${connectionId}
           `;
+          const [prevRow] = yield* sql<{
+            readonly platform: string | null;
+            readonly claimed: number | null;
+            readonly disconnectedAt: number | null;
+          }>`
+            SELECT platform, claimed, disconnected_at AS "disconnectedAt"
+            FROM xtwork_leader_bindings
+            WHERE connection_id = ${connectionId}
+            ORDER BY epoch DESC LIMIT 1
+          `;
+          if (prevRow && prevRow.disconnectedAt !== null) {
+            return;
+          }
+          const resolvedPlatform = cleanPlatform ?? sanitizeBindingPlatform(prevRow?.platform);
+          const resolvedClaimed = claimedInt === 1 || Number(prevRow?.claimed ?? 0) === 1 ? 1 : 0;
           const epoch = Number(maxRow?.maxEpoch ?? 0) + 1;
           yield* sql`INSERT OR IGNORE INTO xtwork_leader_bindings (
-            binding_id, leader_id, connection_id, epoch, active, created_at, unbound_at
-          ) VALUES (${bindingId}, ${leader.id}, ${connectionId}, ${epoch}, 1, ${now}, ${null})`;
+            binding_id, leader_id, connection_id, platform, claimed, epoch, active, created_at, unbound_at, disconnected_at
+          ) VALUES (${bindingId}, ${leader.id}, ${connectionId}, ${resolvedPlatform}, ${resolvedClaimed}, ${epoch}, 1, ${now}, ${null}, ${null})`;
         }),
       )
       .pipe(Effect.ignore);
     const resolved = yield* activeBindingForConnection(connectionId);
-    if (resolved) return resolved;
+    if (resolved) {
+      const nextPlatform = cleanPlatform ?? resolved.platform;
+      const nextClaimed = resolved.claimed || claimed;
+      if (nextPlatform !== resolved.platform || nextClaimed !== resolved.claimed) {
+        if (cleanPlatform) {
+          yield* recordBindingPlatform(connectionId, cleanPlatform, nextClaimed);
+        } else if (nextClaimed) {
+          yield* sql`UPDATE xtwork_leader_bindings SET claimed = 1 WHERE connection_id = ${connectionId} AND active = 1 AND claimed = 0`;
+        }
+        return { ...resolved, platform: nextPlatform, claimed: nextClaimed };
+      }
+      return resolved;
+    }
     return yield* imError("Failed to create active Leader binding.");
   });
 
-  const rebindConnection = Effect.fnUntraced(function* (connectionId: string, nextLeaderId: string) {
+  const rebindConnection = Effect.fnUntraced(function* (
+    connectionId: string,
+    nextLeaderId: string,
+    platform?: string,
+    claimed?: boolean,
+    requireActive = false,
+  ) {
+    const cleanPlatform = sanitizeBindingPlatform(platform);
     const now = Date.now();
     const bindingId = `bind-${randomUUID().slice(0, 12)}`;
     return yield* sql.withTransaction(
@@ -587,24 +742,70 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
           return undefined;
         }
         const existing = yield* activeBindingForConnection(connectionId);
-        if (existing && existing.leaderId === leader.id) return existing;
-        yield* sql`UPDATE xtwork_leader_bindings SET active = 0, unbound_at = ${now}
+        if (!existing && requireActive) {
+          return undefined;
+        }
+        const resolvedPlatform = cleanPlatform ?? existing?.platform ?? null;
+        const resolvedClaimed = Boolean(existing?.claimed) || claimed === true;
+        const resolvedClaimedInt = resolvedClaimed ? 1 : 0;
+        if (existing && existing.leaderId === leader.id) {
+          if (resolvedPlatform !== existing.platform || resolvedClaimed !== existing.claimed) {
+            yield* sql`UPDATE xtwork_leader_bindings
+              SET platform = COALESCE(${resolvedPlatform}, platform),
+                claimed = CASE WHEN claimed = 1 OR ${resolvedClaimedInt} = 1 THEN 1 ELSE 0 END
+              WHERE connection_id = ${connectionId} AND active = 1`;
+            return { ...existing, platform: resolvedPlatform, claimed: resolvedClaimed };
+          }
+          return existing;
+        }
+        let carryPlatform = resolvedPlatform;
+        let carryClaimed = resolvedClaimed;
+        if (!existing) {
+          const [prevRow] = yield* sql<{
+            readonly platform: string | null;
+            readonly claimed: number | null;
+            readonly disconnectedAt: number | null;
+          }>`
+            SELECT platform, claimed, disconnected_at AS "disconnectedAt"
+            FROM xtwork_leader_bindings
+            WHERE connection_id = ${connectionId}
+            ORDER BY epoch DESC LIMIT 1
+          `;
+          if (prevRow && prevRow.disconnectedAt !== null) {
+            return undefined;
+          }
+          carryPlatform = carryPlatform ?? sanitizeBindingPlatform(prevRow?.platform);
+          carryClaimed = carryClaimed || Number(prevRow?.claimed ?? 0) === 1;
+        } else if (!carryPlatform || !carryClaimed) {
+          const [prevRow] = yield* sql<{ readonly platform: string | null; readonly claimed: number | null }>`
+            SELECT platform, claimed FROM xtwork_leader_bindings
+            WHERE connection_id = ${connectionId}
+            ORDER BY epoch DESC LIMIT 1
+          `;
+          carryPlatform = carryPlatform ?? sanitizeBindingPlatform(prevRow?.platform);
+          carryClaimed = carryClaimed || Number(prevRow?.claimed ?? 0) === 1;
+        }
+        const carryClaimedInt = carryClaimed ? 1 : 0;
+        yield* sql`UPDATE xtwork_leader_bindings SET active = 0, unbound_at = ${now}, disconnected_at = NULL
           WHERE connection_id = ${connectionId} AND active = 1`;
         const [maxRow] = yield* sql<{ readonly maxEpoch: number | null }>`
           SELECT MAX(epoch) AS "maxEpoch" FROM xtwork_leader_bindings WHERE connection_id = ${connectionId}
         `;
         const epoch = Number(maxRow?.maxEpoch ?? 0) + 1;
         yield* sql`INSERT INTO xtwork_leader_bindings (
-          binding_id, leader_id, connection_id, epoch, active, created_at, unbound_at
-        ) VALUES (${bindingId}, ${leader.id}, ${connectionId}, ${epoch}, 1, ${now}, ${null})`;
+          binding_id, leader_id, connection_id, platform, claimed, epoch, active, created_at, unbound_at, disconnected_at
+        ) VALUES (${bindingId}, ${leader.id}, ${connectionId}, ${carryPlatform}, ${carryClaimedInt}, ${epoch}, 1, ${now}, ${null}, ${null})`;
         return {
           bindingId,
           leaderId: leader.id,
           connectionId,
+          platform: carryPlatform,
+          claimed: carryClaimed,
           epoch,
           active: true,
           createdAt: now,
           unboundAt: null,
+          disconnectedAt: null,
         } satisfies LeaderBindingRecord;
       }),
     );
@@ -624,7 +825,8 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
         }
         const activeBindings = yield* sql<BindingRow>`
           SELECT binding_id AS "bindingId", leader_id AS "leaderId", connection_id AS "connectionId",
-            epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt"
+            platform, claimed, epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt",
+            disconnected_at AS "disconnectedAt"
           FROM xtwork_leader_bindings
           WHERE leader_id = ${id} AND active = 1
           ORDER BY created_at ASC
@@ -644,24 +846,28 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
             return yield* imError("目标接管领航者不存在或已归档。");
           }
           for (const binding of activeBindings) {
-            yield* sql`UPDATE xtwork_leader_bindings SET active = 0, unbound_at = ${now}
+            yield* sql`UPDATE xtwork_leader_bindings SET active = 0, unbound_at = ${now}, disconnected_at = NULL
               WHERE connection_id = ${binding.connectionId} AND active = 1`;
             const [maxRow] = yield* sql<{ readonly maxEpoch: number | null }>`
               SELECT MAX(epoch) AS "maxEpoch" FROM xtwork_leader_bindings WHERE connection_id = ${binding.connectionId}
             `;
             const nextEpoch = Number(maxRow?.maxEpoch ?? 0) + 1;
             const nextBindingId = `bind-${randomUUID().slice(0, 12)}`;
+            const claimedInt = binding.claimed ? 1 : 0;
             yield* sql`INSERT INTO xtwork_leader_bindings (
-              binding_id, leader_id, connection_id, epoch, active, created_at, unbound_at
-            ) VALUES (${nextBindingId}, ${target.id}, ${binding.connectionId}, ${nextEpoch}, 1, ${now}, ${null})`;
+              binding_id, leader_id, connection_id, platform, claimed, epoch, active, created_at, unbound_at, disconnected_at
+            ) VALUES (${nextBindingId}, ${target.id}, ${binding.connectionId}, ${binding.platform}, ${claimedInt}, ${nextEpoch}, 1, ${now}, ${null}, ${null})`;
             reboundBindings.push({
               bindingId: nextBindingId,
               leaderId: target.id,
               connectionId: binding.connectionId,
+              platform: binding.platform,
+              claimed: binding.claimed,
               epoch: nextEpoch,
               active: true,
               createdAt: now,
               unboundAt: null,
+              disconnectedAt: null,
             });
           }
         }
@@ -687,14 +893,16 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
   const getBindingById = (bindingId: string) =>
     sql<BindingRow>`
       SELECT binding_id AS "bindingId", leader_id AS "leaderId", connection_id AS "connectionId",
-        epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt"
+        platform, claimed, epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt",
+        disconnected_at AS "disconnectedAt"
       FROM xtwork_leader_bindings WHERE binding_id = ${bindingId} LIMIT 1
     `.pipe(Effect.map(([row]) => (row ? rowToBinding(row) : undefined)));
 
   const findBindingByTuple = (connectionId: string, leaderId: string, epoch: number) =>
     sql<BindingRow>`
       SELECT binding_id AS "bindingId", leader_id AS "leaderId", connection_id AS "connectionId",
-        epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt"
+        platform, claimed, epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt",
+        disconnected_at AS "disconnectedAt"
       FROM xtwork_leader_bindings
       WHERE connection_id = ${connectionId} AND leader_id = ${leaderId} AND epoch = ${epoch}
       LIMIT 1
@@ -709,15 +917,77 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     (leaderId
       ? sql<BindingRow>`
           SELECT binding_id AS "bindingId", leader_id AS "leaderId", connection_id AS "connectionId",
-            epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt"
+            platform, claimed, epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt",
+            disconnected_at AS "disconnectedAt"
           FROM xtwork_leader_bindings WHERE leader_id = ${leaderId} AND active = 1 ORDER BY created_at ASC
         `
       : sql<BindingRow>`
           SELECT binding_id AS "bindingId", leader_id AS "leaderId", connection_id AS "connectionId",
-            epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt"
+            platform, claimed, epoch, active, created_at AS "createdAt", unbound_at AS "unboundAt",
+            disconnected_at AS "disconnectedAt"
           FROM xtwork_leader_bindings WHERE active = 1 ORDER BY created_at ASC
         `
     ).pipe(Effect.map((rows) => rows.map(rowToBinding)));
+
+  const listActiveBindingsWithLeaderState = (leaderId?: string) =>
+    (leaderId
+      ? sql<
+          BindingRow & {
+            readonly leaderStatus: string;
+            readonly leaderPauseVersion: number;
+          }
+        >`
+          SELECT b.binding_id AS "bindingId", b.leader_id AS "leaderId", b.connection_id AS "connectionId",
+            b.platform, b.claimed, b.epoch, b.active, b.created_at AS "createdAt", b.unbound_at AS "unboundAt",
+            b.disconnected_at AS "disconnectedAt",
+            l.status AS "leaderStatus", l.pause_version AS "leaderPauseVersion"
+          FROM xtwork_leader_bindings b
+          INNER JOIN xtwork_leaders l ON l.id = b.leader_id
+          WHERE b.leader_id = ${leaderId} AND b.active = 1 AND l.status != 'archived'
+          ORDER BY b.created_at ASC
+        `
+      : sql<
+          BindingRow & {
+            readonly leaderStatus: string;
+            readonly leaderPauseVersion: number;
+          }
+        >`
+          SELECT b.binding_id AS "bindingId", b.leader_id AS "leaderId", b.connection_id AS "connectionId",
+            b.platform, b.claimed, b.epoch, b.active, b.created_at AS "createdAt", b.unbound_at AS "unboundAt",
+            b.disconnected_at AS "disconnectedAt",
+            l.status AS "leaderStatus", l.pause_version AS "leaderPauseVersion"
+          FROM xtwork_leader_bindings b
+          INNER JOIN xtwork_leaders l ON l.id = b.leader_id
+          WHERE b.active = 1 AND l.status != 'archived'
+          ORDER BY b.created_at ASC
+        `
+    ).pipe(
+      Effect.map((rows) =>
+        rows.map((row) => ({
+          ...rowToBinding(row),
+          leaderStatus: (row.leaderStatus === "paused" || row.leaderStatus === "archived"
+            ? row.leaderStatus
+            : "active") as LeaderStatus,
+          leaderPauseVersion: Number(row.leaderPauseVersion ?? 0),
+        })),
+      ),
+    );
+
+  const listBoundPlatforms = (leaderId: string) =>
+    sql<{ readonly platform: string | null }>`
+      SELECT DISTINCT platform
+      FROM xtwork_leader_bindings
+      WHERE leader_id = ${leaderId}
+        AND platform IS NOT NULL
+        AND claimed = 1
+        AND (active = 1 OR disconnected_at IS NOT NULL)
+    `.pipe(
+      Effect.map((rows) =>
+        rows
+          .map((row) => sanitizeBindingPlatform(row.platform))
+          .filter((platform): platform is string => platform !== null),
+      ),
+    );
 
   /**
    * Persist execution policy BEFORE Orchestrator dispatches / Pi launches (ADR-013 §2).
@@ -1020,8 +1290,12 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     findBindingByTuple,
     hasAnyBindingForConnection,
     ensureBinding,
+    recordBindingPlatform,
+    deactivateBindingOnDisconnect,
     rebindConnection,
     listBindings,
+    listActiveBindingsWithLeaderState,
+    listBoundPlatforms,
     persistPolicyBeforeLaunch,
     registerLegacyProtectedThread,
     bindRunPolicySql,
