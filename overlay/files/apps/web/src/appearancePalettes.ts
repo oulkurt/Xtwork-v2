@@ -122,6 +122,27 @@ const THEME_SEEDS = {
 
 type BuiltInThemeId = keyof typeof THEME_SEEDS;
 
+export type BuiltInThemeWashSpec = Readonly<{
+  stops: readonly [string, ...string[]];
+  glow?: string;
+  surface: string;
+  text: string;
+}>;
+
+export function getBuiltInThemeWashSpec(
+  id: string,
+  appearance: ThemeAppearance,
+): BuiltInThemeWashSpec | undefined {
+  if (!Object.hasOwn(THEME_SEEDS, id)) return undefined;
+  const seed: ThemeSeed = THEME_SEEDS[id as BuiltInThemeId][appearance];
+  return {
+    stops: seed.stops,
+    ...(seed.glow === undefined ? {} : { glow: seed.glow }),
+    surface: seed.surface,
+    text: seed.text,
+  };
+}
+
 export function getBuiltInThemeWash(id: string, appearance: ThemeAppearance): string | undefined {
   if (!Object.hasOwn(THEME_SEEDS, id)) return undefined;
   const seed: ThemeSeed = THEME_SEEDS[id as BuiltInThemeId][appearance];

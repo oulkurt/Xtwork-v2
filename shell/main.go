@@ -81,19 +81,33 @@ func (d *Desktop) preloadInit(brand branding, lang []string) map[string]any {
 	}
 }
 
+func windowOptions(brand branding, goos string) mygo.WindowOptions {
+	opts := mygo.WindowOptions{
+		Title:          brand.DisplayName,
+		Width:          1200,
+		Height:         800,
+		MinWidth:       768,
+		MinHeight:      500,
+		TitleBarStyle:  mygo.TitleBarHiddenInset,
+		TitleBarHeight: 52,
+	}
+	if goos == "darwin" {
+		opts.TrafficLightPosition = &mygo.Point{X: 18, Y: 19}
+	}
+	return opts
+}
+
 func (d *Desktop) openWindow(brand branding) {
 	init, err := json.Marshal(d.preloadInit(brand, mygo.App.PreferredLanguages()))
 	if err != nil {
 		panic(err) // All values above are JSON strings or string arrays.
 	}
-	win := mygo.NewWindow(mygo.WindowOptions{
-		Title: brand.DisplayName, Width: 1200, Height: 800, MinWidth: 760, MinHeight: 500,
-		TitleBarStyle: mygo.TitleBarHiddenInset,
-		Page: mygo.PageOptions{
-			TrustedOrigins: []string{d.server.origin},
-			PreloadScript:  "(" + preload + ")(" + string(init) + ");",
-		},
-	})
+	opts := windowOptions(brand, runtime.GOOS)
+	opts.Page = mygo.PageOptions{
+		TrustedOrigins: []string{d.server.origin},
+		PreloadScript:  "(" + preload + ")(" + string(init) + ");",
+	}
+	win := mygo.NewWindow(opts)
 	d.window = win
 	page := win.Page()
 	page.OnWillNavigate(func(e *mygo.NavigateEvent) {

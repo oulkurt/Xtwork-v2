@@ -158,7 +158,7 @@ index 051e3090..cd740974 100644
          } catch {
 @@ -402,15 +301,15 @@
        }
-
+ 
        body {
 -        background: #ffffff;
 -        color: #262626;
@@ -167,14 +167,14 @@ index 051e3090..cd740974 100644
          font-family:
            -apple-system, BlinkMacSystemFont, "Inter Variable", "Segoe UI", system-ui, sans-serif;
        }
-
+ 
        html.dark body {
 -        background: #000000;
 -        color: #f5f5f5;
 +        background: #141416;
 +        color: #e4e4e4;
        }
-
+ 
        #boot-shell {
 @@ -420,13 +319,9 @@
          min-height: 100%;
@@ -191,11 +191,11 @@ index 051e3090..cd740974 100644
 +        background-image: var(--boot-wash, none);
 +        color: var(--boot-foreground, inherit);
        }
-
+ 
        #boot-shell-card {
 @@ -453,8 +348,8 @@
        }
-
+ 
        #boot-error {
 -        --boot-error-fg: #262626;
 -        --boot-error-bg: #ffffff;
@@ -206,15 +206,50 @@ index 051e3090..cd740974 100644
          flex-direction: column;
 @@ -467,8 +362,8 @@
        }
-
+ 
        html.dark #boot-error {
 -        --boot-error-fg: #f5f5f5;
 -        --boot-error-bg: #000000;
 +        --boot-error-fg: #e4e4e4;
 +        --boot-error-bg: #141416;
        }
-
+ 
        html[data-theme-selected="true"] #boot-error {
+diff --git a/apps/web/src/components/AppSidebarLayout.tsx b/apps/web/src/components/AppSidebarLayout.tsx
+index 4b7a6d36..d47f2f4e 100644
+--- a/apps/web/src/components/AppSidebarLayout.tsx
++++ b/apps/web/src/components/AppSidebarLayout.tsx
+@@ -453,7 +453,9 @@ export function AppSidebarLayout({
+   );
+   const windowControlsInsetStyle = (
+     isMacosDesktop && !isWindowFullscreen
+-      ? { "--workspace-controls-left": MACOS_TRAFFIC_LIGHTS_LEFT_INSET }
++      ? {
++          "--workspace-controls-left": `max(var(--xtwork-window-controls-left, 0px), ${MACOS_TRAFFIC_LIGHTS_LEFT_INSET})`,
++        }
+       : {}
+   ) as CSSProperties;
+   const sidebarProviderStyle = {
+@@ -472,6 +474,7 @@ export function AppSidebarLayout({
+       >
+         {showSidebar ? (
+           <>
++            <div aria-hidden="true" className="drag-region" data-xtwork-window-drag-strip="" />
+             <SidebarBrandWidthProbe isElectron={isElectron} onWidthChange={setBrandWidth} />
+             <Sidebar
+               side="left"
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index a731a579..2d61cf61 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -3405,6 +3405,7 @@ export default function ChatView(props: ChatViewProps) {
+             {isElectron && rightPanelControlsAtRoot ? (
+               <span
+                 aria-hidden
++                data-workspace-titlebar-no-drag=""
+                 className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]"
+               />
+             ) : null}
 diff --git a/apps/web/src/components/CommandPaletteThemeItems.tsx b/apps/web/src/components/CommandPaletteThemeItems.tsx
 index 4fde126c..8d507293 100644
 --- a/apps/web/src/components/CommandPaletteThemeItems.tsx
@@ -223,7 +258,7 @@ index 4fde126c..8d507293 100644
 -import { BUILT_IN_THEMES } from "@t3tools/shared/themePalettes";
  import { msg, T, useGT, useMessages } from "gt-react";
  import { MonitorIcon, MoonIcon, PaletteIcon, SunIcon } from "lucide-react";
-
+ 
 @@ -6,7 +5,7 @@ import { m } from "../i18n/messages";
  import { useCustomThemes } from "../hooks/useCustomThemes";
  import { useEnvironmentThemeDefinitions } from "../hooks/useEnvironmentTheme";
@@ -242,6 +277,18 @@ index 4fde126c..8d507293 100644
                    />
                  ))}
                </span>
+diff --git a/apps/web/src/components/RightPanelTabs.tsx b/apps/web/src/components/RightPanelTabs.tsx
+index 2ce8f22f..c06048e5 100644
+--- a/apps/web/src/components/RightPanelTabs.tsx
++++ b/apps/web/src/components/RightPanelTabs.tsx
+@@ -1626,6 +1626,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
+         {ownsDesktopTitleBar ? (
+           <span
+             aria-hidden
++            data-workspace-titlebar-no-drag=""
+             className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]"
+           />
+         ) : null}
 diff --git a/apps/web/src/components/settings/SettingsSidebarNav.tsx b/apps/web/src/components/settings/SettingsSidebarNav.tsx
 index 174a80bf..765bfd71 100644
 --- a/apps/web/src/components/settings/SettingsSidebarNav.tsx
@@ -255,7 +302,7 @@ index 174a80bf..765bfd71 100644
        className={cn(
          "flex w-60 shrink-0 flex-col border-e bg-sidebar text-sidebar-foreground max-md:w-14",
 diff --git a/apps/web/src/components/settings/ThemePreviewCircles.tsx b/apps/web/src/components/settings/ThemePreviewCircles.tsx
-index 8f23f5be..1eed7c53 100644
+index 8f23f5be..5124a6f2 100644
 --- a/apps/web/src/components/settings/ThemePreviewCircles.tsx
 +++ b/apps/web/src/components/settings/ThemePreviewCircles.tsx
 @@ -1,32 +1,24 @@
@@ -277,7 +324,7 @@ index 8f23f5be..1eed7c53 100644
 +  type ThemeColors,
    type ThemeDefinition,
  } from "../../themePalette";
-
+ 
 -const THEME_PREVIEW_ROLES = [
 -  "sidebar",
 -  "canvas",
@@ -304,7 +351,7 @@ index 8f23f5be..1eed7c53 100644
  };
  export type ThemeMode = ThemeAppearance | "system";
 -export type ThemeCardPreviewColors = ThemeCardPreview["colors"];
-
+ 
 -const STANDARD_THEME_PREVIEW_COLORS: Record<
 -  ThemeAppearance,
 -  Readonly<Record<ThemePreviewRole, string>>
@@ -331,7 +378,7 @@ index 8f23f5be..1eed7c53 100644
 +): ThemeCardPreviewColors {
 +  return { ...colors, wash: getBuiltInThemeWash(id, mode) };
 +}
-
+ 
  export const STANDARD_THEME_CARDS: ReadonlyArray<ThemeCardDefinition> = [
    {
      id: "default",
@@ -386,7 +433,7 @@ index 8f23f5be..1eed7c53 100644
 +    })),
    };
  }
-
+ 
 -function themePreviewEdgeShadow(mode: ThemeAppearance): string {
 -  return mode === "dark"
 -    ? "inset 0 0 0 1px rgb(255 255 255 / 0.14), 0 1px 2px rgb(0 0 0 / 0.18)"
@@ -396,7 +443,7 @@ index 8f23f5be..1eed7c53 100644
  export function ThemePreviewCircle({
    colors,
    mode,
-@@ -131,20 +76,50 @@ export function ThemePreviewCircle({
+@@ -131,20 +76,56 @@ export function ThemePreviewCircle({
    return (
      <span
        aria-hidden
@@ -427,7 +474,13 @@ index 8f23f5be..1eed7c53 100644
        />
 +      <span
 +        className="absolute inset-y-[11%] left-[30%] right-[7%] rounded-md"
-+        style={{ backgroundColor: colors.surface }}
++        style={{
++          backgroundColor: colors.surface,
++          boxShadow:
++            mode === "dark"
++              ? "inset 0 1px 0 0 rgb(255 255 255 / 0.16), 0 0 0 1px rgb(255 255 255 / 0.12), 0 1px 2px rgb(0 0 0 / 0.35)"
++              : "0 0 0 1px rgb(0 0 0 / 0.10), 0 1px 2px rgb(0 0 0 / 0.06)",
++        }}
 +      />
 +      <span
 +        className="absolute left-[8%] top-[35%] h-[8%] w-[15%] rounded-sm"
@@ -453,7 +506,7 @@ index 8f23f5be..1eed7c53 100644
      </span>
    );
  }
-@@ -162,7 +137,7 @@ export function ThemePreviewCircles({
+@@ -162,7 +143,7 @@ export function ThemePreviewCircles({
  }) {
    const gt = useGT();
    return (
@@ -462,7 +515,7 @@ index 8f23f5be..1eed7c53 100644
        {previews.map((preview) => {
          const mode = preview.mode;
          const isPicked = activeModes.includes(mode);
-@@ -178,7 +153,8 @@ export function ThemePreviewCircles({
+@@ -178,7 +159,8 @@ export function ThemePreviewCircles({
                    }
                    aria-pressed={isPicked}
                    className={cn(
@@ -472,7 +525,7 @@ index 8f23f5be..1eed7c53 100644
                      isPicked && "hover:scale-100",
                    )}
                    onClick={(event) => {
-@@ -187,17 +163,19 @@ export function ThemePreviewCircles({
+@@ -187,17 +169,19 @@ export function ThemePreviewCircles({
                    }}
                    type="button"
                  >
@@ -597,10 +650,27 @@ index 9e59c2ef..9f73e0d7 100644
                          >
                            <span className="flex scale-75">
 diff --git a/apps/web/src/components/settings/ThemeWireframe.tsx b/apps/web/src/components/settings/ThemeWireframe.tsx
-index d600a7dc..0cd8f4a9 100644
+index d600a7dc..4716ff3c 100644
 --- a/apps/web/src/components/settings/ThemeWireframe.tsx
 +++ b/apps/web/src/components/settings/ThemeWireframe.tsx
-@@ -23,12 +23,24 @@ function ThemeWireframePane({
+@@ -1,6 +1,16 @@
+ import { cn } from "../../lib/utils";
++import { themeColorToHex } from "../../themePalette";
+ import type { ThemeCardPreviewColors } from "./ThemePreviewCircles";
+ 
++function isDarkSurface(value: string): boolean {
++  const hex = themeColorToHex(value);
++  if (!hex) return false;
++  const r = Number.parseInt(hex.slice(1, 3), 16);
++  const g = Number.parseInt(hex.slice(3, 5), 16);
++  const b = Number.parseInt(hex.slice(5, 7), 16);
++  return 0.2126 * r + 0.7152 * g + 0.0722 * b < 128;
++}
++
+ function ThemeWireframePane({
+   colors,
+   clip,
+@@ -23,12 +33,29 @@ function ThemeWireframePane({
              }
        }
      >
@@ -617,24 +687,97 @@ index d600a7dc..0cd8f4a9 100644
 +          boxShadow: `inset -1px 0 0 ${line}`,
 +        }}
        />
-
+ 
 +      {colors.wash ? (
 +        <span
 +          className="absolute inset-y-[4%] left-[23%] right-[2%] rounded-md"
-+          style={{ backgroundColor: colors.surface }}
++          style={{
++            backgroundColor: colors.surface,
++            boxShadow: isDarkSurface(colors.surface)
++              ? "inset 0 1px 0 0 rgb(255 255 255 / 0.16), 0 0 0 1px rgb(255 255 255 / 0.12), 0 1px 2px rgb(0 0 0 / 0.35)"
++              : "0 0 0 1px rgb(0 0 0 / 0.10), 0 1px 2px rgb(0 0 0 / 0.06)",
++          }}
 +        />
 +      ) : null}
        <span
          className="absolute left-[3%] top-[8%] h-[8%] w-[16%] rounded-md"
          style={{ backgroundColor: colors.surface, boxShadow: `inset 0 0 0 1px ${line}` }}
+diff --git a/apps/web/src/hooks/useTheme.ts b/apps/web/src/hooks/useTheme.ts
+index 2467d890..f9a8f600 100644
+--- a/apps/web/src/hooks/useTheme.ts
++++ b/apps/web/src/hooks/useTheme.ts
+@@ -279,9 +279,10 @@ function resolveBrowserChromeSurface(): HTMLElement {
+ export function syncBrowserChromeTheme() {
+   if (typeof document === "undefined" || typeof getComputedStyle === "undefined") return;
+   const rootStyles = getComputedStyle(document.documentElement);
+-  const themeChromeColor = document.documentElement.dataset.themeId
+-    ? normalizeThemeColor(rootStyles.getPropertyValue("--app-chrome-background"))
+-    : null;
++  const themeChromeColor =
++    document.documentElement.dataset.themeId || "xtworkWash" in document.documentElement.dataset
++      ? normalizeThemeColor(rootStyles.getPropertyValue("--app-chrome-background"))
++      : null;
+   const surfaceColor = normalizeThemeColor(
+     getComputedStyle(resolveBrowserChromeSurface()).backgroundColor,
+   );
 diff --git a/apps/web/src/index.css b/apps/web/src/index.css
-index 05541d39..e8ded381 100644
+index 05541d39..99da37e1 100644
 --- a/apps/web/src/index.css
 +++ b/apps/web/src/index.css
-@@ -751,135 +751,134 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
+@@ -120,10 +120,19 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
+   --glass-opacity: 80%;
+   --glass-saturation: 1.14;
+   --desktop-window-right-resize-inset: 0px;
+-  --workspace-topbar-height: 52px;
++  --xtwork-window-topbar-height: 52px;
++  --workspace-topbar-height: var(--xtwork-window-topbar-height);
+   --workspace-controls-top: 0px;
+-  --workspace-controls-left: calc(env(safe-area-inset-left) + 0.75rem);
+-  --workspace-controls-right: calc(env(safe-area-inset-right) + 0.75rem);
++  --xtwork-window-controls-left: max(
++    calc(env(safe-area-inset-left) + 0.75rem),
++    calc(var(--mygo-titlebar-inset-left, 0px) + 0.75rem)
++  );
++  --workspace-controls-left: var(--xtwork-window-controls-left);
++  --xtwork-window-controls-right: max(
++    calc(env(safe-area-inset-right) + 0.75rem),
++    calc(var(--mygo-titlebar-inset-right, 0px) + 0.75rem)
++  );
++  --workspace-controls-right: var(--xtwork-window-controls-right);
+   --workspace-native-controls-inset: 0px;
+   --workspace-titlebar-control-size: 1.75rem;
+   --workspace-titlebar-control-gap: 0.75rem;
+@@ -154,15 +163,20 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
+ 
+ .wco {
+   --native-titlebar-height: env(titlebar-area-height, 0px);
+-  --workspace-topbar-height: max(40px, env(titlebar-area-height, 52px));
++  --xtwork-window-topbar-height: max(40px, env(titlebar-area-height, 52px));
++  --workspace-topbar-height: var(--xtwork-window-topbar-height);
+   --workspace-controls-top: env(titlebar-area-y, 0px);
+-  --workspace-controls-left: calc(env(titlebar-area-x, 0px) + 0.75rem);
+-  --workspace-controls-right: calc(
+-    100vw - env(titlebar-area-width, 100vw) - env(titlebar-area-x, 0px) + 0.75rem
++  --xtwork-window-controls-left: max(
++    calc(env(titlebar-area-x, 0px) + 0.75rem),
++    calc(var(--mygo-titlebar-inset-left, 0px) + 0.75rem)
+   );
+-  --workspace-native-controls-inset: calc(
+-    100vw - env(titlebar-area-width, 100vw) - env(titlebar-area-x, 0px) + 0.75rem
++  --workspace-controls-left: var(--xtwork-window-controls-left);
++  --xtwork-window-controls-right: max(
++    calc(100vw - env(titlebar-area-width, 100vw) - env(titlebar-area-x, 0px) + 0.75rem),
++    calc(var(--mygo-titlebar-inset-right, 0px) + 0.75rem)
+   );
++  --workspace-controls-right: var(--xtwork-window-controls-right);
++  --workspace-native-controls-inset: var(--xtwork-window-controls-right);
+ }
+ 
+ /* The font tokens are declared outside the inline theme so utilities reference
+@@ -751,135 +765,134 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
      display: none;
    }
-
+ 
 -  /* Each maintainer palette gives the same line art its own material: rose
 -     vellum, forest drafting paper, marine cyanotype, copper, and violet ink.
 +  /* Each built-in palette tints the existing sidebar artwork.
@@ -655,7 +798,7 @@ index 05541d39..e8ded381 100644
 +    --stage-art-secondary: #d38ab7;
 +    --stage-art-tertiary: #c8a9df;
 +    --stage-art-line: #f7eee4;
-
+ 
      @variant dark {
 -      --stage-art-top: oklch(0.540689 0.143665 347.587);
 -      --stage-art-mid: oklch(0.396586 0.126592 347.6);
@@ -673,7 +816,7 @@ index 05541d39..e8ded381 100644
 +      --stage-art-line: #f3e7f1;
      }
    }
-
+ 
    html[data-theme-id="grove"] {
 -    --stage-art-top: oklch(0.751465 0.112731 157.313);
 -    --stage-art-mid: oklch(0.567105 0.11099 158.859);
@@ -703,7 +846,7 @@ index 05541d39..e8ded381 100644
 +    --stage-night-secondary: #639b76;
 +    --stage-night-tertiary: #9ca260;
 +    --stage-night-line: #f3f2e2;
-
+ 
      @variant dark {
 -      --stage-art-top: oklch(0.58719 0.09869 157.426);
 -      --stage-art-mid: oklch(0.454979 0.079031 159.756);
@@ -735,7 +878,7 @@ index 05541d39..e8ded381 100644
 +      --stage-night-line: #e2eee5;
      }
    }
-
+ 
    html[data-theme-id="ocean"] {
 -    --stage-art-top: oklch(0.792993 0.088072 220.421);
 -    --stage-art-mid: oklch(0.590296 0.116841 243.184);
@@ -751,7 +894,7 @@ index 05541d39..e8ded381 100644
 +    --stage-art-secondary: #75b9c3;
 +    --stage-art-tertiary: #80c9c4;
 +    --stage-art-line: #ecf3f0;
-
+ 
      @variant dark {
 -      --stage-art-top: oklch(0.59663 0.089167 233.427);
 -      --stage-art-mid: oklch(0.461094 0.084904 243.478);
@@ -769,7 +912,7 @@ index 05541d39..e8ded381 100644
 +      --stage-art-line: #e3eff1;
      }
    }
-
+ 
    html[data-theme-id="ember"] {
 -    --stage-art-top: oklch(0.782439 0.118806 52.569);
 -    --stage-art-mid: oklch(0.62863 0.15922 39.401);
@@ -799,7 +942,7 @@ index 05541d39..e8ded381 100644
 +    --stage-night-secondary: #c5815e;
 +    --stage-night-tertiary: #c36744;
 +    --stage-night-line: #f8eedf;
-
+ 
      @variant dark {
 -      --stage-art-top: oklch(0.597533 0.120694 43.455);
 -      --stage-art-mid: oklch(0.437763 0.101287 34.86);
@@ -831,7 +974,7 @@ index 05541d39..e8ded381 100644
 +      --stage-night-line: #f5e1d6;
      }
    }
-
+ 
    html[data-theme-id="iris"] {
 -    --stage-art-top: oklch(0.738305 0.113454 298.926);
 -    --stage-art-mid: oklch(0.551826 0.159189 294.531);
@@ -847,7 +990,7 @@ index 05541d39..e8ded381 100644
 +    --stage-art-secondary: #b27dcc;
 +    --stage-art-tertiary: #d39ab7;
 +    --stage-art-line: #f6e3dc;
-
+ 
      @variant dark {
 -      --stage-art-top: oklch(0.57297 0.145973 295.185);
 -      --stage-art-mid: oklch(0.419499 0.13752 292.131);
@@ -865,11 +1008,11 @@ index 05541d39..e8ded381 100644
 +      --stage-art-line: #efdeee;
      }
    }
-
-@@ -1111,170 +1110,115 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
+ 
+@@ -1111,170 +1124,115 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
    animation-duration: 0s !important;
  }
-
+ 
 +/* Keep the first paint of the default theme aligned with appearancePalettes.ts. */
  :root {
    color-scheme: light;
@@ -896,27 +1039,27 @@ index 05541d39..e8ded381 100644
 -  --secondary-foreground: var(--color-zinc-800);
 -  --muted: var(--color-zinc-50);
 -  --muted-foreground: var(--color-zinc-500);
-+  --toolbar-control-hover: #edf0fc;
-+  --surface-raised: #fcfcfc;
-+  --foreground: #1d1d1f;
-+  --card: #fcfcfc;
++  --toolbar-control-hover: #f7f7f9;
++  --surface-raised: #ffffff;
++  --foreground: #292929;
++  --card: #ffffff;
 +  --card-foreground: var(--foreground);
-+  --popover: #fcfcfc;
++  --popover: #ffffff;
 +  --popover-foreground: var(--foreground);
-+  --primary: #3b6cf6;
++  --primary: #466fbd;
 +  --primary-foreground: #ffffff;
-+  --secondary: #f3f3f3;
++  --secondary: #f5f5f5;
 +  --secondary-foreground: var(--foreground);
-+  --muted: #f6f6f6;
-+  --muted-foreground: #69696b;
++  --muted: #f5f5f5;
++  --muted-foreground: #6d6d6d;
    --placeholder: var(--muted-foreground);
 -  --secondary-label: var(--muted-foreground);
 -  --icon-muted: var(--muted-foreground);
 -  /* One step past the accent, so a user turn stands off the near-white canvas. */
 -  --message-surface: color-mix(in srgb, var(--color-zinc-200) 55%, var(--color-zinc-100));
-+  --secondary-label: #69696b;
++  --secondary-label: #6d6d6d;
 +  --icon-muted: var(--secondary-label);
-+  --message-surface: #e5ebfb;
++  --message-surface: #cedffd;
    --message-foreground: var(--foreground);
    --message-action: var(--primary);
    --message-action-foreground: var(--primary-foreground);
@@ -925,8 +1068,8 @@ index 05541d39..e8ded381 100644
 -  --accent-foreground: var(--color-zinc-900);
 -  --error: var(--color-red-500);
 -  --error-foreground: var(--color-red-700);
-+  --message-action-hover: #345fd8;
-+  --accent: #e5ebfb;
++  --message-action-hover: #3d60a4;
++  --accent: #cedffd;
 +  --accent-foreground: var(--foreground);
 +  --error: #d93a35;
    --tool-error-icon: var(--error);
@@ -938,8 +1081,8 @@ index 05541d39..e8ded381 100644
 -  --input: var(--color-zinc-300);
 -  --ring: var(--primary);
    --destructive-foreground: var(--error-foreground);
-+  --border: #d8d8d9;
-+  --input: #c6c6c7;
++  --border: #f0f0f0;
++  --input: #d6d6d6;
 +  --ring: var(--primary);
    --info: var(--color-blue-500);
    --info-foreground: var(--color-blue-700);
@@ -960,7 +1103,7 @@ index 05541d39..e8ded381 100644
 -  /* Keep every sidebar primitive on the same light surface hierarchy, including
 -     portaled mobile sheets and settings navigation outside the app sidebar. */
 -  --sidebar: var(--color-zinc-50);
-+  --update-foreground: #345bc7;
++  --update-foreground: #40609c;
 +  --sidebar: #f7f7f8;
    --sidebar-foreground: var(--foreground);
 -  --sidebar-muted-foreground: var(--muted-foreground);
@@ -968,7 +1111,7 @@ index 05541d39..e8ded381 100644
 -  --sidebar-row-hover: var(--color-zinc-25);
 -  --sidebar-row-active: var(--color-white);
 -  --sidebar-row-selected: var(--color-white);
-+  --sidebar-muted-foreground: #69696b;
++  --sidebar-muted-foreground: #6d6d6d;
 +  --sidebar-control-surface: #e6e6e7;
 +  --sidebar-row-hover: #eceff8;
 +  --sidebar-row-active: #e4e9f8;
@@ -976,15 +1119,15 @@ index 05541d39..e8ded381 100644
    --sidebar-border: var(--border);
    --sidebar-stage-fade: var(--sidebar);
 -  --code-background: color-mix(in srgb, var(--card) 90%, var(--background));
-+  --code-background: #fbfbfb;
++  --code-background: #f5f5f5;
    --code-foreground: var(--foreground);
    --terminal-background: var(--background);
    --terminal-foreground: var(--foreground);
 -  --terminal-cursor: rgb(38 56 78);
 -  --terminal-selection-background: rgb(37 63 99 / 20%);
 +  --terminal-cursor: var(--primary);
-+  --terminal-selection-background: #cdd8f7;
-
++  --terminal-selection-background: #cedffd;
+ 
    @variant dark {
      color-scheme: dark;
 -    /* The canvas is true black, matching the sidebar. Raised surfaces keep the tone they had
@@ -1013,26 +1156,26 @@ index 05541d39..e8ded381 100644
 -    --border: --alpha(var(--color-white) / 8%);
 -    --input: --alpha(var(--color-white) / 11%);
 +    --background: #141416;
-+    --toolbar-control-hover: #3e4352;
-+    --surface-raised: #38383a;
-+    --foreground: #ececf0;
-+    --card: #272729;
-+    --popover: #48484a;
-+    --primary: #6b93ff;
++    --toolbar-control-hover: #4a4a52;
++    --surface-raised: #292929;
++    --foreground: #e4e4e4;
++    --card: #232323;
++    --popover: #2c2c2c;
++    --primary: #7daafd;
 +    --primary-foreground: #141416;
-+    --secondary: #373739;
-+    --muted: #313133;
-+    --muted-foreground: #b5b5ba;
-+    --secondary-label: #848487;
-+    --message-surface: #32384b;
-+    --message-action-hover: #80a2ff;
-+    --accent: #363f58;
++    --secondary: #313131;
++    --muted: #313131;
++    --muted-foreground: #9b9b9b;
++    --secondary-label: #9b9b9b;
++    --message-surface: #314262;
++    --message-action-hover: #739ce9;
++    --accent: #314262;
 +    --error: #ff6961;
 +    --tool-error-icon: var(--error-foreground);
 +    --error-foreground: #ffb8b0;
 +    --error-surface: #482727;
-+    --border: #444446;
-+    --input: #59595c;
++    --border: #323232;
++    --input: #595959;
      --info-foreground: var(--color-blue-400);
      --guest-foreground: var(--color-fuchsia-300);
      --success-foreground: var(--color-emerald-400);
@@ -1099,19 +1242,19 @@ index 05541d39..e8ded381 100644
 +    --warning: #f0b94e;
 +    --warning-foreground: #ffdf8f;
 +    --warning-surface: #443822;
-+    --update-foreground: #87a7fc;
-+    --sidebar: #121214;
-+    --sidebar-muted-foreground: #848487;
++    --update-foreground: #94b7f8;
++    --sidebar: #151517;
++    --sidebar-muted-foreground: #9b9b9b;
 +    --sidebar-control-surface: #28282a;
 +    --sidebar-row-hover: #1d2130;
 +    --sidebar-row-active: #22293e;
 +    --sidebar-row-selected: #1e2435;
-+    --code-background: #1e1e20;
-+    --terminal-selection-background: #303d61;
++    --code-background: #313131;
++    --terminal-selection-background: #314262;
    }
  }
-
-@@ -1323,7 +1267,7 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
+ 
+@@ -1323,7 +1281,7 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
     independent; error, warning, and update roles are themeable below. */
  /* The non-empty marker adds enough specificity to outrank the generated root
     dark variant without reintroducing raw `.dark` selectors. */
@@ -1120,10 +1263,10 @@ index 05541d39..e8ded381 100644
    --background: var(--app-theme-canvas);
    --app-chrome-background: var(--app-theme-chrome);
    --toolbar-background: var(--app-theme-toolbar);
-@@ -1389,6 +1333,56 @@ html[data-theme-id]:not([data-theme-id=""]) {
+@@ -1389,6 +1347,150 @@ html[data-theme-id]:not([data-theme-id=""]) {
    --terminal-selection-background: var(--app-theme-terminal-selection-background);
  }
-
+ 
 +/* The window and settings sidebar show the wash beneath opaque work surfaces. */
 +html[data-xtwork-wash] body,
 +html[data-xtwork-wash] [data-xtwork-settings] {
@@ -1132,12 +1275,8 @@ index 05541d39..e8ded381 100644
 +  background-size: 100% 100%;
 +}
 +
-+html[data-xtwork-wash] [data-workspace-area="settings"] {
-+  background: var(--card);
-+}
-+
 +html[data-xtwork-wash] [data-workspace-area="settings"] > header {
-+  background: var(--toolbar-background);
++  background: transparent;
 +}
 +
 +html[data-xtwork-wash] [data-workspace-area="settings-nav"]:not([data-xtwork-search-open]),
@@ -1153,19 +1292,117 @@ index 05541d39..e8ded381 100644
 +  color: var(--ring);
 +}
 +
-+html[data-xtwork-wash] [data-slot="sidebar-inset"] {
-+  background: var(--card);
++html[data-xtwork-wash] [data-slot="sidebar-inset"],
++html[data-xtwork-wash] [data-workspace-area="settings"] {
++  --background: var(--app-theme-surface);
++  --card: var(--app-theme-surface-raised);
++  --xtwork-pane-border: rgb(0 0 0 / 11%);
++  --xtwork-pane-border-computed: color-mix(
++    in srgb,
++    color-mix(in srgb, var(--xtwork-pane-border) var(--appearance-contrast-base), transparent),
++    var(--foreground) var(--appearance-contrast-border-boost)
++  );
++  --xtwork-pane-shadow:
++    0 0 0 0.5px rgb(0 0 0 / 6%),
++    0 1px 3px rgb(0 0 0 / 5%);
++  background: var(--app-theme-surface);
++
++  @variant dark {
++    --xtwork-pane-border: color-mix(in srgb, var(--foreground) 12%, transparent);
++    --xtwork-pane-shadow:
++      0 1px 1px rgb(0 0 0 / 20%),
++      0 2px 2px -1px rgb(0 0 0 / 20%),
++      0 4px 6px -3px rgb(0 0 0 / 24%);
++  }
++}
++
++html[data-xtwork-wash] [data-slot="composer-shell"] {
++  --chat-composer-glass-surface: var(--app-theme-surface-raised);
++  --chat-composer-outline: color-mix(in srgb, var(--foreground) 10%, transparent);
++
++  @variant dark {
++    --chat-composer-outline: color-mix(in srgb, var(--foreground) 12%, transparent);
++  }
++}
++
++[data-xtwork-window-drag-strip] {
++  display: none;
 +}
 +
 +@media (min-width: 48rem) {
++  html[data-xtwork-wash]:has([data-slot="sidebar-wrapper"] [data-app-sidebar]) {
++    --workspace-controls-left: max(
++      var(--xtwork-window-controls-left),
++      calc(env(safe-area-inset-left) + 1rem)
++    );
++    --workspace-controls-right: max(
++      var(--xtwork-window-controls-right),
++      calc(env(safe-area-inset-right) + 1rem)
++    );
++  }
++
++  html[data-xtwork-wash] [data-xtwork-window-drag-strip] {
++    position: fixed;
++    top: 0;
++    right: 0;
++    left: 0;
++    z-index: 1;
++    display: block;
++    height: 8px;
++  }
++
 +  html[data-xtwork-wash]
-+    [data-slot="sidebar-wrapper"][data-sidebar-state="expanded"]:has([data-app-sidebar])
++    [data-slot="sidebar-wrapper"]:has([data-app-sidebar])
 +    > [data-slot="sidebar-inset"] {
++    --xtwork-pane-inset: 8px;
++    --xtwork-pane-radius: clamp(
++      10px,
++      calc(var(--xtwork-window-radius, 22px) - var(--xtwork-pane-inset)),
++      18px
++    );
++    --workspace-topbar-height: calc(var(--xtwork-window-topbar-height) - 18px);
++    position: relative;
 +    max-height: calc(100dvh - 16px);
 +    margin: 8px 8px 8px 0;
 +    overflow: hidden;
-+    border: 1px solid var(--contrast-border);
-+    border-radius: 14px;
++    background-clip: padding-box;
++    border: 1px solid var(--xtwork-pane-border-computed);
++    border-radius: var(--xtwork-pane-radius);
++    box-shadow: var(--xtwork-pane-shadow);
++
++    @variant dark {
++      &::after {
++        content: "";
++        position: absolute;
++        inset: 0;
++        z-index: 40;
++        pointer-events: none;
++        border-radius: inherit;
++        box-shadow: inset 0 1px 0 0 color-mix(in srgb, var(--foreground) 14%, transparent);
++      }
++    }
++  }
++
++  html[data-xtwork-wash]
++    [data-slot="sidebar-wrapper"][data-sidebar-state="collapsed"]:has([data-app-sidebar])
++    > [data-slot="sidebar-inset"] {
++    margin-inline-start: 8px;
++    --workspace-titlebar-content-left: calc(
++      var(--workspace-controls-left) + var(--workspace-titlebar-control-size) +
++        var(--workspace-titlebar-control-gap) - 9px
++    );
++  }
++
++  html[data-xtwork-wash]
++    [data-slot="sidebar-wrapper"]:has([data-app-sidebar])
++    > [data-slot="sidebar-inset"]
++    :is([data-workspace-titlebar-controls].fixed, [data-workspace-titlebar-no-drag].fixed) {
++    --workspace-topbar-height: var(--xtwork-window-topbar-height);
++  }
++
++  html[data-xtwork-wash] [data-xtwork-settings] > [data-workspace-area="settings"] {
++    background-clip: padding-box;
++    border-inline-start: 1px solid var(--xtwork-pane-border-computed);
 +  }
 +
 +  html[data-xtwork-wash] [data-app-sidebar][data-slot="sidebar-container"],
@@ -1177,10 +1414,77 @@ index 05541d39..e8ded381 100644
  /* Theme-token dependency probes are restored synchronously, before paint. Keep
     transitions from observing the temporary sentinel color in between. */
  html[data-theme-token-probe],
-@@ -1539,9 +1533,7 @@ html[data-theme-id] :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblo
+@@ -1517,31 +1619,70 @@ html[data-theme-id] [data-chat-header] [data-slot="separator"] {
+   background-color: var(--contrast-toolbar-border);
+ }
+ 
++html[data-xtwork-wash] [data-chat-header] {
++  background-color: transparent;
++  color: var(--contrast-foreground);
++}
++
++html[data-xtwork-wash]
++  [data-chat-header]
++  :is([data-slot="button"], [data-slot="menu-trigger"], [data-toolbar-control]) {
++  --control-icon-color: var(--contrast-foreground);
++  background-color: transparent;
++  border-color: color-mix(in oklab, var(--contrast-foreground) 14%, transparent);
++  color: var(--contrast-foreground);
++}
++
++html[data-xtwork-wash]
++  [data-chat-header]
++  :is([data-slot="button"], [data-slot="menu-trigger"], [data-toolbar-control]):is(
++    :hover,
++    [data-pressed]
++  ) {
++  background-color: color-mix(in oklab, var(--contrast-foreground) 7%, transparent);
++}
++
++html[data-xtwork-wash] [data-chat-header] [data-slot="separator"] {
++  background-color: color-mix(in oklab, var(--contrast-foreground) 14%, transparent);
++}
++
++html[data-xtwork-wash]
++  :is([data-panel-layout-controls], [data-workspace-titlebar-controls])
++  :is([data-slot="toggle"], [data-slot="tooltip-trigger"]) {
++  --control-icon-color: var(--contrast-foreground);
++  color: var(--contrast-foreground);
++}
++
++html[data-xtwork-wash]
++  :is([data-panel-layout-controls], [data-workspace-titlebar-controls])
++  :is([data-slot="toggle"], [data-slot="tooltip-trigger"]):disabled {
++  --control-icon-color: color-mix(in oklab, var(--contrast-foreground) 45%, transparent);
++  color: color-mix(in oklab, var(--contrast-foreground) 45%, transparent);
++}
++
+ /* Chat code blocks join the other code surfaces on the code tokens. The
+    default look keeps its secondary/input tints; themed palettes tint those
+    surfaces with the accent, which fights syntax highlighting. */
+-html[data-theme-id] :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock {
++html:is([data-theme-id], [data-xtwork-wash]) :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock {
+   background-color: var(--code-background);
+   border-color: var(--contrast-border);
+   color: var(--code-foreground);
+ }
+ 
+-html[data-theme-id] .chat-markdown pre {
++html:is([data-theme-id], [data-xtwork-wash]) .chat-markdown pre {
+   background-color: var(--code-background);
+   color: var(--code-foreground);
+ }
+ 
+-html[data-theme-id] :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock pre {
++html:is([data-theme-id], [data-xtwork-wash]) :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock pre {
+   background-color: transparent;
+ }
+ 
+-html[data-theme-id] :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock-header {
++html:is([data-theme-id], [data-xtwork-wash]) :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock-header {
    color: color-mix(in srgb, var(--code-foreground) 72%, transparent);
  }
-
+ 
 -/* T3 Chat renders inline code and compact chat artifacts with its translucent
 -   secondary surface flattened over the light chat canvas. The raw muted and
 -   secondary tokens are substantially darker than those visible pixels. */
@@ -1188,22 +1492,33 @@ index 05541d39..e8ded381 100644
  html[data-theme-id="t3-chat"] {
    @variant light {
      & .chat-markdown :not(pre) > code,
-@@ -1589,8 +1581,7 @@ html[data-theme-id] [data-app-sidebar] {
+@@ -1589,8 +1730,7 @@ html[data-theme-id] [data-app-sidebar] {
    }
  }
-
+ 
 -/* T3 Chat's panel divider is deliberately pink, and its resize affordance
 -   keeps that color while hovered. Do not neutralize this branded edge. */
 +/* Keep the petal palette's tinted divider on hover. */
  html[data-theme-id="t3-chat"] [data-app-sidebar] {
    @variant dark {
      border-color: var(--contrast-sidebar-border);
+@@ -1599,7 +1739,9 @@ html[data-theme-id="t3-chat"] [data-app-sidebar] {
+ 
+ /* Recompute contrast wherever a subtree owns its own semantic color palette. */
+ :root,
+-[data-app-sidebar] {
++[data-app-sidebar],
++html[data-xtwork-wash] [data-slot="sidebar-inset"],
++html[data-xtwork-wash] [data-workspace-area="settings"] {
+   --contrast-toolbar-foreground: color-mix(
+     in oklab,
+     color-mix(
 diff --git a/apps/web/src/routes/_chat.settings.tsx b/apps/web/src/routes/_chat.settings.tsx
 index c9753493..82b31a5e 100644
 --- a/apps/web/src/routes/_chat.settings.tsx
 +++ b/apps/web/src/routes/_chat.settings.tsx
 @@ -134,7 +134,7 @@ function SettingsContentLayout() {
-
+ 
    return (
      <AppRouteModal label={gt("Settings")}>
 -      <div className="relative flex min-h-0 flex-1">
@@ -1217,7 +1532,7 @@ index 891096cb..f874e9ca 100644
 +++ b/apps/web/src/themeBoot.test.ts
 @@ -1,10 +1,12 @@
  import { describe, expect, it, vi } from "vite-plus/test";
-
+ 
  import indexHtml from "../index.html?raw";
 +import { getBuiltInThemeWash } from "./appearancePalettes";
  import {
@@ -1230,7 +1545,7 @@ index 891096cb..f874e9ca 100644
    isKnownThemePreference,
 @@ -148,6 +150,20 @@ const CHARCOAL_DARK_ONLY = {
  };
-
+ 
  describe("index.html boot script", () => {
 +  it.each(["light", "dark"] as const)("paints the default splash in %s mode", (mode) => {
 +    const boot = runBootScript({
@@ -1275,7 +1590,7 @@ index 891096cb..f874e9ca 100644
 +    expect(toCanonicalThemeColor(dark.bootVariables["--boot-background"])).toBe(
        getThemeColorsForMode(GROVE_THEME, "dark")!.canvas,
      );
-
+ 
      const light = runBootScript({ storage, prefersDark: false });
      expect(light.isDark).toBe(false);
      expect(light.themeId).toBe("t3-chat");
@@ -1295,7 +1610,7 @@ index 891096cb..f874e9ca 100644
    });
 @@ -390,11 +407,16 @@ describe("index.html boot script", () => {
      });
-
+ 
      expect(boot.themeId).toBe("partial");
 -    expect(boot.bootVariables["--boot-background"]).toBe(getDefaultThemeColors("dark").canvas);
 +    expect(toCanonicalThemeColor(boot.bootVariables["--boot-background"])).toBe(
@@ -1312,28 +1627,35 @@ index 891096cb..f874e9ca 100644
 +    expect(toCanonicalThemeColor(boot.backgroundColor)).toBe(DEFAULT_DARK_CHROME);
 +    expect(boot.metaContent).toBe(boot.backgroundColor);
    });
-
+ 
    it("follows the OS appearance when storage is unavailable", () => {
 diff --git a/apps/web/src/themePalette.browser.test.ts b/apps/web/src/themePalette.browser.test.ts
-index 4204b069..315d920f 100644
+index 4204b069..674a8537 100644
 --- a/apps/web/src/themePalette.browser.test.ts
 +++ b/apps/web/src/themePalette.browser.test.ts
-@@ -2,7 +2,11 @@ import { converter } from "culori/fn";
+@@ -1,8 +1,18 @@
+ import { converter } from "culori/fn";
++import { page } from "vite-plus/test/browser";
  import { describe, expect, it } from "vite-plus/test";
-
+ 
  import "~/index.css";
 -import { getStandardPaintedThemeColors } from "./themePalette";
++import { applyAppearancePluginTheme } from "./appearancePlugin";
++import { syncBrowserChromeTheme } from "./hooks/useTheme";
 +import {
++  BUILT_IN_THEMES,
 +  applyThemeColorPreview,
 +  applyThemePalette,
 +  getStandardPaintedThemeColors,
++  getThemeColorsForMode,
++  getThemeDefinition,
 +} from "./themePalette";
-
+ 
  const toRgb = converter("rgb");
-
-@@ -22,23 +26,30 @@ function paintedChannels(variable: string, canvas: readonly number[] = [0, 0, 0]
+ 
+@@ -22,23 +32,30 @@ function paintedChannels(variable: string, canvas: readonly number[] = [0, 0, 0]
  }
-
+ 
  describe("standard painted theme colors", () => {
 -  it("match the chip surfaces index.css paints", () => {
 +  it("match the surfaces and controls applied to index.css", () => {
@@ -1364,7 +1686,7 @@ index 4204b069..315d920f 100644
                1.5,
              );
            });
-@@ -48,4 +59,22 @@ describe("standard painted theme colors", () => {
+@@ -48,4 +65,449 @@ describe("standard painted theme colors", () => {
        root.classList.remove("dark");
      }
    });
@@ -1386,29 +1708,457 @@ index 4204b069..315d920f 100644
 +      applyThemePalette("system", "light");
 +    }
 +  });
++
++  const colorChannels = (cssColor: string): number[] => {
++    const parsed = toRgb(cssColor)!;
++    return [parsed.r * 255, parsed.g * 255, parsed.b * 255];
++  };
++
++  const expectColorClose = (actualCss: string, expectedCss: string, label: string) => {
++    const actual = colorChannels(actualCss);
++    const expected = colorChannels(expectedCss);
++    expected.forEach((channel, index) => {
++      expect(Math.abs(channel - actual[index]!), `${label} channel ${index}`).toBeLessThan(1.5);
++    });
++  };
++
++  const mountFloatingCardFixture = () => {
++    const wrapper = document.createElement("div");
++    wrapper.dataset.slot = "sidebar-wrapper";
++    wrapper.dataset.sidebarState = "expanded";
++    wrapper.className = "flex h-dvh min-h-0 w-full";
++    wrapper.style.setProperty("--sidebar-width", "240px");
++    wrapper.style.setProperty(
++      "--workspace-titlebar-content-left",
++      "calc(var(--workspace-controls-left) + var(--workspace-titlebar-control-size) + var(--workspace-titlebar-control-gap))",
++    );
++
++    const dragStrip = document.createElement("div");
++    dragStrip.setAttribute("aria-hidden", "true");
++    dragStrip.className = "drag-region";
++    dragStrip.dataset.xtworkWindowDragStrip = "";
++
++    const sidebarGroup = document.createElement("div");
++    sidebarGroup.className = "group peer hidden md:block";
++    sidebarGroup.dataset.slot = "sidebar";
++    sidebarGroup.dataset.state = "expanded";
++    sidebarGroup.dataset.collapsible = "";
++    sidebarGroup.dataset.collapsibleMode = "offcanvas";
++    sidebarGroup.dataset.side = "left";
++
++    const sidebarGap = document.createElement("div");
++    sidebarGap.dataset.slot = "sidebar-gap";
++    sidebarGap.className = "relative w-(--sidebar-width) bg-transparent group-data-[collapsible=offcanvas]:w-0";
++
++    const sidebar = document.createElement("div");
++    sidebar.dataset.appSidebar = "";
++    sidebar.dataset.slot = "sidebar-container";
++    sidebar.className =
++      "fixed inset-y-0 left-0 z-10 hidden h-svh w-(--sidebar-width) md:flex group-data-[collapsible=offcanvas]:left-[calc(var(--sidebar-width)*-1)]";
++
++    const sidebarTopbar = document.createElement("div");
++    sidebarTopbar.className = "flex h-[var(--workspace-topbar-height)] items-center";
++
++    const sidebarInner = document.createElement("div");
++    sidebarInner.dataset.slot = "sidebar-inner";
++    sidebarInner.className = "flex h-full w-full flex-col";
++    sidebarInner.append(sidebarTopbar);
++    sidebar.append(sidebarInner);
++    sidebarGroup.append(sidebarGap, sidebar);
++
++    const inset = document.createElement("main");
++    inset.dataset.slot = "sidebar-inset";
++    inset.className = "relative flex min-w-0 w-full flex-1 flex-col bg-background";
++
++    const chatWrapper = document.createElement("div");
++    chatWrapper.className = "bg-background flex flex-1 flex-col";
++
++    const header = document.createElement("header");
++    header.dataset.chatHeader = "";
++    header.className =
++      "relative bg-background flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center";
++
++    const chatNoDragShield = document.createElement("span");
++    chatNoDragShield.setAttribute("aria-hidden", "true");
++    chatNoDragShield.dataset.workspaceTitlebarNoDrag = "";
++    chatNoDragShield.className =
++      "pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]";
++    header.append(chatNoDragShield);
++
++    const rightPanelHeader = document.createElement("div");
++    const rightPanelNoDragShield = document.createElement("span");
++    rightPanelNoDragShield.setAttribute("aria-hidden", "true");
++    rightPanelNoDragShield.dataset.workspaceTitlebarNoDrag = "";
++    rightPanelNoDragShield.className =
++      "pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]";
++    rightPanelHeader.append(rightPanelNoDragShield);
++
++    const nestedCard = document.createElement("div");
++    nestedCard.className = "bg-card";
++
++    const composerShell = document.createElement("div");
++    composerShell.dataset.slot = "composer-shell";
++
++    const fixedControls = document.createElement("div");
++    fixedControls.dataset.workspaceTitlebarControls = "";
++    fixedControls.className =
++      "fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)]";
++
++    chatWrapper.append(header, rightPanelHeader, nestedCard, composerShell, fixedControls);
++    inset.append(chatWrapper);
++    wrapper.append(dragStrip, sidebarGroup, inset);
++    document.body.append(wrapper);
++
++    const setCollapsed = (collapsed: boolean) => {
++      const state = collapsed ? "collapsed" : "expanded";
++      wrapper.dataset.sidebarState = state;
++      sidebarGroup.dataset.state = state;
++      sidebarGroup.dataset.collapsible = collapsed ? "offcanvas" : "";
++    };
++
++    return {
++      wrapper,
++      dragStrip,
++      sidebarGroup,
++      sidebar,
++      sidebarTopbar,
++      inset,
++      chatWrapper,
++      header,
++      chatNoDragShield,
++      rightPanelNoDragShield,
++      nestedCard,
++      composerShell,
++      fixedControls,
++      setCollapsed,
++      cleanup: () => wrapper.remove(),
++    };
++  };
++
++  it("scopes floating-card surfaces, transparent chat header, and translucent borders across all built-in themes", async () => {
++    await page.viewport(1280, 800);
++    const root = document.documentElement;
++    const fixture = mountFloatingCardFixture();
++    try {
++      const themePrefs = ["system", ...BUILT_IN_THEMES.map((theme) => theme.id)] as const;
++      for (const themePref of themePrefs) {
++        for (const appearance of ["light", "dark"] as const) {
++          root.classList.toggle("dark", appearance === "dark");
++          applyThemePalette(themePref, appearance);
++          const colors =
++            themePref === "system"
++              ? getStandardPaintedThemeColors(appearance)
++              : getThemeColorsForMode(getThemeDefinition(themePref)!, appearance)!;
++
++          const rootBackground = paintedChannels("--background");
++          const expectedCanvas = colorChannels(colors.canvas);
++          expectedCanvas.forEach((channel, index) => {
++            expect(
++              Math.abs(channel - rootBackground[index]!),
++              `${themePref} ${appearance} root --background`,
++            ).toBeLessThan(1.5);
++          });
++
++          expectColorClose(
++            getComputedStyle(fixture.chatWrapper).backgroundColor,
++            colors.surface,
++            `${themePref} ${appearance} chatWrapper surface`,
++          );
++          const chatChannels = colorChannels(getComputedStyle(fixture.chatWrapper).backgroundColor);
++          const maxDiffFromCanvas = Math.max(
++            ...chatChannels.map((channel, index) => Math.abs(channel - expectedCanvas[index]!)),
++          );
++          expect(
++            maxDiffFromCanvas,
++            `${themePref} ${appearance} chatWrapper distinct from canvas`,
++          ).toBeGreaterThan(5);
++
++          expect(
++            getComputedStyle(fixture.header).backgroundColor,
++            `${themePref} ${appearance} transparent chat header`,
++          ).toBe("rgba(0, 0, 0, 0)");
++
++          expectColorClose(
++            getComputedStyle(fixture.nestedCard).backgroundColor,
++            colors.surfaceRaised,
++            `${themePref} ${appearance} nestedCard surfaceRaised`,
++          );
++
++          const composerProbe = document.createElement("div");
++          composerProbe.style.backgroundColor = "var(--chat-composer-glass-surface)";
++          composerProbe.style.borderColor = "var(--chat-composer-outline)";
++          fixture.composerShell.append(composerProbe);
++          try {
++            expectColorClose(
++              getComputedStyle(composerProbe).backgroundColor,
++              colors.surfaceRaised,
++              `${themePref} ${appearance} composer glass surface`,
++            );
++            const composerOutline = toRgb(getComputedStyle(composerProbe).borderTopColor)!;
++            expect(composerOutline.alpha ?? 1).toBeGreaterThan(0.05);
++            expect(composerOutline.alpha ?? 1).toBeLessThan(0.5);
++          } finally {
++            composerProbe.remove();
++          }
++
++          const insetStyle = getComputedStyle(fixture.inset);
++          expect(insetStyle.marginTop).toBe("8px");
++          expect(insetStyle.marginRight).toBe("8px");
++          expect(insetStyle.marginBottom).toBe("8px");
++          expect(insetStyle.marginLeft).toBe("0px");
++          expect(insetStyle.overflow).toBe("hidden");
++          expect(insetStyle.boxShadow).not.toBe("none");
++          expect(insetStyle.borderTopStyle).toBe("solid");
++          expect(insetStyle.borderTopWidth).toBe("1px");
++          const borderColor = toRgb(insetStyle.borderTopColor)!;
++          expect(
++            borderColor.alpha ?? 1,
++            `${themePref} ${appearance} translucent pane border`,
++          ).toBeGreaterThan(0.05);
++          expect(
++            borderColor.alpha ?? 1,
++            `${themePref} ${appearance} non-opaque pane border`,
++          ).toBeLessThan(0.5);
++        }
++      }
++    } finally {
++      fixture.cleanup();
++      root.classList.remove("dark");
++      applyThemePalette("system", "light");
++    }
++  });
++
++  it("aligns topbar centerlines, keeps collapsed floating card framing, and clamps concentric corner radii", async () => {
++    await page.viewport(1280, 800);
++    const root = document.documentElement;
++    const fixture = mountFloatingCardFixture();
++    try {
++      root.classList.remove("dark");
++      applyThemePalette("grove", "light");
++
++      const sidebarTopbarRect = fixture.sidebarTopbar.getBoundingClientRect();
++      const headerRect = fixture.header.getBoundingClientRect();
++      const fixedControlsRect = fixture.fixedControls.getBoundingClientRect();
++
++      expect(sidebarTopbarRect.height).toBeCloseTo(52, 0);
++      expect(headerRect.top).toBeCloseTo(9, 0);
++      expect(headerRect.height).toBeCloseTo(34, 0);
++      const sidebarCenterY = sidebarTopbarRect.top + sidebarTopbarRect.height / 2;
++      const headerCenterY = headerRect.top + headerRect.height / 2;
++      const fixedCenterY = fixedControlsRect.top + fixedControlsRect.height / 2;
++      expect(Math.abs(headerCenterY - sidebarCenterY)).toBeLessThanOrEqual(1.5);
++      expect(fixedControlsRect.height).toBeCloseTo(52, 0);
++      expect(Math.abs(fixedCenterY - sidebarCenterY)).toBeLessThanOrEqual(1.5);
++      expect(fixture.chatNoDragShield.getBoundingClientRect().height).toBeCloseTo(52, 0);
++      expect(fixture.rightPanelNoDragShield.getBoundingClientRect().height).toBeCloseTo(52, 0);
++
++      for (const [width, height] of [
++        [1280, 800],
++        [768, 800],
++      ] as const) {
++        await page.viewport(width, height);
++        fixture.setCollapsed(true);
++        const collapsedRect = fixture.inset.getBoundingClientRect();
++        expect(collapsedRect.left).toBeCloseTo(8, 0);
++        expect(collapsedRect.top).toBeCloseTo(8, 0);
++        expect(width - collapsedRect.right).toBeCloseTo(8, 0);
++        expect(height - collapsedRect.bottom).toBeCloseTo(8, 0);
++        expect(document.documentElement.scrollWidth).toBe(width);
++        expect(document.documentElement.scrollHeight).toBe(height);
++        const collapsedStyle = getComputedStyle(fixture.inset);
++        expect(collapsedStyle.marginLeft).toBe("8px");
++        expect(collapsedStyle.borderTopWidth).toBe("1px");
++        expect(collapsedStyle.borderTopLeftRadius).toBe("14px");
++      }
++
++      await page.viewport(1280, 800);
++      fixture.setCollapsed(false);
++
++      const preloadDragSheet = new CSSStyleSheet();
++      preloadDragSheet.replaceSync(".drag-region { --app-region: drag; }");
++      document.adoptedStyleSheets = [...document.adoptedStyleSheets, preloadDragSheet];
++      try {
++        const hitTarget = document.elementFromPoint(500, 4);
++        expect(hitTarget).toBe(fixture.dragStrip);
++        let receivedTarget: EventTarget | null = null;
++        const onMouseDown = (event: MouseEvent) => {
++          receivedTarget = event.target;
++        };
++        window.addEventListener("mousedown", onMouseDown, true);
++        hitTarget!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0, clientX: 500, clientY: 4 }));
++        window.removeEventListener("mousedown", onMouseDown, true);
++        expect(receivedTarget).toBe(fixture.dragStrip);
++        expect(getComputedStyle(fixture.dragStrip).getPropertyValue("--app-region").trim()).toBe(
++          "drag",
++        );
++      } finally {
++        document.adoptedStyleSheets = document.adoptedStyleSheets.filter(
++          (sheet) => sheet !== preloadDragSheet,
++        );
++      }
++
++      root.style.setProperty("--mygo-titlebar-inset-right", "138px");
++      expect(getComputedStyle(fixture.fixedControls).right).toBe("150px");
++      expect(getComputedStyle(fixture.chatNoDragShield).right).toBe("150px");
++      expect(getComputedStyle(fixture.rightPanelNoDragShield).right).toBe("150px");
++      root.style.removeProperty("--mygo-titlebar-inset-right");
++
++      root.style.setProperty("--workspace-controls-right", "150px");
++      expect(getComputedStyle(fixture.fixedControls).right).toBe("150px");
++      expect(getComputedStyle(fixture.chatNoDragShield).right).toBe("150px");
++      root.style.removeProperty("--workspace-controls-right");
++
++      const sidebarControl = document.createElement("div");
++      sidebarControl.dataset.sidebarControl = "";
++      sidebarControl.className = "fixed left-[var(--workspace-controls-left)] top-[var(--workspace-controls-top)] h-[var(--workspace-topbar-height)]";
++      fixture.wrapper.style.setProperty(
++        "--workspace-controls-left",
++        "max(var(--xtwork-window-controls-left, 0px), var(--desktop-window-controls-inset, 90px))",
++      );
++      fixture.wrapper.append(sidebarControl);
++      try {
++        expect(getComputedStyle(sidebarControl).left).toBe("90px");
++        root.style.setProperty("--mygo-titlebar-inset-left", "138px");
++        expect(getComputedStyle(sidebarControl).left).toBe("150px");
++      } finally {
++        root.style.removeProperty("--mygo-titlebar-inset-left");
++        fixture.wrapper.style.removeProperty("--workspace-controls-left");
++        sidebarControl.remove();
++      }
++
++      for (const [windowRadius, expectedPaneRadius] of [
++        [null, "14px"],
++        ["26px", "18px"],
++        ["18px", "10px"],
++        ["0px", "10px"],
++      ] as const) {
++        if (windowRadius === null) {
++          root.style.removeProperty("--xtwork-window-radius");
++        } else {
++          root.style.setProperty("--xtwork-window-radius", windowRadius);
++        }
++        expect(
++          getComputedStyle(fixture.inset).borderTopLeftRadius,
++          `windowRadius=${windowRadius ?? "default"}`,
++        ).toBe(expectedPaneRadius);
++      }
++    } finally {
++      root.style.removeProperty("--mygo-titlebar-inset-right");
++      root.style.removeProperty("--workspace-controls-right");
++      root.style.removeProperty("--xtwork-window-radius");
++      fixture.cleanup();
++      root.classList.remove("dark");
++      applyThemePalette("system", "light");
++    }
++  });
++
++  it("restores built-in floating-card surface fill when an appearance plugin disposes", async () => {
++    await page.viewport(1280, 800);
++    const root = document.documentElement;
++    const fixture = mountFloatingCardFixture();
++    try {
++      root.classList.remove("dark");
++      applyThemePalette("grove", "light");
++      const groveLight = getThemeColorsForMode(getThemeDefinition("grove")!, "light")!;
++      expectColorClose(
++        getComputedStyle(fixture.chatWrapper).backgroundColor,
++        groveLight.surface,
++        "initial grove light surface",
++      );
++
++      const application = applyAppearancePluginTheme(root, {
++        pluginId: "plugin-override",
++        kind: "appearance",
++        theme: {
++          id: "plugin-override",
++          tokens: {
++            surface: "#18181b",
++            canvas: "#101010",
++          },
++        },
++      });
++      expect(root.getAttribute("data-xtwork-wash")).toBeNull();
++      expectColorClose(
++        getComputedStyle(fixture.chatWrapper).backgroundColor,
++        "#101010",
++        "plugin active canvas",
++      );
++
++      application.dispose();
++      expect(root.getAttribute("data-xtwork-wash")).toBe("");
++      expect(getComputedStyle(fixture.chatWrapper).backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
++      expectColorClose(
++        getComputedStyle(fixture.chatWrapper).backgroundColor,
++        groveLight.surface,
++        "restored grove light surface after dispose",
++      );
++    } finally {
++      fixture.cleanup();
++      root.classList.remove("dark");
++      applyThemePalette("system", "light");
++    }
++  });
++
++  it("writes Paper chrome color rather than sidebar-inset card surface in syncBrowserChromeTheme", async () => {
++    await page.viewport(1280, 800);
++    const root = document.documentElement;
++    const fixture = mountFloatingCardFixture();
++    try {
++      for (const appearance of ["light", "dark"] as const) {
++        root.classList.toggle("dark", appearance === "dark");
++        applyThemePalette("system", appearance);
++        syncBrowserChromeTheme();
++        const colors = getStandardPaintedThemeColors(appearance);
++        expect(root.style.backgroundColor).not.toBe("");
++        expectColorClose(
++          root.style.backgroundColor,
++          colors.chrome,
++          `Paper ${appearance} root chrome`,
++        );
++        expectColorClose(
++          document.body.style.backgroundColor,
++          colors.chrome,
++          `Paper ${appearance} body chrome`,
++        );
++        const surfaceChannels = colorChannels(colors.surface);
++        const rootChannels = colorChannels(root.style.backgroundColor);
++        expect(
++          Math.max(...rootChannels.map((channel, index) => Math.abs(channel - surfaceChannels[index]!))),
++          `Paper ${appearance} root chrome != surface`,
++        ).toBeGreaterThan(5);
++      }
++    } finally {
++      fixture.cleanup();
++      root.style.removeProperty("background-color");
++      document.body.style.removeProperty("background-color");
++      root.classList.remove("dark");
++      applyThemePalette("system", "light");
++    }
++  });
  });
 diff --git a/apps/web/src/themePalette.test.ts b/apps/web/src/themePalette.test.ts
-index dd33895b..972ed875 100644
+index dd33895b..54c35397 100644
 --- a/apps/web/src/themePalette.test.ts
 +++ b/apps/web/src/themePalette.test.ts
-@@ -1,12 +1,12 @@
+@@ -1,12 +1,13 @@
  import { describe, expect, it, vi } from "vite-plus/test";
  import { converter } from "culori/fn";
 -import { BUILT_IN_THEMES } from "@t3tools/shared/themePalettes";
-
+ 
++import { getBuiltInThemeWashSpec } from "./appearancePalettes";
  import { CONTEXT_CHIP_ACCENTS, contextChipColorVariable } from "./lib/contextChipAccents";
  import { appAtomRegistry } from "./rpc/atomRegistry";
-
+ 
  import {
    applyThemePalette,
 +  BUILT_IN_THEMES,
    canonicalThemePreference,
    contextChipVariables,
    getThemeDefinition,
-@@ -65,6 +65,20 @@ function contrastRatio(first: string, second: string): number {
+@@ -65,6 +66,131 @@ function contrastRatio(first: string, second: string): number {
    return (lighter + 0.05) / (darker + 0.05);
  }
-
+ 
 +describe("Xtwork appearance palettes", () => {
 +  it("uses Paper by default and displays the product theme names", () => {
 +    expect(asHex(getStandardThemeColors("light").canvas)).toBe("#f6f6f7");
@@ -1421,14 +2171,125 @@ index dd33895b..972ed875 100644
 +      "暮色",
 +    ]);
 +  });
++
++  it("keeps floating-card surface separation, perimeter contrast, and surface elevation across all built-in themes", () => {
++    const toRgb = converter("rgb");
++    type Rgb = { r: number; g: number; b: number; alpha: number };
++    const toRgbChannels = (value: string): Rgb => {
++      const parsed = toRgb(value);
++      if (!parsed) throw new Error(`Expected a CSS color, received ${value}`);
++      return {
++        r: Math.min(1, Math.max(0, parsed.r)),
++        g: Math.min(1, Math.max(0, parsed.g)),
++        b: Math.min(1, Math.max(0, parsed.b)),
++        alpha: parsed.alpha ?? 1,
++      };
++    };
++    const compositeRgb = (fg: Rgb, bg: Rgb, alphaOverride?: number): Rgb => {
++      const a = alphaOverride ?? fg.alpha;
++      return {
++        r: fg.r * a + bg.r * (1 - a),
++        g: fg.g * a + bg.g * (1 - a),
++        b: fg.b * a + bg.b * (1 - a),
++        alpha: 1,
++      };
++    };
++    const relativeLuminance = (color: Rgb): number =>
++      [color.r, color.g, color.b]
++        .map((channel) =>
++          channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4,
++        )
++        .reduce((sum, channel, index) => sum + channel * [0.2126, 0.7152, 0.0722][index]!, 0);
++    const ratio = (first: Rgb, second: Rgb): number => {
++      const l1 = relativeLuminance(first);
++      const l2 = relativeLuminance(second);
++      return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
++    };
++
++    const builtInIds = ["default", "t3-chat", "grove", "ocean", "ember", "iris"] as const;
++    for (const id of builtInIds) {
++      for (const mode of ["light", "dark"] as const) {
++        const spec = getBuiltInThemeWashSpec(id, mode);
++        expect(spec, `${id} ${mode} wash spec`).toBeDefined();
++        const colors =
++          id === "default"
++            ? getStandardThemeColors(mode)
++            : getThemeColorsForMode(getThemeDefinition(id)!, mode)!;
++        const washTop = toRgbChannels(spec!.stops[0]);
++        const washBottom = toRgbChannels(spec!.stops[spec!.stops.length - 1]!);
++        const washGlowTop = spec!.glow
++          ? compositeRgb(toRgbChannels(spec!.glow), washTop)
++          : washTop;
++        const surface = toRgbChannels(spec!.surface);
++        const text = toRgbChannels(spec!.text);
++
++        expect(asHex(colors.surface), `${id} ${mode} surface != washTop`).not.toBe(
++          asHex(spec!.stops[0]),
++        );
++        expect(ratio(surface, washTop), `${id} ${mode} surface vs washTop`).toBeGreaterThanOrEqual(
++          1.07,
++        );
++
++        const backdrops = [
++          ["washTop", washTop],
++          ["washGlowTop", washGlowTop],
++          ["washBottom", washBottom],
++        ] as const;
++        if (mode === "light") {
++          const lightBorder: Rgb = { r: 0, g: 0, b: 0, alpha: 0.11 };
++          for (const [label, backdrop] of backdrops) {
++            const perimeter = compositeRgb(lightBorder, backdrop);
++            expect(
++              ratio(perimeter, backdrop),
++              `${id} light perimeter vs ${label}`,
++            ).toBeGreaterThanOrEqual(1.18);
++            expect(
++              ratio(perimeter, surface),
++              `${id} light perimeter vs surface at ${label}`,
++            ).toBeGreaterThanOrEqual(1.25);
++          }
++        } else {
++          const topRim = compositeRgb(text, surface, 0.14);
++          for (const [label, backdrop] of backdrops) {
++            const perimeter = compositeRgb(text, backdrop, 0.12);
++            expect(
++              ratio(perimeter, backdrop),
++              `${id} dark perimeter vs ${label}`,
++            ).toBeGreaterThanOrEqual(1.18);
++            expect(
++              ratio(topRim, backdrop),
++              `${id} dark topRim vs ${label}`,
++            ).toBeGreaterThanOrEqual(1.25);
++          }
++        }
++
++        const surfaceLum = relativeLuminance(toRgbChannels(colors.surface));
++        const raisedLum = relativeLuminance(toRgbChannels(colors.surfaceRaised));
++        const overlayLum = relativeLuminance(toRgbChannels(colors.surfaceOverlay));
++        if (mode === "dark") {
++          expect(raisedLum, `${id} dark surfaceRaised > surface`).toBeGreaterThan(surfaceLum);
++          expect(overlayLum, `${id} dark surfaceOverlay >= surfaceRaised`).toBeGreaterThanOrEqual(
++            raisedLum,
++          );
++        } else {
++          expect(raisedLum, `${id} light surfaceRaised >= surface`).toBeGreaterThanOrEqual(
++            surfaceLum,
++          );
++          expect(overlayLum, `${id} light surfaceOverlay >= surface`).toBeGreaterThanOrEqual(
++            surfaceLum,
++          );
++        }
++      }
++    }
++  });
 +});
 +
  describe("theme files", () => {
    it("gives non-Latin theme names distinct stable ids", () => {
      const file = {
-@@ -654,10 +668,6 @@ describe("context chip colors", () => {
+@@ -654,10 +780,6 @@ describe("context chip colors", () => {
    });
-
+ 
    it("reads at 5:1 on the standard surfaces as index.css paints them", () => {
 -    const painted = {
 -      light: ["#fcfcfc", "#ffffff", "#ebebed"],
@@ -1437,7 +2298,7 @@ index dd33895b..972ed875 100644
      const properties = new Map<string, string>();
      vi.stubGlobal("window", { localStorage: { getItem: () => null } });
      vi.stubGlobal("document", {
-@@ -673,12 +683,14 @@ describe("context chip colors", () => {
+@@ -673,12 +795,14 @@ describe("context chip colors", () => {
      try {
        for (const appearance of ["light", "dark"] as const) {
          applyThemePalette("system", appearance);
@@ -1475,21 +2336,21 @@ index d04e7e16..1d18dff7 100644
    type ThemeAppearance,
 @@ -31,12 +23,13 @@ import {
  } from "./lib/contextChipAccents";
-
+ 
  import { m } from "./i18n/messages";
 +import { BUILT_IN_PALETTES, getBuiltInThemeWash, PAPER_THEME_COLORS } from "./appearancePalettes";
  import { appAtomRegistry, subscribeAtomChanges } from "./rpc/atomRegistry";
  import { applyThemeBackground } from "./themeBackground";
  import { applyThemeCss } from "./themeCss";
  import { themeServerEnvironmentThemesAtom } from "./state/server";
-
+ 
 -export { EMBER_THEME, GROVE_THEME, IRIS_THEME, OCEAN_THEME, T3_CHAT_THEME, THEME_COLOR_ROLES };
 +export { THEME_COLOR_ROLES };
  export type { ThemeAppearance, ThemeColorRole, ThemeColors, ThemeDefinition, ThemeVariants };
-
+ 
  const T3_CHAT_THEME_ID = "t3-chat" as const;
 @@ -434,24 +427,13 @@ function legacyThemeMode(theme: ThemePreference): ThemeAppearance | null {
-
+ 
  export function getStandardThemeColors(appearance: ThemeAppearance): ThemeColors {
    if (appearance === "dark") {
 -    return (standardDarkThemeColors ??= decodeThemeColors({
@@ -1501,7 +2362,7 @@ index d04e7e16..1d18dff7 100644
 -  return (standardLightThemeColors ??= decodeThemeColors(T3_CODE_LIGHT_THEME_COLORS));
 +  return (standardLightThemeColors ??= decodeThemeColors(PAPER_THEME_COLORS.light));
  }
-
+ 
 -// index.css paints the light bubble a step darker than the shared palette mobile uses.
 -const STANDARD_WEB_PAINTED_COLORS: Record<ThemeAppearance, Partial<ThemeColors>> = {
 -  light: { messageSurface: "#ebebed" },
@@ -1513,13 +2374,13 @@ index d04e7e16..1d18dff7 100644
 -  return { ...getStandardThemeColors(appearance), ...STANDARD_WEB_PAINTED_COLORS[appearance] };
 -}
 +export const getStandardPaintedThemeColors = getStandardThemeColors;
-
+ 
  type ThemeRgbColor = {
    r: number;
 @@ -1226,12 +1208,24 @@ export function updateThemeColorFamily(
    }
  }
-
+ 
 -const BUILT_IN_THEME_DEFINITIONS: ReadonlyArray<ThemeDefinition> = BUILT_IN_THEMES;
 +export const T3_CHAT_THEME = canonicalizeThemeDefinition(BUILT_IN_PALETTES.petal);
 +export const GROVE_THEME = canonicalizeThemeDefinition(BUILT_IN_PALETTES.meadow);
@@ -1534,7 +2395,7 @@ index d04e7e16..1d18dff7 100644
 +  EMBER_THEME,
 +  IRIS_THEME,
 +];
-
+ 
  export function getThemeDefinition(theme: ThemePreference): ThemeDefinition | null {
    const themeId = themeIdFromPreference(theme);
    return (
@@ -1544,7 +2405,7 @@ index d04e7e16..1d18dff7 100644
      getEnvironmentThemes().find((definition) => definition.id === themeId) ??
      null
 @@ -1240,10 +1234,7 @@ export function getThemeDefinition(theme: ThemePreference): ThemeDefinition | nu
-
+ 
  export function themeAllowsSidebarArtwork(theme: ThemePreference): boolean {
    const themeId = themeIdFromPreference(theme);
 -  return (
@@ -1553,7 +2414,7 @@ index d04e7e16..1d18dff7 100644
 -  );
 +  return BUILT_IN_THEMES.find((definition) => definition.id === themeId)?.sidebarArtwork === true;
  }
-
+ 
  /** Every selection path must check single-appearance themes to keep mix and appearance tiles in sync. */
 @@ -1375,7 +1366,7 @@ export function installCustomTheme(theme: ThemeDefinition): ThemeDefinition {
    }
@@ -1574,9 +2435,9 @@ index d04e7e16..1d18dff7 100644
      if (
        !storedThemeHasCollectionId(storedTheme, collectionId) &&
 @@ -1720,6 +1711,16 @@ export function getThemeColorVariable(role: ThemeColorRole): string {
-
+ 
  export const THEME_PREVIEW_ID = "__preview";
-
+ 
 +function applyWindowWash(root: HTMLElement, wash?: string): void {
 +  if (wash === undefined) {
 +    delete root.dataset.xtworkWash;
@@ -1593,7 +2454,7 @@ index d04e7e16..1d18dff7 100644
 @@ -1730,6 +1731,7 @@ export function applyThemeColorPreview(
    const root = document.documentElement;
    if (!root?.style) return;
-
+ 
 +  applyWindowWash(root);
    root.dataset.themeId = THEME_PREVIEW_ID;
    root.classList.toggle("dark", appearance === "dark");
@@ -1601,7 +2462,7 @@ index d04e7e16..1d18dff7 100644
 @@ -1751,22 +1753,25 @@ export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppe
    applyThemeCss(palette?.css);
    applyThemeBackground(palette?.id);
-
+ 
 +  const mode =
 +    appearance ??
 +    legacyThemeMode(theme) ??
@@ -1634,5 +2495,5 @@ index d04e7e16..1d18dff7 100644
 -  applyContextChipVariables(root, getStandardPaintedThemeColors(appearance ?? "light"));
 +  applyContextChipVariables(root, colors);
  }
-
+ 
  export function resolveThemeAppearance(

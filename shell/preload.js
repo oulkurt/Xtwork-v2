@@ -26,7 +26,25 @@
   });
   const unsupportedCli = async () => ({ supported: false, installedPath: null, onPath: false });
   let fullscreen = false;
-  native.on("xtwork:fullscreen", (value) => { fullscreen = value; });
+  const syncWindowCornerRadius = () => {
+    if (fullscreen) {
+      if (document.documentElement) {
+        document.documentElement.style.setProperty("--xtwork-window-radius", "0px");
+      }
+      return;
+    }
+    call("GetWindowCornerRadius").then((radius) => {
+      if (!document.documentElement) return;
+      if (fullscreen) {
+        document.documentElement.style.setProperty("--xtwork-window-radius", "0px");
+      } else if (typeof radius === "number" && radius > 0) {
+        document.documentElement.style.setProperty("--xtwork-window-radius", `${radius}px`);
+      } else {
+        document.documentElement.style.removeProperty("--xtwork-window-radius");
+      }
+    }).catch(() => {});
+  };
+  native.on("xtwork:fullscreen", (value) => { fullscreen = value; syncWindowCornerRadius(); });
 
   Object.defineProperty(window, "desktopBridge", { value: Object.freeze({
     xtwork: true,
@@ -122,13 +140,9 @@
   const titlebar = new CSSStyleSheet();
   titlebar.replaceSync(`
     .drag-region { --app-region: drag; }
-    [class~="[-webkit-app-region:no-drag]"] { --app-region: no-drag; }
+    .drag-region :is(button, input, textarea, select, a), [class~="[-webkit-app-region:no-drag]"] { --app-region: no-drag; }
   `);
   document.adoptedStyleSheets = [...document.adoptedStyleSheets, titlebar];
 
-  call("GetWindowCornerRadius").then((radius) => {
-    if (radius > 0) {
-      titlebar.insertRule(`:root { --xtwork-window-radius: ${radius}px; }`);
-    }
-  }).catch(() => {});
+  syncWindowCornerRadius();
 }
