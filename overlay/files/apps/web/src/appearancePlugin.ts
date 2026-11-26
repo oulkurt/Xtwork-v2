@@ -3,7 +3,7 @@ import {
   type ThemeColorRole,
 } from "@t3tools/shared/themePalettes";
 
-import { getThemeColorVariable, isThemeColor } from "./themePalette";
+import { isThemeColor, registerAppearancePluginLayer } from "./themePalette";
 
 export type AppearancePluginTheme = Readonly<{
   pluginId: string;
@@ -21,7 +21,6 @@ export type AppearanceApplication = Readonly<{
 }>;
 
 const themeRoles = new Set<string>(THEME_COLOR_ROLES);
-const WINDOW_WASH_VARIABLE = "--xtwork-window-wash";
 
 export function applyAppearancePluginTheme(
   root: HTMLElement,
@@ -29,7 +28,7 @@ export function applyAppearancePluginTheme(
 ): AppearanceApplication {
   const appliedRoles: ThemeColorRole[] = [];
   const rejectedRoles: string[] = [];
-  const previousRoleValues: Array<readonly [string, string]> = [];
+  const validTokens: Partial<Record<ThemeColorRole, string>> = {};
 
   for (const [role, value] of Object.entries(plugin.theme.tokens)) {
     if (!themeRoles.has(role) || !isThemeColor(value)) {
@@ -37,47 +36,28 @@ export function applyAppearancePluginTheme(
       continue;
     }
     const themeRole = role as ThemeColorRole;
-    const variable = getThemeColorVariable(themeRole);
-    previousRoleValues.push([variable, root.style.getPropertyValue(variable)]);
-    root.style.setProperty(variable, value);
+    validTokens[themeRole] = value;
     appliedRoles.push(themeRole);
   }
 
-  const dataset = (root as { dataset?: DOMStringMap }).dataset;
-  let hadWash = false;
-  let previousWash = "";
-
-  if (appliedRoles.length > 0) {
-    if (dataset) {
-      hadWash = "xtworkWash" in dataset;
-    }
-    previousWash = root.style.getPropertyValue(WINDOW_WASH_VARIABLE);
-    if (dataset && hadWash) {
-      delete dataset.xtworkWash;
-    }
-    if (hadWash || previousWash !== "") {
-      root.style.removeProperty(WINDOW_WASH_VARIABLE);
-    }
+  if (appliedRoles.length === 0) {
+    return {
+      appliedRoles,
+      rejectedRoles,
+      dispose: () => {},
+    };
   }
 
+  const releaseLayer = registerAppearancePluginLayer(root, validTokens);
+
+  let disposed = false;
   return {
     appliedRoles,
     rejectedRoles,
     dispose: () => {
-      for (let index = previousRoleValues.length - 1; index >= 0; index -= 1) {
-        const [variable, previousValue] = previousRoleValues[index]!;
-        if (previousValue !== "") {
-          root.style.setProperty(variable, previousValue);
-        } else {
-          root.style.removeProperty(variable);
-        }
-      }
-      if (dataset && hadWash) {
-        dataset.xtworkWash = "";
-      }
-      if (previousWash !== "") {
-        root.style.setProperty(WINDOW_WASH_VARIABLE, previousWash);
-      }
+      if (disposed) return;
+      disposed = true;
+      releaseLayer();
     },
   };
 }

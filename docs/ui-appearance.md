@@ -8,8 +8,8 @@
 
 桌面宽度（`>= 768px`，窗口最小宽度同步为 `768px`）下，右侧主工作区在侧栏展开态保持上/右/下 `8px` 留白（左侧贴合透明侧栏），在侧栏折叠态保持四边对称 `8px` 留白的整体悬浮卡片形态：
 - **边界与组合海拔**：浅色模式采用 `background-clip: padding-box` 下的半透明黑细线与轻环境影，深色模式采用半透明浅色边框、顶边高光边（`::after` 顶亮边缘）与三层紧致落影，并继续响应高对比度设置（`--appearance-contrast-*`）。
-- **同心圆角与标题栏中轴对齐**：`shell/preload.js` 在启动及 `xtwork:fullscreen` 切换时实时同步 `--xtwork-window-radius`，卡片圆角按 `clamp(10px, calc(var(--xtwork-window-radius, 22px) - 8px), 18px)` 计算；`shell/main.go` 将 `TitleBarHeight` 设为 `52`、macOS `TrafficLightPosition` 置于 `(18, 19)`，与侧栏 `52px` 顶栏及卡片内 `34px` 顶栏共享同一水平中轴线（`26px`）；窗口层统一按 WCO、`--mygo-titlebar-inset-*` 与卡片留白取最大值计算左右控制区预留；顶部 `8px` 留白通过真实 DOM 节点 `[data-xtwork-window-drag-strip].drag-region` 承载 MyGo/Electron 窗口拖动，聊天顶栏与右侧面板共用 `[data-workspace-titlebar-no-drag]` 对齐 `52px` 防拖动护盾。
-- **纸白同步**：默认纸白主题在未设置 `data-theme-id` 时仍通过 `data-xtwork-wash` 写入 `--app-chrome-background` 作为浏览器/壳层底色，避免回写卡片白色。
+- **同心圆角与标题栏中轴对齐**：`shell/preload.js` 在启动、`xtwork:fullscreen`、`xtwork:window-state`（最大化/还原）与窗口尺寸变化时实时同步 `--xtwork-window-radius`（将合法的 `0` 窗口圆角明确写为 `0px`，仅非数值或负值时回退默认 `22px`），卡片圆角按 `clamp(10px, calc(var(--xtwork-window-radius, 22px) - 8px), 18px)` 计算；`shell/main.go` 将 `TitleBarHeight` 设为 `52`、macOS `TrafficLightPosition` 置于 `(18, 19)`，与侧栏 `52px` 顶栏及卡片内 `34px` 顶栏共享同一水平中轴线（`26px`）；窗口层统一按 WCO、`--mygo-titlebar-inset-*` 与卡片留白取最大值计算左右控制区预留；顶部 `8px` 留白通过真实 DOM 节点 `[data-xtwork-window-drag-strip].drag-region` 承载 MyGo/Electron 窗口拖动，聊天顶栏与右侧面板共用 `[data-workspace-titlebar-no-drag]` 对齐 `52px` 防拖动护盾。
+- **正交状态标记与声明式图层合成**：根元素将语义令牌激活标记（`data-xtwork-theme-tokens`）、内置渐变/悬浮卡标记（`data-xtwork-wash`）与底层主题/预览身份（`data-theme-id`）拆为 3 个正交维度。无论是在默认纸白（浅/深色）、内置主题、自定义主题还是主题编辑器预览（`__preview`）上叠加一个或多个外观插件，语义颜色映射、代码块表面和 `syncBrowserChromeTheme()` 均由 `data-xtwork-theme-tokens` 统一驱动；插件与基础主题写入共用声明式图层投影栈，释放插件（含乱序/重复调用 `dispose()`）时始终恢复**最新**基础主题色板、顶栏底色与对应渐变状态。
 
 色板是圆角矩形，预览同一套主题的背景、侧栏、带细线边界的悬浮正文卡、消息和按钮。桌面端从 mygo 读取主窗口圆角，浏览器使用 18px 的圆角。一次可选整套主题，也可单独指定浅色或深色。
 

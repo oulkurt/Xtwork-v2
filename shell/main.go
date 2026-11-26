@@ -20,8 +20,9 @@ import (
 var preload string
 
 var (
-	fullscreenEvent = mygo.NewEvent[bool]("xtwork:fullscreen")
-	updateEvent     = mygo.NewEvent[updateState]("xtwork:update")
+	fullscreenEvent  = mygo.NewEvent[bool]("xtwork:fullscreen")
+	windowStateEvent = mygo.NewEvent[string]("xtwork:window-state")
+	updateEvent      = mygo.NewEvent[updateState]("xtwork:update")
 )
 
 func main() {
@@ -131,6 +132,8 @@ func (d *Desktop) openWindow(brand branding) {
 	})
 	win.OnEnterFullScreen(func() { _ = fullscreenEvent.Emit(win, true) })
 	win.OnLeaveFullScreen(func() { _ = fullscreenEvent.Emit(win, false) })
+	win.OnMaximize(func() { _ = windowStateEvent.Emit(win, "maximize") })
+	win.OnUnmaximize(func() { _ = windowStateEvent.Emit(win, "unmaximize") })
 	page.LoadURL(d.server.origin + "/")
 }
 

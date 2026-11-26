@@ -84,6 +84,7 @@ func TestPreloadDragRegionAndCornerRadiusHooks(t *testing.T) {
 		`.drag-region :is(button, input, textarea, select, a), [class~="[-webkit-app-region:no-drag]"] { --app-region: no-drag; }`,
 		`syncWindowCornerRadius`,
 		`native.on("xtwork:fullscreen", (value) => { fullscreen = value; syncWindowCornerRadius(); });`,
+		`native.on("xtwork:window-state", () => { syncWindowCornerRadius(); });`,
 		`document.documentElement.style.setProperty("--xtwork-window-radius", "0px")`,
 		"document.documentElement.style.setProperty(\"--xtwork-window-radius\", `${radius}px`)",
 		`document.documentElement.style.removeProperty("--xtwork-window-radius")`,
@@ -101,11 +102,133 @@ func TestPreloadDragRegionAndCornerRadiusHooks(t *testing.T) {
 	if strings.Contains(preload, "titlebar.insertRule") {
 		t.Fatalf("preload.js must not accumulate titlebar.insertRule calls")
 	}
-	if nodePath, err := exec.LookPath("node"); err == nil {
-		cmd := exec.Command(nodePath, "-e", `const fs = require("fs"); const vm = require("vm"); new vm.Script("(" + fs.readFileSync(0, "utf8") + ");");`)
-		cmd.Stdin = strings.NewReader(preload)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("preload.js syntax check failed: %v: %s", err, string(out))
-		}
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		return
+	}
+	script := `
+const fs = require("fs");
+const vm = require("vm");
+const assert = require("assert");
+const source = fs.readFileSync(0, "utf8");
+
+(async () => {
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  const props = new Map();
+  const nativeHandlers = new Map();
+  const windowHandlers = new Map();
+  const radiusResponses = [
+    () => Promise.resolve(8),
+    () => Promise.resolve(0),
+    () => Promise.resolve(8),
+  ];
+  let deferredResolve = null;
+  radiusResponses.push(() => new Promise((resolve) => { deferredResolve = resolve; }));
+  radiusResponses.push(() => Promise.resolve(20));
+  radiusResponses.push(() => Promise.resolve(-1));
+  radiusResponses.push(() => Promise.resolve(null));
+  radiusResponses.push(() => Promise.resolve(0));
+
+  const documentElement = {
+    style: {
+      setProperty: (k, v) => props.set(k, v),
+      removeProperty: (k) => props.delete(k),
+      getPropertyValue: (k) => props.get(k) ?? "",
+    },
+  };
+  const win = {
+    addEventListener: (name, fn) => {
+      const list = windowHandlers.get(name) ?? [];
+      list.push(fn);
+      windowHandlers.set(name, list);
+    },
+    mygo: {
+      call: (method) => {
+        if (method === "Desktop.GetWindowCornerRadius") {
+          const next = radiusResponses.shift();
+          return next ? next() : Promise.resolve(0);
+        }
+        return Promise.resolve(null);
+      },
+      on: (name, fn) => {
+        const list = nativeHandlers.get(name) ?? [];
+        list.push(fn);
+        nativeHandlers.set(name, list);
+        return () => {};
+      },
+    },
+  };
+  win.top = win;
+
+  class FakeCSSStyleSheet {
+    replaceSync(text) { this.text = text; }
+  }
+
+  const sandbox = {
+    window: win,
+    location: { origin: "http://127.0.0.1:43123" },
+    navigator: { language: "zh-CN" },
+    document: { documentElement, adoptedStyleSheets: [] },
+    CSSStyleSheet: FakeCSSStyleSheet,
+    Object,
+    Number,
+    setTimeout,
+    clearTimeout,
+  };
+  const fn = vm.runInNewContext("(" + source + ")", sandbox);
+  fn({
+    origin: "http://127.0.0.1:43123",
+    wsOrigin: "ws://127.0.0.1:43123",
+    bootstrapToken: "tok",
+    platform: "windows",
+    preferredLanguages: ["zh-CN"],
+    backendLogPath: "/tmp/backend.log",
+    branding: { baseName: "小瞳 Work", displayName: "小瞳 Work", stageLabel: "" },
+  });
+
+  await flush();
+  assert.strictEqual(props.get("--xtwork-window-radius"), "8px");
+
+  for (const h of nativeHandlers.get("xtwork:window-state") ?? []) h("maximize");
+  await flush();
+  assert.strictEqual(props.get("--xtwork-window-radius"), "0px");
+
+  for (const h of nativeHandlers.get("xtwork:window-state") ?? []) h("unmaximize");
+  await flush();
+  assert.strictEqual(props.get("--xtwork-window-radius"), "8px");
+
+  for (const h of nativeHandlers.get("xtwork:window-state") ?? []) h("unmaximize");
+  for (const h of nativeHandlers.get("xtwork:fullscreen") ?? []) h(true);
+  assert.strictEqual(props.get("--xtwork-window-radius"), "0px");
+  deferredResolve(16);
+  await flush();
+  assert.strictEqual(props.get("--xtwork-window-radius"), "0px");
+
+  for (const h of nativeHandlers.get("xtwork:fullscreen") ?? []) h(false);
+  await flush();
+  assert.strictEqual(props.get("--xtwork-window-radius"), "20px");
+
+  for (const h of nativeHandlers.get("xtwork:window-state") ?? []) h("unmaximize");
+  await flush();
+  assert.strictEqual(props.has("--xtwork-window-radius"), false);
+
+  props.set("--xtwork-window-radius", "12px");
+  for (const h of nativeHandlers.get("xtwork:window-state") ?? []) h("unmaximize");
+  await flush();
+  assert.strictEqual(props.has("--xtwork-window-radius"), false);
+
+  for (const h of windowHandlers.get("resize") ?? []) h();
+  await new Promise((resolve) => setTimeout(resolve, 90));
+  await flush();
+  assert.strictEqual(props.get("--xtwork-window-radius"), "0px");
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+`
+	cmd := exec.Command(nodePath, "-e", script)
+	cmd.Stdin = strings.NewReader(preload)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("preload.js runtime verification failed: %v: %s", err, string(out))
 	}
 }

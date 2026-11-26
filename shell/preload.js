@@ -26,25 +26,44 @@
   });
   const unsupportedCli = async () => ({ supported: false, installedPath: null, onPath: false });
   let fullscreen = false;
-  const syncWindowCornerRadius = () => {
+  let cornerRadiusRequest = 0;
+  let resizeSyncTimer = 0;
+  const applyWindowCornerRadius = (radius) => {
+    if (!document.documentElement) return;
     if (fullscreen) {
-      if (document.documentElement) {
-        document.documentElement.style.setProperty("--xtwork-window-radius", "0px");
-      }
+      document.documentElement.style.setProperty("--xtwork-window-radius", "0px");
+    } else if (typeof radius === "number" && Number.isFinite(radius) && radius >= 0) {
+      document.documentElement.style.setProperty("--xtwork-window-radius", `${radius}px`);
+    } else {
+      document.documentElement.style.removeProperty("--xtwork-window-radius");
+    }
+  };
+  const syncWindowCornerRadius = () => {
+    if (resizeSyncTimer) {
+      clearTimeout(resizeSyncTimer);
+      resizeSyncTimer = 0;
+    }
+    const requestId = ++cornerRadiusRequest;
+    if (fullscreen) {
+      applyWindowCornerRadius(0);
       return;
     }
     call("GetWindowCornerRadius").then((radius) => {
-      if (!document.documentElement) return;
-      if (fullscreen) {
-        document.documentElement.style.setProperty("--xtwork-window-radius", "0px");
-      } else if (typeof radius === "number" && radius > 0) {
-        document.documentElement.style.setProperty("--xtwork-window-radius", `${radius}px`);
-      } else {
-        document.documentElement.style.removeProperty("--xtwork-window-radius");
-      }
+      if (requestId !== cornerRadiusRequest) return;
+      applyWindowCornerRadius(radius);
     }).catch(() => {});
   };
   native.on("xtwork:fullscreen", (value) => { fullscreen = value; syncWindowCornerRadius(); });
+  native.on("xtwork:window-state", () => { syncWindowCornerRadius(); });
+  if (typeof window.addEventListener === "function") {
+    window.addEventListener("resize", () => {
+      if (resizeSyncTimer) clearTimeout(resizeSyncTimer);
+      resizeSyncTimer = setTimeout(() => {
+        resizeSyncTimer = 0;
+        syncWindowCornerRadius();
+      }, 50);
+    });
+  }
 
   Object.defineProperty(window, "desktopBridge", { value: Object.freeze({
     xtwork: true,

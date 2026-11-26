@@ -703,25 +703,98 @@ index d600a7dc..4716ff3c 100644
          className="absolute left-[3%] top-[8%] h-[8%] w-[16%] rounded-md"
          style={{ backgroundColor: colors.surface, boxShadow: `inset 0 0 0 1px ${line}` }}
 diff --git a/apps/web/src/hooks/useTheme.ts b/apps/web/src/hooks/useTheme.ts
-index 2467d890..f9a8f600 100644
+index 2467d890..31d7f862 100644
 --- a/apps/web/src/hooks/useTheme.ts
 +++ b/apps/web/src/hooks/useTheme.ts
-@@ -279,9 +279,10 @@ function resolveBrowserChromeSurface(): HTMLElement {
- export function syncBrowserChromeTheme() {
-   if (typeof document === "undefined" || typeof getComputedStyle === "undefined") return;
-   const rootStyles = getComputedStyle(document.documentElement);
+@@ -16,6 +16,7 @@ import {
+   resolveThemeAppearance,
+   resolveThemeHalf,
+   subscribeToThemePreview,
++  syncBrowserChromeTheme,
+   THEME_PREVIEW_ID,
+   THEME_APPEARANCE_MODE_STORAGE_KEY,
+   THEME_FOLLOW_SYSTEM_STORAGE_KEY,
+@@ -90,8 +91,7 @@ function themeHalvesSignature(halves: ThemeHalves | null): string {
+   return `${halves?.light ?? ""}|${halves?.dark ?? ""}`;
+ }
+ 
+-const THEME_COLOR_META_NAME = "theme-color";
+-const DYNAMIC_THEME_COLOR_SELECTOR = `meta[name="${THEME_COLOR_META_NAME}"][data-dynamic-theme-color="true"]`;
++export { syncBrowserChromeTheme };
+ 
+ export class ThemeStorageError extends Schema.TaggedError<ThemeStorageError>()(
+   "ThemeStorageError",
+@@ -241,68 +241,6 @@ function getStored(): Theme {
+   }
+ }
+ 
+-function ensureThemeColorMetaTag(): HTMLMetaElement {
+-  let element = document.querySelector<HTMLMetaElement>(DYNAMIC_THEME_COLOR_SELECTOR);
+-  if (element) {
+-    return element;
+-  }
+-
+-  element = document.createElement("meta");
+-  element.name = THEME_COLOR_META_NAME;
+-  element.setAttribute("data-dynamic-theme-color", "true");
+-  document.head.append(element);
+-  return element;
+-}
+-
+-function normalizeThemeColor(value: string | null | undefined): string | null {
+-  const normalizedValue = value?.trim().toLowerCase();
+-  if (
+-    !normalizedValue ||
+-    normalizedValue === "transparent" ||
+-    normalizedValue === "rgba(0, 0, 0, 0)" ||
+-    normalizedValue === "rgba(0 0 0 / 0)"
+-  ) {
+-    return null;
+-  }
+-
+-  return value?.trim() ?? null;
+-}
+-
+-function resolveBrowserChromeSurface(): HTMLElement {
+-  return (
+-    document.querySelector<HTMLElement>("main[data-slot='sidebar-inset']") ??
+-    document.querySelector<HTMLElement>("[data-slot='sidebar-inner']") ??
+-    document.body
+-  );
+-}
+-
+-export function syncBrowserChromeTheme() {
+-  if (typeof document === "undefined" || typeof getComputedStyle === "undefined") return;
+-  const rootStyles = getComputedStyle(document.documentElement);
 -  const themeChromeColor = document.documentElement.dataset.themeId
 -    ? normalizeThemeColor(rootStyles.getPropertyValue("--app-chrome-background"))
 -    : null;
-+  const themeChromeColor =
-+    document.documentElement.dataset.themeId || "xtworkWash" in document.documentElement.dataset
-+      ? normalizeThemeColor(rootStyles.getPropertyValue("--app-chrome-background"))
-+      : null;
-   const surfaceColor = normalizeThemeColor(
-     getComputedStyle(resolveBrowserChromeSurface()).backgroundColor,
-   );
+-  const surfaceColor = normalizeThemeColor(
+-    getComputedStyle(resolveBrowserChromeSurface()).backgroundColor,
+-  );
+-  const fallbackColor = normalizeThemeColor(getComputedStyle(document.body).backgroundColor);
+-  const backgroundColor = themeChromeColor ?? surfaceColor ?? fallbackColor;
+-  if (!backgroundColor) return;
+-
+-  document.documentElement.style.backgroundColor = backgroundColor;
+-  document.body.style.backgroundColor = backgroundColor;
+-  const themeColorMetas = document.querySelectorAll<HTMLMetaElement>(
+-    `meta[name="${THEME_COLOR_META_NAME}"]`,
+-  );
+-  if (themeColorMetas.length === 0) {
+-    ensureThemeColorMetaTag().setAttribute("content", backgroundColor);
+-    return;
+-  }
+-  for (const element of themeColorMetas) {
+-    element.setAttribute("content", backgroundColor);
+-  }
+-}
+-
+ function applyTheme(theme: Theme, { suppressTransitions = false, preservePreview = true } = {}) {
+   if (typeof document === "undefined" || typeof window === "undefined") return;
+   if (preservePreview && document.documentElement.dataset?.themeId === THEME_PREVIEW_ID) {
 diff --git a/apps/web/src/index.css b/apps/web/src/index.css
-index 05541d39..99da37e1 100644
+index 05541d39..69323d7d 100644
 --- a/apps/web/src/index.css
 +++ b/apps/web/src/index.css
 @@ -120,10 +120,19 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
@@ -1259,7 +1332,7 @@ index 05541d39..99da37e1 100644
  /* The non-empty marker adds enough specificity to outrank the generated root
     dark variant without reintroducing raw `.dark` selectors. */
 -html[data-theme-id]:not([data-theme-id=""]) {
-+html:is([data-xtwork-wash], [data-theme-id]):not([data-theme-id=""]) {
++html:is([data-xtwork-theme-tokens], [data-theme-id]):not([data-theme-id=""]) {
    --background: var(--app-theme-canvas);
    --app-chrome-background: var(--app-theme-chrome);
    --toolbar-background: var(--app-theme-toolbar);
@@ -1463,25 +1536,25 @@ index 05541d39..99da37e1 100644
     default look keeps its secondary/input tints; themed palettes tint those
     surfaces with the accent, which fights syntax highlighting. */
 -html[data-theme-id] :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock {
-+html:is([data-theme-id], [data-xtwork-wash]) :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock {
++html:is([data-xtwork-theme-tokens], [data-theme-id]) :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock {
    background-color: var(--code-background);
    border-color: var(--contrast-border);
    color: var(--code-foreground);
  }
  
 -html[data-theme-id] .chat-markdown pre {
-+html:is([data-theme-id], [data-xtwork-wash]) .chat-markdown pre {
++html:is([data-xtwork-theme-tokens], [data-theme-id]) .chat-markdown pre {
    background-color: var(--code-background);
    color: var(--code-foreground);
  }
  
 -html[data-theme-id] :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock pre {
-+html:is([data-theme-id], [data-xtwork-wash]) :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock pre {
++html:is([data-xtwork-theme-tokens], [data-theme-id]) :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock pre {
    background-color: transparent;
  }
  
 -html[data-theme-id] :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock-header {
-+html:is([data-theme-id], [data-xtwork-wash]) :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock-header {
++html:is([data-xtwork-theme-tokens], [data-theme-id]) :is(.chat-markdown, .composer-tiptap) .chat-markdown-codeblock-header {
    color: color-mix(in srgb, var(--code-foreground) 72%, transparent);
  }
  
@@ -1630,10 +1703,10 @@ index 891096cb..f874e9ca 100644
  
    it("follows the OS appearance when storage is unavailable", () => {
 diff --git a/apps/web/src/themePalette.browser.test.ts b/apps/web/src/themePalette.browser.test.ts
-index 4204b069..674a8537 100644
+index 4204b069..2596839a 100644
 --- a/apps/web/src/themePalette.browser.test.ts
 +++ b/apps/web/src/themePalette.browser.test.ts
-@@ -1,8 +1,18 @@
+@@ -1,8 +1,24 @@
  import { converter } from "culori/fn";
 +import { page } from "vite-plus/test/browser";
  import { describe, expect, it } from "vite-plus/test";
@@ -1644,16 +1717,22 @@ index 4204b069..674a8537 100644
 +import { syncBrowserChromeTheme } from "./hooks/useTheme";
 +import {
 +  BUILT_IN_THEMES,
++  THEME_FILE_VERSION,
++  THEME_PREVIEW_ID,
 +  applyThemeColorPreview,
 +  applyThemePalette,
 +  getStandardPaintedThemeColors,
 +  getThemeColorsForMode,
 +  getThemeDefinition,
++  installCustomTheme,
++  invalidateCustomThemes,
++  parseThemeFile,
++  removeCustomTheme,
 +} from "./themePalette";
  
  const toRgb = converter("rgb");
  
-@@ -22,23 +32,30 @@ function paintedChannels(variable: string, canvas: readonly number[] = [0, 0, 0]
+@@ -22,23 +38,30 @@ function paintedChannels(variable: string, canvas: readonly number[] = [0, 0, 0]
  }
  
  describe("standard painted theme colors", () => {
@@ -1686,7 +1765,7 @@ index 4204b069..674a8537 100644
                1.5,
              );
            });
-@@ -48,4 +65,449 @@ describe("standard painted theme colors", () => {
+@@ -48,4 +71,787 @@ describe("standard painted theme colors", () => {
        root.classList.remove("dark");
      }
    });
@@ -2135,6 +2214,344 @@ index 4204b069..674a8537 100644
 +      applyThemePalette("system", "light");
 +    }
 +  });
++
++  it("keeps appearance plugin canvas, text, codeblock, and browser chrome active on Paper light and dark", async () => {
++    await page.viewport(1280, 800);
++    const root = document.documentElement;
++    const fixture = mountFloatingCardFixture();
++    const markdown = document.createElement("div");
++    markdown.className = "chat-markdown";
++    const codeBlock = document.createElement("div");
++    codeBlock.className = "chat-markdown-codeblock";
++    markdown.append(codeBlock);
++    fixture.chatWrapper.classList.add("text-foreground");
++    fixture.chatWrapper.append(markdown);
++    const meta = document.createElement("meta");
++    meta.name = "theme-color";
++    meta.setAttribute("data-dynamic-theme-color", "true");
++    document.head.append(meta);
++    try {
++      for (const appearance of ["light", "dark"] as const) {
++        root.classList.toggle("dark", appearance === "dark");
++        applyThemePalette("system", appearance);
++        syncBrowserChromeTheme();
++        const paper = getStandardPaintedThemeColors(appearance);
++
++        const application = applyAppearancePluginTheme(root, {
++          pluginId: `paper-plugin-${appearance}`,
++          kind: "appearance",
++          theme: {
++            id: `paper-plugin-${appearance}`,
++            tokens: {
++              canvas: "#123456",
++              text: "#abcdef",
++              chrome: "#112233",
++              codeBackground: "#221133",
++              codeForeground: "#eeddff",
++            },
++          },
++        });
++
++        expect(root.getAttribute("data-theme-id")).toBeNull();
++        expect(root.getAttribute("data-xtwork-wash")).toBeNull();
++        expect(root.getAttribute("data-xtwork-theme-tokens")).toBe("");
++        expectColorClose(
++          getComputedStyle(fixture.chatWrapper).backgroundColor,
++          "#123456",
++          `Paper ${appearance} plugin canvas`,
++        );
++        expectColorClose(
++          getComputedStyle(fixture.chatWrapper).color,
++          "#abcdef",
++          `Paper ${appearance} plugin text`,
++        );
++        expectColorClose(
++          getComputedStyle(codeBlock).backgroundColor,
++          "#221133",
++          `Paper ${appearance} plugin codeBackground`,
++        );
++        expectColorClose(
++          getComputedStyle(codeBlock).color,
++          "#eeddff",
++          `Paper ${appearance} plugin codeForeground`,
++        );
++        expectColorClose(
++          root.style.backgroundColor,
++          "#112233",
++          `Paper ${appearance} plugin root chrome`,
++        );
++        expectColorClose(
++          document.body.style.backgroundColor,
++          "#112233",
++          `Paper ${appearance} plugin body chrome`,
++        );
++        expectColorClose(
++          meta.getAttribute("content") ?? "",
++          "#112233",
++          `Paper ${appearance} plugin meta chrome`,
++        );
++
++        application.dispose();
++        expect(root.getAttribute("data-theme-id")).toBeNull();
++        expect(root.getAttribute("data-xtwork-wash")).toBe("");
++        expect(root.getAttribute("data-xtwork-theme-tokens")).toBe("");
++        expectColorClose(
++          getComputedStyle(fixture.chatWrapper).backgroundColor,
++          paper.surface,
++          `Paper ${appearance} restored surface`,
++        );
++        expectColorClose(
++          getComputedStyle(fixture.chatWrapper).color,
++          paper.text,
++          `Paper ${appearance} restored text`,
++        );
++        expectColorClose(
++          getComputedStyle(codeBlock).backgroundColor,
++          paper.codeBackground,
++          `Paper ${appearance} restored codeBackground`,
++        );
++        expectColorClose(
++          root.style.backgroundColor,
++          paper.chrome,
++          `Paper ${appearance} restored root chrome`,
++        );
++        expectColorClose(
++          meta.getAttribute("content") ?? "",
++          paper.chrome,
++          `Paper ${appearance} restored meta chrome`,
++        );
++      }
++    } finally {
++      meta.remove();
++      fixture.cleanup();
++      root.style.removeProperty("background-color");
++      document.body.style.removeProperty("background-color");
++      root.classList.remove("dark");
++      applyThemePalette("system", "light");
++    }
++  });
++
++  it("restores latest theme, custom theme, t3-chat dark, and preview draft across plugin lifecycle", async () => {
++    await page.viewport(1280, 800);
++    const root = document.documentElement;
++    const fixture = mountFloatingCardFixture();
++    const customThemeId = "browser-custom-oceanic";
++    try {
++      root.classList.remove("dark");
++      applyThemePalette("grove", "light");
++      const switchingPlugin = applyAppearancePluginTheme(root, {
++        pluginId: "switch-plugin",
++        kind: "appearance",
++        theme: {
++          id: "switch-plugin",
++          tokens: {
++            canvas: "#123456",
++            chrome: "#112233",
++          },
++        },
++      });
++      root.classList.add("dark");
++      applyThemePalette("ocean", "dark");
++      const oceanDark = getThemeColorsForMode(getThemeDefinition("ocean")!, "dark")!;
++      expect(root.getAttribute("data-theme-id")).toBe("ocean");
++      expect(root.getAttribute("data-xtwork-wash")).toBeNull();
++      expectColorClose(
++        getComputedStyle(fixture.chatWrapper).backgroundColor,
++        "#123456",
++        "plugin remains layered over newly switched ocean dark",
++      );
++
++      switchingPlugin.dispose();
++      expect(root.getAttribute("data-theme-id")).toBe("ocean");
++      expect(root.getAttribute("data-xtwork-wash")).toBe("");
++      expectColorClose(
++        getComputedStyle(fixture.chatWrapper).backgroundColor,
++        oceanDark.surface,
++        "disposing old plugin restores ocean dark surface",
++      );
++      expectColorClose(
++        root.style.backgroundColor,
++        oceanDark.chrome,
++        "disposing old plugin syncs ocean dark chrome",
++      );
++
++      root.classList.add("dark");
++      applyThemePalette("t3-chat", "dark");
++      const petalDark = getThemeColorsForMode(getThemeDefinition("t3-chat")!, "dark")!;
++      const petalPlugin = applyAppearancePluginTheme(root, {
++        pluginId: "petal-plugin",
++        kind: "appearance",
++        theme: {
++          id: "petal-plugin",
++          tokens: {
++            canvas: "#202430",
++            text: "#e6edf3",
++          },
++        },
++      });
++      expect(root.getAttribute("data-theme-id")).toBe("t3-chat");
++      expect(root.getAttribute("data-xtwork-wash")).toBeNull();
++      expectColorClose(
++        getComputedStyle(fixture.chatWrapper).backgroundColor,
++        "#202430",
++        "t3-chat dark plugin canvas",
++      );
++      petalPlugin.dispose();
++      expect(root.getAttribute("data-xtwork-wash")).toBe("");
++      expectColorClose(
++        getComputedStyle(fixture.chatWrapper).backgroundColor,
++        petalDark.surface,
++        "t3-chat dark restored surface",
++      );
++
++      const customTheme = installCustomTheme(
++        parseThemeFile({
++          version: THEME_FILE_VERSION,
++          id: customThemeId,
++          name: "Browser Custom Oceanic",
++          appearance: "dark",
++          colors: {
++            canvas: "#0e1a24",
++            surface: "#152634",
++            text: "#eef6ff",
++          },
++        }),
++      );
++      applyThemePalette(customTheme.id, "dark");
++      expect(root.getAttribute("data-xtwork-wash")).toBeNull();
++      const customPlugin = applyAppearancePluginTheme(root, {
++        pluginId: "custom-over-plugin",
++        kind: "appearance",
++        theme: {
++          id: "custom-over-plugin",
++          tokens: {
++            canvas: "#2a1f3d",
++          },
++        },
++      });
++      expectColorClose(
++        getComputedStyle(fixture.chatWrapper).backgroundColor,
++        "#2a1f3d",
++        "custom theme plugin canvas",
++      );
++      customPlugin.dispose();
++      expect(root.getAttribute("data-xtwork-wash")).toBeNull();
++      expectColorClose(
++        getComputedStyle(fixture.chatWrapper).backgroundColor,
++        customTheme.colors.canvas,
++        "custom theme restored canvas without wash",
++      );
++
++      const draftOne = {
++        ...getStandardPaintedThemeColors("dark"),
++        canvas: "#1b2028",
++        chrome: "#112233",
++      };
++      const draftTwo = {
++        ...getStandardPaintedThemeColors("dark"),
++        canvas: "#2c1b28",
++        chrome: "#334455",
++      };
++      const previewMeta = document.createElement("meta");
++      previewMeta.name = "theme-color";
++      previewMeta.setAttribute("data-dynamic-theme-color", "true");
++      document.head.append(previewMeta);
++      fixture.chatWrapper.classList.add("text-foreground");
++      try {
++        applyThemeColorPreview(draftOne, "dark");
++        expectColorClose(root.style.backgroundColor, "#112233", "draft one root chrome");
++        expectColorClose(document.body.style.backgroundColor, "#112233", "draft one body chrome");
++        expectColorClose(previewMeta.getAttribute("content") ?? "", "#112233", "draft one meta chrome");
++
++        const previewPlugin = applyAppearancePluginTheme(root, {
++          pluginId: "preview-plugin",
++          kind: "appearance",
++          theme: {
++            id: "preview-plugin",
++            tokens: {
++              canvas: "#102030",
++              text: "#abcdef",
++            },
++          },
++        });
++        expect(root.getAttribute("data-theme-id")).toBe(THEME_PREVIEW_ID);
++        expect(root.getAttribute("data-xtwork-wash")).toBeNull();
++        expectColorClose(
++          getComputedStyle(fixture.chatWrapper).backgroundColor,
++          "#102030",
++          "preview plugin canvas",
++        );
++        expectColorClose(
++          getComputedStyle(fixture.chatWrapper).color,
++          "#abcdef",
++          "preview plugin text",
++        );
++        expectColorClose(root.style.backgroundColor, "#112233", "preview plugin preserves draft one root chrome");
++
++        applyThemeColorPreview(draftTwo, "dark");
++        expect(root.getAttribute("data-theme-id")).toBe(THEME_PREVIEW_ID);
++        expectColorClose(
++          getComputedStyle(fixture.chatWrapper).backgroundColor,
++          "#102030",
++          "plugin stays active across preview update",
++        );
++        expectColorClose(
++          getComputedStyle(fixture.chatWrapper).color,
++          "#abcdef",
++          "plugin text stays active across preview update",
++        );
++        expectColorClose(
++          root.style.backgroundColor,
++          "#334455",
++          "preview update immediately syncs root chrome",
++        );
++        expectColorClose(
++          document.body.style.backgroundColor,
++          "#334455",
++          "preview update immediately syncs body chrome",
++        );
++        expectColorClose(
++          previewMeta.getAttribute("content") ?? "",
++          "#334455",
++          "preview update immediately syncs meta chrome",
++        );
++
++        previewPlugin.dispose();
++        expect(root.getAttribute("data-theme-id")).toBe(THEME_PREVIEW_ID);
++        expect(root.getAttribute("data-xtwork-wash")).toBeNull();
++        expectColorClose(
++          getComputedStyle(fixture.chatWrapper).backgroundColor,
++          "#2c1b28",
++          "disposing plugin restores latest preview draft",
++        );
++        expectColorClose(
++          root.style.backgroundColor,
++          "#334455",
++          "disposing plugin keeps latest preview root chrome",
++        );
++        expectColorClose(
++          document.body.style.backgroundColor,
++          "#334455",
++          "disposing plugin keeps latest preview body chrome",
++        );
++        expectColorClose(
++          previewMeta.getAttribute("content") ?? "",
++          "#334455",
++          "disposing plugin keeps latest preview meta chrome",
++        );
++      } finally {
++        previewMeta.remove();
++      }
++    } finally {
++      removeCustomTheme(customThemeId);
++      invalidateCustomThemes();
++      fixture.cleanup();
++      root.style.removeProperty("background-color");
++      document.body.style.removeProperty("background-color");
++      root.classList.remove("dark");
++      applyThemePalette("system", "light");
++    }
++  });
  });
 diff --git a/apps/web/src/themePalette.test.ts b/apps/web/src/themePalette.test.ts
 index dd33895b..54c35397 100644
@@ -2316,7 +2733,7 @@ index dd33895b..54c35397 100644
            }
          }
 diff --git a/apps/web/src/themePalette.ts b/apps/web/src/themePalette.ts
-index d04e7e16..1d18dff7 100644
+index d04e7e16..d2202f3d 100644
 --- a/apps/web/src/themePalette.ts
 +++ b/apps/web/src/themePalette.ts
 @@ -8,14 +8,6 @@ import { msg } from "gt-react";
@@ -2434,35 +2851,289 @@ index d04e7e16..1d18dff7 100644
    for (const storedTheme of library.storedThemes) {
      if (
        !storedThemeHasCollectionId(storedTheme, collectionId) &&
-@@ -1720,6 +1711,16 @@ export function getThemeColorVariable(role: ThemeColorRole): string {
+@@ -1720,6 +1711,235 @@ export function getThemeColorVariable(role: ThemeColorRole): string {
  
  export const THEME_PREVIEW_ID = "__preview";
  
-+function applyWindowWash(root: HTMLElement, wash?: string): void {
-+  if (wash === undefined) {
-+    delete root.dataset.xtworkWash;
-+    root.style.removeProperty("--xtwork-window-wash");
-+  } else {
-+    root.dataset.xtworkWash = "";
-+    root.style.setProperty("--xtwork-window-wash", wash);
++export type AppearancePluginLayer = Readonly<{
++  tokens: Readonly<Partial<Record<ThemeColorRole, string>>>;
++}>;
++
++type AppearanceRootState = {
++  baseKnown: boolean;
++  baseTokensActive: boolean;
++  baseColors: ThemeColors | undefined;
++  baseTokens: Partial<Record<ThemeColorRole, string>>;
++  baseWash: string | undefined;
++  baseHadWashAttribute: boolean;
++  pluginLayers: AppearancePluginLayer[];
++  managedRoles: Set<ThemeColorRole>;
++};
++
++const WINDOW_WASH_VARIABLE = "--xtwork-window-wash";
++const THEME_COLOR_META_NAME = "theme-color";
++const DYNAMIC_THEME_COLOR_SELECTOR = `meta[name="${THEME_COLOR_META_NAME}"][data-dynamic-theme-color="true"]`;
++const appearanceRootStates = new WeakMap<object, AppearanceRootState>();
++
++function ensureThemeColorMetaTag(): HTMLMetaElement {
++  let element = document.querySelector<HTMLMetaElement>(DYNAMIC_THEME_COLOR_SELECTOR);
++  if (element) {
++    return element;
 +  }
++
++  element = document.createElement("meta");
++  element.name = THEME_COLOR_META_NAME;
++  element.setAttribute("data-dynamic-theme-color", "true");
++  document.head.append(element);
++  return element;
++}
++
++function normalizeThemeColor(value: string | null | undefined): string | null {
++  const normalizedValue = value?.trim().toLowerCase();
++  if (
++    !normalizedValue ||
++    normalizedValue === "transparent" ||
++    normalizedValue === "rgba(0, 0, 0, 0)" ||
++    normalizedValue === "rgba(0 0 0 / 0)"
++  ) {
++    return null;
++  }
++
++  return value?.trim() ?? null;
++}
++
++function resolveBrowserChromeSurface(): HTMLElement {
++  return (
++    document.querySelector<HTMLElement>("main[data-slot='sidebar-inset']") ??
++    document.querySelector<HTMLElement>("[data-slot='sidebar-inner']") ??
++    document.body
++  );
++}
++
++export function syncBrowserChromeTheme(): void {
++  if (
++    typeof document === "undefined" ||
++    typeof getComputedStyle === "undefined" ||
++    !document.documentElement ||
++    !document.body ||
++    !document.head ||
++    typeof document.querySelector !== "function" ||
++    typeof document.querySelectorAll !== "function"
++  ) {
++    return;
++  }
++  const rootStyles = getComputedStyle(document.documentElement);
++  const themeChromeColor =
++    document.documentElement.dataset.themeId ||
++    "xtworkThemeTokens" in document.documentElement.dataset
++      ? normalizeThemeColor(rootStyles.getPropertyValue("--app-chrome-background"))
++      : null;
++  const surfaceColor = normalizeThemeColor(
++    getComputedStyle(resolveBrowserChromeSurface()).backgroundColor,
++  );
++  const fallbackColor = normalizeThemeColor(getComputedStyle(document.body).backgroundColor);
++  const backgroundColor = themeChromeColor ?? surfaceColor ?? fallbackColor;
++  if (!backgroundColor) return;
++
++  document.documentElement.style.backgroundColor = backgroundColor;
++  document.body.style.backgroundColor = backgroundColor;
++  const themeColorMetas = document.querySelectorAll<HTMLMetaElement>(
++    `meta[name="${THEME_COLOR_META_NAME}"]`,
++  );
++  if (themeColorMetas.length === 0) {
++    ensureThemeColorMetaTag().setAttribute("content", backgroundColor);
++    return;
++  }
++  for (const element of themeColorMetas) {
++    element.setAttribute("content", backgroundColor);
++  }
++}
++
++function getRootDataset(root: HTMLElement): DOMStringMap | undefined {
++  return (root as { dataset?: DOMStringMap }).dataset;
++}
++
++function readRootProperty(root: HTMLElement, name: string): string {
++  return typeof root.style.getPropertyValue === "function"
++    ? root.style.getPropertyValue(name)
++    : "";
++}
++
++function getOrCreateAppearanceRootState(root: HTMLElement): AppearanceRootState {
++  let state = appearanceRootStates.get(root);
++  if (!state) {
++    state = {
++      baseKnown: false,
++      baseTokensActive: false,
++      baseColors: undefined,
++      baseTokens: {},
++      baseWash: undefined,
++      baseHadWashAttribute: false,
++      pluginLayers: [],
++      managedRoles: new Set<ThemeColorRole>(),
++    };
++    appearanceRootStates.set(root, state);
++  }
++  return state;
++}
++
++function projectAppearanceLayers(
++  root: HTMLElement,
++  state: AppearanceRootState,
++  syncChrome = true,
++): void {
++  const dataset = getRootDataset(root);
++  const hasPlugins = state.pluginLayers.length > 0;
++  const tokensActive = state.baseTokensActive || hasPlugins;
++
++  if (dataset) {
++    if (tokensActive) {
++      dataset.xtworkThemeTokens = "";
++    } else {
++      delete dataset.xtworkThemeTokens;
++    }
++
++    if (!hasPlugins && state.baseHadWashAttribute) {
++      dataset.xtworkWash = "";
++    } else {
++      delete dataset.xtworkWash;
++    }
++  }
++
++  if (!hasPlugins && state.baseWash !== undefined) {
++    root.style.setProperty(WINDOW_WASH_VARIABLE, state.baseWash);
++  } else if (
++    hasPlugins ||
++    state.baseKnown ||
++    readRootProperty(root, WINDOW_WASH_VARIABLE) !== ""
++  ) {
++    root.style.removeProperty(WINDOW_WASH_VARIABLE);
++  }
++
++  const effectiveColors = state.baseColors ? { ...state.baseColors } : undefined;
++  for (const role of state.managedRoles) {
++    let value = state.baseTokens[role];
++    for (const layer of state.pluginLayers) {
++      const override = layer.tokens[role];
++      if (override !== undefined) {
++        value = override;
++      }
++    }
++    if (value !== undefined) {
++      root.style.setProperty(APP_THEME_VARIABLES[role], value);
++      if (effectiveColors) {
++        effectiveColors[role] = value;
++      }
++    } else {
++      root.style.removeProperty(APP_THEME_VARIABLES[role]);
++    }
++  }
++
++  if (effectiveColors) {
++    applyContextChipVariables(root, effectiveColors);
++  }
++
++  if (syncChrome && typeof document !== "undefined" && root === document.documentElement) {
++    syncBrowserChromeTheme();
++  }
++}
++
++export function registerAppearancePluginLayer(
++  root: HTMLElement,
++  tokens: Readonly<Partial<Record<ThemeColorRole, string>>>,
++): () => void {
++  const roles = Object.keys(tokens) as ThemeColorRole[];
++  if (roles.length === 0) {
++    return () => {};
++  }
++
++  const state = getOrCreateAppearanceRootState(root);
++  const dataset = getRootDataset(root);
++  if (!state.baseKnown && state.pluginLayers.length === 0) {
++    state.baseTokensActive = dataset ? "xtworkThemeTokens" in dataset : false;
++    state.baseHadWashAttribute = dataset ? "xtworkWash" in dataset : false;
++    const existingWash = readRootProperty(root, WINDOW_WASH_VARIABLE);
++    state.baseWash = existingWash !== "" ? existingWash : undefined;
++  }
++
++  for (const role of roles) {
++    if (!state.baseKnown && !state.managedRoles.has(role)) {
++      const existing = readRootProperty(root, APP_THEME_VARIABLES[role]);
++      if (existing !== "") {
++        state.baseTokens[role] = existing;
++      }
++    }
++    state.managedRoles.add(role);
++  }
++
++  const layer: AppearancePluginLayer = { tokens: { ...tokens } };
++  state.pluginLayers.push(layer);
++  projectAppearanceLayers(root, state);
++
++  let disposed = false;
++  return () => {
++    if (disposed) return;
++    disposed = true;
++    const index = state.pluginLayers.indexOf(layer);
++    if (index === -1) return;
++    state.pluginLayers.splice(index, 1);
++    projectAppearanceLayers(root, state);
++    if (!state.baseKnown && state.pluginLayers.length === 0) {
++      appearanceRootStates.delete(root);
++    }
++  };
 +}
 +
  /** Callers must restore the stored theme with refreshTheme when the draft closes. */
  export function applyThemeColorPreview(
    colors: ThemeColors,
-@@ -1730,6 +1731,7 @@ export function applyThemeColorPreview(
+@@ -1730,14 +1950,29 @@ export function applyThemeColorPreview(
    const root = document.documentElement;
    if (!root?.style) return;
  
-+  applyWindowWash(root);
-   root.dataset.themeId = THEME_PREVIEW_ID;
-   root.classList.toggle("dark", appearance === "dark");
+-  root.dataset.themeId = THEME_PREVIEW_ID;
+-  root.classList.toggle("dark", appearance === "dark");
++  const state = getOrCreateAppearanceRootState(root);
++  const nextBaseTokens: Partial<Record<ThemeColorRole, string>> = state.baseKnown
++    ? { ...state.baseTokens }
++    : {};
    for (const [role, value] of Object.entries(colors) as Array<[ThemeColorRole, string]>) {
-@@ -1751,22 +1753,25 @@ export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppe
+-    if (isThemeColor(value)) root.style.setProperty(APP_THEME_VARIABLES[role], value);
++    if (isThemeColor(value)) {
++      nextBaseTokens[role] = value;
++      state.managedRoles.add(role);
++    }
+   }
+-  applyContextChipVariables(root, colors);
++  state.baseKnown = true;
++  state.baseTokensActive = true;
++  state.baseColors = colors;
++  state.baseTokens = nextBaseTokens;
++  state.baseWash = undefined;
++  state.baseHadWashAttribute = false;
++
++  root.dataset.themeId = THEME_PREVIEW_ID;
++  root.classList.toggle("dark", appearance === "dark");
++  projectAppearanceLayers(root, state, false);
+   applyThemeCss(css);
+   setThemePreviewAppearance(appearance);
++  syncBrowserChromeTheme();
+ }
+ 
+ export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppearance): void {
+@@ -1751,22 +1986,34 @@ export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppe
    applyThemeCss(palette?.css);
    applyThemeBackground(palette?.id);
  
+-  if (palette) {
+-    root.dataset.themeId = palette.id;
+-    const mode = appearance ?? legacyThemeMode(theme) ?? palette.appearance;
+-    const colors = getThemeColorsForMode(palette, mode) ?? palette.colors;
+-    for (const [role, value] of Object.entries(colors) as Array<[ThemeColorRole, string]>) {
+-      root.style.setProperty(APP_THEME_VARIABLES[role], value);
+-    }
+-    applyContextChipVariables(root, colors);
+-    return;
 +  const mode =
 +    appearance ??
 +    legacyThemeMode(theme) ??
@@ -2471,29 +3142,30 @@ index d04e7e16..1d18dff7 100644
 +  const colors = palette
 +    ? (getThemeColorsForMode(palette, mode) ?? palette.colors)
 +    : getStandardPaintedThemeColors(mode);
-+  applyWindowWash(root, getBuiltInThemeWash(palette?.id ?? "default", mode));
-+
-   if (palette) {
-     root.dataset.themeId = palette.id;
--    const mode = appearance ?? legacyThemeMode(theme) ?? palette.appearance;
--    const colors = getThemeColorsForMode(palette, mode) ?? palette.colors;
--    for (const [role, value] of Object.entries(colors) as Array<[ThemeColorRole, string]>) {
--      root.style.setProperty(APP_THEME_VARIABLES[role], value);
--    }
--    applyContextChipVariables(root, colors);
--    return;
-+  } else {
-+    delete root.dataset.themeId;
++  const wash = getBuiltInThemeWash(palette?.id ?? "default", mode);
++  const state = getOrCreateAppearanceRootState(root);
++  const nextBaseTokens: Partial<Record<ThemeColorRole, string>> = {};
++  for (const [role, value] of Object.entries(colors) as Array<[ThemeColorRole, string]>) {
++    nextBaseTokens[role] = value;
++    state.managedRoles.add(role);
    }
--
++  state.baseKnown = true;
++  state.baseTokensActive = true;
++  state.baseColors = colors;
++  state.baseTokens = nextBaseTokens;
++  state.baseWash = wash;
++  state.baseHadWashAttribute = wash !== undefined;
+ 
 -  delete root.dataset.themeId;
 -  for (const variable of Object.values(APP_THEME_VARIABLES)) {
 -    root.style.removeProperty(variable);
-+  for (const [role, value] of Object.entries(colors) as Array<[ThemeColorRole, string]>) {
-+    root.style.setProperty(APP_THEME_VARIABLES[role], value);
++  if (palette) {
++    root.dataset.themeId = palette.id;
++  } else {
++    delete root.dataset.themeId;
    }
 -  applyContextChipVariables(root, getStandardPaintedThemeColors(appearance ?? "light"));
-+  applyContextChipVariables(root, colors);
++  projectAppearanceLayers(root, state);
  }
  
  export function resolveThemeAppearance(
