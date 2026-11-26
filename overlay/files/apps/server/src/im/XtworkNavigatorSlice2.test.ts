@@ -1,4 +1,4 @@
-import { AuthOrchestrationOperateScope, AuthOrchestrationReadScope, ProjectId, ThreadId } from "@t3tools/contracts";
+import { AuthOrchestrationOperateScope, AuthOrchestrationReadScope, EnvironmentId, ProjectId, RunId, RuntimeRequestId, ThreadId } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as DateTime from "effect/DateTime";
@@ -7,6 +7,7 @@ import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/sql/SqlClient";
 import { describe, expect, it } from "vite-plus/test";
 import { EnvironmentAuth } from "../auth/EnvironmentAuth.ts";
 import type { AgentAwarenessThread } from "../orchestration-v2/ProjectionStore.ts";
@@ -16,6 +17,7 @@ import {
   DEFAULT_LEADER_ID,
   ImApprovals,
   containsLeaderArchivedError,
+  desktopContext,
   evaluateImDelegationPolicy,
   hashArgs,
   imError,
@@ -25,9 +27,15 @@ import {
   type Execution,
 } from "./XtworkImSecurity.ts";
 import { XtworkIm, makeBridgeEventHandler, makeDeliverySync, route as xtworkImRoute } from "./XtworkImService.ts";
-import { makeLeaderStore } from "./XtworkLeaderStore.ts";
+import { buildScopedAwareness } from "./XtworkLeaderAwareness.ts";
+import { makeLeaderStore, sanitizeBindingPlatform, sanitizeLeaderAvatar } from "./XtworkLeaderStore.ts";
 
-function makeAwarenessThread(id: string, projectId: string, title: string): AgentAwarenessThread {
+function makeAwarenessThread(
+  id: string,
+  projectId: string,
+  title: string,
+  overrides: Partial<AgentAwarenessThread> = {},
+): AgentAwarenessThread {
   const now = DateTime.nowUnsafe();
   return {
     id: ThreadId.make(id),
@@ -56,6 +64,7 @@ function makeAwarenessThread(id: string, projectId: string, title: string): Agen
     activeRunId: null,
     latestRunId: null,
     hasActionableProposedPlan: false,
+    ...overrides,
   };
 }
 
@@ -882,6 +891,22 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
           expect(pendingBindingSyncs.has("conn-feishu-1")).toBe(false);
 
           yield* leaders.updateLeader(engLeader.id, { pinnedThreadId: ThreadId.make(`xtwork-leader-${engLeader.id}-01`) });
+          const blankRename = yield* api("POST", `leaders/${engLeader.id}/update`, { name: "   " });
+          expect(blankRename.status).toBe(400);
+
+          const groupPolicyRestricted = yield* api("POST", `leaders/${engLeader.id}/update`, {
+            imPolicy: { group: { delegationMode: "deny", progressReportMode: "silent" } },
+          });
+          expect(groupPolicyRestricted.status).toBe(200);
+          const ownerDmReportUpdated = yield* api("POST", `leaders/${engLeader.id}/update`, {
+            imPolicy: { ownerDm: { progressReportMode: "phase_summary" } },
+          });
+          expect(ownerDmReportUpdated.status).toBe(200);
+          const mergedPolicyLeader = yield* leaders.getLeader(engLeader.id);
+          expect(mergedPolicyLeader?.imPolicy.group.delegationMode).toBe("deny");
+          expect(mergedPolicyLeader?.imPolicy.group.progressReportMode).toBe("silent");
+          expect(mergedPolicyLeader?.imPolicy.ownerDm.progressReportMode).toBe("phase_summary");
+
           const renamed = yield* api("POST", `leaders/${engLeader.id}/update`, { name: "工程总监" });
           expect(renamed.status).toBe(200);
           expect(
@@ -1076,7 +1101,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
             return origGetLeader(id);
           };
           mutableLeaders.activeBindingForConnection = (connId: string) =>
-            failActiveBindingCheck ? Effect.fail(imError("db read glitch")) : origActiveBinding(connId);
+            failActiveBindingCheck ? Effect.fail(imError("db read glitch") as never) : origActiveBinding(connId);
 
           holdGetLeaderOnce = true;
           const fastRebindPromise = handler(
@@ -1243,6 +1268,991 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
           const listed = yield* api("GET", "leaders");
           const ids = (listed.json.leaders as Array<{ leader: { id: string } }>).map((item) => item.leader.id);
           expect(ids).toEqual([DEFAULT_LEADER_ID]);
+        } finally {
+          yield* Effect.promise(() => dispose());
+        }
+      }).pipe(Effect.provide(dbLayer)),
+    );
+  });
+
+  it("stores tagged bot avatars without truncation, rejects malformed bot tags safely, and preserves S29b blank-avatar reset", async () => {
+    expect(sanitizeLeaderAvatar("  bot:v1:Cat:#F8A01C  ")).toBe("bot:v1:cat:#f8a01c");
+    expect(sanitizeLeaderAvatar("bot:v1:rocket:#1F2937:#F8FAFC")).toBe("bot:v1:rocket:#1f2937:#f8fafc");
+    expect(sanitizeLeaderAvatar("bot:v1:bot-1:#abc")).toBe("bot:v1:bot-1:#abc");
+    expect(sanitizeLeaderAvatar("bot:v1:cat:notacolor")).toBe("bot:v1:c");
+    expect(sanitizeLeaderAvatar("bot:v1:../evil:#ffffff")).toBe("bot:v1:.");
+    expect(sanitizeLeaderAvatar("bot:v1:cat:#1234")).toBe("bot:v1:c");
+    expect(sanitizeLeaderAvatar("bot:v1:cat:#12345")).toBe("bot:v1:c");
+    expect(sanitizeLeaderAvatar("bot:v1:cat:#1234567")).toBe("bot:v1:c");
+    expect(sanitizeLeaderAvatar("bot:v1:cat:#fff:#12345")).toBe("bot:v1:c");
+    expect(sanitizeLeaderAvatar("bot:v1:cat:#fff:#gggggg")).toBe("bot:v1:c");
+    expect(sanitizeLeaderAvatar("研")).toBe("研");
+    expect(sanitizeLeaderAvatar("★")).toBe("★");
+    expect(sanitizeLeaderAvatar("瞳")).toBe("瞳");
+    expect(sanitizeLeaderAvatar("1234567890")).toBe("12345678");
+
+    const dbLayer = NodeSqliteClient.layer({ filename: ":memory:" });
+    const testAuthLayer = Layer.succeed(EnvironmentAuth, {
+      authenticateHttpRequest: () =>
+        Effect.succeed({
+          subject: "desktop-bootstrap",
+          scopes: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+        }),
+    } as never);
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const leaders = yield* makeLeaderStore();
+        const catLeader = yield* leaders.createLeader({
+          name: "猫咪领航者",
+          avatar: "  bot:v1:Cat:#F8A01C  ",
+        });
+        expect(catLeader.avatar).toBe("bot:v1:cat:#f8a01c");
+
+        const withEyes = yield* leaders.updateLeader(catLeader.id, {
+          avatar: "bot:v1:rocket:#1F2937:#F8FAFC",
+        });
+        expect(withEyes?.avatar).toBe("bot:v1:rocket:#1f2937:#f8fafc");
+
+        const malformedUpdated = yield* leaders.updateLeader(catLeader.id, {
+          avatar: "bot:v1:cat:invalid-hex",
+        });
+        expect(malformedUpdated?.avatar).toBe("bot:v1:c");
+
+        const monogramUpdated = yield* leaders.updateLeader(catLeader.id, {
+          avatar: "研",
+        });
+        expect(monogramUpdated?.avatar).toBe("研");
+
+        const paused = yield* leaders.updateLeader(catLeader.id, { status: "paused" });
+        expect(paused?.status).toBe("paused");
+        expect(paused?.pauseVersion).toBe(1);
+
+        const reTaggedWhilePaused = yield* leaders.updateLeader(catLeader.id, {
+          avatar: "bot:v1:cat:#f8a01c",
+        });
+        expect(reTaggedWhilePaused?.avatar).toBe("bot:v1:cat:#f8a01c");
+        expect(reTaggedWhilePaused?.status).toBe("paused");
+        expect(reTaggedWhilePaused?.pauseVersion).toBe(1);
+
+        const resetBlank = yield* leaders.updateLeader(catLeader.id, { avatar: "   " });
+        expect(resetBlank?.avatar).toBe("猫");
+        expect(resetBlank?.status).toBe("paused");
+        expect(resetBlank?.pauseVersion).toBe(1);
+
+        const serviceLayer = Layer.succeed(XtworkIm, {
+          leaders,
+          approvals: new ImApprovals(),
+          pendingBindingSyncs: new Map<string, string>(),
+          markReplySucceeded: () => undefined,
+          hasReplySucceeded: () => false,
+          eventsSince: () => [],
+        });
+        const fullLayer = Layer.mergeAll(
+          xtworkImRoute.pipe(Layer.provide(Layer.mergeAll(serviceLayer, testAuthLayer))),
+          testAuthLayer,
+          HttpPlatform.layer.pipe(Layer.provide(NodeServices.layer)),
+          Etag.layerWeak,
+          NodeServices.layer,
+        );
+        const { handler, dispose } = HttpRouter.toWebHandler(fullLayer as never);
+        try {
+          const postCreate = yield* Effect.promise(async () => {
+            const res = await handler(
+              new Request("http://localhost/api/xtwork/im/leaders", {
+                method: "POST",
+                headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+                body: JSON.stringify({ name: "火箭领航者", avatar: "bot:v1:rocket:#1f2937:#f8fafc" }),
+              }),
+            );
+            return { status: res.status, json: (await res.json()) as { leader: { id: string; avatar: string } } };
+          });
+          expect(postCreate.status).toBe(200);
+          expect(postCreate.json.leader.avatar).toBe("bot:v1:rocket:#1f2937:#f8fafc");
+
+          const postUpdate = yield* Effect.promise(async () => {
+            const res = await handler(
+              new Request(`http://localhost/api/xtwork/im/leaders/${postCreate.json.leader.id}/update`, {
+                method: "POST",
+                headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+                body: JSON.stringify({ avatar: "bot:v1:cat:#f8a01c" }),
+              }),
+            );
+            return { status: res.status, json: (await res.json()) as { leader: { avatar: string } } };
+          });
+          expect(postUpdate.status).toBe(200);
+          expect(postUpdate.json.leader.avatar).toBe("bot:v1:cat:#f8a01c");
+        } finally {
+          yield* Effect.promise(() => dispose());
+        }
+      }).pipe(Effect.provide(dbLayer)),
+    );
+  });
+
+  it("persists xtwork_leader_bindings.platform across migration, rebind, archive, and offline bridge states", async () => {
+    expect(sanitizeBindingPlatform("wechat")).toBe("wechat");
+    expect(sanitizeBindingPlatform("feishu")).toBe("feishu");
+    expect(sanitizeBindingPlatform("wecom")).toBe("wecom");
+    expect(sanitizeBindingPlatform("slack")).toBeNull();
+    expect(sanitizeBindingPlatform("FEISHU")).toBeNull();
+    expect(sanitizeBindingPlatform("")).toBeNull();
+    expect(sanitizeBindingPlatform(null)).toBeNull();
+
+    const dbLayer = NodeSqliteClient.layer({ filename: ":memory:" });
+    const testAuthLayer = Layer.succeed(EnvironmentAuth, {
+      authenticateHttpRequest: () =>
+        Effect.succeed({
+          subject: "desktop-bootstrap",
+          scopes: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+        }),
+    } as never);
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE IF NOT EXISTS xtwork_leader_bindings (
+          binding_id TEXT PRIMARY KEY,
+          leader_id TEXT NOT NULL,
+          connection_id TEXT NOT NULL,
+          epoch INTEGER NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL,
+          unbound_at INTEGER
+        )`;
+        yield* sql`INSERT INTO xtwork_leader_bindings (
+          binding_id, leader_id, connection_id, epoch, active, created_at, unbound_at
+        ) VALUES ('bind-legacy-1', ${DEFAULT_LEADER_ID}, 'conn-legacy-wechat', 1, 1, 1000, NULL)`;
+
+        const leaders = yield* makeLeaderStore();
+        const migrated = yield* leaders.activeBindingForConnection("conn-legacy-wechat");
+        expect(migrated?.platform).toBeNull();
+
+        yield* leaders.recordBindingPlatform("conn-legacy-wechat", "invalid-platform");
+        expect((yield* leaders.activeBindingForConnection("conn-legacy-wechat"))?.platform).toBeNull();
+
+        yield* leaders.recordBindingPlatform("conn-legacy-wechat", "wechat", true);
+        expect((yield* leaders.activeBindingForConnection("conn-legacy-wechat"))?.platform).toBe("wechat");
+        expect((yield* leaders.activeBindingForConnection("conn-legacy-wechat"))?.claimed).toBe(true);
+
+        const navDirect = yield* leaders.createLeader({ name: "直接归档测试" });
+        const directRebound = yield* leaders.rebindConnection("conn-legacy-wechat", navDirect.id);
+        expect(directRebound?.platform).toBe("wechat");
+        expect((yield* leaders.getBindingById(directRebound!.bindingId))?.platform).toBe("wechat");
+        expect((yield* leaders.findBindingByTuple("conn-legacy-wechat", navDirect.id, directRebound!.epoch))?.platform).toBe("wechat");
+
+        const directArchived = yield* leaders.archiveLeader(navDirect.id, DEFAULT_LEADER_ID);
+        expect(directArchived?.reboundBindings).toHaveLength(1);
+        expect(directArchived?.reboundBindings[0]?.platform).toBe("wechat");
+        expect((yield* leaders.activeBindingForConnection("conn-legacy-wechat"))?.platform).toBe("wechat");
+
+        let liveConnections: Array<Record<string, unknown>> = [
+          {
+            id: "conn-feishu-live",
+            platform: "feishu",
+            lifecycleState: "active",
+            state: "connected",
+            leaderId: DEFAULT_LEADER_ID,
+            bindingId: "",
+            bindingEpoch: 0,
+          },
+          {
+            id: "conn-wecom-live",
+            platform: "wecom",
+            lifecycleState: "active",
+            state: "connected",
+            leaderId: DEFAULT_LEADER_ID,
+            bindingId: "",
+            bindingEpoch: 0,
+          },
+          {
+            id: "conn-pairing-unclaimed",
+            platform: "wechat",
+            lifecycleState: "pairing",
+            state: "connected",
+            leaderId: DEFAULT_LEADER_ID,
+            bindingId: "",
+            bindingEpoch: 0,
+          },
+        ];
+
+        const fakeHost = {
+          available: true,
+          request: async (method: string, params: Record<string, unknown> = {}) => {
+            if (method === "connections.list") {
+              return { connections: liveConnections };
+            }
+            if (method === "connections.disconnect") {
+              const targetId = typeof params.connectionId === "string" ? params.connectionId : "";
+              liveConnections = liveConnections.filter((c) => c.id !== targetId);
+              return { disconnected: true, connectionId: targetId };
+            }
+            if (method === "connections.syncBindings") {
+              const items = Array.isArray(params.bindings)
+                ? (params.bindings as Array<{ connectionId: string; leaderId: string; bindingId: string; bindingEpoch: number }>)
+                : [];
+              for (const item of items) {
+                const hit = liveConnections.find((c) => c.id === item.connectionId);
+                if (hit) {
+                  hit.leaderId = item.leaderId;
+                  hit.bindingId = item.bindingId;
+                  hit.bindingEpoch = item.bindingEpoch;
+                }
+              }
+              return { synced: items.length, connections: liveConnections };
+            }
+            if (method === "paused.list") {
+              return { items: [], heldCount: 0 };
+            }
+            return { ok: true };
+          },
+        };
+
+        const serviceLayer = Layer.succeed(XtworkIm, {
+          host: fakeHost as never,
+          leaders,
+          approvals: new ImApprovals(),
+          pendingBindingSyncs: new Map<string, string>(),
+          markReplySucceeded: () => undefined,
+          hasReplySucceeded: () => false,
+          eventsSince: () => [],
+        });
+        const fullLayer = Layer.mergeAll(
+          xtworkImRoute.pipe(Layer.provide(Layer.mergeAll(serviceLayer, testAuthLayer))),
+          testAuthLayer,
+          HttpPlatform.layer.pipe(Layer.provide(NodeServices.layer)),
+          Etag.layerWeak,
+          NodeServices.layer,
+        );
+        const { handler, dispose } = HttpRouter.toWebHandler(fullLayer as never);
+        const api = (method: "GET" | "POST", path: string, body?: unknown) =>
+          Effect.promise(async () => {
+            const res = await handler(
+              new Request(`http://localhost/api/xtwork/im/${path}`, {
+                method,
+                headers: {
+                  Authorization: "Bearer test-token",
+                  ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+                },
+                ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+              }),
+            );
+            return { status: res.status, json: (await res.json()) as Record<string, unknown> };
+          });
+
+        try {
+          const connsRes = yield* api("GET", "connections");
+          expect(connsRes.status).toBe(200);
+          expect((yield* leaders.activeBindingForConnection("conn-feishu-live"))?.platform).toBe("feishu");
+          expect((yield* leaders.activeBindingForConnection("conn-feishu-live"))?.claimed).toBe(true);
+          expect((yield* leaders.activeBindingForConnection("conn-wecom-live"))?.platform).toBe("wecom");
+          expect((yield* leaders.activeBindingForConnection("conn-wecom-live"))?.claimed).toBe(true);
+          expect((yield* leaders.activeBindingForConnection("conn-pairing-unclaimed"))?.claimed).toBe(false);
+
+          const navPairing = yield* leaders.createLeader({ name: "配对中领航者" });
+          yield* api("POST", "connections/rebind", {
+            connectionId: "conn-pairing-unclaimed",
+            leaderId: navPairing.id,
+          });
+          const pairingOverview = yield* api("GET", `leaders/${navPairing.id}/overview`);
+          expect(pairingOverview.status).toBe(200);
+          expect(pairingOverview.json.boundPlatforms).toEqual([]);
+
+          const disconnectPairing = yield* api("POST", "connections/disconnect", {
+            connectionId: "conn-pairing-unclaimed",
+          });
+          expect(disconnectPairing.status).toBe(200);
+          expect(yield* leaders.activeBindingForConnection("conn-pairing-unclaimed")).toBeUndefined();
+          expect(yield* leaders.listBoundPlatforms(navPairing.id)).toEqual([]);
+          const archivePairing = yield* api("POST", `leaders/${navPairing.id}/archive`, {});
+          expect(archivePairing.status).toBe(200);
+
+          const navHttp = yield* leaders.createLeader({ name: "渠道换绑领航者" });
+          const rebindRes = yield* api("POST", "connections/rebind", {
+            connectionId: "conn-feishu-live",
+            leaderId: navHttp.id,
+          });
+          expect(rebindRes.status).toBe(200);
+          expect((rebindRes.json.binding as { platform: string | null }).platform).toBe("feishu");
+
+          const archiveHttp = yield* api("POST", `leaders/${navHttp.id}/archive`, {
+            rebindToLeaderId: DEFAULT_LEADER_ID,
+          });
+          expect(archiveHttp.status).toBe(200);
+          const archivedBindings = archiveHttp.json.reboundBindings as Array<{ connectionId: string; platform: string | null }>;
+          expect(archivedBindings[0]?.connectionId).toBe("conn-feishu-live");
+          expect(archivedBindings[0]?.platform).toBe("feishu");
+
+          const navDisconnect = yield* leaders.createLeader({ name: "断开后归档领航者" });
+          liveConnections.push({
+            id: "conn-wecom-temp",
+            platform: "wecom",
+            lifecycleState: "active",
+            state: "connected",
+            leaderId: DEFAULT_LEADER_ID,
+            bindingId: "",
+            bindingEpoch: 0,
+          });
+          yield* api("GET", "connections");
+          const rebindTemp = yield* api("POST", "connections/rebind", {
+            connectionId: "conn-wecom-temp",
+            leaderId: navDisconnect.id,
+          });
+          expect(rebindTemp.status).toBe(200);
+          expect(yield* leaders.listBoundPlatforms(navDisconnect.id)).toEqual(["wecom"]);
+
+          const disconnectTemp = yield* api("POST", "connections/disconnect", {
+            connectionId: "conn-wecom-temp",
+          });
+          expect(disconnectTemp.status).toBe(200);
+          expect(yield* leaders.listBindings(navDisconnect.id)).toEqual([]);
+          expect(yield* leaders.listBoundPlatforms(navDisconnect.id)).toEqual(["wecom"]);
+
+          fakeHost.available = false;
+          const offlineRebindDisconnected = yield* api("POST", "connections/rebind", {
+            connectionId: "conn-wecom-temp",
+            leaderId: DEFAULT_LEADER_ID,
+          });
+          expect(offlineRebindDisconnected.status).toBe(404);
+          expect(yield* leaders.activeBindingForConnection("conn-wecom-temp")).toBeUndefined();
+          expect(
+            (yield* leaders.listBindings(DEFAULT_LEADER_ID)).some((b) => b.connectionId === "conn-wecom-temp"),
+          ).toBe(false);
+          fakeHost.available = true;
+
+          const disconnectOverview = yield* api("GET", `leaders/${navDisconnect.id}/overview`);
+          expect(disconnectOverview.status).toBe(200);
+          expect(disconnectOverview.json.connections).toEqual([]);
+          expect(disconnectOverview.json.bindings).toEqual([]);
+          expect(disconnectOverview.json.boundPlatforms).toEqual(["wecom"]);
+
+          const archiveAfterDisconnect = yield* api("POST", `leaders/${navDisconnect.id}/archive`, {});
+          expect(archiveAfterDisconnect.status).toBe(200);
+          expect(archiveAfterDisconnect.json.reboundBindings).toEqual([]);
+
+          const navRaceDisconnect = yield* leaders.createLeader({ name: "断连竞态领航者" });
+          liveConnections.push({
+            id: "conn-race-disconnect",
+            platform: "wechat",
+            lifecycleState: "active",
+            state: "connected",
+            leaderId: DEFAULT_LEADER_ID,
+            bindingId: "",
+            bindingEpoch: 0,
+          });
+          yield* api("GET", "connections");
+          expect(
+            (yield* api("POST", "connections/rebind", {
+              connectionId: "conn-race-disconnect",
+              leaderId: navRaceDisconnect.id,
+            })).status,
+          ).toBe(200);
+          const origHostReqRace = fakeHost.request;
+          let holdConnListOnce = true;
+          let releaseConnList!: () => void;
+          fakeHost.request = async (method: string, params: Record<string, unknown> = {}) => {
+            if (method === "connections.list" && holdConnListOnce) {
+              holdConnListOnce = false;
+              const staleSnap = liveConnections.map((c) => ({ ...c }));
+              await new Promise<void>((resolve) => {
+                releaseConnList = resolve;
+              });
+              return { connections: staleSnap };
+            }
+            return origHostReqRace(method, params);
+          };
+          const staleConnsPoll = handler(
+            new Request("http://localhost/api/xtwork/im/connections", {
+              method: "GET",
+              headers: { Authorization: "Bearer test-token" },
+            }),
+          );
+          yield* Effect.sleep("15 millis");
+          const raceDisconnectRes = yield* api("POST", "connections/disconnect", {
+            connectionId: "conn-race-disconnect",
+          });
+          expect(raceDisconnectRes.status).toBe(200);
+          releaseConnList();
+          const staleConnsRes = yield* Effect.promise(() => staleConnsPoll);
+          expect(staleConnsRes.status).toBe(200);
+          const staleConnsJson = (yield* Effect.promise(() => staleConnsRes.json())) as {
+            connections: Array<{ id: string }>;
+          };
+          expect(staleConnsJson.connections.some((c) => c.id === "conn-race-disconnect")).toBe(false);
+          expect(yield* leaders.activeBindingForConnection("conn-race-disconnect")).toBeUndefined();
+          fakeHost.request = origHostReqRace;
+          fakeHost.available = false;
+          const offlineRebindAfterRace = yield* api("POST", "connections/rebind", {
+            connectionId: "conn-race-disconnect",
+            leaderId: DEFAULT_LEADER_ID,
+          });
+          expect(offlineRebindAfterRace.status).toBe(404);
+          fakeHost.available = true;
+          expect((yield* api("POST", `leaders/${navRaceDisconnect.id}/archive`, {})).status).toBe(200);
+
+          const navRaceSyncDisconnect = yield* leaders.createLeader({ name: "同步挂起断连领航者" });
+          liveConnections.push({
+            id: "conn-race-sync-disconnect",
+            platform: "feishu",
+            lifecycleState: "active",
+            state: "connected",
+            leaderId: DEFAULT_LEADER_ID,
+            bindingId: "",
+            bindingEpoch: 0,
+          });
+          const origHostReqSyncRace = fakeHost.request;
+          let holdSyncOnce = true;
+          let releaseSyncOnce!: () => void;
+          fakeHost.request = async (method: string, params: Record<string, unknown> = {}) => {
+            if (method === "connections.syncBindings" && holdSyncOnce) {
+              holdSyncOnce = false;
+              await new Promise<void>((resolve) => {
+                releaseSyncOnce = resolve;
+              });
+              return { synced: 0, connections: [] };
+            }
+            return origHostReqSyncRace(method, params);
+          };
+          const syncRacePoll = handler(
+            new Request("http://localhost/api/xtwork/im/connections", {
+              method: "GET",
+              headers: { Authorization: "Bearer test-token" },
+            }),
+          );
+          yield* Effect.sleep("15 millis");
+          expect(
+            (yield* api("POST", "connections/disconnect", { connectionId: "conn-race-sync-disconnect" })).status,
+          ).toBe(200);
+          releaseSyncOnce();
+          const syncRaceRes = yield* Effect.promise(() => syncRacePoll);
+          expect(syncRaceRes.status).toBe(200);
+          const syncRaceJson = (yield* Effect.promise(() => syncRaceRes.json())) as {
+            connections: Array<{ id: string }>;
+          };
+          expect(syncRaceJson.connections.some((c) => c.id === "conn-race-sync-disconnect")).toBe(false);
+          fakeHost.request = origHostReqSyncRace;
+          expect((yield* api("POST", `leaders/${navRaceSyncDisconnect.id}/archive`, {})).status).toBe(200);
+
+          for (const confirmB of [false, true]) {
+            const connAId = `conn-dual-a-${confirmB ? "ok" : "empty"}`;
+            const connBId = `conn-dual-b-${confirmB ? "ok" : "empty"}`;
+            liveConnections.push({
+              id: connAId,
+              platform: "wechat",
+              lifecycleState: "active",
+              state: "connected",
+              leaderId: DEFAULT_LEADER_ID,
+              bindingId: "",
+              bindingEpoch: 0,
+            });
+            yield* api("GET", "connections");
+            liveConnections.push({
+              id: connBId,
+              platform: "wecom",
+              lifecycleState: "active",
+              state: "connected",
+              leaderId: DEFAULT_LEADER_ID,
+              bindingId: "",
+              bindingEpoch: 0,
+            });
+            const origDualReq = fakeHost.request;
+            let holdSyncB = true;
+            let releaseSyncB!: () => void;
+            fakeHost.request = async (method: string, params: Record<string, unknown> = {}) => {
+              if (method === "connections.syncBindings" && holdSyncB) {
+                const items = Array.isArray(params.bindings)
+                  ? (params.bindings as Array<{ connectionId: string }>)
+                  : [];
+                if (items.some((item) => item.connectionId === connBId)) {
+                  holdSyncB = false;
+                  await new Promise<void>((resolve) => {
+                    releaseSyncB = resolve;
+                  });
+                  if (!confirmB) {
+                    return { synced: 0, connections: [] };
+                  }
+                }
+              }
+              return origDualReq(method, params);
+            };
+            const dualPoll = handler(
+              new Request("http://localhost/api/xtwork/im/connections", {
+                method: "GET",
+                headers: { Authorization: "Bearer test-token" },
+              }),
+            );
+            yield* Effect.sleep("15 millis");
+            expect((yield* api("POST", "connections/disconnect", { connectionId: connAId })).status).toBe(200);
+            releaseSyncB();
+            const dualRes = yield* Effect.promise(() => dualPoll);
+            expect(dualRes.status).toBe(200);
+            const dualJson = (yield* Effect.promise(() => dualRes.json())) as {
+              connections: Array<{ id: string }>;
+            };
+            expect(dualJson.connections.some((c) => c.id === connAId)).toBe(false);
+            expect(dualJson.connections.some((c) => c.id === connBId)).toBe(true);
+            const joinedSnap = yield* leaders.listActiveBindingsWithLeaderState();
+            expect(joinedSnap.some((entry) => entry.connectionId === connAId)).toBe(false);
+            expect(joinedSnap.some((entry) => entry.connectionId === connBId && entry.leaderStatus === "active")).toBe(true);
+            fakeHost.request = origDualReq;
+            expect((yield* api("POST", "connections/disconnect", { connectionId: connBId })).status).toBe(200);
+          }
+
+          const navPauseSync = yield* leaders.createLeader({ name: "暂停同步校验领航者" });
+          liveConnections.push({
+            id: "conn-pause-sync",
+            platform: "feishu",
+            lifecycleState: "active",
+            state: "connected",
+            leaderId: DEFAULT_LEADER_ID,
+            bindingId: "",
+            bindingEpoch: 0,
+            leaderPaused: false,
+          });
+          yield* api("GET", "connections");
+          expect(
+            (yield* api("POST", "connections/rebind", {
+              connectionId: "conn-pause-sync",
+              leaderId: navPauseSync.id,
+            })).status,
+          ).toBe(200);
+
+          const origHostReq = fakeHost.request;
+          let failPauseSync = true;
+          let holdOverviewListOnce = true;
+          let releaseOverviewList!: () => void;
+          fakeHost.request = async (method: string, params: Record<string, unknown> = {}) => {
+            if (method === "connections.list" && holdOverviewListOnce) {
+              holdOverviewListOnce = false;
+              const staleSnap = liveConnections.map((c) => ({ ...c }));
+              await new Promise<void>((resolve) => {
+                releaseOverviewList = resolve;
+              });
+              return { connections: staleSnap };
+            }
+            if (method === "connections.syncBindings") {
+              if (failPauseSync) {
+                throw new Error("bridge pause sync failed");
+              }
+              const items = Array.isArray(params.bindings)
+                ? (params.bindings as Array<{
+                    connectionId: string;
+                    leaderId: string;
+                    bindingId: string;
+                    bindingEpoch: number;
+                    leaderPaused?: boolean;
+                  }>)
+                : [];
+              for (const item of items) {
+                const hit = liveConnections.find((c) => c.id === item.connectionId);
+                if (hit) {
+                  hit.leaderId = item.leaderId;
+                  hit.bindingId = item.bindingId;
+                  hit.bindingEpoch = item.bindingEpoch;
+                  hit.leaderPaused = Boolean(item.leaderPaused);
+                }
+              }
+              return { synced: items.length, connections: liveConnections };
+            }
+            return origHostReq(method, params);
+          };
+
+          const staleOverviewPromise = handler(
+            new Request(`http://localhost/api/xtwork/im/leaders/${navPauseSync.id}/overview`, {
+              method: "GET",
+              headers: { Authorization: "Bearer test-token" },
+            }),
+          );
+          yield* Effect.sleep("15 millis");
+          const pauseRes = yield* api("POST", `leaders/${navPauseSync.id}/pause`, {});
+          expect(pauseRes.status).toBe(200);
+          releaseOverviewList();
+          const staleOverviewHttp = yield* Effect.promise(() => staleOverviewPromise);
+          expect(staleOverviewHttp.status).toBe(200);
+          const staleOverviewJson = (yield* Effect.promise(() => staleOverviewHttp.json())) as {
+            connections: Array<Record<string, unknown>>;
+          };
+          expect(staleOverviewJson.connections[0]?.leaderPaused).toBe(false);
+          expect(staleOverviewJson.connections[0]?.syncPending).toBe(true);
+
+          const resumeWhileStillFailing = yield* api("POST", `leaders/${navPauseSync.id}/resume`, {});
+          expect(resumeWhileStillFailing.status).toBe(200);
+          const afterDoubleFailOverview = yield* api("GET", `leaders/${navPauseSync.id}/overview`);
+          const doubleFailConn = (afterDoubleFailOverview.json.connections as Array<Record<string, unknown>>)[0]!;
+          expect(doubleFailConn.leaderPaused).toBe(false);
+          expect(doubleFailConn.syncPending).toBe(true);
+
+          const connsDoubleFail = yield* api("GET", "connections");
+          const connFromList = (connsDoubleFail.json.connections as Array<Record<string, unknown>>).find(
+            (c) => c.id === "conn-pause-sync",
+          )!;
+          expect(connFromList.syncPending).toBe(true);
+
+          failPauseSync = false;
+          const recoveredOverview = yield* api("GET", `leaders/${navPauseSync.id}/overview`);
+          const recoveredConn = (recoveredOverview.json.connections as Array<Record<string, unknown>>)[0]!;
+          expect(recoveredConn.leaderPaused).toBe(false);
+          expect(recoveredConn.syncPending).toBe(false);
+
+          failPauseSync = true;
+          let holdPausedListOnce = true;
+          let releasePausedListOnce!: () => void;
+          const prevReqBeforePausedListRace = fakeHost.request;
+          fakeHost.request = async (method: string, params: Record<string, unknown> = {}) => {
+            if (method === "paused.list" && params.leaderId === navPauseSync.id && holdPausedListOnce) {
+              holdPausedListOnce = false;
+              await new Promise<void>((resolve) => {
+                releasePausedListOnce = resolve;
+              });
+              return { items: [], heldCount: 0 };
+            }
+            return prevReqBeforePausedListRace(method, params);
+          };
+          const pausedListRaceOverview = handler(
+            new Request(`http://localhost/api/xtwork/im/leaders/${navPauseSync.id}/overview`, {
+              method: "GET",
+              headers: { Authorization: "Bearer test-token" },
+            }),
+          );
+          yield* Effect.sleep("15 millis");
+          expect((yield* api("POST", `leaders/${navPauseSync.id}/pause`, {})).status).toBe(200);
+          releasePausedListOnce();
+          const pausedListRaceRes = yield* Effect.promise(() => pausedListRaceOverview);
+          expect(pausedListRaceRes.status).toBe(200);
+          const pausedListRaceJson = (yield* Effect.promise(() => pausedListRaceRes.json())) as {
+            leader: { status: string };
+            connections: Array<Record<string, unknown>>;
+          };
+          expect(pausedListRaceJson.leader.status).toBe("paused");
+          expect(pausedListRaceJson.connections[0]?.syncPending).toBe(true);
+          fakeHost.request = prevReqBeforePausedListRace;
+
+          failPauseSync = false;
+          const pausedOverviewSynced = yield* api("GET", `leaders/${navPauseSync.id}/overview`);
+          const syncedConn = (pausedOverviewSynced.json.connections as Array<Record<string, unknown>>)[0]!;
+          expect(syncedConn.leaderPaused).toBe(true);
+          expect(syncedConn.syncPending).toBe(false);
+
+          yield* api("POST", `leaders/${navPauseSync.id}/resume`, {});
+          fakeHost.request = origHostReq;
+          yield* api("POST", "connections/disconnect", { connectionId: "conn-pause-sync" });
+          expect((yield* api("POST", `leaders/${navPauseSync.id}/archive`, {})).status).toBe(200);
+
+          const navStateEventDisconnect = yield* leaders.createLeader({ name: "事件断开领航者" });
+          yield* leaders.ensureBinding("conn-event-gone", navStateEventDisconnect.id, "feishu", true);
+          const disconnectHandler = makeBridgeEventHandler(
+            fakeHost as never,
+            {
+              accept: () => Effect.fail(imError("unused")),
+              firstContext: () => Effect.undefined,
+              stop: () => Effect.void,
+            } as never,
+            leaders,
+          );
+          yield* disconnectHandler({
+            sequence: 10,
+            event: "connection.state",
+            payload: {
+              connectionId: "conn-event-gone",
+              platform: "feishu",
+              lifecycleState: "idle",
+              state: "idle",
+              stateDetail: "disconnected",
+            },
+          });
+          expect(yield* leaders.listBindings(navStateEventDisconnect.id)).toEqual([]);
+          expect(yield* leaders.listBoundPlatforms(navStateEventDisconnect.id)).toEqual(["feishu"]);
+          const archiveAfterEventDisconnect = yield* api("POST", `leaders/${navStateEventDisconnect.id}/archive`, {});
+          expect(archiveAfterEventDisconnect.status).toBe(200);
+
+          const navOrphan = yield* leaders.createLeader({ name: "升级前孤立绑定领航者" });
+          yield* leaders.ensureBinding("conn-preupgrade-orphan", navOrphan.id, "wechat", true);
+          const archiveOrphan = yield* api("POST", `leaders/${navOrphan.id}/archive`, {});
+          expect(archiveOrphan.status).toBe(200);
+          expect(yield* leaders.activeBindingForConnection("conn-preupgrade-orphan")).toBeUndefined();
+          const defaultBindingsAfterOrphan = yield* leaders.listBindings(DEFAULT_LEADER_ID);
+          expect(defaultBindingsAfterOrphan.some((b) => b.connectionId === "conn-preupgrade-orphan")).toBe(false);
+
+          fakeHost.available = false;
+          const offlineLeaders = yield* api("GET", "leaders");
+          expect(offlineLeaders.status).toBe(200);
+          const defaultOffline = (
+            offlineLeaders.json.leaders as Array<{
+              leader: { id: string };
+              bindings: Array<{ connectionId: string; platform: string | null }>;
+              boundPlatforms: string[];
+              connections: unknown[];
+            }>
+          ).find((item) => item.leader.id === DEFAULT_LEADER_ID)!;
+          expect(defaultOffline.connections).toEqual([]);
+          expect(defaultOffline.boundPlatforms).toEqual(expect.arrayContaining(["wechat", "feishu", "wecom"]));
+          expect(defaultOffline.bindings).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({ connectionId: "conn-legacy-wechat", platform: "wechat" }),
+              expect.objectContaining({ connectionId: "conn-feishu-live", platform: "feishu" }),
+              expect.objectContaining({ connectionId: "conn-wecom-live", platform: "wecom" }),
+            ]),
+          );
+
+          fakeHost.available = true;
+          liveConnections = liveConnections.filter((c) => c.id === "conn-feishu-live");
+          const partialLeaders = yield* api("GET", "leaders");
+          expect(partialLeaders.status).toBe(200);
+          const defaultPartial = (
+            partialLeaders.json.leaders as Array<{
+              leader: { id: string };
+              bindings: Array<{ connectionId: string; platform: string | null }>;
+              boundPlatforms: string[];
+              connections: Array<{ id: string }>;
+            }>
+          ).find((item) => item.leader.id === DEFAULT_LEADER_ID)!;
+          expect(defaultPartial.connections.map((c) => c.id)).toEqual(["conn-feishu-live"]);
+          expect(defaultPartial.boundPlatforms).toEqual(expect.arrayContaining(["wechat", "feishu", "wecom"]));
+          expect(defaultPartial.bindings).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({ connectionId: "conn-feishu-live", platform: "feishu" }),
+              expect.objectContaining({ connectionId: "conn-wecom-live", platform: "wecom" }),
+            ]),
+          );
+        } finally {
+          yield* Effect.promise(() => dispose());
+        }
+      }).pipe(Effect.provide(dbLayer)),
+    );
+  });
+
+  it("exposes accurate startingCount, waitingCount, failedCount, completedCount, and latestCompletedKey in awareness and GET /api/xtwork/im/leaders", async () => {
+    const dbLayer = NodeSqliteClient.layer({ filename: ":memory:" });
+    const testAuthLayer = Layer.succeed(EnvironmentAuth, {
+      authenticateHttpRequest: () =>
+        Effect.succeed({
+          subject: "desktop-bootstrap",
+          scopes: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
+        }),
+    } as never);
+
+    const tStarting = makeAwarenessThread("t-starting", "proj-a", "Starting Task", {
+      status: "starting",
+      activityRunStatus: "starting",
+      updatedAt: DateTime.makeUnsafe("2026-11-26T04:00:00.000Z"),
+    });
+    const tRunning = makeAwarenessThread("t-running", "proj-a", "Running Task", {
+      status: "running",
+      activityRunStatus: "running",
+      updatedAt: DateTime.makeUnsafe("2026-11-26T04:01:00.000Z"),
+    });
+    const tWaitApproval = makeAwarenessThread("t-wait-approval", "proj-a", "Approval Task", {
+      status: "waiting",
+      activityRunStatus: "waiting",
+      updatedAt: DateTime.makeUnsafe("2026-11-26T04:02:00.000Z"),
+      pendingRuntimeRequest: {
+        id: RuntimeRequestId.make("req-approval-1"),
+        kind: "command",
+        createdAt: DateTime.makeUnsafe("2026-11-26T04:02:00.000Z"),
+      },
+    });
+    const tWaitInput = makeAwarenessThread("t-wait-input", "proj-a", "Input Task", {
+      status: "waiting",
+      activityRunStatus: "waiting",
+      updatedAt: DateTime.makeUnsafe("2026-11-26T04:03:00.000Z"),
+      pendingRuntimeRequest: {
+        id: RuntimeRequestId.make("req-input-1"),
+        kind: "user_input",
+        createdAt: DateTime.makeUnsafe("2026-11-26T04:03:00.000Z"),
+      },
+    });
+    const tFailed = makeAwarenessThread("t-failed", "proj-a", "Failed Task", {
+      status: "failed",
+      activityRunStatus: null,
+      updatedAt: DateTime.makeUnsafe("2026-11-26T04:04:00.000Z"),
+    });
+    const compOldAt = DateTime.makeUnsafe("2026-11-26T01:00:00.000Z");
+    const compMidAt = DateTime.makeUnsafe("2026-11-26T02:15:00.000Z");
+    const compNewAt = DateTime.makeUnsafe("2026-11-26T03:30:00.000Z");
+    const compOtherAt = DateTime.makeUnsafe("2026-11-26T09:00:00.000Z");
+    const compStoppedAt = DateTime.makeUnsafe("2026-11-26T10:00:00.000Z");
+
+    const tCompletedOld = makeAwarenessThread("t-comp-old", "proj-a", "Old Done", {
+      status: "completed",
+      activityRunStatus: null,
+      latestRunId: RunId.make("run-old"),
+      latestRunCompletedAt: compOldAt,
+      updatedAt: DateTime.makeUnsafe("2026-11-26T12:00:00.000Z"),
+    });
+    const tCompletedNew = makeAwarenessThread("t-comp-new", "proj-a", "Newest Done", {
+      status: "completed",
+      activityRunStatus: null,
+      latestRunId: RunId.make("run-new"),
+      latestRunCompletedAt: compNewAt,
+      updatedAt: compNewAt,
+    });
+    const tCompletedMid = makeAwarenessThread("t-comp-mid", "proj-a", "Mid Done", {
+      status: "completed",
+      activityRunStatus: null,
+      latestRunId: RunId.make("run-mid"),
+      latestRunCompletedAt: compMidAt,
+      updatedAt: compMidAt,
+    });
+    const tCompletedStopped = makeAwarenessThread("t-comp-stopped", "proj-a", "Stopped Done", {
+      status: "completed",
+      activityRunStatus: null,
+      latestRunId: RunId.make("run-stopped"),
+      latestRunCompletedAt: compStoppedAt,
+      latestRunStopRequested: true,
+      updatedAt: compStoppedAt,
+    });
+    const tCompletedOtherProject = makeAwarenessThread("t-comp-other", "proj-other", "Other Project Done", {
+      status: "completed",
+      activityRunStatus: null,
+      latestRunId: RunId.make("run-other"),
+      latestRunCompletedAt: compOtherAt,
+      updatedAt: compOtherAt,
+    });
+    const snapshotThreads = [
+      tStarting,
+      tRunning,
+      tWaitApproval,
+      tWaitInput,
+      tFailed,
+      tCompletedOld,
+      tCompletedNew,
+      tCompletedMid,
+      tCompletedStopped,
+      tCompletedOtherProject,
+    ];
+
+    const expectedNewMs = DateTime.toEpochMillis(compNewAt);
+    const expectedOtherMs = DateTime.toEpochMillis(compOtherAt);
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const leaders = yield* makeLeaderStore();
+        const approvals = new ImApprovals();
+        const defaultLeader = yield* leaders.ensureDefaultLeader();
+        const scopedLeader = yield* leaders.createLeader({
+          name: "项目A领航者",
+          awarenessScope: { kind: "projects", projectIds: ["proj-a"] },
+        });
+        const isolatedLeader = yield* leaders.createLeader({
+          name: "隔离领航者",
+          awarenessScope: { kind: "none", projectIds: [] },
+        });
+
+        const directScoped = buildScopedAwareness({
+          caller: { ...desktopContext, leaderId: scopedLeader.id },
+          leader: scopedLeader,
+          snapshotSequence: 99,
+          snapshotThreads,
+          leaderStore: leaders,
+          approvals,
+          environmentId: EnvironmentId.make("local"),
+        });
+        expect(directScoped.startingCount).toBe(1);
+        expect(directScoped.runningCount).toBe(2);
+        expect(directScoped.waitingCount).toBe(2);
+        expect(directScoped.failedCount).toBe(1);
+        expect(directScoped.completedCount).toBe(3);
+        expect(directScoped.needsYouCount).toBe(3);
+        expect(directScoped.latestCompletedKey).toBe(`t-comp-new:run-new:${expectedNewMs}`);
+        expect(directScoped.latestCompletedAtMs).toBe(expectedNewMs);
+
+        const directMetadataBumped = buildScopedAwareness({
+          caller: { ...desktopContext, leaderId: scopedLeader.id },
+          leader: scopedLeader,
+          snapshotSequence: 100,
+          snapshotThreads: snapshotThreads.map((t) =>
+            t.id === tCompletedOld.id ? { ...t, updatedAt: DateTime.makeUnsafe("2026-11-26T23:59:59.000Z") } : t,
+          ),
+          leaderStore: leaders,
+          approvals,
+          environmentId: EnvironmentId.make("local"),
+        });
+        expect(directMetadataBumped.latestCompletedKey).toBe(directScoped.latestCompletedKey);
+        expect(directMetadataBumped.latestCompletedAtMs).toBe(expectedNewMs);
+
+        const directIsolated = buildScopedAwareness({
+          caller: { ...desktopContext, leaderId: isolatedLeader.id },
+          leader: isolatedLeader,
+          snapshotSequence: 99,
+          snapshotThreads,
+          leaderStore: leaders,
+          approvals,
+          environmentId: EnvironmentId.make("local"),
+        });
+        expect(directIsolated.startingCount).toBe(0);
+        expect(directIsolated.runningCount).toBe(0);
+        expect(directIsolated.waitingCount).toBe(0);
+        expect(directIsolated.failedCount).toBe(0);
+        expect(directIsolated.completedCount).toBe(0);
+        expect(directIsolated.latestCompletedKey).toBeNull();
+        expect(directIsolated.latestCompletedAtMs).toBeNull();
+
+        const fakeProjection = {
+          getAgentAwarenessSnapshot: () =>
+            Effect.succeed({
+              snapshotSequence: 99,
+              threads: snapshotThreads,
+            }),
+        };
+        const serviceLayer = Layer.succeed(XtworkIm, {
+          leaders,
+          projection: fakeProjection as never,
+          approvals,
+          pendingBindingSyncs: new Map<string, string>(),
+          markReplySucceeded: () => undefined,
+          hasReplySucceeded: () => false,
+          eventsSince: () => [],
+        });
+        const fullLayer = Layer.mergeAll(
+          xtworkImRoute.pipe(Layer.provide(Layer.mergeAll(serviceLayer, testAuthLayer))),
+          testAuthLayer,
+          HttpPlatform.layer.pipe(Layer.provide(NodeServices.layer)),
+          Etag.layerWeak,
+          NodeServices.layer,
+        );
+        const { handler, dispose } = HttpRouter.toWebHandler(fullLayer as never);
+        try {
+          const res = yield* Effect.promise(async () => {
+            const raw = await handler(
+              new Request("http://localhost/api/xtwork/im/leaders", {
+                method: "GET",
+                headers: { Authorization: "Bearer test-token" },
+              }),
+            );
+            return { status: raw.status, json: (await raw.json()) as { leaders: Array<Record<string, unknown>> } };
+          });
+          expect(res.status).toBe(200);
+          const byId = new Map(
+            res.json.leaders.map((item) => [(item.leader as { id: string }).id, item]),
+          );
+          const defaultItem = byId.get(defaultLeader.id)!;
+          expect(defaultItem.startingCount).toBe(1);
+          expect(defaultItem.runningCount).toBe(2);
+          expect(defaultItem.waitingCount).toBe(2);
+          expect(defaultItem.failedCount).toBe(1);
+          expect(defaultItem.completedCount).toBe(4);
+          expect(defaultItem.needsYouCount).toBe(3);
+          expect(defaultItem.latestCompletedKey).toBe(`t-comp-other:run-other:${expectedOtherMs}`);
+          expect(defaultItem.latestCompletedAtMs).toBe(expectedOtherMs);
+
+          const scopedItem = byId.get(scopedLeader.id)!;
+          expect(scopedItem.startingCount).toBe(1);
+          expect(scopedItem.runningCount).toBe(2);
+          expect(scopedItem.waitingCount).toBe(2);
+          expect(scopedItem.failedCount).toBe(1);
+          expect(scopedItem.completedCount).toBe(3);
+          expect(scopedItem.needsYouCount).toBe(3);
+          expect(scopedItem.latestCompletedKey).toBe(`t-comp-new:run-new:${expectedNewMs}`);
+          expect(scopedItem.latestCompletedAtMs).toBe(expectedNewMs);
+
+          const isolatedItem = byId.get(isolatedLeader.id)!;
+          expect(isolatedItem.startingCount).toBe(0);
+          expect(isolatedItem.runningCount).toBe(0);
+          expect(isolatedItem.waitingCount).toBe(0);
+          expect(isolatedItem.failedCount).toBe(0);
+          expect(isolatedItem.completedCount).toBe(0);
+          expect(isolatedItem.needsYouCount).toBe(0);
+          expect(isolatedItem.latestCompletedKey).toBeNull();
+          expect(isolatedItem.latestCompletedAtMs).toBeNull();
         } finally {
           yield* Effect.promise(() => dispose());
         }

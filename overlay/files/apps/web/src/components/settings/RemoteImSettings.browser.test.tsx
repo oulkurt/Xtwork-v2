@@ -530,3 +530,140 @@ it("lets users rebind an active IM connection between Navigators from RemoteImSe
     expect(rebindCalls).toEqual([{ connectionId: "conn-feishu-1", leaderId: "leader-eng" }]);
   });
 });
+
+it("downgrades connected cards and rows to unconfirmed when GET status subsequently returns HTTP 503", async () => {
+  stubDesktopBridge();
+  let failStatus = false;
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const path = new URL(url, "http://localhost").pathname.replace(/^.*\/api\/xtwork\/im\//, "");
+      const json = (data: unknown, status = 200) =>
+        new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+
+      if (path === "status") {
+        if (failStatus) return json({ error: "bridge down" }, 503);
+        return json({ state: "idle", lifecycle: "idle" });
+      }
+      if (path === "connections") {
+        return json({
+          connections: [
+            { id: "conn-feishu-1", platform: "feishu", lifecycleState: "active", state: "connected", botName: "飞书小瞳" },
+            { id: "conn-wecom-1", platform: "wecom", lifecycleState: "active", state: "connected", botName: "企微小瞳" },
+          ],
+        });
+      }
+      if (path === "leaders") return json({ leaders: [{ leader: { id: "leader-default", name: "小瞳" } }] });
+      if (path === "access") return json({ held: [] });
+      if (path === "approvals") return json({ approvals: [] });
+      if (path === "onboarding/events") return json({ events: [] });
+      return json({});
+    }),
+  );
+
+  await page.viewport(1280, 960);
+  await using _screen = await render(<RemoteImSettings />, {
+    router: "/settings/remote-connections",
+  });
+
+  const feishuCard = page.getByTestId("holo-card-feishu");
+  const wecomCard = page.getByTestId("holo-card-wecom");
+  await expect.element(feishuCard.getByText("已连接", { exact: true })).toBeVisible();
+  await expect.element(wecomCard.getByText("已连接", { exact: true })).toBeVisible();
+
+  failStatus = true;
+  await vi.waitFor(
+    async () => {
+      expect(feishuCard.element().textContent).toContain("无法确认在线");
+      expect(wecomCard.element().textContent).toContain("无法确认在线");
+      expect(document.body.textContent).toContain("飞书小瞳");
+      expect(document.body.textContent).toContain("桥接不可用 · 无法确认在线");
+    },
+    { timeout: 5000 },
+  );
+});
+
+it("does not flash green connected during retry when /status returns 200 while /connections is still failing", async () => {
+  stubDesktopBridge();
+  let connectionsMode: "ok" | "fail" | "slow_fail" = "ok";
+  let slowConnectionsStarted = false;
+  let releaseSlowConnections: (() => void) | undefined;
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const path = new URL(url, "http://localhost").pathname.replace(/^.*\/api\/xtwork\/im\//, "");
+      const json = (data: unknown, status = 200) =>
+        new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+
+      if (path === "status") return json({ state: "idle", lifecycle: "idle" });
+      if (path === "connections") {
+        if (connectionsMode === "fail") {
+          return json({ error: "connections unavailable" }, 503);
+        }
+        if (connectionsMode === "slow_fail") {
+          slowConnectionsStarted = true;
+          await new Promise<void>((resolve) => {
+            releaseSlowConnections = resolve;
+          });
+          return json({ error: "connections still unavailable" }, 503);
+        }
+        return json({
+          connections: [
+            { id: "conn-feishu-1", platform: "feishu", lifecycleState: "active", state: "connected", botName: "飞书小瞳" },
+            { id: "conn-wecom-1", platform: "wecom", lifecycleState: "active", state: "connected", botName: "企微小瞳" },
+          ],
+        });
+      }
+      if (path === "leaders") return json({ leaders: [{ leader: { id: "leader-default", name: "小瞳" } }] });
+      if (path === "access") return json({ held: [] });
+      if (path === "approvals") return json({ approvals: [] });
+      if (path === "onboarding/events") return json({ events: [] });
+      return json({});
+    }),
+  );
+
+  await page.viewport(1280, 960);
+  await using _screen = await render(<RemoteImSettings />, {
+    router: "/settings/remote-connections",
+  });
+
+  const feishuCard = page.getByTestId("holo-card-feishu");
+  const wecomCard = page.getByTestId("holo-card-wecom");
+  await expect.element(feishuCard.getByText("已连接", { exact: true })).toBeVisible();
+  await expect.element(wecomCard.getByText("已连接", { exact: true })).toBeVisible();
+
+  connectionsMode = "fail";
+  await vi.waitFor(
+    () => {
+      expect(feishuCard.element().textContent).toContain("无法确认在线");
+      expect(wecomCard.element().textContent).toContain("无法确认在线");
+    },
+    { timeout: 5000 },
+  );
+
+  connectionsMode = "slow_fail";
+  await vi.waitFor(
+    () => {
+      expect(slowConnectionsStarted).toBe(true);
+    },
+    { timeout: 5000 },
+  );
+  expect(feishuCard.element().textContent).toContain("无法确认在线");
+  expect(wecomCard.element().textContent).toContain("无法确认在线");
+  expect(feishuCard.element().textContent).not.toContain("已连接");
+  expect(wecomCard.element().textContent).not.toContain("已连接");
+
+  connectionsMode = "ok";
+  releaseSlowConnections?.();
+  await vi.waitFor(
+    () => {
+      expect(feishuCard.element().textContent).toContain("已连接");
+      expect(wecomCard.element().textContent).toContain("已连接");
+    },
+    { timeout: 5000 },
+  );
+});
