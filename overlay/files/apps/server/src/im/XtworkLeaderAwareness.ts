@@ -96,6 +96,7 @@ export function buildScopedAwareness(input: {
       callerLeaderId: leader.id,
       awarenessScope: leader.awarenessScope,
       ownerDmDesktopGrants: ownerDmGrants,
+      imPolicy: leader.imPolicy,
       action: "status_read",
       target: {
         threadId: thread.id,

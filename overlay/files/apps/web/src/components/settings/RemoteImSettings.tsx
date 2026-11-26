@@ -9,6 +9,7 @@ import {
   RotateCcwIcon,
 } from "lucide-react";
 import { readDesktopPrimaryBearerToken } from "../../environments/primary/desktopAuth";
+import { emitNavigatorsChanged, useNavigatorLang } from "../leader/leaderTypes";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { QRCodeSvg } from "../ui/qr-code";
@@ -39,6 +40,14 @@ type Connection = {
   message?: string;
   claimCode?: string | null;
   claimExpiresAt?: number | null;
+  leaderId?: string;
+  desiredLeaderId?: string;
+  syncPending?: boolean;
+};
+
+type NavigatorOption = {
+  readonly id: string;
+  readonly name: string;
 };
 
 type Access = {
@@ -235,7 +244,10 @@ function StatusPill({ label, tone }: { readonly label: string; readonly tone: "c
 }
 
 export function RemoteImSettings() {
+  const navLang = useNavigatorLang();
+  const isEnNav = navLang === "en";
   const [connections, setConnections] = useState<Connection[]>([]);
+  const [navigators, setNavigators] = useState<readonly NavigatorOption[]>([]);
   const [access, setAccess] = useState<Access[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [available, setAvailable] = useState<boolean>();
@@ -280,16 +292,23 @@ export function RemoteImSettings() {
     const snapshotSeq = ++snapshotSeqRef.current;
     const hasUnboundStart = () => Object.keys(unboundStartsRef.current).length > 0;
     const shouldPollEvents = !hasUnboundStart();
-    const [items, requests, permissions, notifications] = await Promise.all([
+    const [items, requests, permissions, notifications, leadersRes] = await Promise.all([
       request("connections", undefined, signal),
       request("access", undefined, signal),
       request("approvals", undefined, signal),
       shouldPollEvents ? request(`onboarding/events?after=${cursor.current}`, undefined, signal) : Promise.resolve(null),
+      request("leaders", undefined, signal).catch(() => null),
     ]);
     if (signal?.aborted) return;
     if (snapshotSeq >= appliedSnapshotSeqRef.current) {
       appliedSnapshotSeqRef.current = snapshotSeq;
       setConnections(collection(items, "connections"));
+      const rawLeaders = collection<{ leader?: { id?: string; name?: string } }>(leadersRes, "leaders");
+      setNavigators(
+        rawLeaders
+          .map((item) => item.leader)
+          .filter((leader): leader is { id: string; name: string } => Boolean(leader?.id && leader?.name)),
+      );
       const held = collection<Access>(requests, "held");
       setAccess(
         (held.length > 0 ? held : collection<Access>(requests, "requests")).filter(
@@ -834,7 +853,9 @@ export function RemoteImSettings() {
           <div className="flex items-center gap-2">
             <h2 className="text-base font-semibold text-foreground">远程连接</h2>
             <span className="rounded-full border border-border/70 bg-muted/50 px-2 py-0.5 text-[11px] text-muted-foreground">
-              绑定至默认 Leader（小瞳）
+              {navigators.length > 1
+                ? `可自由分配至 ${navigators.length} 位领航者`
+                : `绑定至默认领航者（${navigators[0]?.name ?? "小瞳"}）`}
             </span>
           </div>
           <p className="text-xs text-muted-foreground" role="status">
@@ -905,7 +926,41 @@ export function RemoteImSettings() {
                   .filter(Boolean)
                   .join(" · ")}
                 control={
-                  <div className="flex flex-wrap gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {navigators.length > 0 ? (
+                      <label className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+                        <span>{isEnNav ? "Navigator" : "领航者"}</span>
+                        <select
+                          data-testid={`connection-rebind-${id}`}
+                          aria-label={
+                            isEnNav
+                              ? `Assign Navigator for ${connection.name ?? REMOTE_IM_CHANNELS[connection.platform]?.name ?? connection.platform}`
+                              : `选择 ${connection.name ?? REMOTE_IM_CHANNELS[connection.platform]?.name ?? "远程连接"} 所属领航者`
+                          }
+                          value={connection.desiredLeaderId ?? connection.leaderId ?? "leader-default"}
+                          disabled={busy}
+                          onChange={(event) => {
+                            const nextLeaderId = event.target.value;
+                            void perform(async () => {
+                              await request("connections/rebind", { connectionId: id, leaderId: nextLeaderId });
+                              emitNavigatorsChanged();
+                            });
+                          }}
+                          className="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground"
+                        >
+                          {navigators.map((nav) => (
+                            <option key={nav.id} value={nav.id}>
+                              {nav.name}
+                            </option>
+                          ))}
+                        </select>
+                        {connection.syncPending ? (
+                          <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-700 dark:text-amber-300">
+                            {isEnNav ? "Sync pending" : "同步中…"}
+                          </span>
+                        ) : null}
+                      </label>
+                    ) : null}
                     {lifecycle === "pairing" ? (
                       <Button
                         size="sm"

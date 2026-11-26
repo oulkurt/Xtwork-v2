@@ -8,7 +8,9 @@ import { McpInvocationContext } from "../mcp/McpInvocationContext.ts";
 import { type BridgePayload, isRecord } from "./XtworkImBridgeHost.ts";
 import { memoryScope } from "./XtworkImMemory.ts";
 import {
+  DEFAULT_IM_DELEGATION_POLICY,
   DEFAULT_LEADER_ID,
+  evaluateImDelegationPolicy,
   hashArgs,
   imError,
   isImThread,
@@ -17,6 +19,7 @@ import {
   scopedPath,
   untrustedEnvelope,
 } from "./XtworkImSecurity.ts";
+import { buildScopedAwareness } from "./XtworkLeaderAwareness.ts";
 import { XtworkIm } from "./XtworkImService.ts";
 
 const field = { type: "string" } as const;
@@ -34,13 +37,14 @@ const schemas = {
   im__memory_read: ["Read companion memory or a Markdown note.", { scope: field, note: field }, []],
   im__memory_write: ["Write companion memory or a Markdown note.", { scope: field, note: field, text: field }, ["text"]],
   im__memory_share: ["Request Owner snapshot approval to copy a specific private memory note into the current group.", { note: field }, []],
+  im__workspace_status: ["Check progress of authorized threads or a specific local project folder.", { projectId: field }, []],
   im__native_policy: ["Internal Pi permission hook.", { toolName: field, args: { type: "object" } }, ["toolName", "args"]],
 } as const;
 
 type ToolName = keyof typeof schemas;
-type ToolService = Pick<XtworkIm["Service"], "approvals" | "host" | "memory" | "markReplySucceeded">;
+type ToolService = Pick<XtworkIm["Service"], "approvals" | "host" | "memory" | "leaders" | "projection" | "markReplySucceeded">;
 type ImExecution = NonNullable<Effect.Success<ReturnType<NonNullable<XtworkIm["Service"]["dispatch"]>["resolveExecution"]>>>;
-const readOnly = new Set<ToolName>(["im__read", "im__search", "im__contact_list", "im__memory_read"]);
+const readOnly = new Set<ToolName>(["im__read", "im__search", "im__contact_list", "im__memory_read", "im__workspace_status"]);
 const rpcMethods = {
   im__reply: "messages.reply",
   im__send: "messages.send",
@@ -89,6 +93,93 @@ export async function runImTool(service: ToolService, execution: ImExecution, na
       await service.approvals.require(execution, toolName, args.args, signal);
     }
     return { allowed: true };
+  }
+
+  if (name === "im__workspace_status") {
+    if (!service.leaders) throw new Error("Navigator service is unavailable.");
+    const initialLeader = service.leaders.getLeaderSync(leaderId);
+    if (!initialLeader || initialLeader.status === "archived") {
+      throw new Error("Navigator is unavailable.");
+    }
+    const requestedProjectId =
+      args.projectId === undefined ? undefined : textField(args, "projectId").trim() || undefined;
+    const snapshot = service.projection
+      ? await Effect.runPromise(service.projection.getAgentAwarenessSnapshot())
+      : { snapshotSequence: 0, threads: [] };
+    const leader = service.leaders.getLeaderSync(leaderId);
+    if (!leader || leader.status === "archived") {
+      throw new Error("Navigator is unavailable.");
+    }
+    const policy = service.leaders.getImPolicySync(leaderId);
+    const decision = evaluateImDelegationPolicy({
+      caller: context,
+      policy,
+      ...(requestedProjectId ? { targetProjectId: requestedProjectId } : {}),
+    });
+    if (decision.decision === "deny") {
+      throw new Error(decision.reason);
+    }
+    if (decision.decision === "require_approval") {
+      await approve({ ...(requestedProjectId ? { projectId: requestedProjectId } : {}), leaderId });
+      const freshLeader = service.leaders.getLeaderSync(leaderId);
+      if (!freshLeader || freshLeader.status === "archived") {
+        throw new Error("Navigator is unavailable.");
+      }
+      const freshPolicy = service.leaders.getImPolicySync(leaderId);
+      const recheck = evaluateImDelegationPolicy({
+        caller: context,
+        policy: freshPolicy,
+        ...(requestedProjectId ? { targetProjectId: requestedProjectId } : {}),
+      });
+      if (recheck.decision === "deny") {
+        throw new Error(recheck.reason);
+      }
+      const effectiveLeader =
+        context.replyAudience === "owner_dm" && requestedProjectId
+          ? {
+              ...freshLeader,
+              ownerDmDesktopGrants: [...freshLeader.ownerDmDesktopGrants, `project:${requestedProjectId}`],
+            }
+          : freshLeader;
+      const scoped = buildScopedAwareness({
+        caller: context,
+        leader: effectiveLeader,
+        snapshotSequence: snapshot.snapshotSequence,
+        snapshotThreads: snapshot.threads,
+        leaderStore: service.leaders,
+        approvals: service.approvals,
+      });
+      const threads = requestedProjectId
+        ? scoped.threads.filter((thread) => thread.projectId === requestedProjectId)
+        : scoped.threads;
+      return untrustedEnvelope(
+        {
+          snapshotSequence: scoped.snapshotSequence,
+          projectId: requestedProjectId ?? null,
+          threads,
+        },
+        context,
+      );
+    }
+    const scoped = buildScopedAwareness({
+      caller: context,
+      leader,
+      snapshotSequence: snapshot.snapshotSequence,
+      snapshotThreads: snapshot.threads,
+      leaderStore: service.leaders,
+      approvals: service.approvals,
+    });
+    const threads = requestedProjectId
+      ? scoped.threads.filter((thread) => thread.projectId === requestedProjectId)
+      : scoped.threads;
+    return untrustedEnvelope(
+      {
+        snapshotSequence: scoped.snapshotSequence,
+        projectId: requestedProjectId ?? null,
+        threads,
+      },
+      context,
+    );
   }
 
   // ADR-013 §4: Sharing private memory into a group MUST bind an exact content snapshot + hash
@@ -204,7 +295,28 @@ export async function runImTool(service: ToolService, execution: ImExecution, na
   const connectionId = args.connectionId === undefined ? target.connectionId : textField(args, "connectionId");
   if (name === "im__send" || name === "im__read" || name === "im__search") {
     if (!connectionId || !chatId) throw new Error("An explicit destination is required.");
-    if (chatId !== target.chatId || connectionId !== target.connectionId) await approve({ ...args, chatId, connectionId });
+    if (chatId !== target.chatId || connectionId !== target.connectionId) {
+      if (context.replyAudience === "group" && (name === "im__read" || name === "im__search")) {
+        throw new Error("Group turns cannot read or search messages from another chat.");
+      }
+      const policy = service.leaders?.getImPolicySync(leaderId) ?? DEFAULT_IM_DELEGATION_POLICY;
+      const decision = evaluateImDelegationPolicy({ caller: context, policy });
+      if (decision.decision === "deny") {
+        throw new Error(decision.reason);
+      }
+      await approve({ ...args, chatId, connectionId });
+      if (service.leaders) {
+        const freshLeader = service.leaders.getLeaderSync(leaderId);
+        if (!freshLeader || freshLeader.status === "archived") {
+          throw new Error("Navigator is unavailable.");
+        }
+        const freshPolicy = service.leaders.getImPolicySync(leaderId);
+        const recheck = evaluateImDelegationPolicy({ caller: context, policy: freshPolicy });
+        if (recheck.decision === "deny") {
+          throw new Error(recheck.reason);
+        }
+      }
+    }
   }
   if (["im__contact_name", "im__contact_note", "im__contact_link"].includes(name)) {
     await approve();

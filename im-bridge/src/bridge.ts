@@ -924,7 +924,10 @@ export class ImBridge {
       body: item.body,
       createdAt: item.createdAt,
     }));
-    return { items };
+    return {
+      items,
+      ...(leaderId ? { heldCount: this.store.heldMessageCountForLeader(leaderId) } : {}),
+    };
   }
 
   private handlePausedDecide(params: Record<string, unknown>) {
@@ -1256,25 +1259,20 @@ export class ImBridge {
    * S17: Check whether an idempotent outbound operationKey already reached `sent`, `uncertain`,
    * or a recovered `pending` state from a crash after provider acceptance before result persistence.
    */
-  private recordedOutboundResponse(operationKey: string, replyToId?: string | null) {
+  private recordedOutboundResponse(operationKey: string, replyToId?: string | null, preserveInboundState = false) {
     const existing = this.store.findOutboundByOperationKey(operationKey);
     if (!existing) return undefined;
-    // S17: Fall back to the persisted outbound row's `replyTo` so retries after bridge restart
-    // (when in-memory `liveReplies` is empty) still settle the inbound message row!
     const inboundTargetId = replyToId ?? existing.replyTo;
     if (existing.state === "pending") {
-      // `runIdempotentSend` serializes live in-process calls via `inflightOperations`, so a
-      // persisted `pending` row here means an earlier process died mid-send before persisting the
-      // outcome. Treat it as `uncertain` instead of risking a duplicate send!
       this.store.setOutboundResult(existing.id, "uncertain", existing.platformMsgId);
       const promoted = this.store.message(existing.id) ?? { ...existing, state: "uncertain" as const };
-      if (inboundTargetId && this.store.message(inboundTargetId)) {
+      if (!preserveInboundState && inboundTargetId && this.store.message(inboundTargetId)) {
         this.store.moveInbound([inboundTargetId], "reply");
       }
       return { message: promoted, result: { kind: "uncertain" as const }, deduplicated: true };
     }
     if (existing.state === "sent" || existing.state === "uncertain") {
-      if (inboundTargetId && this.store.message(inboundTargetId)) {
+      if (!preserveInboundState && inboundTargetId && this.store.message(inboundTargetId)) {
         this.store.moveInbound([inboundTargetId], "reply");
       }
       const result: SendResult =
@@ -1362,9 +1360,10 @@ export class ImBridge {
     const text = reqStr(params, "text");
     const operationKey = optStr(params, "operationKey");
     const replyToId = optStr(params, "replyTo");
+    const preserveInboundState = params.preserveInboundState === true;
     return this.runIdempotentSend(operationKey, async () => {
       if (operationKey) {
-        const recorded = this.recordedOutboundResponse(operationKey, replyToId);
+        const recorded = this.recordedOutboundResponse(operationKey, replyToId, preserveInboundState);
         if (recorded) return recorded;
       }
       const chat = this.store.chat(chatId);
@@ -1405,7 +1404,7 @@ export class ImBridge {
         result.kind === "sent" ? "sent" : result.kind === "uncertain" ? "uncertain" : "failed",
         result.kind === "sent" ? result.platformId : null,
       );
-      if (result.kind === "sent" || result.kind === "uncertain") {
+      if (!preserveInboundState && (result.kind === "sent" || result.kind === "uncertain")) {
         if (replyTarget) this.store.moveInbound([replyTarget.id], "reply");
         else this.store.settleChatOnSend(chat.id);
       }

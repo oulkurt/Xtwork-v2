@@ -275,22 +275,67 @@ try {
   assert.equal(await modelPicker.count(), 0);
   assert.equal(await terminal.count(), 0);
   const initialChineseHome = await page.locator("body").innerText();
+  const initialHeaderText = await page.locator("[data-chat-header]").innerText();
+  assert.match(initialChineseHome, /领航者/);
   assert.match(initialChineseHome, /对话/);
   assert.match(initialChineseHome, /文件夹/);
-  assert.doesNotMatch(initialChineseHome, /T3 Code|会话|线程|Try asking|Example tasks/i);
+  assert.doesNotMatch(initialHeaderText, /无文件夹|Unknown Subject/i);
+  assert.doesNotMatch(initialChineseHome, /Unknown Subject|T3 Code|会话|线程|Try asking|Example tasks/i);
   await page.locator('[data-testid="leader-sidebar-slot"]').waitFor({ state: "visible" });
+  await page.locator('[data-testid="sidebar-navigators-heading"]').waitFor({ state: "visible" });
+  await page.locator('[data-testid="sidebar-threads-heading"]').waitFor({ state: "visible" });
   await page.locator('[data-testid="leader-slot-leader-default"]').waitFor({ state: "visible" });
+  const navRect = await page.locator('[data-testid="sidebar-navigators-heading"]').boundingBox();
+  const threadsRect = await page.locator('[data-testid="sidebar-threads-heading"]').boundingBox();
+  assert.ok(navRect && threadsRect && navRect.y < threadsRect.y, "Navigators section must sit above Threads section");
+  const centerY = (box) => box.y + box.height / 2;
+  const sidebarBrandBox = await page.locator("[data-app-sidebar] a").first().boundingBox();
+  const homeHeaderTitleBox = await page.locator("[data-chat-header] h2").first().boundingBox();
+  const homeRightToggleBox = await page.locator("[data-workspace-titlebar-controls] button").last().boundingBox();
+  assert.ok(sidebarBrandBox && homeHeaderTitleBox && homeRightToggleBox, "Expected topbar bounding boxes on home");
+  assert.ok(
+    Math.abs(centerY(sidebarBrandBox) - centerY(homeHeaderTitleBox)) <= 1.5,
+    `Sidebar brand (${centerY(sidebarBrandBox)}) and chat header (${centerY(homeHeaderTitleBox)}) must align`,
+  );
+  assert.ok(
+    Math.abs(centerY(sidebarBrandBox) - centerY(homeRightToggleBox)) <= 1.5,
+    `Sidebar brand (${centerY(sidebarBrandBox)}) and right controls (${centerY(homeRightToggleBox)}) must align`,
+  );
   await page.screenshot({ path: join(testOutput, "ordinary-home-zh.png") });
   await page.locator('[data-testid="leader-slot-leader-default"]').click();
+  await page.locator('[data-navigator-header="true"]').waitFor({ state: "visible" });
   await page.locator('[data-testid="leader-supervisory-bar"]').waitFor({ state: "visible" });
+  const headerBg = await page.locator("[data-chat-header]").evaluate((el) => getComputedStyle(el).backgroundColor);
+  assert.equal(headerBg, "rgba(0, 0, 0, 0)", "Chat header should stay transparent to blend with canvas");
+  const navIdBefore = await page.locator('[data-testid="leader-header-identity"]').boundingBox();
+  const navManageBefore = await page.getByRole("button", { name: "管理", exact: true }).boundingBox();
+  const navRightBefore = await page.locator("[data-workspace-titlebar-controls] button").last().boundingBox();
+  assert.ok(navIdBefore && navManageBefore && navRightBefore, "Expected Navigator topbar bounding boxes");
+  assert.ok(
+    Math.abs(centerY(sidebarBrandBox) - 26) <= 3 &&
+      Math.abs(centerY(sidebarBrandBox) - centerY(navIdBefore)) <= 1.5 &&
+      Math.abs(centerY(navIdBefore) - centerY(navManageBefore)) <= 1.5 &&
+      Math.abs(centerY(navManageBefore) - centerY(navRightBefore)) <= 1.5,
+    `Navigator topbar must align horizontally near y=26: brand=${centerY(sidebarBrandBox)}, id=${centerY(navIdBefore)}, manage=${centerY(navManageBefore)}, right=${centerY(navRightBefore)}`,
+  );
   await page.getByRole("button", { name: "管理", exact: true }).click();
   await page.locator('[data-testid="leader-config-panel"]').waitFor({ state: "visible" });
+  await page.locator('[data-testid="leader-im-policy-section"]').waitFor({ state: "visible" });
+  const navIdAfter = await page.locator('[data-testid="leader-header-identity"]').boundingBox();
+  const navManageAfter = await page.getByRole("button", { name: "管理", exact: true }).boundingBox();
+  assert.ok(
+    navIdAfter &&
+      navManageAfter &&
+      Math.abs(centerY(navIdAfter) - centerY(navIdBefore)) <= 0.5 &&
+      Math.abs(centerY(navManageAfter) - centerY(navManageBefore)) <= 0.5,
+    "Opening Navigator config drawer must not shift the topbar vertically",
+  );
   const leaderViewText = await page.locator("body").innerText();
-  assert.doesNotMatch(leaderViewText, /T3 Code|会话|线程/);
+  assert.doesNotMatch(leaderViewText, /无文件夹|Unknown Subject|T3 Code|会话|线程/);
   await page.screenshot({ path: join(testOutput, "leader-desktop-zh.png") });
   await go(draftPath);
   await page.locator("[data-chat-composer-form]").waitFor({ state: "visible" });
-  console.log("Passed first-run default Chinese UI, fixed Leader sidebar slot, and Leader supervisory bar.");
+  console.log("Passed first-run default Chinese UI, Navigator/Threads split sidebar, immersive header, and Slice 2 config drawer.");
 
   await go("/settings/general");
   await page.getByRole("switch", { name: "显示开发者功能" }).waitFor({ state: "visible" });
@@ -315,6 +360,9 @@ try {
   await page.locator("[data-chat-composer-form]").waitFor({ state: "visible" });
   assert.equal(await modelPicker.count(), 0);
   assert.equal(await terminal.count(), 0);
+  await page.locator('[data-testid="sidebar-navigators-heading"]').waitFor({ state: "visible" });
+  assert.equal((await page.locator('[data-testid="sidebar-navigators-heading"]').innerText()).trim(), "Navigators");
+  assert.equal((await page.locator('[data-testid="sidebar-threads-heading"]').innerText()).trim(), "Threads");
   assert.doesNotMatch(await page.locator("body").innerText(), /T3 Code|Try asking|Example tasks/i);
   await absent("Pull requests", "Issues");
   await checkPalette(false);
@@ -509,9 +557,12 @@ try {
   await page.locator("[data-chat-composer-form]").waitFor();
   await page.getByRole("dialog", { name: "设置", exact: true }).waitFor({ state: "hidden" });
   const chineseHome = await page.locator("body").innerText();
+  const chineseHeaderText = await page.locator("[data-chat-header]").innerText();
+  assert.match(chineseHome, /领航者/);
   assert.match(chineseHome, /对话/);
   assert.match(chineseHome, /文件夹/);
-  assert.doesNotMatch(chineseHome, /T3 Code|会话|线程/);
+  assert.doesNotMatch(chineseHeaderText, /无文件夹|Unknown Subject/i);
+  assert.doesNotMatch(chineseHome, /Unknown Subject|T3 Code|会话|线程/);
   console.log("Passed switching back to Chinese conversation, folder, and developer-switch labels.");
 
   console.log(

@@ -14,7 +14,9 @@ import { type BridgePayload, isRecord } from "./XtworkImBridgeHost.ts";
 import {
   DEFAULT_LEADER_ID,
   ImDispatchAuthority,
+  LEADER_ARCHIVED_ERROR,
   LEADER_PAUSED_ERROR,
+  containsLeaderArchivedError,
   containsLeaderPausedError,
   hashArgs,
   imError,
@@ -303,10 +305,13 @@ export const makeDispatcher = Effect.fnUntraced(function* (
       // dispatch that saved a delivery row without committing a run), snapshot the target Leader's
       // pause generation and enforce both status and generation BEFORE creating a new turn!
       const startLeader = yield* leaders.getLeader(activeLeaderId);
-      const expectedPauseGeneration = observedPauseGeneration ?? startLeader?.pauseGeneration ?? 0;
+      if (!startLeader || startLeader.status === "archived") {
+        return yield* imError(`${LEADER_ARCHIVED_ERROR}: Navigator is archived; new IM tasks are rejected.`);
+      }
+      const expectedPauseGeneration = observedPauseGeneration ?? startLeader.pauseGeneration;
       if (
-        startLeader?.status === "paused" ||
-        (startLeader !== undefined && startLeader.pauseGeneration !== expectedPauseGeneration)
+        startLeader.status === "paused" ||
+        startLeader.pauseGeneration !== expectedPauseGeneration
       ) {
         return yield* imError(`${LEADER_PAUSED_ERROR}: Leader is currently paused; new IM tasks are deferred.`);
       }
@@ -346,9 +351,12 @@ export const makeDispatcher = Effect.fnUntraced(function* (
       // (in addition to the atomic SQLite check inside `EventSink.commitCommand` -> `bindRunPolicySql`)
       // so a pause -> resume cycle cannot let an earlier in-flight dispatch bypass the paused backlog!
       const latestLeader = yield* leaders.getLeader(activeLeaderId);
+      if (!latestLeader || latestLeader.status === "archived") {
+        return yield* imError(`${LEADER_ARCHIVED_ERROR}: Navigator was archived during dispatch; IM task rejected.`);
+      }
       if (
-        latestLeader?.status === "paused" ||
-        (latestLeader !== undefined && latestLeader.pauseGeneration !== expectedPauseGeneration)
+        latestLeader.status === "paused" ||
+        latestLeader.pauseGeneration !== expectedPauseGeneration
       ) {
         return yield* imError(`${LEADER_PAUSED_ERROR}: Leader pause state changed during dispatch; IM task deferred.`);
       }
@@ -369,9 +377,11 @@ export const makeDispatcher = Effect.fnUntraced(function* (
           })).pipe(
         Effect.provideService(ImDispatchAuthority, true),
         Effect.mapError((cause) =>
-          containsLeaderPausedError(cause)
-            ? imError(`${LEADER_PAUSED_ERROR}: Leader is currently paused; new IM tasks are deferred.`)
-            : cause,
+          containsLeaderArchivedError(cause)
+            ? imError(`${LEADER_ARCHIVED_ERROR}: Navigator is archived; new IM tasks are rejected.`)
+            : containsLeaderPausedError(cause)
+              ? imError(`${LEADER_PAUSED_ERROR}: Leader is currently paused; new IM tasks are deferred.`)
+              : cause,
         ),
       );
       const created = result.storedEvents.find(({ event }) => event.type === "run.created")?.event;
