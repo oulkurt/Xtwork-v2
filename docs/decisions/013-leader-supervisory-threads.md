@@ -1,7 +1,7 @@
 # ADR-013 · Leader（Captain 式主管实体）、侧栏置顶入口与 Mingle 能力移植边界
 
 - **Date** 2026-11-25
-- **Status** Accepted（Slice 1 已于 [PR #25](https://github.com/oulkurt/Xtwork-v2/pull/25) 合入 `main`；Slice 2 与「领航者 / 对话」界面重构已完成实现与验证；Stage 3 按排期推进）
+- **Status** Accepted（Slice 1 已于 [PR #25](https://github.com/oulkurt/Xtwork-v2/pull/25) 合入 `main`；Slice 2 与「领航者 / 对话」界面重构已于 [PR #31](https://github.com/oulkurt/Xtwork-v2/pull/31) 合入 `main`，动态 Bot 头像与 IM 在线/离线指示已于 [PR #34](https://github.com/oulkurt/Xtwork-v2/pull/34) 合入 `main`；Stage 3 按排期推进）
 - **Evidence** Confirmed · 2026-11-25 项目负责人批准方向并指示在 GPT-6.2 Astra 与 Claude Opus 5.5 达成一致后直接推进；经 Gemini 4 Neon、GPT-6.2 Astra（两轮）与 Claude Opus 5.5 核对锁定源码（`t3code@3ce2145`、`im-bridge`、`034-im-bridge.patch`、`035-pi-im-security-hook.patch`）后全面达成一致（`CONSENSUS: AGREED`）
 
 ## Context

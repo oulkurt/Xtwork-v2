@@ -1,6 +1,6 @@
 # 小瞳 Work v2
 
-小瞳 Work 的下一版，面向日常任务。当前处于 Apple Silicon Mac 的 Alpha 预览（基线 `main@62e84cb`），已落地默认简体中文界面、普通模式内置浏览器、内置助手「小瞳」（随包 Pi `1.5.2` + 企业微信公司渠道 + 19 类供应商模型平面与硬化 OS 钥匙串）、6 大外部编码 Agent 普通模式一键安装与确定性 Coding Agent 委派路由、插件 v2 双轨与待办对话通路、独立 Node `im-bridge` 远程 IM 连接服务，以及 Leader 主管控制面 Slice 1。[查看当前进度](docs/README.md#当前进度)
+小瞳 Work 的下一版，面向日常任务。当前处于 Apple Silicon Mac 的 Alpha 预览（基线 `main@9d792e7`），已落地默认简体中文界面、普通模式内置浏览器、内置助手「小瞳」（随包 Pi `1.5.2` + 企业微信公司渠道 + 19 类供应商模型平面与硬化 OS 钥匙串）、6 大外部编码 Agent 普通模式一键安装与确定性 Coding Agent 委派路由、插件 v2 双轨与待办对话通路、独立 Node `im-bridge` 远程 IM 连接服务，以及领航者（Leader）控制面 Slice 1/2 与动态 Bot 头像。[查看当前进度](docs/README.md#当前进度)
 
 ## 已确认的方向
 
