@@ -500,7 +500,7 @@ it("lets users rebind an active IM connection between Navigators from RemoteImSe
         return json({
           leaders: [
             { leader: { id: "leader-default", name: "小瞳" } },
-            { leader: { id: "leader-eng", name: "研发领航者" } },
+            { leader: { id: "leader-eng", name: "研发领航员" } },
           ],
         });
       }
@@ -521,7 +521,7 @@ it("lets users rebind an active IM connection between Navigators from RemoteImSe
     router: "/settings/remote-connections",
   });
 
-  await expect.element(page.getByText("可自由分配至 2 位领航者")).toBeVisible();
+  await expect.element(page.getByText("可自由分配至 2 位领航员")).toBeVisible();
   const rebindSelect = page.getByTestId("connection-rebind-conn-feishu-1");
   await expect.element(rebindSelect).toBeVisible();
   await rebindSelect.selectOptions("leader-eng");

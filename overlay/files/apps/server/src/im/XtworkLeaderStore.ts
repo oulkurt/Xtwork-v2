@@ -490,7 +490,7 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
     readonly imPolicy?: unknown;
   }) {
     const id = validateLeaderId(input.id ?? `leader-${randomUUID().slice(0, 8)}`);
-    const name = input.name.trim() || "新领航者";
+    const name = input.name.trim() || "新领航员";
     const sanitizedAvatar = input.avatar !== undefined ? sanitizeLeaderAvatar(input.avatar) : "";
     const avatar = sanitizedAvatar || sanitizeLeaderAvatar(Array.from(name)[0] || "航");
     const role = input.role ?? "";
@@ -813,7 +813,7 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
 
   const archiveLeader = Effect.fnUntraced(function* (id: string, rebindToLeaderId?: string) {
     if (id === DEFAULT_LEADER_ID) {
-      return yield* imError("默认领航者不可归档。");
+      return yield* imError("默认领航员不可归档。");
     }
     const now = Date.now();
     return yield* sql.withTransaction(
@@ -834,16 +834,16 @@ export const makeLeaderStore = Effect.fnUntraced(function* () {
         const reboundBindings: LeaderBindingRecord[] = [];
         if (activeBindings.length > 0) {
           if (!rebindToLeaderId) {
-            const err = new Error("该领航者仍绑定着远程连接，请先换绑或指定接管领航者后再归档。");
+            const err = new Error("该领航员仍绑定着远程连接，请先换绑或指定接管领航员后再归档。");
             Reflect.set(err, "code", "LEADER_HAS_ACTIVE_BINDINGS");
             return yield* imError(err);
           }
           if (rebindToLeaderId === id) {
-            return yield* imError("接管领航者不能与待归档领航者相同。");
+            return yield* imError("接管领航员不能与待归档领航员相同。");
           }
           const target = yield* getLeader(rebindToLeaderId);
           if (!target || target.status === "archived") {
-            return yield* imError("目标接管领航者不存在或已归档。");
+            return yield* imError("目标接管领航员不存在或已归档。");
           }
           for (const binding of activeBindings) {
             yield* sql`UPDATE xtwork_leader_bindings SET active = 0, unbound_at = ${now}, disconnected_at = NULL

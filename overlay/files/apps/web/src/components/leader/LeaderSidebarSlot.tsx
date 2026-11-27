@@ -269,7 +269,7 @@ export function LeaderSidebarSlot({ onOpenThread, onPinnedThreadIdsChange }: Lea
               ? cause.message
               : isEn
                 ? "Failed to load Navigators."
-                : "加载领航者列表失败。",
+                : "加载领航员列表失败。",
           );
         }
       } finally {
@@ -409,7 +409,7 @@ export function LeaderSidebarSlot({ onOpenThread, onPinnedThreadIdsChange }: Lea
           ? cause.message
           : isEn
             ? "Failed to open Navigator thread."
-            : "打开领航者对话失败。",
+            : "打开领航员对话失败。",
       );
     } finally {
       setOpeningId(null);
@@ -439,7 +439,7 @@ export function LeaderSidebarSlot({ onOpenThread, onPinnedThreadIdsChange }: Lea
             ? cause.message
             : isEn
               ? "Failed to create Navigator."
-              : "创建领航者失败。",
+              : "创建领航员失败。",
         );
         setSubmitting(false);
       }
@@ -468,7 +468,7 @@ export function LeaderSidebarSlot({ onOpenThread, onPinnedThreadIdsChange }: Lea
       setLoadError(
         isEn
           ? `Navigator created, but refreshing the list failed: ${refreshCause instanceof Error ? refreshCause.message : "unknown error"}`
-          : `领航者已创建，但刷新列表失败：${refreshCause instanceof Error ? refreshCause.message : "未知错误"}`,
+          : `领航员已创建，但刷新列表失败：${refreshCause instanceof Error ? refreshCause.message : "未知错误"}`,
       );
     } finally {
       if (createSubmitEpochRef.current === submitEpoch) {
@@ -485,14 +485,14 @@ export function LeaderSidebarSlot({ onOpenThread, onPinnedThreadIdsChange }: Lea
     <div
       data-testid="leader-sidebar-slot"
       className="mb-2.5 flex flex-col gap-1.5 border-b border-sidebar-border/45 pb-3"
-      aria-label={isEn ? "Navigators" : "领航者"}
+      aria-label={isEn ? "Navigators" : "领航员"}
     >
       <div className="relative flex items-center justify-between gap-1 px-1" ref={menuContainerRef}>
         <span
           data-testid="sidebar-navigators-heading"
           className="text-[13px] font-semibold tracking-tight text-sidebar-foreground/90"
         >
-          {isEn ? "Navigators" : "领航者"}
+          {isEn ? "Navigators" : "领航员"}
         </span>
         <div className="flex shrink-0 items-center gap-0.5">
           <button
@@ -502,10 +502,10 @@ export function LeaderSidebarSlot({ onOpenThread, onPinnedThreadIdsChange }: Lea
               creating
                 ? isEn
                   ? "Close new Navigator form"
-                  : "关闭新建领航者"
+                  : "关闭新建领航员"
                 : isEn
                   ? "New Navigator"
-                  : "新建领航者"
+                  : "新建领航员"
             }
             aria-expanded={creating}
             aria-controls="leader-create-form"
@@ -513,10 +513,10 @@ export function LeaderSidebarSlot({ onOpenThread, onPinnedThreadIdsChange }: Lea
               creating
                 ? isEn
                   ? "Close new Navigator form"
-                  : "关闭新建领航者"
+                  : "关闭新建领航员"
                 : isEn
                   ? "New Navigator"
-                  : "新建领航者"
+                  : "新建领航员"
             }
             onClick={() => {
               setMenuOpen(false);
@@ -534,10 +534,10 @@ export function LeaderSidebarSlot({ onOpenThread, onPinnedThreadIdsChange }: Lea
             ref={moreTriggerRef}
             type="button"
             data-testid="leader-more-trigger"
-            aria-label={isEn ? "Navigator options" : "领航者选项"}
+            aria-label={isEn ? "Navigator options" : "领航员选项"}
             aria-expanded={menuOpen}
             aria-controls="leader-more-menu"
-            title={isEn ? "Navigator options" : "领航者选项"}
+            title={isEn ? "Navigator options" : "领航员选项"}
             onClick={() => setMenuOpen((prev) => !prev)}
             className="inline-flex size-7 items-center justify-center rounded-md text-sidebar-muted-foreground transition-colors hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
@@ -565,7 +565,7 @@ export function LeaderSidebarSlot({ onOpenThread, onPinnedThreadIdsChange }: Lea
               className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-accent focus-visible:bg-accent focus-visible:outline-none"
             >
               <PlusIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
-              {isEn ? "New Navigator" : "新建领航者"}
+              {isEn ? "New Navigator" : "新建领航员"}
             </button>
             <button
               ref={(el) => {
@@ -641,8 +641,8 @@ export function LeaderSidebarSlot({ onOpenThread, onPinnedThreadIdsChange }: Lea
               data-testid="leader-create-name"
               value={newName}
               onChange={(event) => setNewName(event.target.value)}
-              placeholder={isEn ? "Navigator name" : "领航者名字"}
-              aria-label={isEn ? "Navigator name" : "领航者名字"}
+              placeholder={isEn ? "Navigator name" : "领航员名字"}
+              aria-label={isEn ? "Navigator name" : "领航员名字"}
               autoFocus
               required
               className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"

@@ -276,7 +276,7 @@ try {
   assert.equal(await terminal.count(), 0);
   const initialChineseHome = await page.locator("body").innerText();
   const initialHeaderText = await page.locator("[data-chat-header]").innerText();
-  assert.match(initialChineseHome, /领航者/);
+  assert.match(initialChineseHome, /领航员/);
   assert.match(initialChineseHome, /对话/);
   assert.match(initialChineseHome, /文件夹/);
   assert.doesNotMatch(initialHeaderText, /无文件夹|Unknown Subject/i);
@@ -617,7 +617,7 @@ try {
   await page.getByRole("dialog", { name: "设置", exact: true }).waitFor({ state: "hidden" });
   const chineseHome = await page.locator("body").innerText();
   const chineseHeaderText = await page.locator("[data-chat-header]").innerText();
-  assert.match(chineseHome, /领航者/);
+  assert.match(chineseHome, /领航员/);
   assert.match(chineseHome, /对话/);
   assert.match(chineseHome, /文件夹/);
   assert.doesNotMatch(chineseHeaderText, /无文件夹|Unknown Subject/i);

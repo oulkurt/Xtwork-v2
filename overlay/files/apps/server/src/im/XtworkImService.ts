@@ -1253,7 +1253,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
   }
 
   if (isLeaderPath) {
-    if (!service.leaders) return failure("领航者服务暂不可用。", 503);
+    if (!service.leaders) return failure("领航员服务暂不可用。", 503);
     const segments = rawPath.split("/").filter(Boolean);
     const body = writing
       ? yield* request.json.pipe(
@@ -1298,7 +1298,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
 
     if (writing && segments.length === 1) {
       const name = typeof params.name === "string" ? params.name : "";
-      if (!name.trim()) return failure("请填写领航者名字。", 400);
+      if (!name.trim()) return failure("请填写领航员名字。", 400);
       const roleText = typeof params.role === "string" ? params.role : undefined;
       if (roleText !== undefined && Buffer.byteLength(roleText, "utf8") > MAX_COMPANION_FILE_BYTES) {
         return failure("角色说明不能超过 64 KiB。", 400);
@@ -1403,7 +1403,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
 
     if (writing && subAction === "archive") {
       if (leaderId === DEFAULT_LEADER_ID) {
-        return failure("默认领航者不可归档。", 400);
+        return failure("默认领航员不可归档。", 400);
       }
       const rebindToLeaderId =
         typeof params.rebindToLeaderId === "string" && params.rebindToLeaderId.trim().length > 0
@@ -1416,7 +1416,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
           const leadersStore = service.leaders!;
           const existingTarget = yield* leadersStore.getLeader(leaderId);
           if (!existingTarget || existingTarget.status === "archived") {
-            return failure("找不到对应的领航者。", 404);
+            return failure("找不到对应的领航员。", 404);
           }
           if (!service.host?.available) {
             return failure("远程连接服务离线，无法确认暂停积压队列是否已清空，暂不可归档。", 503);
@@ -1437,7 +1437,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
               return {
                 ok: false as const,
                 status: 409,
-                message: "该领航者仍有暂停积压或待审批入站消息，请先在 Needs You / 访问审批中处理后再归档。",
+                message: "该领航员仍有暂停积压或待审批入站消息，请先在 Needs You / 访问审批中处理后再归档。",
               };
             }
             return { ok: true as const };
@@ -1470,14 +1470,14 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
           const activeBindings = allActiveBindings.filter((binding) => liveBridgeConnIds.has(binding.connectionId));
           if (activeBindings.length > 0) {
             if (!rebindToLeaderId) {
-              return failure("该领航者仍绑定着远程连接，请先换绑或指定接管领航者后再归档。", 409);
+              return failure("该领航员仍绑定着远程连接，请先换绑或指定接管领航员后再归档。", 409);
             }
             if (rebindToLeaderId === leaderId) {
-              return failure("目标领航者不能与待归档领航者相同。", 400);
+              return failure("目标领航员不能与待归档领航员相同。", 400);
             }
             const targetLeader = yield* leadersStore.getLeader(rebindToLeaderId);
             if (!targetLeader || targetLeader.status === "archived") {
-              return failure("目标领航者不存在或已归档。", 400);
+              return failure("目标领航员不存在或已归档。", 400);
             }
           }
 
@@ -1494,7 +1494,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
               connClaimed,
             );
             if (!nextBinding) {
-              return failure("目标领航者不存在或已归档。", 400);
+              return failure("目标领航员不存在或已归档。", 400);
             }
             recordBindingEpoch(service, nextBinding.connectionId, nextBinding.epoch);
             reboundBindings.push(nextBinding);
@@ -1517,11 +1517,11 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
             if (!currentBinding) continue;
             recordBindingEpoch(service, currentBinding.connectionId, currentBinding.epoch);
             if (currentBinding.leaderId === existingTarget.id) {
-              return failure("该领航者仍绑定着远程连接，请先换绑或指定接管领航者后再归档。", 409);
+              return failure("该领航员仍绑定着远程连接，请先换绑或指定接管领航员后再归档。", 409);
             }
             const ownerLeader = yield* leadersStore.getLeader(currentBinding.leaderId);
             if (!ownerLeader) {
-              return failure("目标领航者不存在或已归档。", 503);
+              return failure("目标领航员不存在或已归档。", 503);
             }
             const { synced } = yield* trySyncLeaderBindingsToBridge(service, ownerLeader, [currentBinding]);
             if (!synced) {
@@ -1542,7 +1542,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
               (c) => isRecord(c) && c.leaderId === existingTarget.id,
             )
           ) {
-            return failure("远程桥接仍有连接指向待归档领航者，请稍后重试归档。", 503);
+            return failure("远程桥接仍有连接指向待归档领航员，请稍后重试归档。", 503);
           }
 
           const postQueueCheck = yield* checkEmptyPausedQueue;
@@ -1558,7 +1558,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
             return failure(archived.failure.message, status);
           }
           if (!archived.success) {
-            return failure("找不到对应的领航者。", 404);
+            return failure("找不到对应的领航员。", 404);
           }
           return response({ leader: archived.success.leader, reboundBindings, syncPending: false });
         }),
@@ -1567,7 +1567,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
 
     if (writing && subAction === "update") {
       if (params.name !== undefined && (typeof params.name !== "string" || params.name.trim().length === 0)) {
-        return failure("领航者名字不能为空。", 400);
+        return failure("领航员名字不能为空。", 400);
       }
       const roleText = typeof params.role === "string" ? params.role : undefined;
       if (roleText !== undefined && Buffer.byteLength(roleText, "utf8") > MAX_COMPANION_FILE_BYTES) {
@@ -1579,7 +1579,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
         Effect.gen(function* () {
           const leadersStore = service.leaders!;
           const existing = yield* leadersStore.getLeader(leaderId);
-          if (!existing || existing.status === "archived") return failure("找不到对应的领航者。", 404);
+          if (!existing || existing.status === "archived") return failure("找不到对应的领航员。", 404);
           const awarenessScope = isRecord(params.awarenessScope)
             ? ({
                 kind:
@@ -1627,7 +1627,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
             ...(awarenessScope ? { awarenessScope } : {}),
             ...(imPolicy ? { imPolicy } : {}),
           });
-          if (!updated) return failure("找不到对应的领航者。", 404);
+          if (!updated) return failure("找不到对应的领航员。", 404);
           if (
             typeof params.name === "string" &&
             params.name.trim().length > 0 &&
@@ -1657,7 +1657,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
         Effect.gen(function* () {
           const leadersStore = service.leaders!;
           const updated = yield* leadersStore.updateLeader(leaderId, { status: nextPaused ? "paused" : "active" });
-          if (!updated) return failure("找不到对应的领航者。", 404);
+          if (!updated) return failure("找不到对应的领航员。", 404);
           const bindings = yield* leadersStore.listBindings(updated.id);
           for (const binding of bindings) {
             yield* markPendingBindingSyncIfCurrent(service, binding, updated.pauseVersion);
@@ -1682,7 +1682,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
     if (writing && subAction === "paused-decide") {
       if (!service.host?.available) return failure("远程连接服务暂不可用。", 503);
       const leader = yield* service.leaders.getLeader(leaderId);
-      if (!leader) return failure("找不到对应的领航者。", 404);
+      if (!leader) return failure("找不到对应的领航员。", 404);
       const allowedList = yield* call(service.host, "paused.list", { leaderId: leader.id }).pipe(
         Effect.map((val) => (isRecord(val) && Array.isArray(val.items) ? val.items : [])),
         Effect.orElseSucceed(() => []),
@@ -1697,7 +1697,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
         : [];
       const scopedIds = requestedIds.filter((id) => allowedIds.has(id));
       if (requestedIds.length > 0 && scopedIds.length === 0) {
-        return failure("所选积压消息不属于该领航者。", 403);
+        return failure("所选积压消息不属于该领航员。", 403);
       }
       if (params.decision === "replay" && leader.status === "paused") {
         return response({
@@ -1723,7 +1723,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
     if (writing && subAction === "handoff") {
       if (!service.memory) return failure("伴侣记忆服务暂不可用。", 503);
       const existing = yield* service.leaders.getLeader(leaderId);
-      if (!existing || existing.status === "archived") return failure("找不到对应的领航者。", 404);
+      if (!existing || existing.status === "archived") return failure("找不到对应的领航员。", 404);
       const summary = typeof params.summary === "string" ? params.summary.trim() : "";
       if (!summary) return failure("请提供交接摘要内容。", 400);
       const targetScope = yield* Effect.try({
@@ -1747,7 +1747,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
       );
     }
 
-    return failure("找不到对应的领航者操作。", 404);
+    return failure("找不到对应的领航员操作。", 404);
   }
 
   if (!writing && action === "status" && !service.host?.available) {
@@ -1825,7 +1825,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
         if (service.leaders) {
           const existingLeader = yield* service.leaders.getLeader(leaderId);
           if (!existingLeader || existingLeader.status === "archived") {
-            return failure("找不到对应的领航者。", 404);
+            return failure("找不到对应的领航员。", 404);
           }
         }
         const roleResult = yield* tryWork(async () => {
@@ -1841,7 +1841,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
             return failure(updated.failure.message, 500);
           }
           if (!updated.success) {
-            return failure("找不到对应的领航者。", 404);
+            return failure("找不到对应的领航员。", 404);
           }
         }
         return response(roleResult.success);
@@ -1849,11 +1849,11 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
     );
   }
   if (writing && action === "connections.rebind") {
-    if (!service.leaders) return failure("领航者服务暂不可用。", 503);
+    if (!service.leaders) return failure("领航员服务暂不可用。", 503);
     const connectionId = typeof params.connectionId === "string" ? params.connectionId.trim() : "";
     const targetLeaderId = typeof params.leaderId === "string" ? params.leaderId.trim() : "";
     if (!connectionId || connectionId.includes(":") || !targetLeaderId) {
-      return failure("请提供有效的连接标识与目标领航者。", 400);
+      return failure("请提供有效的连接标识与目标领航员。", 400);
     }
     return yield* withLeaderLock(
       service,
@@ -1862,7 +1862,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
         const leadersStore = service.leaders!;
         const targetLeader = yield* leadersStore.getLeader(targetLeaderId);
         if (!targetLeader || targetLeader.status === "archived") {
-          return failure("目标领航者不存在或已归档。", 404);
+          return failure("目标领航员不存在或已归档。", 404);
         }
         let matchedPlatform: string | undefined;
         let matchedClaimed: boolean | undefined;
@@ -1896,7 +1896,7 @@ const serve = Effect.fnUntraced(function* (service: ImService) {
           !bridgeVerified,
         );
         if (!binding) {
-          return failure(bridgeVerified ? "目标领航者不存在或已归档。" : "找不到对应的远程连接。", 404);
+          return failure(bridgeVerified ? "目标领航员不存在或已归档。" : "找不到对应的远程连接。", 404);
         }
         recordBindingEpoch(service, binding.connectionId, binding.epoch);
         const freshLeader = (yield* leadersStore.getLeader(targetLeader.id)) ?? targetLeader;
