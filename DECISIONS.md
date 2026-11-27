@@ -4,7 +4,7 @@
 
 ## 证据范围
 
-2026-11-19 初始化，2026-11-27 对账至 `main` 基线 `9d792e7`（覆盖已合入的 PR #1–#31、#34 与 ADR-001–ADR-013）。文档严格区分三层状态：**已合入 `main` 实建（As-Built）**、**已批准待落地/在途（Accepted / In-Flight）**与**已替代历史（Superseded）**；如代码与旧文档存在冲突，以 `main` 源码及已批准的最新 ADR 为准。历史初始化证据保留自 `f652f9c`、`488b882`、`6b0e780` 与 [PR #1](https://github.com/oulkurt/Xtwork-v2/pull/1)。 [规划首页](README.md) · [文档首页与权威层级](docs/README.md) · [上游同步讨论](t3-thread://v2/1a5417d8-ad4a-4937-a679-e9a08eb9fbca/7686181e-5c5e-488b-8440-4d5583408106)
+2026-11-19 初始化，2026-11-27 对账至 `main` 基线 `9d792e7`（覆盖已合入的 PR #1–#31、#34 与 ADR-001–ADR-013），同日纳入领航员控制面 v2 规划待办 [ADR-014](docs/decisions/014-navigator-control-plane-v2.md) 与跨设备互联规划决策 [ADR-015](docs/decisions/015-cross-device-interconnect-and-e2e-relay.md)（独立演进线 M6，暂不排期开工）。文档严格区分三层状态：**已合入 `main` 实建（As-Built）**、**已批准待落地/在途（Accepted / In-Flight）**与**已替代历史（Superseded）**；如代码与旧文档存在冲突，以 `main` 源码及已批准的最新 ADR 为准。历史初始化证据保留自 `f652f9c`、`488b882`、`6b0e780` 与 [PR #1](https://github.com/oulkurt/Xtwork-v2/pull/1)。 [规划首页](README.md) · [文档首页与权威层级](docs/README.md) · [上游同步讨论](t3-thread://v2/1a5417d8-ad4a-4937-a679-e9a08eb9fbca/7686181e-5c5e-488b-8440-4d5583408106)
 
 | 证据标签 | 含义 |
 | --- | --- |
@@ -26,6 +26,7 @@
 | [ADR-011](docs/decisions/011-mingle-im-bridge.md) | 复用 Mingle（MIT）渠道层与状态机，在 T3 侧以独立 Node `im-bridge` 提供内置 IM 远程连接服务，首发飞书/微信/企微，第一版开放私聊与群聊 `@`，对齐 Mingle 伴侣范式并以危险工具 Owner 批准和提示词注入四层防御守住安全边界。 | Confirmed |
 | [ADR-012](docs/decisions/012-xiaotong-model-channels-and-coding-agents.md) | M1 桌面版采用「模型平面 + 运行时平面 + 委派路由」双平面架构：内置助手定名「小瞳」并经 Proxy-Only 保协议网关与单一硬化 OS SecretStore 接入企业微信公司渠道 + 19 类成员供应商；普通模式保留 6 大外部编码 Agent（Claude Code / Codex / Kimi Code / Qoder / Codebuddy Code / DeepSeek Harness）与服务端统一授权一键安装，并经 T3 `delegate_task` 提供 Coding Agent 委派（IM/群聊首版硬拒绝）。 | Confirmed |
 | [ADR-013](docs/decisions/013-leader-supervisory-threads.md) | 以 T3 托管的一等「领航员」（`Navigator`，底层表沿用 `xtwork_leaders`）统一绑定所有远程 IM 连接，在桌面侧栏形成上方「领航员」与下方「对话」清晰分栏、透明沉浸式单一控制顶栏与受众过滤的 Needs You 主动感知；执行策略在 Pi 启动前按 run 持久化并 fail-closed，支持多领航员创建/归档、IM 渠道原子换绑与按受众分级的 IM 委派/进展汇报审批策略（群聊硬执行权限收窄），目录演进为 `companion/leaders/<leaderId>/`，群分享收紧为内容快照审批，首发拒绝任意环境变量注入。 | Confirmed |
+| [ADR-015](docs/decisions/015-cross-device-interconnect-and-e2e-relay.md) | 跨设备互联与多机流转（独立演进线 M6，暂不排期开工，不阻塞 M1–M5 首发）采用「T3 权威环境 + 直连/Tailscale/SSH 优先 + 渐进式零账号盲转 E2E 中继（`xtwork-relay/v1`）兜底 + 可插拔身份控制面」三层解耦架构：面向外部用户默认零账号二维码配对并支持自托管，不绑定企业微信或 Clerk；盲转 E2EE 为公网中继目标态，M6.1 直连无需自研 E2EE，M6.2 中继允许先以可选 `M6.2a`（TLS + Host 质询注册 + T3 鉴权最小中继）快速跑通再平滑升级至 `M6.2b` 完整盲转 E2EE；按 M6.0–M6.4 门禁顺序推进跨机线程控制、远端 iOS 模拟器交互、桌面 `local_only` 跨机委派与 mygo 两阶段远程更新。 | Confirmed |
 
 ## 技术基线与契约（As-Built · `main@9d792e7`）
 
@@ -56,6 +57,7 @@
 | Q-12 | 首发平台、架构与正式制品范围。 | Unknown · macOS arm64 有预览证据 | [ADR-001](docs/decisions/001-desktop-architecture.md) |
 | Q-13 | Leader Stage 2/3 排期细节：多 Leader 复杂换绑 UI、外部会话扫描交接 UI 与非 Pi 远程运行时逐个验收时点（核心实体模型、安全契约与暂停/快照分享边界已在 ADR-013 确认）。 | Confirmed · 核心边界已定，后续交互排期待验证 | [ADR-013](docs/decisions/013-leader-supervisory-threads.md) · [ADR-011](docs/decisions/011-mingle-im-bridge.md) |
 | Q-14 | 领航员控制面 v2 后续规划待办（暂不排期开工）：Slice A（默认 `none` 隔离 / 拆分看状态与派单权 / `triggerOrigin` / 侧栏去 `N+1` / 封堵 `scratch` 跨线程直读）、Slice B（桌面单次确认建同级领航员 / 2 槽无死锁 Crew 项目工单 / 独立 Drive 工作笔记 / 1 次防抖消化回合）与 Slice C（正交 Squad 小队路由层）；开工前复核并发上限 `2` 与单工单自动委派 `1` 次等默认参数。 | Confirmed 方向 · Proposed 待办，暂未排期实现 | [ADR-014](docs/decisions/014-navigator-control-plane-v2.md) · [ADR-013](docs/decisions/013-leader-supervisory-threads.md) · [ADR-012](docs/decisions/012-xiaotong-model-channels-and-coding-agents.md) |
+| Q-15 | M6 跨设备互联落地细节（暂不排期开工）：官方是否提供默认大陆可达中继托管节点（含带宽/模拟器流配额）、M6.2 公网中继先走可选 `M6.2a`（TLS + Host 质询 + T3 鉴权最小中继）还是直达 `M6.2b` 完整盲转 E2EE，以及是否将 Linux（含 Omarchy）控制端或无头服务端纳入 M6.3 验收目标（核心三层架构、盲转 E2EE 目标态与 M6.0–M6.4 推进顺序已在 ADR-015 确认）。 | Unknown · 架构、渐进 E2EE 策略与分阶段顺序已定，运营配额、M6.2a/b 切入点与 Linux 范围待定 | [ADR-015](docs/decisions/015-cross-device-interconnect-and-e2e-relay.md) · [ADR-001](docs/decisions/001-desktop-architecture.md) |
 | PD-01 | 冻结 v2 插件契约、授权与存储兼容边界。 | Unknown · 公开契约尚未冻结，有预览实现 | [ADR-007](docs/decisions/007-plugin-contract.md) |
 | PD-02 | 验收正式模型网关的实跑表现（方向已在 ADR-012 确认：Proxy-Only 多协议网关 + 企业微信 OIDC + 19 类供应商；M1b Gate 1/2 代码与离线/集成测试已于 [PR #24](https://github.com/oulkurt/Xtwork-v2/pull/24)、[PR #28](https://github.com/oulkurt/Xtwork-v2/pull/28) 合入 `main`，待真实线上账号实跑验收）。 | Confirmed 方向 · 代码已合入，待真实账号实跑验收 | [ADR-008](docs/decisions/008-model-gateway.md) · [ADR-012](docs/decisions/012-xiaotong-model-channels-and-coding-agents.md) |
 | PD-03 | 免项目对话的默认位置与并发隔离规则。 | Unknown · 共享 scratch 是规划候选 | [ADR-004](docs/decisions/004-general-task-experience.md) |
