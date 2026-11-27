@@ -223,7 +223,7 @@ export const LEADER_ROLE_TEMPLATES: readonly {
     id: "assistant",
     label: "私人助理",
     labelEn: "Personal Assistant",
-    prompt: "你是我的日常工作领航者。帮我跟进各项任务进展、整理待办与笔记，并在需要我决策时简明直接地提醒我。",
+    prompt: "你是我的日常工作领航员。帮我跟进各项任务进展、整理待办与笔记，并在需要我决策时简明直接地提醒我。",
     promptEn: "You are my daily work Navigator. Track task progress, organize todos and notes, and flag decisions concisely when my input is needed.",
   },
   {
@@ -280,7 +280,7 @@ export async function leaderRequest<T>(
   });
   const value = await res.json();
   if (!res.ok) {
-    throw new Error(typeof value?.error === "string" ? value.error : "领航者服务暂不可用。");
+    throw new Error(typeof value?.error === "string" ? value.error : "领航员服务暂不可用。");
   }
   return value as T;
 }

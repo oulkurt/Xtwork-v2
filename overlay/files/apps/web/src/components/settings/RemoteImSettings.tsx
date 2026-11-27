@@ -872,8 +872,8 @@ export function RemoteImSettings() {
             <h2 className="text-base font-semibold text-foreground">远程连接</h2>
             <span className="rounded-full border border-border/70 bg-muted/50 px-2 py-0.5 text-[11px] text-muted-foreground">
               {navigators.length > 1
-                ? `可自由分配至 ${navigators.length} 位领航者`
-                : `绑定至默认领航者（${navigators[0]?.name ?? "小瞳"}）`}
+                ? `可自由分配至 ${navigators.length} 位领航员`
+                : `绑定至默认领航员（${navigators[0]?.name ?? "小瞳"}）`}
             </span>
           </div>
           <p className="text-xs text-muted-foreground" role="status">
@@ -935,7 +935,7 @@ export function RemoteImSettings() {
               available === false
                 ? undefined
                 : connection.leaderPaused === true
-                  ? "领航者已暂停接单"
+                  ? "领航员已暂停接单"
                   : connection.syncPending === true
                     ? "换绑同步中"
                     : undefined;
@@ -958,13 +958,13 @@ export function RemoteImSettings() {
                   <div className="flex flex-wrap items-center gap-2">
                     {navigators.length > 0 ? (
                       <label className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-                        <span>{isEnNav ? "Navigator" : "领航者"}</span>
+                        <span>{isEnNav ? "Navigator" : "领航员"}</span>
                         <select
                           data-testid={`connection-rebind-${id}`}
                           aria-label={
                             isEnNav
                               ? `Assign Navigator for ${connection.name ?? REMOTE_IM_CHANNELS[connection.platform]?.name ?? connection.platform}`
-                              : `选择 ${connection.name ?? REMOTE_IM_CHANNELS[connection.platform]?.name ?? "远程连接"} 所属领航者`
+                              : `选择 ${connection.name ?? REMOTE_IM_CHANNELS[connection.platform]?.name ?? "远程连接"} 所属领航员`
                           }
                           value={connection.desiredLeaderId ?? connection.leaderId ?? "leader-default"}
                           disabled={busy}

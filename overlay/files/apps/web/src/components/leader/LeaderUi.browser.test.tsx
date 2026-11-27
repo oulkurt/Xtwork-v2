@@ -102,7 +102,7 @@ const sampleLeaderItem: LeaderListItem = {
     id: "leader-default",
     name: "小瞳",
     avatar: "瞳",
-    role: "你的个人与团队领航者",
+    role: "你的个人与团队领航员",
     status: "active",
     pinnedThreadId: "xtwork-leader-leader-default-abc123",
     awarenessScope: { kind: "all_local", projectIds: [] },
@@ -122,7 +122,7 @@ const sampleLeaderItem: LeaderListItem = {
 const secondLeaderItem: LeaderListItem = {
   leader: {
     id: "leader-eng",
-    name: "研发领航者",
+    name: "研发领航员",
     avatar: "研",
     role: "技术搭档",
     status: "active",
@@ -240,7 +240,7 @@ it("renders the Navigator sidebar section with heading, quick-create form, and o
   );
 
   await expect.element(page.getByTestId("leader-sidebar-slot")).toBeVisible();
-  await expect.element(page.getByTestId("sidebar-navigators-heading")).toHaveTextContent("领航者");
+  await expect.element(page.getByTestId("sidebar-navigators-heading")).toHaveTextContent("领航员");
   await expect.element(page.getByTestId("leader-slot-leader-default")).toBeVisible();
   await expect.element(page.getByTestId("leader-needs-you-badge-leader-default")).toHaveTextContent("2");
 
@@ -256,12 +256,12 @@ it("renders the Navigator sidebar section with heading, quick-create form, and o
   const rolledShape = page.getByTestId("leader-create-avatar-preview").element().getAttribute("data-avatar-shape");
   expect(rolledShape).toBeTruthy();
   expect(rolledShape).not.toBe(initialShape);
-  await page.getByTestId("leader-create-name").fill("研发领航者");
+  await page.getByTestId("leader-create-name").fill("研发领航员");
   await page.getByRole("button", { name: "创建", exact: true }).click();
 
   await vi.waitFor(() => {
     expect(createdPayloads).toHaveLength(1);
-    expect(createdPayloads[0]).toMatchObject({ name: "研发领航者" });
+    expect(createdPayloads[0]).toMatchObject({ name: "研发领航员" });
     expect(String(createdPayloads[0]?.avatar ?? "")).toMatch(/^bot:v1:[a-z0-9-]+:#[0-9a-f]{6}$/);
     expect(opened).toContainEqual({ envId: "local", threadId: "xtwork-leader-leader-eng-xyz789" });
   });
@@ -365,7 +365,7 @@ it("renders unified Navigator supervisory bar with Needs You, IM policy controls
   await page.getByRole("button", { name: "重投", exact: true }).click();
   await expect
     .element(page.getByRole("status"))
-    .toHaveTextContent("当前连接或领航者处于暂停/未激活状态，消息仍保留在暂停积压队列中。");
+    .toHaveTextContent("当前连接或领航员处于暂停/未激活状态，消息仍保留在暂停积压队列中。");
 
   await page.getByRole("button", { name: "重投", exact: true }).click();
   await expect.element(page.getByRole("status")).toHaveTextContent("已按原幂等键重新投递。");
@@ -698,7 +698,7 @@ it("preserves archive syncPending notice and renders pending badge on target Nav
   );
   await expect
     .element(page.getByRole("status"))
-    .toHaveTextContent("已归档领航者并保存换绑至默认领航者，远程桥接同步待重试确认。");
+    .toHaveTextContent("已归档领航员并保存换绑至默认领航员，远程桥接同步待重试确认。");
   await page.getByRole("button", { name: "管理", exact: true }).click();
   await expect.element(page.getByTestId("leader-conn-sync-pending-conn-wecom")).toHaveTextContent("同步中…");
 });
@@ -1342,7 +1342,7 @@ it("closes quick-create after POST succeeds even when list refresh returns 503 a
   expect((page.getByTestId("leader-create-name").element() as HTMLInputElement).value).toBe("");
   expect(page.getByTestId("leader-create-template-group").element().getAttribute("aria-pressed")).toBe("false");
 
-  await page.getByTestId("leader-create-name").fill("正式领航者");
+  await page.getByTestId("leader-create-name").fill("正式领航员");
   await page.getByRole("button", { name: "创建", exact: true }).click();
 
   await vi.waitFor(() => {

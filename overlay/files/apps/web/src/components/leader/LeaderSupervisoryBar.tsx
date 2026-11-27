@@ -341,7 +341,7 @@ export function LeaderSupervisoryBar({
               ? cause.message
               : isEn
                 ? "Failed to load Navigator controls."
-                : "加载领航者控制栏失败。",
+                : "加载领航员控制栏失败。",
           );
         }
       } finally {
@@ -633,7 +633,7 @@ export function LeaderSupervisoryBar({
     event.preventDefault();
     const trimmedName = draftName.trim();
     if (!trimmedName) {
-      setError(isEn ? "Navigator name cannot be empty." : "领航者名字不能为空。");
+      setError(isEn ? "Navigator name cannot be empty." : "领航员名字不能为空。");
       return;
     }
     const base: ConfigSnapshot = openedSnapshotRef.current ?? {
@@ -694,7 +694,7 @@ export function LeaderSupervisoryBar({
     await runAction(async () => {
       await leaderRequest(`leaders/${leader.id}/update`, patch);
       closeConfigPanel();
-    }, isEn ? "Navigator settings saved." : "领航者设置已保存。");
+    }, isEn ? "Navigator settings saved." : "领航员设置已保存。");
   }
 
   async function handleRebindConnection(connectionId: string, nextLeaderId: string) {
@@ -712,7 +712,7 @@ export function LeaderSupervisoryBar({
       }
       return isEn
         ? `Connection rebound to ${target}. New messages route there while history stays preserved.`
-        : `连接已换绑至「${target}」，新消息将由该领航者承接，历史归属保持不变。`;
+        : `连接已换绑至「${target}」，新消息将由该领航员承接，历史归属保持不变。`;
     });
   }
 
@@ -733,7 +733,7 @@ export function LeaderSupervisoryBar({
           "leader-default",
           isEn
             ? "Navigator archived and rebind saved to default Navigator; waiting for IM bridge sync retry."
-            : "已归档领航者并保存换绑至默认领航者，远程桥接同步待重试确认。",
+            : "已归档领航员并保存换绑至默认领航员，远程桥接同步待重试确认。",
         );
       }
       emitNavigatorsChanged();
@@ -743,7 +743,7 @@ export function LeaderSupervisoryBar({
         jumpToThread(fallback.threadId);
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : isEn ? "Failed to archive Navigator." : "归档领航者失败。");
+      setError(cause instanceof Error ? cause.message : isEn ? "Failed to archive Navigator." : "归档领航员失败。");
     } finally {
       setBusy(false);
     }
@@ -818,7 +818,7 @@ export function LeaderSupervisoryBar({
   const headerRow = (
     <div
       data-testid="leader-supervisory-bar"
-      aria-label={isEn ? "Navigator supervisory header" : "领航者控制栏"}
+      aria-label={isEn ? "Navigator supervisory header" : "领航员控制栏"}
       className={`@container flex h-full min-w-0 flex-1 items-center justify-between gap-2 ${
         rightPanelOpen ? "pr-10" : "pr-24"
       }`}
@@ -931,10 +931,10 @@ export function LeaderSupervisoryBar({
               isPaused
                 ? isEn
                   ? "Navigator resumed. Review queued messages below to replay or dismiss."
-                  : "领航者已恢复接单，可在下方选择重投暂停期间的消息。"
+                  : "领航员已恢复接单，可在下方选择重投暂停期间的消息。"
                 : isEn
                   ? "Navigator paused. In-flight tasks will finish and /stop remains available."
-                  : "领航者已暂停接单，在途任务将继续完成且 /stop 保持可用。",
+                  : "领航员已暂停接单，在途任务将继续完成且 /stop 保持可用。",
             )
           }
         >
@@ -1160,7 +1160,7 @@ export function LeaderSupervisoryBar({
                         if (res.skippedIds && res.skippedIds.length > 0) {
                           return isEn
                             ? "Connection or Navigator is paused/inactive; message stays queued."
-                            : "当前连接或领航者处于暂停/未激活状态，消息仍保留在暂停积压队列中。";
+                            : "当前连接或领航员处于暂停/未激活状态，消息仍保留在暂停积压队列中。";
                         }
                         return isEn ? "No replayable message found." : "未找到可重投的积压消息。";
                       })
@@ -1250,11 +1250,11 @@ export function LeaderSupervisoryBar({
     >
       <div className="flex items-center justify-between gap-2">
         <h3 className="min-w-0 truncate text-sm font-semibold text-foreground">
-          {isEn ? `Navigator settings · ${leader.name}` : `领航者设置 · ${leader.name}`}
+          {isEn ? `Navigator settings · ${leader.name}` : `领航员设置 · ${leader.name}`}
         </h3>
         <button
           type="button"
-          aria-label={isEn ? "Close Navigator settings" : "关闭领航者设置"}
+          aria-label={isEn ? "Close Navigator settings" : "关闭领航员设置"}
           onClick={closeConfigPanel}
           className="shrink-0 rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
         >
@@ -1268,7 +1268,7 @@ export function LeaderSupervisoryBar({
           <Input
             value={draftName}
             onChange={(e) => setDraftName(e.target.value)}
-            placeholder={isEn ? "Name this Navigator" : "给领航者起个名字"}
+            placeholder={isEn ? "Name this Navigator" : "给领航员起个名字"}
             required
           />
         </label>
@@ -1339,13 +1339,13 @@ export function LeaderSupervisoryBar({
             >
               <option value="all_local">{isEn ? "All local tasks" : "全部本机任务"}</option>
               <option value="projects">{isEn ? "Selected folders" : "指定文件夹"}</option>
-              <option value="none">{isEn ? "Remote tasks only" : "仅此领航者远程任务"}</option>
+              <option value="none">{isEn ? "Remote tasks only" : "仅此领航员远程任务"}</option>
             </select>
           </div>
           {draftAwarenessKind === "projects" ? (
             <div data-testid="leader-project-scope-picker" className="space-y-1.5 border-t border-border/60 pt-2">
               <div className="text-[11px] text-muted-foreground">
-                {isEn ? "Select folders visible to this Navigator:" : "选择允许此领航者感知状态的文件夹："}
+                {isEn ? "Select folders visible to this Navigator:" : "选择允许此领航员感知状态的文件夹："}
               </div>
               {allSelectableProjects.length === 0 ? (
                 <p className="text-[11px] text-muted-foreground">
@@ -1393,7 +1393,7 @@ export function LeaderSupervisoryBar({
               <p className="text-[11px] text-muted-foreground">
                 {isEn
                   ? "Rebinding starts a fresh binding epoch for new messages while preserving historical ownership"
-                  : "换绑后仅新消息路由至目标领航者，历史任务与暂停积压保留原领航者归属"}
+                  : "换绑后仅新消息路由至目标领航员，历史任务与暂停积压保留原领航员归属"}
               </p>
             </div>
             <Button
@@ -1408,7 +1408,7 @@ export function LeaderSupervisoryBar({
           </div>
           {overview.connections.length === 0 && missingBoundPlatforms.length === 0 ? (
             <p className="text-[11px] text-muted-foreground">
-              {isEn ? "No IM channels bound to this Navigator yet." : "当前领航者暂未绑定任何聊天软件连接。"}
+              {isEn ? "No IM channels bound to this Navigator yet." : "当前领航员暂未绑定任何聊天软件连接。"}
             </p>
           ) : (
             <div className="space-y-1.5 pt-1">
@@ -1463,7 +1463,7 @@ export function LeaderSupervisoryBar({
                         <span className="text-[10px] text-amber-700/90 dark:text-amber-300/90">
                           {isEn
                             ? "Bridge still routing to previous Navigator until synced"
-                            : "桥接同步完成前仍向原领航者投递"}
+                            : "桥接同步完成前仍向原领航员投递"}
                         </span>
                       ) : null}
                     </div>
@@ -1742,7 +1742,7 @@ export function LeaderSupervisoryBar({
                       : "请先在 Needs You 中处理暂停积压消息后再归档。"
                     : isEn
                       ? "Archiving stops this Navigator from accepting new work; historical threads stay readable."
-                      : "归档后该领航者不再接单，历史消息仍保留可查。"}
+                      : "归档后该领航员不再接单，历史消息仍保留可查。"}
                 </p>
               </div>
               {!confirmingArchive ? (
@@ -1763,7 +1763,7 @@ export function LeaderSupervisoryBar({
                   className="border-destructive/40 text-destructive hover:bg-destructive/10"
                 >
                   <ArchiveIcon className="mr-1 size-3.5" aria-hidden="true" />
-                  {isEn ? "Archive Navigator" : "归档领航者"}
+                  {isEn ? "Archive Navigator" : "归档领航员"}
                 </Button>
               ) : null}
             </div>
@@ -1777,10 +1777,10 @@ export function LeaderSupervisoryBar({
                   {archiveAffectedChannels.length > 0
                     ? isEn
                       ? `Confirm archiving "${leader.name}"? Bound channels (${archiveAffectedChannels.join(", ")}) will be handed over to "${defaultLeaderName}" for new messages.`
-                      : `确认归档「${leader.name}」？已绑定的渠道（${archiveAffectedChannels.join("、")}）将立即换绑并移交给默认领航者「${defaultLeaderName}」承接新消息。`
+                      : `确认归档「${leader.name}」？已绑定的渠道（${archiveAffectedChannels.join("、")}）将立即换绑并移交给默认领航员「${defaultLeaderName}」承接新消息。`
                     : isEn
                       ? `Confirm archiving "${leader.name}"? It will no longer appear in the active Navigator list.`
-                      : `确认归档「${leader.name}」？归档后将从活跃领航者列表中移除。`}
+                      : `确认归档「${leader.name}」？归档后将从活跃领航员列表中移除。`}
                 </p>
                 <div className="flex flex-wrap items-center justify-end gap-2">
                   <Button

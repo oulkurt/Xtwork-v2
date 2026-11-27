@@ -811,7 +811,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
 
         try {
           const created = yield* api("POST", "leaders", {
-            name: "研发领航者",
+            name: "研发领航员",
             avatar: "研",
             role: "专注工程交付",
             imPolicy: {
@@ -1053,7 +1053,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
           ).toBe(true);
           expect(handlerCalls.some((c) => c.method === "connections.syncBindings")).toBe(true);
 
-          const thirdLeaderRes = yield* api("POST", "leaders", { name: "并发测试领航者" });
+          const thirdLeaderRes = yield* api("POST", "leaders", { name: "并发测试领航员" });
           const thirdId = (thirdLeaderRes.json.leader as { id: string }).id;
           let releaseSlowSync!: () => void;
           let interceptFirstSync = true;
@@ -1170,8 +1170,8 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
           expect((yield* leaders.getLeader(thirdId))?.role).toBe("role before archive");
           expect((yield* leaders.getLeader(thirdId))?.status).toBe("archived");
 
-          const navARes = yield* api("POST", "leaders", { name: "并发领航者A" });
-          const navBRes = yield* api("POST", "leaders", { name: "并发领航者B" });
+          const navARes = yield* api("POST", "leaders", { name: "并发领航员A" });
+          const navBRes = yield* api("POST", "leaders", { name: "并发领航员B" });
           const navAId = (navARes.json.leader as { id: string }).id;
           const navBId = (navBRes.json.leader as { id: string }).id;
           const bindToB = yield* api("POST", "connections/rebind", {
@@ -1304,7 +1304,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
       Effect.gen(function* () {
         const leaders = yield* makeLeaderStore();
         const catLeader = yield* leaders.createLeader({
-          name: "猫咪领航者",
+          name: "猫咪领航员",
           avatar: "  bot:v1:Cat:#F8A01C  ",
         });
         expect(catLeader.avatar).toBe("bot:v1:cat:#f8a01c");
@@ -1362,7 +1362,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
               new Request("http://localhost/api/xtwork/im/leaders", {
                 method: "POST",
                 headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
-                body: JSON.stringify({ name: "火箭领航者", avatar: "bot:v1:rocket:#1f2937:#f8fafc" }),
+                body: JSON.stringify({ name: "火箭领航员", avatar: "bot:v1:rocket:#1f2937:#f8fafc" }),
               }),
             );
             return { status: res.status, json: (await res.json()) as { leader: { id: string; avatar: string } } };
@@ -1548,7 +1548,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
           expect((yield* leaders.activeBindingForConnection("conn-wecom-live"))?.claimed).toBe(true);
           expect((yield* leaders.activeBindingForConnection("conn-pairing-unclaimed"))?.claimed).toBe(false);
 
-          const navPairing = yield* leaders.createLeader({ name: "配对中领航者" });
+          const navPairing = yield* leaders.createLeader({ name: "配对中领航员" });
           yield* api("POST", "connections/rebind", {
             connectionId: "conn-pairing-unclaimed",
             leaderId: navPairing.id,
@@ -1566,7 +1566,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
           const archivePairing = yield* api("POST", `leaders/${navPairing.id}/archive`, {});
           expect(archivePairing.status).toBe(200);
 
-          const navHttp = yield* leaders.createLeader({ name: "渠道换绑领航者" });
+          const navHttp = yield* leaders.createLeader({ name: "渠道换绑领航员" });
           const rebindRes = yield* api("POST", "connections/rebind", {
             connectionId: "conn-feishu-live",
             leaderId: navHttp.id,
@@ -1582,7 +1582,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
           expect(archivedBindings[0]?.connectionId).toBe("conn-feishu-live");
           expect(archivedBindings[0]?.platform).toBe("feishu");
 
-          const navDisconnect = yield* leaders.createLeader({ name: "断开后归档领航者" });
+          const navDisconnect = yield* leaders.createLeader({ name: "断开后归档领航员" });
           liveConnections.push({
             id: "conn-wecom-temp",
             platform: "wecom",
@@ -1629,7 +1629,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
           expect(archiveAfterDisconnect.status).toBe(200);
           expect(archiveAfterDisconnect.json.reboundBindings).toEqual([]);
 
-          const navRaceDisconnect = yield* leaders.createLeader({ name: "断连竞态领航者" });
+          const navRaceDisconnect = yield* leaders.createLeader({ name: "断连竞态领航员" });
           liveConnections.push({
             id: "conn-race-disconnect",
             platform: "wechat",
@@ -1689,7 +1689,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
           fakeHost.available = true;
           expect((yield* api("POST", `leaders/${navRaceDisconnect.id}/archive`, {})).status).toBe(200);
 
-          const navRaceSyncDisconnect = yield* leaders.createLeader({ name: "同步挂起断连领航者" });
+          const navRaceSyncDisconnect = yield* leaders.createLeader({ name: "同步挂起断连领航员" });
           liveConnections.push({
             id: "conn-race-sync-disconnect",
             platform: "feishu",
@@ -1797,7 +1797,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
             expect((yield* api("POST", "connections/disconnect", { connectionId: connBId })).status).toBe(200);
           }
 
-          const navPauseSync = yield* leaders.createLeader({ name: "暂停同步校验领航者" });
+          const navPauseSync = yield* leaders.createLeader({ name: "暂停同步校验领航员" });
           liveConnections.push({
             id: "conn-pause-sync",
             platform: "feishu",
@@ -1937,7 +1937,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
           yield* api("POST", "connections/disconnect", { connectionId: "conn-pause-sync" });
           expect((yield* api("POST", `leaders/${navPauseSync.id}/archive`, {})).status).toBe(200);
 
-          const navStateEventDisconnect = yield* leaders.createLeader({ name: "事件断开领航者" });
+          const navStateEventDisconnect = yield* leaders.createLeader({ name: "事件断开领航员" });
           yield* leaders.ensureBinding("conn-event-gone", navStateEventDisconnect.id, "feishu", true);
           const disconnectHandler = makeBridgeEventHandler(
             fakeHost as never,
@@ -1964,7 +1964,7 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
           const archiveAfterEventDisconnect = yield* api("POST", `leaders/${navStateEventDisconnect.id}/archive`, {});
           expect(archiveAfterEventDisconnect.status).toBe(200);
 
-          const navOrphan = yield* leaders.createLeader({ name: "升级前孤立绑定领航者" });
+          const navOrphan = yield* leaders.createLeader({ name: "升级前孤立绑定领航员" });
           yield* leaders.ensureBinding("conn-preupgrade-orphan", navOrphan.id, "wechat", true);
           const archiveOrphan = yield* api("POST", `leaders/${navOrphan.id}/archive`, {});
           expect(archiveOrphan.status).toBe(200);
@@ -2129,11 +2129,11 @@ describe("ADR-013 Slice 2: Multi-Navigator archive, connection rebinding, and IM
         const approvals = new ImApprovals();
         const defaultLeader = yield* leaders.ensureDefaultLeader();
         const scopedLeader = yield* leaders.createLeader({
-          name: "项目A领航者",
+          name: "项目A领航员",
           awarenessScope: { kind: "projects", projectIds: ["proj-a"] },
         });
         const isolatedLeader = yield* leaders.createLeader({
-          name: "隔离领航者",
+          name: "隔离领航员",
           awarenessScope: { kind: "none", projectIds: [] },
         });
 
