@@ -213,12 +213,53 @@ for (const dir of brandSourceDirs) {
     if (entry.parentPath === translationsDir) {
       const catalog = brandTranslationCatalog(JSON.parse(original), brand.name, brandedMessageKeys);
       branded = `${JSON.stringify(catalog, null, 2)}\n`;
-    } else if (original.includes("T3 Code")) {
-      branded = original.replaceAll("T3 Code", () => brand.name);
+    } else {
+      if (/T3(?: |\r?\n[ \t]*)Code/.test(branded)) {
+        branded = branded.replace(/T3(?: |\r?\n[ \t]*)Code/g, () => brand.name);
+      }
+      if (/T3(?: |\r?\n[ \t]*)Connect/.test(branded)) {
+        branded = branded.replace(/T3(?: |\r?\n[ \t]*)Connect/g, () => `${brand.name} Connect`);
+      }
     }
     if (branded !== original) writeFileSync(path, branded);
   }
 }
+overlayFile("packages/client-runtime/src/mcpApps/host.ts", [
+  ['export const MCP_APP_HOST_NAME = "t3-code";', `export const MCP_APP_HOST_NAME = ${JSON.stringify(brand.slug)};`],
+]);
+overlayFile("apps/web/src/components/settings/AcpSessionManagementSection.tsx", [
+  ["Resume agent-owned conversations as T3 threads.", "Resume agent-owned conversations as threads."],
+]);
+overlayFile("apps/web/src/components/settings/CodexSetupSection.tsx", [
+  ["<T>Use T3 desktop for automatic return</T>", `<T>Use ${brand.name} desktop for automatic return</T>`],
+]);
+overlayFile("packages/shared/src/speechCopy.ts", [
+  ["T3 requests zero data retention", `${brand.name} requests zero data retention`],
+]);
+overlayFile("apps/web/src/components/settings/DiagnosticsSettings.tsx", [
+  ["T3 Server", `${brand.name} server`],
+  ["T3 server", `${brand.name} server`],
+]);
+overlayFile("apps/web/src/components/settings/ResourceTelemetryDiagnostics.tsx", [
+  ['msg("T3 process")', `msg(${JSON.stringify(`${brand.name} process`)})`],
+  ["<T>T3 system footprint</T>", `<T>${brand.name} system footprint</T>`],
+  ["known T3 operations", `known ${brand.name} operations`],
+]);
+overlayFile("apps/web/src/components/settings/LabsSettingsPanel.tsx", [
+  ["T3 home folder", `${brand.name} home folder`],
+]);
+overlayFile("apps/web/src/components/settings/StorageSettings.tsx", [
+  ["T3 home folder", `${brand.name} home folder`],
+]);
+overlayFile("apps/web/src/connection/platform.ts", [
+  ["Restart the T3 server", `Restart the ${brand.name} server`],
+]);
+overlayFile("packages/client-runtime/src/state/device.ts", [
+  ["This environment's T3 server", `This environment's ${brand.name} server`],
+]);
+overlayFile("packages/shared/src/htmlRender.ts", [
+  ["T3 adds an overridable 8px html gutter", `${brand.name} adds an overridable 8px html gutter`],
+]);
 for (const path of [
   "apps/server/src/orchestration-v2/Orchestrator.ts",
   "apps/server/src/orchestration-v2/ProviderTurnStartService.ts",
@@ -236,10 +277,12 @@ for (const path of [
   "apps/server/src/provider/ClaudeProvider.ts",
   "apps/server/src/provider/CodexInstallation.ts",
   "apps/server/src/provider/CodexAuthCallbackPage.ts",
+  "apps/server/src/provider/CodexChatGptAuth.ts",
   "apps/server/src/provider/ProviderAuthService.ts",
   "apps/server/src/provider/providerCompatibility.ts",
   "apps/server/src/provider/providerInstallation.ts",
   "apps/server/src/provider/providerMaintenanceRunner.ts",
+  "apps/server/src/provider/acp/AntigravityAcpSupport.ts",
   "apps/server/src/persistence/Sqlite.ts",
   "apps/server/src/persistence/DatabaseMaintenance.ts",
   "apps/server/src/persistence/DatabaseStorage.ts",
@@ -247,26 +290,268 @@ for (const path of [
   "apps/server/src/project/ManagedProjectFolders.ts",
   "apps/server/src/preview/ServerBrowserPage.ts",
   "apps/server/src/device/SshDeviceHost.ts",
+  "apps/server/src/device/DeviceToolchain.ts",
+  "apps/server/src/device/AgentDeviceShim.ts",
+  "apps/server/src/cli/managedChatGptToken.ts",
+  "apps/server/src/peer/PeerLinks.ts",
+  "apps/server/src/mcp/McpHttpServer.ts",
+  "apps/server/src/mcp/McpInvocationContext.ts",
+  "apps/server/src/mcp/WorktreeMcpService.ts",
+  "apps/server/src/mcp/AcpMcpStdioBridge.ts",
+  "apps/server/src/mcp/toolkits/issues/tools.ts",
+  "apps/server/src/mcp/toolkits/theme/tools.ts",
+  "apps/server/src/mcp/toolkits/device/handlers.ts",
   "apps/server/src/cloud/cliAuthHtml.ts",
   "apps/server/src/cloud/relayResponse.ts",
   "apps/server/src/cloud/selfUpdate.ts",
+  "apps/server/src/cloud/ConnectReachability.ts",
+  "apps/server/src/cloud/bootService.ts",
+  "apps/server/src/cloud/RelayClientLedger.ts",
+  "apps/server/src/startupAccess.ts",
+  "apps/server/src/serverRuntimeStartup.ts",
+  "apps/server/src/background/KeepAwake.ts",
+  "apps/server/src/auth/McpOAuth.ts",
+  "apps/server/src/device/EasDeviceHost.ts",
+  "apps/server/src/policy/policyTemplates.ts",
+  "apps/server/src/binCli.ts",
+  "apps/server/src/serviceLauncher.ts",
   "apps/server/src/cli/app.ts",
+  "apps/server/src/cli/acpMcpBridge.ts",
+  "apps/server/src/cli/automaticPort.ts",
+  "apps/server/src/cli/config.ts",
+  "apps/server/src/cli/doctor.ts",
+  "apps/server/src/cli/environment.ts",
+  "apps/server/src/cli/pair.ts",
+  "apps/server/src/cli/policy.ts",
+  "apps/server/src/cli/server.ts",
+  "apps/server/src/cli/service.ts",
+  "apps/server/src/cli/theme.ts",
+  "apps/server/src/cli/thread.ts",
+  "apps/server/src/cli/triage.ts",
+  "apps/server/src/cli/uninstall.ts",
+  "apps/server/src/cli/up.ts",
+  "apps/server/src/cli/update.ts",
+  "apps/server/src/cli/updateProgress.ts",
+  "apps/server/src/triage/triagePrompt.ts",
+  ".github/triage/PLAYBOOK.md",
+  "packages/contracts/src/pullRequest.ts",
+  "packages/contracts/src/device.ts",
+  "packages/contracts/src/preview.ts",
+  "packages/contracts/src/managedPolicy.ts",
+  "packages/contracts/src/browserImport.ts",
+  "packages/provider-opencode/src/server/OpenCodeServerLedger.ts",
+  "packages/source-control-forgejo/src/server/ForgejoPullRequestProvider.ts",
+  "packages/source-control-gitcafe/src/server/GitCafePullRequestProvider.ts",
+  "packages/ssh/src/auth.ts",
+  "packages/provider-core/src/server/orchestrationInstructions.ts",
+  "packages/provider-core/src/server/runtimeInstructions.ts",
+  "packages/provider-core/src/server/maintenanceResolver.ts",
   "packages/provider-pi/src/server/status.ts",
+  "packages/provider-pi/src/server/mcpExtensionSource.ts",
+  "packages/provider-pi/src/server/adapter.ts",
+  "packages/provider-pi/src/server/mcpInjection.ts",
+  "packages/provider-acp/src/server/adapter.ts",
+  "packages/provider-acp/src/server/mcpOverAcpBridge.ts",
   "packages/provider-kiro/src/server/status.ts",
   "packages/provider-acp-registry/src/server/driver.ts",
+  "packages/provider-cursor/src/server/adapter.ts",
+  "packages/provider-cursor/src/server/auth.ts",
   "packages/provider-cursor/src/server/textGeneration.ts",
   "packages/provider-grok/src/server/status.ts",
   "packages/provider-fx/src/server/status.ts",
+  "packages/provider-muse/src/server/adapter.ts",
+  "packages/provider-muse/src/server/sdk.ts",
   "packages/provider-muse/src/server/status.ts",
+  "packages/provider-muse/src/server/textGeneration.ts",
   "packages/provider-opencode/src/server/status.ts",
+  "packages/provider-opencode/src/server/OpenCodeRuntime.ts",
+  "packages/provider-opencode/src/server/versionProbe.ts",
+  "packages/provider-opencode/src/settings.ts",
+  "packages/provider-opencode/src/server/textGeneration.ts",
+  "packages/provider-opencode/src/server/v2/textGeneration.ts",
+  "packages/provider-opencode/src/server/v2/adapter.ts",
 ]) {
   overlayFile(path, [["T3 Code", brand.name]]);
 }
 overlayFile("apps/server/src/provider/CodexProvider.ts", [
   ["Codex is disabled in T3 Code settings.", `Codex is disabled in ${brand.name} settings.`],
+  ['export const CODEX_CLIENT_TITLE = "T3 Code";', `export const CODEX_CLIENT_TITLE = ${quotedName};`],
 ]);
 overlayFile("packages/provider-cursor/src/server/status.ts", [
   ["Cursor is disabled in T3 Code settings.", `Cursor is disabled in ${brand.name} settings.`],
+  ["run in T3 Code.", `run in ${brand.name}.`],
+]);
+overlayFile("apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts", [
+  ["T3 MCP tools are deferred:", "Workspace tools are deferred:"],
+  ["T3 could not confirm Claude bypass permissions here", `${brand.name} could not confirm Claude bypass permissions here`],
+]);
+overlayFile("apps/server/src/mcp/McpInvocationContext.ts", [
+  ["calling T3 thread", "calling thread"],
+]);
+overlayFile("apps/server/src/mcp/OrchestratorMcpService.ts", [
+  ["inside a T3 thread.", "inside a thread."],
+]);
+overlayFile("apps/server/src/mcp/ThreadMetadataMcpService.ts", [
+  ["inside a T3 thread.", "inside a thread."],
+]);
+overlayFile("apps/server/src/mcp/WorktreeMcpService.ts", [
+  ["calling T3 thread", "calling thread"],
+]);
+overlayFile("apps/server/src/mcp/threadAccess.ts", [
+  ["inside a T3 thread.", "inside a thread."],
+]);
+overlayFile("apps/server/src/mcp/toolkits/toolSearch/tools.ts", [
+  ["Load T3 Code tools you do not have yet", "Load workspace tools you do not have yet"],
+]);
+overlayFile("apps/server/src/mcp/toolkits/issues/tools.ts", [
+  ["inside a T3 thread", "inside a thread"],
+]);
+overlayFile("apps/server/src/mcp/toolkits/pullRequests/tools.ts", [
+  ["inside a T3 thread.", "inside a thread."],
+  ["T3 shows its status", `${brand.name} shows its status`],
+  ["T3 wakes you on failed checks", `${brand.name} wakes you on failed checks`],
+]);
+overlayFile("apps/server/src/device/DeviceToolchain.ts", [
+  ["the T3 server's PATH", `the ${brand.name} server's PATH`],
+]);
+overlayFile("apps/server/src/device/SimlockDeviceHost.ts", [
+  ["answer T3 could not read.", `answer ${brand.name} could not read.`],
+]);
+overlayFile("apps/server/src/provider/AcpRegistrySessions.ts", [
+  ["Could not create a T3 thread", "Could not create a thread"],
+]);
+overlayFile("apps/server/src/ws.ts", [
+  ["Delete the imported T3 thread", "Delete the imported thread"],
+]);
+overlayFile("packages/contracts/src/orchestratorMcp.ts", [
+  ["for a T3 tool; file for a command.", "for a workspace tool; file for a command."],
+]);
+overlayFile("packages/contracts/src/device.ts", [
+  ["the T3 server's PATH", `the ${brand.name} server's PATH`],
+]);
+overlayFile("packages/provider-core/src/server/failure.ts", [
+  ["T3 could not confirm whether conversation history reached the provider.", `${brand.name} could not confirm whether conversation history reached the provider.`],
+]);
+overlayFile("packages/provider-pi/src/server/adapter.ts", [
+  ["outside an active T3 turn.", "outside an active turn."],
+]);
+overlayFile("packages/provider-acp/src/server/adapter.ts", [
+  ["The active T3 runtime policy", "The active runtime policy"],
+]);
+overlayFile("packages/provider-muse/src/server/status.ts", [
+  ["on this T3 server host", `on this ${brand.name} server host`],
+]);
+overlayFile("packages/provider-muse/src/server/textGeneration.ts", [
+  ["on this T3 server host", `on this ${brand.name} server host`],
+]);
+overlayFile("packages/provider-acp/src/server/AcpSessionRuntime.ts", [
+  ["Cannot identify the current T3 process group", `Cannot identify the current ${brand.name} process group`],
+]);
+overlayFile("apps/server/src/diagnostics/ProcessDiagnostics.ts", [
+  ["Refusing to signal the T3 server process.", `Refusing to signal the ${brand.name} server process.`],
+  ["is not a signalable T3 backend descendant.", `is not a signalable ${brand.name} backend descendant.`],
+]);
+overlayFile("apps/server/src/provider/CodexAuthCallbackPage.ts", [
+  ["<strong>T3</strong> Code", `<strong>${safeHtml(brand.name)}</strong>`],
+]);
+overlayFile("apps/server/src/provider/CodexManagedRuntime.ts", [
+  ["Restart T3 and retry.", `Restart ${brand.name} and retry.`],
+]);
+overlayFile("apps/server/src/provider/antigravityAuthSupport.ts", [
+  ["The T3 runtime path cannot be used", `The ${brand.name} runtime path cannot be used`],
+]);
+overlayFile("apps/server/src/environment/ServerEnvironmentLabel.ts", [
+  ['"T3 environment"', JSON.stringify(`${brand.name} environment`)],
+]);
+overlayFile("apps/server/src/preview/PreviewBrowserHost.ts", [
+  ["T3 server is running as root", `${brand.name} server is running as root`],
+  ["Run T3 as a nonroot user.", `Run ${brand.name} as a nonroot user.`],
+  ["in the T3 server's environment", `in the ${brand.name} server's environment`],
+  ["T3 Code's headless browser", `${brand.name}'s headless browser`],
+  ["T3's browser", `${brand.name}'s browser`],
+]);
+overlayFile("apps/server/src/preview/PreviewBrowser.ts", [
+  ["T3 could not install its headless browser", `${brand.name} could not install its headless browser`],
+  ["T3 is installing its headless browser", `${brand.name} is installing its headless browser`],
+  ["T3's headless browser", `${brand.name}'s headless browser`],
+  ["T3's home directory", `${brand.name}'s home directory`],
+]);
+for (const path of [
+  "apps/server/src/cloud/bootService.ts",
+  "apps/server/src/serverOwnership.ts",
+  "apps/server/src/cli/up.ts",
+  "apps/server/src/cli/policy.ts",
+  "apps/server/src/cli/service.ts",
+  "apps/server/src/cli/update.ts",
+  "apps/server/src/project/ManagedProjectFolders.ts",
+  "apps/server/src/serviceLauncher.ts",
+]) {
+  overlayFile(path, [["T3 home", `${brand.name} home`]]);
+}
+for (const path of [
+  "apps/server/src/auth/EnvironmentAuth.ts",
+  "apps/server/src/auth/PairingGrantStore.ts",
+  "apps/server/src/binCli.ts",
+  "apps/server/src/cli/auth.ts",
+  "apps/server/src/cli/connect.ts",
+  "apps/server/src/cli/environment.ts",
+  "apps/server/src/cli/pair.ts",
+  "apps/server/src/cli/up.ts",
+  "apps/server/src/cliAuthFormat.ts",
+  "apps/server/src/cloud/CliTokenManager.ts",
+  "apps/server/src/cloud/CloudLink.ts",
+  "apps/server/src/cloud/ConnectReachability.ts",
+  "apps/server/src/cloud/cliAuthHtml.ts",
+  "apps/server/src/cloud/managedTunnelStartup.ts",
+  "apps/server/src/cloud/relayResponse.ts",
+  "apps/server/src/mcp/toolkits/orchestrator/tools.ts",
+  "apps/server/src/policy/managedLimits.ts",
+  "apps/server/src/policy/policyTemplates.ts",
+  "apps/server/src/relay/AgentAwarenessRelay.ts",
+  "apps/server/src/relay/HeldHooksWaker.ts",
+  "apps/server/src/server.ts",
+  "apps/server/src/telemetry/Identify.ts",
+  "apps/server/src/triage/triagePrompt.ts",
+  "packages/contracts/src/guestShare.ts",
+  "packages/contracts/src/managedPolicy.ts",
+  "packages/contracts/src/orchestratorMcp.ts",
+  "packages/contracts/src/relay.ts",
+]) {
+  overlayFile(path, [["T3 Connect", `${brand.name} Connect`]]);
+}
+for (const path of [
+  "apps/server/src/cli/up.ts",
+  "apps/server/src/cli/connect.ts",
+]) {
+  overlayFile(path, [["your T3 account", `your ${brand.name} account`]]);
+}
+overlayFile("apps/server/src/preview/ServerBrowser.ts", [
+  ["T3's browser", `${brand.name}'s browser`],
+]);
+overlayFile("apps/server/src/cli/browser.ts", [
+  ["Restart the T3 server if browser tabs were already open.", `Restart the ${brand.name} server if browser tabs were already open.`],
+  ["T3's browser", `${brand.name}'s browser`],
+  ["T3's headless browser", `${brand.name}'s headless browser`],
+]);
+overlayFile("apps/server/src/cli/connect.ts", [
+  ["The T3 server on this machine did not answer.", `The ${brand.name} server on this machine did not answer.`],
+  ["Start T3 to ", `Start ${brand.name} to `],
+  ["Restart T3 to ", `Restart ${brand.name} to `],
+  ["The T3 relay client", `The ${brand.name} relay client`],
+]);
+overlayFile("apps/server/src/cloud/bootService.ts", [
+  ["do not run T3 with sudo.", `do not run ${brand.name} with sudo.`],
+]);
+overlayFile("apps/server/src/cloud/ConnectReachability.ts", [
+  ["reach the T3 server on this machine.", `reach the ${brand.name} server on this machine.`],
+]);
+overlayFile("packages/ssh/src/tunnel.ts", [
+  ["A T3 server launch stopped", `A ${brand.name} server launch stopped`],
+  ["Another T3 server launch has held", `Another ${brand.name} server launch has held`],
+  ["Remote T3 server is still running", `Remote ${brand.name} server is still running`],
+  ["A T3 server or boot service holds", `A ${brand.name} server or boot service holds`],
+  ["Remote T3 server did not become ready", `Remote ${brand.name} server did not become ready`],
+  ["Remote T3 server with PID", `Remote ${brand.name} server with PID`],
 ]);
 
 const publicDir = join(t3, "apps/web/public");
