@@ -22,6 +22,7 @@
 | M3 内置插件 | 待办（`api: 2`）已实现创建、查询、编辑、完成、重开、删除、对话回执撤销与重启持久化。 | 待办提醒、日程插件、Obsidian 笔记插件。 [工具型插件](plugin-tools.md) · [内置插件规划](plan/06-内置插件-待办日程笔记.md) |
 | M4 远程连接与领航员 | **`im-bridge` 底座与领航员（Leader）Slice 1 / Slice 2 已合入**（[PR #15](https://github.com/oulkurt/Xtwork-v2/pull/15)–[PR #18](https://github.com/oulkurt/Xtwork-v2/pull/18)、[PR #21](https://github.com/oulkurt/Xtwork-v2/pull/21)、[PR #25](https://github.com/oulkurt/Xtwork-v2/pull/25)、[PR #31](https://github.com/oulkurt/Xtwork-v2/pull/31)、[PR #34](https://github.com/oulkurt/Xtwork-v2/pull/34)）：独立 Node `im-bridge`、飞书/企微/个人微信适配器、配对与门禁、侧栏「远程连接」镭射卡、侧栏顶部固定入口、按 run 持久化 fail-closed 策略（`xtwork_run_policies`）、受众过滤 Needs You 聚合、暂停/恢复重投及 `companion/leaders/<leaderId>/` 幂等迁移；Slice 2 补齐多领航员创建与两步确认归档、IM 渠道原子换绑与断连墓碑、按受众分级的 IM 委派/进展汇报审批策略（`im_policy_json`，支持子字段并发合并）、透明沉浸式容器响应式单顶栏、侧栏「领航员 / 对话」分栏、基于 `open-bot-avatar`（MIT，23 款动态 Bot 造型 + 自由调色 + 编辑/新建区无放回随机 + WKWebView 显式尺寸/独立 SVG ID）的状态驱动领航员头像，以及移除「领航控制面」兜底文案后的 IM 绑定平台在线（绿圆）/离线（红方）指示。 [桌面预览](desktop-foundation.md#远程连接im-bridge与-leader-控制面) | 飞书/企微/个人微信三平台真机闭环、微信 iLink 合规、飞书卡片审批（Q-09）、[ADR-013](decisions/013-leader-supervisory-threads.md) 剩余项（外部会话扫描交接 UI、空闲 `tidy` 调度、非 Pi 远程运行时，见 Q-13），以及**后续规划待办**（暂未排期）：领航员控制面 v2（默认隔离与去 `N+1` / 同级派生 / 受控 Crew 工单 / 独立 Drive / 正交 Squad 小队，见 [ADR-014](decisions/014-navigator-control-plane-v2.md) 与 [Q-14](../DECISIONS.md#pending-decisions)）。 [远程连接规划](plan/07-远程连接插件.md) |
 | M5 发布候选 | 已有 macOS arm64 打包（含 Node/`npm`/`npx`、T3、Pi、`plugin-host`、`im-bridge`）、签名更新与 R2 上传脚本。 | 正式签名公证、发布渠道、干净机器安装升级验收及 Windows 独立验收。 [发布规划](plan/09-品牌与发布.md) |
+| M6 跨设备互联（独立演进线） | 规划已定（[ADR-015](decisions/015-cross-device-interconnect-and-e2e-relay.md)），暂不排期开工；不阻塞 M1–M5 首发验收。 | 按 M6.0–M6.4 推进：传输能力矩阵冻结 → LAN/Tailscale/SSH 直连闭环（远端线程、iOS 模拟器、桌面跨机 `PeerLinks`，无需自研 E2EE）→ 渐进式零账号公网中继（`xtwork-relay/v1`，允许先可选 `M6.2a` TLS 最小中继再升 `M6.2b` 盲转 E2EE，并支持自托管）→ mygo 远程两阶段更新 → 可插拔身份控制面与机器共享。 [跨设备规划](plan/14-跨设备互联与多机流转.md) |
 
 **已定方向速览**：首发模型供给（Q-03）与外部编码 Agent 可见性（Q-02）均已由 [ADR-012](decisions/012-xiaotong-model-channels-and-coding-agents.md) 定案并完成 M1b/M1c 代码合入；待确认事项唯一总表见 [Pending Decisions](../DECISIONS.md#pending-decisions)。
 
@@ -44,12 +45,12 @@ mygo 外壳管理本机 T3 Node 服务，WebView 加载服务提供的同源 Rea
 |---|---|
 | 架构和依赖 | [01 架构](plan/01-架构.md) · [02 上游与改造层](plan/02-上游与改造层.md) |
 | 运行时、外壳与模型 | [03 内置运行时 · Pi](plan/03-内置运行时-Pi.md) · [04 mygo 外壳](plan/04-mygo外壳.md) · [13 模型网关](plan/13-模型网关.md) |
-| 插件与通用任务 | [05 插件系统](plan/05-插件系统.md) · [06 内置插件](plan/06-内置插件-待办日程笔记.md) · [07 远程连接](plan/07-远程连接插件.md) · [08 通用任务](plan/08-通用任务化改造.md) |
+| 插件与通用任务 | [05 插件系统](plan/05-插件系统.md) · [06 内置插件](plan/06-内置插件-待办日程笔记.md) · [07 远程连接](plan/07-远程连接插件.md) · [08 通用任务](plan/08-通用任务化改造.md) · [14 跨设备互联与多机流转](plan/14-跨设备互联与多机流转.md) |
 | 品牌、发布与迁移 | [09 品牌与发布](plan/09-品牌与发布.md) · [12 从 xtwork 迁移](plan/12-从xtwork迁移.md) |
 | 验收、风险和依据 | [10 里程碑与验收](plan/10-里程碑与验收.md) · [11 风险与待定](plan/11-风险与待定.md) · [附录 已核实事实](plan/附录-已核实事实.md) |
 | 已确认方向与待决策 | [决策索引](../DECISIONS.md) · [工程决策记录](decisions/README.md) |
 
-插件 v2 的已确认协议见 [ADR-010](decisions/010-plugin-v2-runtime.md)，基于 Mingle 渠道层与伴侣范式的 IM 远程连接服务见 [ADR-011](decisions/011-mingle-im-bridge.md)，M1 内置助手「小瞳」多渠道模型平面、六大编码 Agent 一键安装与 Coding Agent 委派架构见 [ADR-012](decisions/012-xiaotong-model-channels-and-coding-agents.md)，将远程连接统一归属到 Captain 式 Leader 主管、侧栏顶部固定入口与 Mingle 能力分级移植边界见 [ADR-013](decisions/013-leader-supervisory-threads.md)；后续规划待办的领航员控制面 v2（同级派生、受控 Crew 工单、独立 Drive 与正交 Squad 小队）见 [ADR-014](decisions/014-navigator-control-plane-v2.md)。
+插件 v2 的已确认协议见 [ADR-010](decisions/010-plugin-v2-runtime.md)，基于 Mingle 渠道层与伴侣范式的 IM 远程连接服务见 [ADR-011](decisions/011-mingle-im-bridge.md)，M1 内置助手「小瞳」多渠道模型平面、六大编码 Agent 一键安装与 Coding Agent 委派架构见 [ADR-012](decisions/012-xiaotong-model-channels-and-coding-agents.md)，将远程连接统一归属到 Captain 式 Leader 主管、侧栏顶部固定入口与 Mingle 能力分级移植边界见 [ADR-013](decisions/013-leader-supervisory-threads.md)；后续规划待办的领航员控制面 v2（同级派生、受控 Crew 工单、独立 Drive 与正交 Squad 小队）见 [ADR-014](decisions/014-navigator-control-plane-v2.md)；不绑定企业微信或 Clerk 的跨设备互联、渐进式零账号盲转 E2E 中继与可插拔身份控制面（M6，暂不排期开工）见 [ADR-015](decisions/015-cross-device-interconnect-and-e2e-relay.md)。
 
 历史资料见 [Dim 架构](plan/03-内置运行时-Dim.md) 和 [Dim ACP 未实施待办](plan/dim-acp-flavor-todo.md)。
 

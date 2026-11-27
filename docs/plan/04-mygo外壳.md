@@ -65,9 +65,9 @@ T3 界面用 `window.desktopBridge` 判断自己是否在桌面壳里：`apps/we
 | 文件与系统 | pickFolder、pickThemeFiles、pickProjectFavicon、getPathForFile、toLocalBackendPath、openExternal、openSystemSettings、readMedia、startFileDrag、showContextMenu、checkSystemPermission | 实现 |
 | 窗口 | revealWindow、getWindowFullscreenState、onWindowFullscreenStateChange、getWindowZoomFactor、onMenuAction、onQuitShortcut、setTheme | 实现 |
 | 通知角标 | setNotificationBadge、onNotificationBadgeClear | 映射到原生角标，平台行为见 §7 |
-| 更新 | getUpdateState、setUpdateChannel、checkForUpdate、downloadUpdate、installUpdate、onUpdateState | 映射到 mygo updater |
+| 更新 | getUpdateState、setUpdateChannel、checkForUpdate、downloadUpdate、installUpdate、onUpdateState | 映射到 mygo updater；M6.3 另补 `desktopTelemetryFd` / `desktopTelemetryControlFd`（POSIX fd 4/5 与 Windows 等价 IPC）承接远程两阶段桌面更新，见 [14](14-跨设备互联与多机流转.md#m63--mygo-壳远程两阶段桌面更新--跨平台补齐) |
 | 遥测 | getRelayTelemetryEnabled | 固定返回 false |
-| SSH、WSL、Tailscale、服务端暴露 | discoverSshHosts、ensureSshEnvironment、getWslState、setWslBackendEnabled、setTailscaleServeEnabled、setServerExposureMode、getAdvertisedEndpoints 等 | v1 不支持 |
+| SSH、WSL、Tailscale、服务端暴露 | discoverSshHosts、ensureSshEnvironment、getWslState、setWslBackendEnabled、setTailscaleServeEnabled、setServerExposureMode、getAdvertisedEndpoints 等 | M1–M5 首发保持 `local-only` / 不支持；M6.1/M6.2 按 [ADR-015](../decisions/015-cross-device-interconnect-and-e2e-relay.md) 补齐 LAN/Tailscale 暴露、SSH 隧道与本机 Loopback Relay Gateway |
 | SnapShot、预览 | setupSnapShot 等、preview | v1 不支持。预览依赖 CDP |
 | 运行时登录回调 | receiveProviderAuthCallback、cancelProviderAuthCallback | 开发者功能需要时再做 |
 | 其他 | cliCommand、webLinks、appActivation、probeRemoteEditors、pasteAsText、getPrimaryPasteEnabled、restartAudioService、onTrackpadScrollBegin/End | 逐个评估 |

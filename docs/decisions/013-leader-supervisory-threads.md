@@ -140,6 +140,7 @@
 - [ADR-011 · 基于 Mingle 渠道层与伴侣范式的内置 IM 远程连接服务](011-mingle-im-bridge.md)
 - [ADR-012 · 小瞳模型渠道与编码 Agent 委派](012-xiaotong-model-channels-and-coding-agents.md)
 - [ADR-014 · 领航员控制面 v2（后续规划待办）](014-navigator-control-plane-v2.md)
+- [ADR-015 · 跨设备互联、渐进式零账号盲转 E2E 中继与可插拔身份控制面](015-cross-device-interconnect-and-e2e-relay.md)（细化跨设备互联与 Stage 3 多机演进，保持本 ADR 受保护任务 fail-closed 红线）
 - [07 远程连接插件](../plan/07-远程连接插件.md)
 - [08 通用任务化改造](../plan/08-通用任务化改造.md)
 - [11 风险与待定](../plan/11-风险与待定.md)
