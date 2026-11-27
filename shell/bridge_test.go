@@ -221,6 +221,69 @@ const source = fs.readFileSync(0, "utf8");
   await new Promise((resolve) => setTimeout(resolve, 90));
   await flush();
   assert.strictEqual(props.get("--xtwork-window-radius"), "0px");
+
+  const lateProps = new Map();
+  const lateDocListeners = [];
+  const lateDoc = {
+    documentElement: null,
+    adoptedStyleSheets: [],
+    addEventListener: (name, fn, opts) => {
+      lateDocListeners.push({ name, fn, opts });
+    },
+  };
+  let lateRadiusCalls = 0;
+  const lateWin = {
+    addEventListener: () => {},
+    mygo: {
+      call: (method) => {
+        if (method === "Desktop.GetWindowCornerRadius") {
+          lateRadiusCalls += 1;
+          return Promise.resolve(26);
+        }
+        return Promise.resolve(null);
+      },
+      on: () => () => {},
+    },
+  };
+  lateWin.top = lateWin;
+  const lateSandbox = {
+    window: lateWin,
+    location: { origin: "http://127.0.0.1:43123" },
+    navigator: { language: "zh-CN" },
+    document: lateDoc,
+    CSSStyleSheet: FakeCSSStyleSheet,
+    Object,
+    Number,
+    setTimeout,
+    clearTimeout,
+  };
+  const lateFn = vm.runInNewContext("(" + source + ")", lateSandbox);
+  lateFn({
+    origin: "http://127.0.0.1:43123",
+    wsOrigin: "ws://127.0.0.1:43123",
+    bootstrapToken: "tok",
+    platform: "darwin",
+    preferredLanguages: ["zh-CN"],
+    backendLogPath: "/tmp/backend.log",
+    branding: { baseName: "小瞳 Work", displayName: "小瞳 Work", stageLabel: "" },
+  });
+  await flush();
+  assert.strictEqual(lateRadiusCalls, 0);
+  assert.strictEqual(lateDocListeners.length, 1);
+  assert.strictEqual(lateDocListeners[0].name, "DOMContentLoaded");
+  assert.strictEqual(lateDocListeners[0].opts.once, true);
+
+  lateDoc.documentElement = {
+    style: {
+      setProperty: (k, v) => lateProps.set(k, v),
+      removeProperty: (k) => lateProps.delete(k),
+      getPropertyValue: (k) => lateProps.get(k) ?? "",
+    },
+  };
+  lateDocListeners[0].fn();
+  await flush();
+  assert.strictEqual(lateRadiusCalls, 1);
+  assert.strictEqual(lateProps.get("--xtwork-window-radius"), "26px");
 })().catch((err) => {
   console.error(err);
   process.exit(1);

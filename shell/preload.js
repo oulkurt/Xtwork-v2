@@ -28,8 +28,20 @@
   let fullscreen = false;
   let cornerRadiusRequest = 0;
   let resizeSyncTimer = 0;
+  let pendingCornerRadiusSync = false;
+  const scheduleCornerRadiusSyncOnReady = () => {
+    if (pendingCornerRadiusSync || typeof document.addEventListener !== "function") return;
+    pendingCornerRadiusSync = true;
+    document.addEventListener("DOMContentLoaded", () => {
+      pendingCornerRadiusSync = false;
+      syncWindowCornerRadius();
+    }, { once: true });
+  };
   const applyWindowCornerRadius = (radius) => {
-    if (!document.documentElement) return;
+    if (!document.documentElement) {
+      scheduleCornerRadiusSyncOnReady();
+      return;
+    }
     if (fullscreen) {
       document.documentElement.style.setProperty("--xtwork-window-radius", "0px");
     } else if (typeof radius === "number" && Number.isFinite(radius) && radius >= 0) {
@@ -42,6 +54,10 @@
     if (resizeSyncTimer) {
       clearTimeout(resizeSyncTimer);
       resizeSyncTimer = 0;
+    }
+    if (!document.documentElement) {
+      scheduleCornerRadiusSyncOnReady();
+      return;
     }
     const requestId = ++cornerRadiusRequest;
     if (fullscreen) {

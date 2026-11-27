@@ -215,6 +215,30 @@ index 051e3090..cd740974 100644
        }
  
        html[data-theme-selected="true"] #boot-error {
+diff --git a/apps/web/src/components/AppRouteModal.tsx b/apps/web/src/components/AppRouteModal.tsx
+index 1414b198..72da5f57 100644
+--- a/apps/web/src/components/AppRouteModal.tsx
++++ b/apps/web/src/components/AppRouteModal.tsx
+@@ -68,14 +68,15 @@ export function AppRouteModal({ label, children }: { label: string; children: Re
+         <DialogPrimitive.Viewport
+           style={
+             {
+-              "--app-modal-titlebar-height": `${nativeTitlebarHeight}px`,
+-              "--app-modal-top-inset": `max(env(safe-area-inset-top), ${nativeTitlebarHeight}px)`,
+-              "--app-modal-sm-top": `max(1.5rem, ${nativeTitlebarHeight}px)`,
++              "--app-modal-titlebar-height": `max(${nativeTitlebarHeight}px, var(--mygo-titlebar-height, 0px), var(--mygo-titlebar-controls-bottom, 0px))`,
++              "--app-modal-top-inset": `max(env(safe-area-inset-top), ${nativeTitlebarHeight}px, var(--mygo-titlebar-height, 0px), var(--mygo-titlebar-controls-bottom, 0px))`,
++              "--app-modal-sm-top": `max(1.5rem, ${nativeTitlebarHeight}px, var(--mygo-titlebar-height, 0px), var(--mygo-titlebar-controls-bottom, 0px))`,
++              "--app-modal-lg-top": `max(2.5rem, ${nativeTitlebarHeight}px, var(--mygo-titlebar-height, 0px), var(--mygo-titlebar-controls-bottom, 0px))`,
+             } as CSSProperties
+           }
+           // Electron hit-tests drag regions under the backdrop regardless of z-index; without
+           // this, presses above the modal move the window instead of dismissing it.
+-          className="fixed inset-0 z-50 flex items-center justify-center [-webkit-app-region:no-drag] sm:p-6 sm:pt-(--app-modal-sm-top) lg:p-10"
++          className="fixed inset-0 z-50 flex items-center justify-center [-webkit-app-region:no-drag] sm:p-6 sm:pt-(--app-modal-sm-top) lg:p-10 lg:pt-(--app-modal-lg-top)"
+           onPointerDown={(event) => {
+             backdropPressRef.current = event.target === event.currentTarget;
+           }}
 diff --git a/apps/web/src/components/AppSidebarLayout.tsx b/apps/web/src/components/AppSidebarLayout.tsx
 index 4b7a6d36..d47f2f4e 100644
 --- a/apps/web/src/components/AppSidebarLayout.tsx
@@ -278,10 +302,25 @@ index 4fde126c..8d507293 100644
                  ))}
                </span>
 diff --git a/apps/web/src/components/RightPanelTabs.tsx b/apps/web/src/components/RightPanelTabs.tsx
-index 2ce8f22f..c06048e5 100644
+index 2ce8f22f..7540ee12 100644
 --- a/apps/web/src/components/RightPanelTabs.tsx
 +++ b/apps/web/src/components/RightPanelTabs.tsx
-@@ -1626,6 +1626,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
+@@ -1431,7 +1431,13 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
+       <div
+         className={cn(
+           "flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center gap-1 pl-2",
+-          props.mode === "inline" && !props.layoutControls ? "pr-28" : "pr-3",
++          props.mode === "inline" && !props.layoutControls
++            ? ownsDesktopTitleBar
++              ? "pr-[calc(7rem+var(--mygo-titlebar-inset-right,0px))]"
++              : "pr-28"
++            : ownsDesktopTitleBar
++              ? "pr-[calc(0.75rem+var(--mygo-titlebar-inset-right,0px))]"
++              : "pr-3",
+           ownsDesktopTitleBar && "drag-region",
+           ownsDesktopTitleBar && "wco:pr-(--workspace-native-controls-inset)",
+           props.mode === "inline" && props.maximized && COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
+@@ -1626,6 +1632,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
          {ownsDesktopTitleBar ? (
            <span
              aria-hidden
@@ -302,10 +341,10 @@ index 174a80bf..765bfd71 100644
        className={cn(
          "flex w-60 shrink-0 flex-col border-e bg-sidebar text-sidebar-foreground max-md:w-14",
 diff --git a/apps/web/src/components/settings/ThemePreviewCircles.tsx b/apps/web/src/components/settings/ThemePreviewCircles.tsx
-index 8f23f5be..5124a6f2 100644
+index 8f23f5be..41f2dbfe 100644
 --- a/apps/web/src/components/settings/ThemePreviewCircles.tsx
 +++ b/apps/web/src/components/settings/ThemePreviewCircles.tsx
-@@ -1,32 +1,24 @@
+@@ -1,32 +1,25 @@
  import { useGT } from "gt-react";
  import { MoonIcon, SunIcon } from "lucide-react";
 -import type { CSSProperties } from "react";
@@ -317,6 +356,7 @@ index 8f23f5be..5124a6f2 100644
  import { cn } from "../../lib/utils";
  import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
  import {
++  BUILT_IN_THEMES,
 +  getStandardThemeColors,
    getThemeColorsForMode,
    getThemeModes,
@@ -346,7 +386,7 @@ index 8f23f5be..5124a6f2 100644
  };
  export type ThemeCardDefinition = {
    id: string;
-@@ -34,35 +26,22 @@ export type ThemeCardDefinition = {
+@@ -34,35 +27,22 @@ export type ThemeCardDefinition = {
    previews: ReadonlyArray<ThemeCardPreview>;
  };
  export type ThemeMode = ThemeAppearance | "system";
@@ -391,7 +431,11 @@ index 8f23f5be..5124a6f2 100644
      })),
    },
  ];
-@@ -78,47 +57,13 @@ export function getThemeCardDefinition(theme: ThemeDefinition): ThemeCardDefinit
+@@ -75,50 +55,20 @@ export function previewColorsOf(
+ }
+ 
+ export function getThemeCardDefinition(theme: ThemeDefinition): ThemeCardDefinition {
++  const isBuiltIn = BUILT_IN_THEMES.some((definition) => definition === theme);
    return {
      id: theme.id,
      label: theme.label,
@@ -429,7 +473,10 @@ index 8f23f5be..5124a6f2 100644
 -    ].join(", "),
 +    previews: getThemeModes(theme).map((mode) => ({
 +      mode,
-+      colors: previewColors(theme.id, mode, getThemeColorsForMode(theme, mode) ?? theme.colors),
++      colors: {
++        ...(getThemeColorsForMode(theme, mode) ?? theme.colors),
++        wash: isBuiltIn ? getBuiltInThemeWash(theme.id, mode) : undefined,
++      },
 +    })),
    };
  }
@@ -443,7 +490,7 @@ index 8f23f5be..5124a6f2 100644
  export function ThemePreviewCircle({
    colors,
    mode,
-@@ -131,20 +76,56 @@ export function ThemePreviewCircle({
+@@ -131,20 +81,56 @@ export function ThemePreviewCircle({
    return (
      <span
        aria-hidden
@@ -506,7 +553,7 @@ index 8f23f5be..5124a6f2 100644
      </span>
    );
  }
-@@ -162,7 +143,7 @@ export function ThemePreviewCircles({
+@@ -162,7 +148,7 @@ export function ThemePreviewCircles({
  }) {
    const gt = useGT();
    return (
@@ -515,7 +562,7 @@ index 8f23f5be..5124a6f2 100644
        {previews.map((preview) => {
          const mode = preview.mode;
          const isPicked = activeModes.includes(mode);
-@@ -178,7 +159,8 @@ export function ThemePreviewCircles({
+@@ -178,7 +164,8 @@ export function ThemePreviewCircles({
                    }
                    aria-pressed={isPicked}
                    className={cn(
@@ -525,7 +572,7 @@ index 8f23f5be..5124a6f2 100644
                      isPicked && "hover:scale-100",
                    )}
                    onClick={(event) => {
-@@ -187,17 +169,19 @@ export function ThemePreviewCircles({
+@@ -187,17 +174,19 @@ export function ThemePreviewCircles({
                    }}
                    type="button"
                  >
@@ -794,7 +841,7 @@ index 2467d890..31d7f862 100644
    if (typeof document === "undefined" || typeof window === "undefined") return;
    if (preservePreview && document.documentElement.dataset?.themeId === THEME_PREVIEW_ID) {
 diff --git a/apps/web/src/index.css b/apps/web/src/index.css
-index 05541d39..69323d7d 100644
+index 05541d39..9757df34 100644
 --- a/apps/web/src/index.css
 +++ b/apps/web/src/index.css
 @@ -120,10 +120,19 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
@@ -1336,7 +1383,7 @@ index 05541d39..69323d7d 100644
    --background: var(--app-theme-canvas);
    --app-chrome-background: var(--app-theme-chrome);
    --toolbar-background: var(--app-theme-toolbar);
-@@ -1389,6 +1347,150 @@ html[data-theme-id]:not([data-theme-id=""]) {
+@@ -1389,6 +1347,161 @@ html[data-theme-id]:not([data-theme-id=""]) {
    --terminal-selection-background: var(--app-theme-terminal-selection-background);
  }
  
@@ -1403,6 +1450,15 @@ index 05541d39..69323d7d 100644
 +}
 +
 +@media (min-width: 48rem) {
++  html[data-xtwork-wash] {
++    --xtwork-pane-inset: 8px;
++    --xtwork-pane-top-inset: clamp(
++      4px,
++      calc((var(--xtwork-window-topbar-height) - 30px) / 2),
++      var(--xtwork-pane-inset)
++    );
++  }
++
 +  html[data-xtwork-wash]:has([data-slot="sidebar-wrapper"] [data-app-sidebar]) {
 +    --workspace-controls-left: max(
 +      var(--xtwork-window-controls-left),
@@ -1421,22 +1477,24 @@ index 05541d39..69323d7d 100644
 +    left: 0;
 +    z-index: 1;
 +    display: block;
-+    height: 8px;
++    height: var(--xtwork-pane-top-inset);
 +  }
 +
 +  html[data-xtwork-wash]
 +    [data-slot="sidebar-wrapper"]:has([data-app-sidebar])
 +    > [data-slot="sidebar-inset"] {
-+    --xtwork-pane-inset: 8px;
 +    --xtwork-pane-radius: clamp(
 +      10px,
 +      calc(var(--xtwork-window-radius, 22px) - var(--xtwork-pane-inset)),
 +      18px
 +    );
-+    --workspace-topbar-height: calc(var(--xtwork-window-topbar-height) - 18px);
++    --workspace-topbar-height: max(
++      28px,
++      calc(var(--xtwork-window-topbar-height) - var(--xtwork-pane-top-inset) * 2 - 2px)
++    );
 +    position: relative;
-+    max-height: calc(100dvh - 16px);
-+    margin: 8px 8px 8px 0;
++    max-height: calc(100dvh - var(--xtwork-pane-top-inset) - var(--xtwork-pane-inset));
++    margin: var(--xtwork-pane-top-inset) var(--xtwork-pane-inset) var(--xtwork-pane-inset) 0;
 +    overflow: hidden;
 +    background-clip: padding-box;
 +    border: 1px solid var(--xtwork-pane-border-computed);
@@ -1487,25 +1545,72 @@ index 05541d39..69323d7d 100644
  /* Theme-token dependency probes are restored synchronously, before paint. Keep
     transitions from observing the temporary sentinel color in between. */
  html[data-theme-token-probe],
-@@ -1517,31 +1619,70 @@ html[data-theme-id] [data-chat-header] [data-slot="separator"] {
-   background-color: var(--contrast-toolbar-border);
+@@ -1462,86 +1575,72 @@ html[data-theme-token-probe] *::after {
+   top: calc(100% + 0.35rem);
  }
  
-+html[data-xtwork-wash] [data-chat-header] {
+-/* Workspace actions use a small, separate chrome hierarchy. Keeping these
+-   roles explicit prevents the thread toolbar from falling back to the default
+-   dark-mode whites while preserving the same theme file across clients. */
+-html[data-theme-id] [data-chat-header] {
+-  background-color: var(--toolbar-background);
+-  color: var(--contrast-toolbar-foreground);
+-}
+-
+-html[data-theme-id] [data-chat-header] [data-slot="button"],
+-html[data-theme-id] [data-chat-header] [data-slot="menu-trigger"],
+-html[data-theme-id] [data-chat-header] [data-toolbar-control] {
+-  --control-icon-color: var(--contrast-toolbar-control-foreground);
+-  background-color: var(--toolbar-control);
+-  border-color: var(--contrast-toolbar-border);
+-  color: var(--contrast-toolbar-control-foreground);
+-}
+-
+-/* The panel layout toggles stay ghost: they render both inside the header and
+-   in the titlebar strip, so filling them would make them change appearance as
+-   the panel opens. They only take the themed foreground; hover and pressed
+-   keep the base ghost accent. The tooltip trigger's data-slot wins over the
+-   toggle's when the trigger renders the toggle, so match both. */
+-html[data-theme-id] [data-panel-layout-controls] [data-slot="toggle"],
+-html[data-theme-id] [data-panel-layout-controls] [data-slot="tooltip-trigger"],
+-html[data-theme-id] [data-workspace-titlebar-controls] [data-slot="toggle"],
+-html[data-theme-id] [data-workspace-titlebar-controls] [data-slot="tooltip-trigger"] {
+-  --control-icon-color: var(--contrast-toolbar-foreground);
+-  color: var(--contrast-toolbar-foreground);
+-}
+-
+-html[data-theme-id] [data-panel-layout-controls] [data-slot="toggle"]:disabled,
+-html[data-theme-id] [data-panel-layout-controls] [data-slot="tooltip-trigger"]:disabled,
+-html[data-theme-id] [data-workspace-titlebar-controls] [data-slot="toggle"]:disabled,
+-html[data-theme-id] [data-workspace-titlebar-controls] [data-slot="tooltip-trigger"]:disabled {
+-  --control-icon-color: color-mix(
+-    in oklab,
+-    var(--contrast-toolbar-foreground) 55%,
+-    var(--toolbar-background)
+-  );
+-  color: color-mix(in oklab, var(--contrast-toolbar-foreground) 55%, var(--toolbar-background));
++html:is([data-xtwork-theme-tokens], [data-theme-id], [data-xtwork-wash]) [data-chat-header] {
 +  background-color: transparent;
 +  color: var(--contrast-foreground);
 +}
 +
-+html[data-xtwork-wash]
++html:is([data-xtwork-theme-tokens], [data-theme-id], [data-xtwork-wash])
 +  [data-chat-header]
 +  :is([data-slot="button"], [data-slot="menu-trigger"], [data-toolbar-control]) {
 +  --control-icon-color: var(--contrast-foreground);
 +  background-color: transparent;
 +  border-color: color-mix(in oklab, var(--contrast-foreground) 14%, transparent);
 +  color: var(--contrast-foreground);
-+}
-+
-+html[data-xtwork-wash]
+ }
+ 
+-html[data-theme-id] [data-chat-header] [data-slot="button"]:hover,
+-html[data-theme-id] [data-chat-header] [data-slot="button"][data-pressed],
+-html[data-theme-id] [data-chat-header] [data-slot="menu-trigger"]:hover,
+-html[data-theme-id] [data-chat-header] [data-slot="menu-trigger"][data-pressed],
+-html[data-theme-id] [data-chat-header] [data-toolbar-control]:hover,
+-html[data-theme-id] [data-chat-header] [data-toolbar-control][data-pressed] {
+-  background-color: var(--toolbar-control-hover);
++html:is([data-xtwork-theme-tokens], [data-theme-id], [data-xtwork-wash])
 +  [data-chat-header]
 +  :is([data-slot="button"], [data-slot="menu-trigger"], [data-toolbar-control]):is(
 +    :hover,
@@ -1514,24 +1619,28 @@ index 05541d39..69323d7d 100644
 +  background-color: color-mix(in oklab, var(--contrast-foreground) 7%, transparent);
 +}
 +
-+html[data-xtwork-wash] [data-chat-header] [data-slot="separator"] {
++html:is([data-xtwork-theme-tokens], [data-theme-id], [data-xtwork-wash])
++  [data-chat-header]
++  [data-slot="separator"] {
 +  background-color: color-mix(in oklab, var(--contrast-foreground) 14%, transparent);
 +}
 +
-+html[data-xtwork-wash]
++html:is([data-xtwork-theme-tokens], [data-theme-id], [data-xtwork-wash])
 +  :is([data-panel-layout-controls], [data-workspace-titlebar-controls])
 +  :is([data-slot="toggle"], [data-slot="tooltip-trigger"]) {
 +  --control-icon-color: var(--contrast-foreground);
 +  color: var(--contrast-foreground);
-+}
-+
-+html[data-xtwork-wash]
+ }
+ 
+-html[data-theme-id] [data-chat-header] [data-slot="separator"] {
+-  background-color: var(--contrast-toolbar-border);
++html:is([data-xtwork-theme-tokens], [data-theme-id], [data-xtwork-wash])
 +  :is([data-panel-layout-controls], [data-workspace-titlebar-controls])
 +  :is([data-slot="toggle"], [data-slot="tooltip-trigger"]):disabled {
 +  --control-icon-color: color-mix(in oklab, var(--contrast-foreground) 45%, transparent);
 +  color: color-mix(in oklab, var(--contrast-foreground) 45%, transparent);
-+}
-+
+ }
+ 
  /* Chat code blocks join the other code surfaces on the code tokens. The
     default look keeps its secondary/input tints; themed palettes tint those
     surfaces with the accent, which fights syntax highlighting. */
@@ -1565,7 +1674,7 @@ index 05541d39..69323d7d 100644
  html[data-theme-id="t3-chat"] {
    @variant light {
      & .chat-markdown :not(pre) > code,
-@@ -1589,8 +1730,7 @@ html[data-theme-id] [data-app-sidebar] {
+@@ -1589,8 +1688,7 @@ html[data-theme-id] [data-app-sidebar] {
    }
  }
  
@@ -1575,7 +1684,7 @@ index 05541d39..69323d7d 100644
  html[data-theme-id="t3-chat"] [data-app-sidebar] {
    @variant dark {
      border-color: var(--contrast-sidebar-border);
-@@ -1599,7 +1739,9 @@ html[data-theme-id="t3-chat"] [data-app-sidebar] {
+@@ -1599,7 +1697,9 @@ html[data-theme-id="t3-chat"] [data-app-sidebar] {
  
  /* Recompute contrast wherever a subtree owns its own semantic color palette. */
  :root,
@@ -1703,10 +1812,10 @@ index 891096cb..f874e9ca 100644
  
    it("follows the OS appearance when storage is unavailable", () => {
 diff --git a/apps/web/src/themePalette.browser.test.ts b/apps/web/src/themePalette.browser.test.ts
-index 4204b069..2596839a 100644
+index 4204b069..6a2a0d1f 100644
 --- a/apps/web/src/themePalette.browser.test.ts
 +++ b/apps/web/src/themePalette.browser.test.ts
-@@ -1,8 +1,24 @@
+@@ -1,8 +1,25 @@
  import { converter } from "culori/fn";
 +import { page } from "vite-plus/test/browser";
  import { describe, expect, it } from "vite-plus/test";
@@ -1714,6 +1823,7 @@ index 4204b069..2596839a 100644
  import "~/index.css";
 -import { getStandardPaintedThemeColors } from "./themePalette";
 +import { applyAppearancePluginTheme } from "./appearancePlugin";
++import { getThemeCardDefinition } from "./components/settings/ThemePreviewCircles";
 +import { syncBrowserChromeTheme } from "./hooks/useTheme";
 +import {
 +  BUILT_IN_THEMES,
@@ -1732,7 +1842,7 @@ index 4204b069..2596839a 100644
  
  const toRgb = converter("rgb");
  
-@@ -22,23 +38,30 @@ function paintedChannels(variable: string, canvas: readonly number[] = [0, 0, 0]
+@@ -22,23 +39,30 @@ function paintedChannels(variable: string, canvas: readonly number[] = [0, 0, 0]
  }
  
  describe("standard painted theme colors", () => {
@@ -1765,7 +1875,7 @@ index 4204b069..2596839a 100644
                1.5,
              );
            });
-@@ -48,4 +71,787 @@ describe("standard painted theme colors", () => {
+@@ -48,4 +72,910 @@ describe("standard painted theme colors", () => {
        root.classList.remove("dark");
      }
    });
@@ -2552,6 +2662,129 @@ index 4204b069..2596839a 100644
 +      applyThemePalette("system", "light");
 +    }
 +  });
++
++  it("renders dark-mode specular rim, responds to contrast boost, adapts 40px WCO topbar height, keeps custom/plugin headers transparent, and isolates custom default id", async () => {
++    await page.viewport(1280, 800);
++    const root = document.documentElement;
++    const fixture = mountFloatingCardFixture();
++    const customToolbarThemeId = "browser-custom-toolbar-band";
++    try {
++      root.classList.remove("dark");
++      applyThemePalette("grove", "light");
++      expect(getComputedStyle(fixture.inset, "::after").boxShadow).toBe("none");
++
++      root.classList.add("dark");
++      applyThemePalette("grove", "dark");
++      const darkRimShadow = getComputedStyle(fixture.inset, "::after").boxShadow;
++      expect(darkRimShadow).not.toBe("none");
++      expect(darkRimShadow).toContain("inset");
++
++      const defaultBorderColor = getComputedStyle(fixture.inset).borderTopColor;
++      root.style.setProperty("--appearance-contrast-border-boost", "25%");
++      const boostedBorderColor = getComputedStyle(fixture.inset).borderTopColor;
++      expect(boostedBorderColor).not.toBe(defaultBorderColor);
++      root.style.removeProperty("--appearance-contrast-border-boost");
++
++      root.classList.remove("dark");
++      applyThemePalette("grove", "light");
++      root.classList.add("wco");
++      root.style.setProperty("--xtwork-window-topbar-height", "40px");
++      const navButton = document.createElement("button");
++      navButton.type = "button";
++      navButton.className = "h-7 min-h-7 px-2";
++      navButton.textContent = "管理";
++      fixture.header.append(navButton);
++      try {
++        expect(getComputedStyle(fixture.inset).marginTop).toBe("5px");
++        expect(fixture.dragStrip.getBoundingClientRect().height).toBeCloseTo(5, 0);
++        const wcoHeaderRect = fixture.header.getBoundingClientRect();
++        expect(wcoHeaderRect.height).toBeGreaterThanOrEqual(28);
++        expect(wcoHeaderRect.height).toBeCloseTo(28, 0);
++        const wcoHeaderCenterY = wcoHeaderRect.top + wcoHeaderRect.height / 2;
++        expect(Math.abs(wcoHeaderCenterY - 20)).toBeLessThanOrEqual(1.5);
++        const btnRect = navButton.getBoundingClientRect();
++        expect(btnRect.top).toBeGreaterThanOrEqual(wcoHeaderRect.top - 0.5);
++        expect(btnRect.bottom).toBeLessThanOrEqual(wcoHeaderRect.bottom + 0.5);
++      } finally {
++        navButton.remove();
++        root.classList.remove("wco");
++        root.style.removeProperty("--xtwork-window-topbar-height");
++      }
++
++      const toolbarCustomTheme = installCustomTheme(
++        parseThemeFile({
++          version: THEME_FILE_VERSION,
++          id: customToolbarThemeId,
++          name: "Custom Contrasting Toolbar",
++          appearance: "dark",
++          colors: {
++            canvas: "#0e1a24",
++            surface: "#152634",
++            toolbar: "#882244",
++            text: "#eef6ff",
++          },
++        }),
++      );
++      root.classList.add("dark");
++      applyThemePalette(toolbarCustomTheme.id, "dark");
++      expect(root.getAttribute("data-xtwork-wash")).toBeNull();
++      expect(getComputedStyle(fixture.header).backgroundColor).toBe("rgba(0, 0, 0, 0)");
++
++      applyThemePalette("grove", "dark");
++      const pluginOverNamed = applyAppearancePluginTheme(root, {
++        pluginId: "named-header-plugin",
++        kind: "appearance",
++        theme: {
++          id: "named-header-plugin",
++          tokens: {
++            canvas: "#141824",
++            toolbar: "#993355",
++          },
++        },
++      });
++      try {
++        expect(root.getAttribute("data-xtwork-wash")).toBeNull();
++        expect(getComputedStyle(fixture.header).backgroundColor).toBe("rgba(0, 0, 0, 0)");
++      } finally {
++        pluginOverNamed.dispose();
++      }
++
++      const customDefaultTheme = installCustomTheme(
++        parseThemeFile({
++          version: THEME_FILE_VERSION,
++          id: "default",
++          name: "Saved Custom",
++          appearance: "dark",
++          colors: {
++            canvas: "#101820",
++            surface: "#182430",
++            toolbar: "#243444",
++            text: "#e6edf3",
++          },
++        }),
++      );
++      applyThemePalette(customDefaultTheme.id, "dark");
++      expect(root.getAttribute("data-theme-id")).toBe("default");
++      expect(root.getAttribute("data-xtwork-wash")).toBeNull();
++      expect(getComputedStyle(document.body).backgroundImage).not.toContain("linear-gradient");
++      expect(getComputedStyle(fixture.header).backgroundColor).toBe("rgba(0, 0, 0, 0)");
++      expect(
++        getThemeCardDefinition(customDefaultTheme).previews.every(
++          (preview) => preview.colors.wash === undefined,
++        ),
++      ).toBe(true);
++    } finally {
++      removeCustomTheme(customToolbarThemeId);
++      removeCustomTheme("default");
++      invalidateCustomThemes();
++      root.classList.remove("wco");
++      root.style.removeProperty("--xtwork-window-topbar-height");
++      root.style.removeProperty("--appearance-contrast-border-boost");
++      fixture.cleanup();
++      root.classList.remove("dark");
++      applyThemePalette("system", "light");
++    }
++  });
  });
 diff --git a/apps/web/src/themePalette.test.ts b/apps/web/src/themePalette.test.ts
 index dd33895b..54c35397 100644
@@ -2733,7 +2966,7 @@ index dd33895b..54c35397 100644
            }
          }
 diff --git a/apps/web/src/themePalette.ts b/apps/web/src/themePalette.ts
-index d04e7e16..d2202f3d 100644
+index d04e7e16..5931d260 100644
 --- a/apps/web/src/themePalette.ts
 +++ b/apps/web/src/themePalette.ts
 @@ -8,14 +8,6 @@ import { msg } from "gt-react";
@@ -3121,7 +3354,7 @@ index d04e7e16..d2202f3d 100644
  }
  
  export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppearance): void {
-@@ -1751,22 +1986,34 @@ export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppe
+@@ -1751,22 +1986,36 @@ export function applyThemePalette(theme: ThemePreference, appearance?: ThemeAppe
    applyThemeCss(palette?.css);
    applyThemeBackground(palette?.id);
  
@@ -3142,7 +3375,9 @@ index d04e7e16..d2202f3d 100644
 +  const colors = palette
 +    ? (getThemeColorsForMode(palette, mode) ?? palette.colors)
 +    : getStandardPaintedThemeColors(mode);
-+  const wash = getBuiltInThemeWash(palette?.id ?? "default", mode);
++  const isBuiltInPalette =
++    palette === null || BUILT_IN_THEMES.some((definition) => definition === palette);
++  const wash = isBuiltInPalette ? getBuiltInThemeWash(palette?.id ?? "default", mode) : undefined;
 +  const state = getOrCreateAppearanceRootState(root);
 +  const nextBaseTokens: Partial<Record<ThemeColorRole, string>> = {};
 +  for (const [role, value] of Object.entries(colors) as Array<[ThemeColorRole, string]>) {

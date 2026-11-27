@@ -49,10 +49,10 @@ index aafca841..91a8301e 100644
 +    "relative bg-transparent [[data-panel-animations=true]_&]:motion-safe:transition-[padding-left] [[data-panel-animations=true]_&]:motion-safe:duration-(--panel-animation-duration) [[data-panel-animations=true]_&]:motion-safe:ease-out",
 +    isElectron
 +      ? cn(
-+          "drag-region flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center px-3 sm:px-5",
-+          reserveTitleBarControlInset &&
-+            !inlineRightPanelOwnsTitleBar &&
-+            "wco:pr-(--workspace-native-controls-inset)",
++          "drag-region flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center",
++          reserveTitleBarControlInset && !inlineRightPanelOwnsTitleBar
++            ? "pl-3 sm:pl-5 pr-[calc(0.75rem+var(--mygo-titlebar-inset-right,0px))] sm:pr-[calc(1.25rem+var(--mygo-titlebar-inset-right,0px))] wco:pr-(--workspace-native-controls-inset)"
++            : "px-3 sm:px-5",
 +        )
 +      : "flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center pl-(--workspace-gutter-start) pr-(--workspace-gutter-end)",
 +    COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,

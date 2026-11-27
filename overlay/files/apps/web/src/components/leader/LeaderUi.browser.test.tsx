@@ -13,6 +13,8 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import { render } from "../../../test/render";
+import { AppRouteModal, AppRouteModalClose } from "../AppRouteModal";
+import { applyThemePalette } from "../../themePalette";
 import { LeaderSidebarSlot } from "./LeaderSidebarSlot";
 import { LeaderSupervisoryBar } from "./LeaderSupervisoryBar";
 import { NavigatorBotAvatar } from "./NavigatorBotAvatar";
@@ -78,10 +80,14 @@ function makeRealThreadShell(
   });
 }
 
-vi.mock("../../state/entities", () => ({
-  useProjects: () => [],
-  useQuietThreadShells: () => mockThreadShells,
-}));
+vi.mock("../../state/entities", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../state/entities")>();
+  return {
+    ...actual,
+    useProjects: () => [],
+    useQuietThreadShells: () => mockThreadShells,
+  };
+});
 
 afterEach(() => {
   mockThreadShells = [];
@@ -1545,4 +1551,123 @@ it("patches only edited imPolicy sub-fields, expands truncated short paused mess
   await new Promise((resolve) => setTimeout(resolve, 150));
   await expect.element(page.getByTestId("leader-create-form")).toBeVisible();
   expect((page.getByTestId("leader-create-name").element() as HTMLInputElement).value).toBe("第二份草稿");
+});
+
+it("keeps Navigator Manage button and right-panel tabs clear of Windows MyGo native controls and fixed titlebar controls without WCO", async () => {
+  stubDesktopBridge();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const path = url.replace(/^.*\/api\/xtwork\/im\//, "").split("?")[0] ?? "";
+      const json = (data: unknown) =>
+        new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } });
+      if (path === "leaders") return json({ leaders: [sampleLeaderItem] });
+      if (path === "leaders/leader-default/overview") return json(sampleOverview);
+      return json({});
+    }),
+  );
+
+  const root = document.documentElement;
+  root.classList.remove("wco", "dark");
+  applyThemePalette("grove", "light");
+  root.style.setProperty("--mygo-titlebar-inset-right", "138px");
+  try {
+    await page.viewport(1280, 800);
+    await using _screen = await render(
+      <div data-slot="sidebar-wrapper" data-sidebar-state="expanded" className="flex h-dvh w-full">
+        <div data-app-sidebar="" data-slot="sidebar-container" className="w-[240px] shrink-0" />
+        <main data-slot="sidebar-inset" className="relative flex min-w-0 flex-1 flex-col bg-background">
+          <div
+            data-testid="fixed-titlebar-controls"
+            data-workspace-titlebar-controls=""
+            className="fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] z-30 flex h-[var(--workspace-topbar-height)] w-24 items-center justify-end"
+          />
+          <div className="flex min-h-0 flex-1 flex-col" data-chat-column>
+            <LeaderSupervisoryBar
+              threadId="xtwork-leader-leader-default-abc123"
+              environmentId={EnvironmentId.make("local")}
+              rightPanelOpen={false}
+              renderHeader={(header) => (
+                <header
+                  data-chat-header=""
+                  className="drag-region relative flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center bg-transparent pl-3 sm:pl-5 pr-[calc(0.75rem+var(--mygo-titlebar-inset-right,0px))] sm:pr-[calc(1.25rem+var(--mygo-titlebar-inset-right,0px))] wco:pr-(--workspace-native-controls-inset)"
+                >
+                  {header}
+                </header>
+              )}
+            />
+            <div
+              data-testid="mygo-right-panel-tabbar"
+              className="drag-region flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center gap-1 pl-2 pr-[calc(7rem+var(--mygo-titlebar-inset-right,0px))] wco:pr-(--workspace-native-controls-inset)"
+            >
+              <div data-testid="mygo-right-panel-tab-end" className="ml-auto h-6 w-20" />
+            </div>
+          </div>
+        </main>
+      </div>,
+      { router: "/local/xtwork-leader-leader-default-abc123" },
+    );
+
+    await expect.element(page.getByTestId("leader-supervisory-bar")).toBeVisible();
+    const manageButton = page.getByRole("button", { name: "管理", exact: true }).element() as HTMLElement;
+    const fixedControls = page.getByTestId("fixed-titlebar-controls").element() as HTMLElement;
+    const manageRect = manageButton.getBoundingClientRect();
+    const fixedRect = fixedControls.getBoundingClientRect();
+    const captionLeftEdge = 1280 - 138;
+
+    expect(fixedRect.right).toBeLessThanOrEqual(captionLeftEdge);
+    expect(manageRect.right).toBeLessThanOrEqual(captionLeftEdge);
+    expect(manageRect.right).toBeLessThanOrEqual(fixedRect.left);
+
+    const hitTarget = document.elementFromPoint(
+      manageRect.left + manageRect.width / 2,
+      manageRect.top + manageRect.height / 2,
+    );
+    expect(hitTarget && manageButton.contains(hitTarget)).toBe(true);
+    await page.getByRole("button", { name: "管理", exact: true }).click();
+    await expect.element(page.getByTestId("leader-config-panel")).toBeVisible();
+
+    const tabEndRect = page.getByTestId("mygo-right-panel-tab-end").element().getBoundingClientRect();
+    expect(tabEndRect.right).toBeLessThanOrEqual(captionLeftEdge);
+    expect(tabEndRect.right).toBeLessThanOrEqual(fixedRect.left + 1);
+  } finally {
+    root.style.removeProperty("--mygo-titlebar-inset-right");
+    applyThemePalette("system", "light");
+  }
+});
+
+it("keeps AppRouteModal and its Close button below the 52px Windows MyGo native titlebar at 768x500 and 1200x800", async () => {
+  const root = document.documentElement;
+  root.classList.remove("wco");
+  root.style.setProperty("--mygo-titlebar-height", "52px");
+  root.style.setProperty("--mygo-titlebar-controls-bottom", "52px");
+  try {
+    for (const [width, height] of [
+      [768, 500],
+      [1200, 800],
+    ] as const) {
+      await page.viewport(width, height);
+      await using _screen = await render(
+        <AppRouteModal label="Settings" onClose={() => {}}>
+          <div className="flex h-12 items-center justify-end px-4">
+            <AppRouteModalClose />
+          </div>
+        </AppRouteModal>,
+        { router: "/" },
+      );
+
+      const modal = document.querySelector("[data-app-modal]") as HTMLElement;
+      expect(modal).not.toBeNull();
+      const closeButton = page.getByRole("button", { name: "Close" }).element() as HTMLElement;
+      const modalRect = modal.getBoundingClientRect();
+      const closeRect = closeButton.getBoundingClientRect();
+      expect(modalRect.top, `${width}x${height} modal top`).toBeGreaterThanOrEqual(51.5);
+      expect(closeRect.top, `${width}x${height} close button top`).toBeGreaterThanOrEqual(51.5);
+      expect(closeRect.bottom).toBeGreaterThan(closeRect.top);
+    }
+  } finally {
+    root.style.removeProperty("--mygo-titlebar-height");
+    root.style.removeProperty("--mygo-titlebar-controls-bottom");
+  }
 });
