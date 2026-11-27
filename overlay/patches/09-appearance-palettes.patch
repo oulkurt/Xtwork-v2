@@ -301,6 +301,32 @@ index 4fde126c..8d507293 100644
                    />
                  ))}
                </span>
+diff --git a/apps/web/src/components/RightPanelSheet.tsx b/apps/web/src/components/RightPanelSheet.tsx
+index d12ea950..5efe1863 100644
+--- a/apps/web/src/components/RightPanelSheet.tsx
++++ b/apps/web/src/components/RightPanelSheet.tsx
+@@ -1,5 +1,5 @@
+ import { T } from "gt-react";
+-import { type ReactNode } from "react";
++import { type CSSProperties, type ReactNode } from "react";
+ 
+ import { Sheet, SheetHeader, SheetPopup, SheetTitle } from "./ui/sheet";
+ 
+@@ -23,7 +23,13 @@ export function RightPanelSheet(props: {
+         side="right"
+         showCloseButton={false}
+         keepMounted
+-        className="w-[min(42vw,28rem)] min-w-80 max-w-[28rem] max-[760px]:w-[min(88vw,24rem)] max-[760px]:min-w-0 wco:mt-(--workspace-topbar-height) wco:h-[calc(100%-var(--workspace-topbar-height))] wco:max-h-[calc(100%-var(--workspace-topbar-height))]"
++        style={
++          {
++            "--right-panel-sheet-top":
++              "max(var(--mygo-titlebar-height, 0px), var(--mygo-titlebar-controls-bottom, 0px))",
++          } as CSSProperties
++        }
++        className="w-[min(42vw,28rem)] min-w-80 max-w-[28rem] max-[760px]:w-[min(88vw,24rem)] max-[760px]:min-w-0 mt-(--right-panel-sheet-top) h-[calc(100%-var(--right-panel-sheet-top))] max-h-[calc(100%-var(--right-panel-sheet-top))] wco:mt-(--workspace-topbar-height) wco:h-[calc(100%-var(--workspace-topbar-height))] wco:max-h-[calc(100%-var(--workspace-topbar-height))]"
+       >
+         <SheetHeader className="sr-only">
+           <SheetTitle>
 diff --git a/apps/web/src/components/RightPanelTabs.tsx b/apps/web/src/components/RightPanelTabs.tsx
 index 2ce8f22f..7540ee12 100644
 --- a/apps/web/src/components/RightPanelTabs.tsx
