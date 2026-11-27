@@ -26,7 +26,7 @@
    - 若直接放开上游裸 `t3_thread_launch`，既不校验「查看状态权 ≠ 改代码派单权」，且上游本机调用会丢弃 `delegatedFrom` 导致新线程失去归属记录并绕过并发限流。
 2. **默认 `awarenessScope = all_local` 与桌面只读工具穿墙**：
    - `XtworkLeaderStore.ts` 中 `DEFAULT_AWARENESS_SCOPE` 默认为 `all_local`，且 `XtworkImService.ts` 创建/编辑接口对未知值也会回落 `all_local`。
-   - 更隐蔽的是：桌面领航员线程目前不是受保护线程，`t3_thread_list` / `t3_thread_read` / `t3_thread_search`（默认搜调用方所在的 `scratch`，而全机所有领航员和所有 `xtwork-im-*` 聊天都挂在 `scratch` 下）以及随包 Pi 的原生 `read` / `grep` / `find` / `ls` 均免确认直通，导致受限领航员可绕过侧栏直接读出其他项目与聊天记录。
+   - 更隐蔽的是：桌面领航员线程目前不是受保护线程，`t3_thread_list` / `t3_thread_read` / `t3_thread_search`（默认搜调用方所在的 `scratch`，而全机所有领航员和所有 `xtwork-im-*` 聊天都挂在 `scratch` 下）免确认直通，导致受限领航员可绕过侧栏直接读出其他领航员的对话与 IM 聊天记录；对于本机文件访问，产品确认桌面领航员的只读查看（`read` / `grep` / `find` / `ls`）越界自动放行，但编辑、删除、命令执行等写操作必须交由用户决定（IM 受保护线程仍维持原有沙箱隔离）。
 3. **`source: "desktop" | "im"` 分不清「人亲手下令」与「自动唤醒」，且策略落库与 IM 保护态耦合**：
    - `TurnExecutionContext` 仅有 `desktop | im`，无法区分桌面本人敲回车与定时任务、工单回报、跨领航员留言等自动唤醒。
    - 现有 `persistPolicyBeforeLaunch` 会同时写入 `xtwork_run_policies` 与 `xtwork_protected_threads`；若直接给桌面线程写策略，会误触发 IM 受保护态，同时封死 M1c 编码委派、隐藏 `t3_*` 工具并强制私聊 fork。
@@ -87,7 +87,7 @@
   2. **去 `N+1` 与脱敏投影**（`XtworkImService.ts`、`XtworkImDispatch.ts`、`XtworkLeaderAwareness.ts`）：
      - `GET /api/xtwork/im/leaders` 改为批量单次拉取公共数据（1 次 `connections.list` + 至多 1 次合并 `connections.syncBindings` + 1 次 `paused.list` + 1 次 `getAgentAwarenessSnapshot()`），内存按领航员过滤；
      - 新增 `buildCountsOnlyAwareness`（仅返状态计数，剥离标题/细节/审批参数）；`POST /leaders` 与 `/update` 拒收非法 `awarenessScope.kind`（返 `400`）；`reset-session` 切换前自动归档旧 `pinnedThreadId`；动态读取当前生效小瞳默认模型替代硬编码 `xtwork/standard`；仅在 `connections.list` 成功时附带 `triggerReplay: true`。
-  3. **规划薄补丁（`048`，届时新增）**：在桌面消息入口盖章 `triggerOrigin` 并于 `EventSink` 事务内为非受保护线程原子绑定 `run_id`（同步绑定 `McpSessionRegistry` 的 `runId`）；对 `xtwork-leader-*` 的 `t3_thread_list/read/search/send`、`t3_project_list/read` 以及 Pi 原生只读工具统一套上 `awarenessScope` 门禁（严格隔离 `scratch` 下其他领航员与 IM 线程）。
+  3. **规划薄补丁（`049`，届时新增）**：在桌面消息入口盖章 `triggerOrigin` 并于 `EventSink` 事务内为非受保护线程原子绑定 `run_id`（同步绑定 `McpSessionRegistry` 的 `runId`）；对 `xtwork-leader-*` 的 `t3_thread_*`（`list/read/search/send/wait/configure/transfer/interrupt/organize`）、`t3_queue`、`t3_pending_request`、`t3_project_list/read` 统一套上 `awarenessScope` 门禁（严格隔离 `scratch` 下其他领航员与 IM 线程，并消除跨线程只读的 `thread-read-acknowledge` 副作用）；桌面领航员的 Pi 原生只读工具（`read`/`grep`/`find`/`ls`）对越界路径保持自动放行，编辑、删除与命令执行等写操作统一保持用户确认门禁（`auto` 回合硬禁无确认写入）。
   4. **前端 UI**（`LeaderSidebarSlot.tsx`、`LeaderSupervisoryBar.tsx`）：新建小表单增加可选文件夹勾选；`none` 空态明确提示未关联文件夹并提供一键跳转管理设置按钮；去掉顶栏冗余串行请求。
 - **验收标准**：老数据升级保留「小瞳」设置与既有会话摘要；5 领航员刷新快照/桥接调用严格为 1 次；受限领航员调 `t3_thread_search()` 搜默认 `scratch` 或猜 ID 100% 被拒；桌面 M1c 编码委派零误伤；存量测试与 `node scripts/check-docs.mjs` 全绿。
 - **Out of Scope**：本切片不引入自然语言建领航员、Crew 跨项目派单、Drive 目录与 Squad。
@@ -100,7 +100,7 @@
      - `XtworkLeaderDrive.ts`：管理 `<dataDir>/leaders/<leaderId>/drive/{NAVIGATOR.md,CREW.md,NOTES.md}`，内置 `KeyedLock(leaderId, file)` + `expectedSha256` 乐观并发校验 + 单文件 `32 KiB` 上限 + 回合注入截断摘要（单文件 `8 KiB`）。
      - `XtworkCrewScheduler.ts`：管理 SQLite 表 `xtwork_crew_threads`（含 `UNIQUE(leader_id, client_request_id)`、`auto_coding_used`、`digest_dispatched`）与 `xtwork_leader_create_proposals`（`run_id UNIQUE` 实现单回合一次确认只建一个、重放幂等）；2 槽限流器实时从 `getAgentAwarenessSnapshot()` 计数 + 30s 短启动租约；工单终态经 3–5 秒防抖合并触发至多 1 次 `triggerOrigin = "auto"` 的只读/记笔记消化回合。
      - `XtworkNavigatorMcp.ts`：仅对桌面 `xtwork-leader-*` 暴露 `navigator__propose_peer`、`navigator__dispatch_crew`、`navigator__drive_read` / `navigator__drive_write`、`navigator__peer_status`（内部调 `buildCountsOnlyAwareness`），IM 受保护线程硬屏蔽。
-  2. **规划薄补丁（`049`，届时新增）**：挂载 `XtworkNavigatorMcp` 并在 `xtwork-leader-*` 隐藏裸 `t3_thread_launch` / `create_threads`；在 `OrchestratorMcpService.delegateTask` 对 Crew 工单执行「单工单最多自动派 1 次编码工作（同 `commandId` 重试幂等放行），第 2 次转入 `Needs You`」；回合启动注入 Drive 摘要；`XtworkImService` 归档领航员时拦截在途运行 Crew 工单、自动取消 `queued` 工单并拒绝清理挂起内存审批。
+  2. **规划薄补丁（`050`，届时新增）**：挂载 `XtworkNavigatorMcp` 并在 `xtwork-leader-*` 隐藏裸 `t3_thread_launch` / `create_threads`；在 `OrchestratorMcpService.delegateTask` 对 Crew 工单执行「单工单最多自动派 1 次编码工作（同 `commandId` 重试幂等放行），第 2 次转入 `Needs You`」；回合启动注入 Drive 摘要；`XtworkImService` 归档领航员时拦截在途运行 Crew 工单、自动取消 `queued` 工单并拒绝清理挂起内存审批。
   3. **前端 UI**：顶栏与 Needs You 支持新建领航员确认卡、未授权项目派单确认卡与下一步建议卡，并新增轻量「工作笔记」抽屉。
 - **验收标准**：Crew 工单准确绑定目标项目 `cwd` 并成功走通 1 次 M1c 委派；3 单连发遇到崩溃、`/stop`、人工等待与服务重启均自动补位无死锁；`auto` / `im_inbound` 回合严禁建领航员或续派工单；Drive 并发写无丢写且对 `im__memory_*` 不可见。
 - **Out of Scope**：不做领航员之间自动互聊或互派工单；定时汇总若开启仅用零模型模板；IM 回合继续硬禁外部编码 CLI。
@@ -126,7 +126,7 @@
 ## Consequences and Trade-offs
 
 - **收益**：在守住既有 IM 受众隔离、按 run fail-closed 策略与薄改上游红线的前提下，将领航员从“多渠道伴侣控制栏”平滑升级为可控、防死锁、防烧钱的长期项目主管，并为后续 Squad 多专家协同留出干净的正交扩展面。
-- **代价**：需在 Slice A 补齐桌面领航员对 `t3_thread_*` 与 Pi 原生只读工具的范围校验，并引入 2 份极薄上游钩子补丁；Slice B 的单次确认卡与 2 槽/1 次自动委派护栏在重度自动化场景偏保守，待真机跑顺后再按实测放宽。
+- **代价**：需在 Slice A 补齐桌面领航员对 `t3_thread_*` / `t3_project_*` 的范围校验与写操作确认门禁，并引入 2 份极薄上游钩子补丁；Slice B 的单次确认卡与 2 槽/1 次自动委派护栏在重度自动化场景偏保守，待真机跑顺后再按实测放宽。
 
 ## Migration Implications
 
