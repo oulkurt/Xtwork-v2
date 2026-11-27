@@ -26,7 +26,60 @@
   });
   const unsupportedCli = async () => ({ supported: false, installedPath: null, onPath: false });
   let fullscreen = false;
-  native.on("xtwork:fullscreen", (value) => { fullscreen = value; });
+  let cornerRadiusRequest = 0;
+  let resizeSyncTimer = 0;
+  let pendingCornerRadiusSync = false;
+  const scheduleCornerRadiusSyncOnReady = () => {
+    if (pendingCornerRadiusSync || typeof document.addEventListener !== "function") return;
+    pendingCornerRadiusSync = true;
+    document.addEventListener("DOMContentLoaded", () => {
+      pendingCornerRadiusSync = false;
+      syncWindowCornerRadius();
+    }, { once: true });
+  };
+  const applyWindowCornerRadius = (radius) => {
+    if (!document.documentElement) {
+      scheduleCornerRadiusSyncOnReady();
+      return;
+    }
+    if (fullscreen) {
+      document.documentElement.style.setProperty("--xtwork-window-radius", "0px");
+    } else if (typeof radius === "number" && Number.isFinite(radius) && radius >= 0) {
+      document.documentElement.style.setProperty("--xtwork-window-radius", `${radius}px`);
+    } else {
+      document.documentElement.style.removeProperty("--xtwork-window-radius");
+    }
+  };
+  const syncWindowCornerRadius = () => {
+    if (resizeSyncTimer) {
+      clearTimeout(resizeSyncTimer);
+      resizeSyncTimer = 0;
+    }
+    if (!document.documentElement) {
+      scheduleCornerRadiusSyncOnReady();
+      return;
+    }
+    const requestId = ++cornerRadiusRequest;
+    if (fullscreen) {
+      applyWindowCornerRadius(0);
+      return;
+    }
+    call("GetWindowCornerRadius").then((radius) => {
+      if (requestId !== cornerRadiusRequest) return;
+      applyWindowCornerRadius(radius);
+    }).catch(() => {});
+  };
+  native.on("xtwork:fullscreen", (value) => { fullscreen = value; syncWindowCornerRadius(); });
+  native.on("xtwork:window-state", () => { syncWindowCornerRadius(); });
+  if (typeof window.addEventListener === "function") {
+    window.addEventListener("resize", () => {
+      if (resizeSyncTimer) clearTimeout(resizeSyncTimer);
+      resizeSyncTimer = setTimeout(() => {
+        resizeSyncTimer = 0;
+        syncWindowCornerRadius();
+      }, 50);
+    });
+  }
 
   Object.defineProperty(window, "desktopBridge", { value: Object.freeze({
     xtwork: true,
@@ -122,13 +175,9 @@
   const titlebar = new CSSStyleSheet();
   titlebar.replaceSync(`
     .drag-region { --app-region: drag; }
-    [class~="[-webkit-app-region:no-drag]"] { --app-region: no-drag; }
+    .drag-region :is(button, input, textarea, select, a), [class~="[-webkit-app-region:no-drag]"] { --app-region: no-drag; }
   `);
   document.adoptedStyleSheets = [...document.adoptedStyleSheets, titlebar];
 
-  call("GetWindowCornerRadius").then((radius) => {
-    if (radius > 0) {
-      titlebar.insertRule(`:root { --xtwork-window-radius: ${radius}px; }`);
-    }
-  }).catch(() => {});
+  syncWindowCornerRadius();
 }

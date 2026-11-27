@@ -3,7 +3,7 @@ import {
   type ThemeColorRole,
 } from "@t3tools/shared/themePalettes";
 
-import { getThemeColorVariable, isThemeColor } from "./themePalette";
+import { isThemeColor, registerAppearancePluginLayer } from "./themePalette";
 
 export type AppearancePluginTheme = Readonly<{
   pluginId: string;
@@ -28,6 +28,7 @@ export function applyAppearancePluginTheme(
 ): AppearanceApplication {
   const appliedRoles: ThemeColorRole[] = [];
   const rejectedRoles: string[] = [];
+  const validTokens: Partial<Record<ThemeColorRole, string>> = {};
 
   for (const [role, value] of Object.entries(plugin.theme.tokens)) {
     if (!themeRoles.has(role) || !isThemeColor(value)) {
@@ -35,15 +36,28 @@ export function applyAppearancePluginTheme(
       continue;
     }
     const themeRole = role as ThemeColorRole;
-    root.style.setProperty(getThemeColorVariable(themeRole), value);
+    validTokens[themeRole] = value;
     appliedRoles.push(themeRole);
   }
 
+  if (appliedRoles.length === 0) {
+    return {
+      appliedRoles,
+      rejectedRoles,
+      dispose: () => {},
+    };
+  }
+
+  const releaseLayer = registerAppearancePluginLayer(root, validTokens);
+
+  let disposed = false;
   return {
     appliedRoles,
     rejectedRoles,
     dispose: () => {
-      for (const role of appliedRoles) root.style.removeProperty(getThemeColorVariable(role));
+      if (disposed) return;
+      disposed = true;
+      releaseLayer();
     },
   };
 }

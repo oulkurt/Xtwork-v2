@@ -12,7 +12,7 @@
 
 `kind: "appearance"` 的插件不启动 worker。Go 宿主只登记它的主题 ID 和 token 快照，`plugins.list` 返回静态信息供 Web 侧使用。
 
-Web 侧 `applyAppearancePluginTheme` 只接受共享主题角色和合法主题颜色，映射到现有 `--app-theme-*` 变量。未知角色或非法颜色会被拒绝。清理函数只移除这次应用的变量。
+Web 侧 `applyAppearancePluginTheme` 只接受共享主题角色和合法主题颜色，通过声明式图层栈叠加到现有 `--app-theme-*` 变量并保持 `data-xtwork-theme-tokens` 激活、剥离内置窗口渐变，同时同步浏览器/壳层底色。未知角色或非法颜色会被拒绝；幂等清理函数只移除自身插件层并按当前最新基础主题与剩余插件重新投影。
 
 外观插件没有 iframe、JavaScript、HTML 或任意 CSS 注入入口。
 

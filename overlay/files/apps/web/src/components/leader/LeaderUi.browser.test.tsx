@@ -13,6 +13,7 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import { render } from "../../../test/render";
+import { AppRouteModal, AppRouteModalClose } from "../AppRouteModal";
 import { LeaderSidebarSlot } from "./LeaderSidebarSlot";
 import { LeaderSupervisoryBar } from "./LeaderSupervisoryBar";
 import { NavigatorBotAvatar } from "./NavigatorBotAvatar";
@@ -78,10 +79,14 @@ function makeRealThreadShell(
   });
 }
 
-vi.mock("../../state/entities", () => ({
-  useProjects: () => [],
-  useQuietThreadShells: () => mockThreadShells,
-}));
+vi.mock("../../state/entities", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../state/entities")>();
+  return {
+    ...actual,
+    useProjects: () => [],
+    useQuietThreadShells: () => mockThreadShells,
+  };
+});
 
 afterEach(() => {
   mockThreadShells = [];
@@ -1545,4 +1550,44 @@ it("patches only edited imPolicy sub-fields, expands truncated short paused mess
   await new Promise((resolve) => setTimeout(resolve, 150));
   await expect.element(page.getByTestId("leader-create-form")).toBeVisible();
   expect((page.getByTestId("leader-create-name").element() as HTMLInputElement).value).toBe("第二份草稿");
+});
+
+it("keeps AppRouteModal and its Close button below Windows MyGo titlebar via both height and controls-bottom CSS vars at 768x500 and 1200x800", async () => {
+  const root = document.documentElement;
+  root.classList.remove("wco");
+  const cases = [
+    { width: 768, height: 500, titlebarHeight: "52px", controlsBottom: "20px", expectedMinTop: 51.5 },
+    { width: 1200, height: 800, titlebarHeight: "20px", controlsBottom: "58px", expectedMinTop: 57.5 },
+  ] as const;
+  try {
+    for (const item of cases) {
+      root.style.setProperty("--mygo-titlebar-height", item.titlebarHeight);
+      root.style.setProperty("--mygo-titlebar-controls-bottom", item.controlsBottom);
+      await page.viewport(item.width, item.height);
+      await using _screen = await render(
+        <AppRouteModal label="Settings" onClose={() => {}}>
+          <div className="flex h-12 items-center justify-end px-4">
+            <AppRouteModalClose />
+          </div>
+        </AppRouteModal>,
+        { router: "/" },
+      );
+
+      const modal = document.querySelector("[data-app-modal]") as HTMLElement;
+      expect(modal).not.toBeNull();
+      const closeButton = page.getByRole("button", { name: "Close" }).element() as HTMLElement;
+      const modalRect = modal.getBoundingClientRect();
+      const closeRect = closeButton.getBoundingClientRect();
+      expect(modalRect.top, `${item.width}x${item.height} modal top`).toBeGreaterThanOrEqual(
+        item.expectedMinTop,
+      );
+      expect(closeRect.top, `${item.width}x${item.height} close button top`).toBeGreaterThanOrEqual(
+        item.expectedMinTop,
+      );
+      expect(closeRect.bottom).toBeGreaterThan(closeRect.top);
+    }
+  } finally {
+    root.style.removeProperty("--mygo-titlebar-height");
+    root.style.removeProperty("--mygo-titlebar-controls-bottom");
+  }
 });
