@@ -301,35 +301,35 @@ it("keeps real ChatView Navigator Manage button, inline RightPanelTabs, and narr
     expect(addSurfaceRect.right).toBeLessThanOrEqual(captionLeftWide + 0.5);
 
     await page.viewport(768, 500);
-    await vi.waitFor(
-      () => {
-        const sheetPopup = document.querySelector('[data-slot="sheet-popup"]') as HTMLElement | null;
-        expect(sheetPopup).not.toBeNull();
-        expect(sheetPopup!.getBoundingClientRect().top).toBeGreaterThanOrEqual(51.5);
-      },
-      { timeout: 2500 },
-    );
-    const sheetTabbar = document.querySelector(
-      '[data-slot="sheet-popup"] [data-right-panel-tabbar]',
-    ) as HTMLElement;
-    expect(sheetTabbar).not.toBeNull();
-    expect(sheetTabbar.getBoundingClientRect().top).toBeGreaterThanOrEqual(51.5);
-    const sheetButtons = Array.from(sheetTabbar.querySelectorAll("button"));
-    expect(sheetButtons.length).toBeGreaterThan(0);
-    for (const button of sheetButtons) {
-      expect(button.getBoundingClientRect().top).toBeGreaterThanOrEqual(51.5);
+    for (const sheetCase of [
+      { titlebarHeight: "52px", controlsBottom: "20px", expectedMinTop: 51.5 },
+      { titlebarHeight: "20px", controlsBottom: "58px", expectedMinTop: 57.5 },
+    ] as const) {
+      root.style.setProperty("--mygo-titlebar-height", sheetCase.titlebarHeight);
+      root.style.setProperty("--mygo-titlebar-controls-bottom", sheetCase.controlsBottom);
+      await vi.waitFor(
+        () => {
+          const sheetPopup = document.querySelector('[data-slot="sheet-popup"]') as HTMLElement | null;
+          expect(sheetPopup).not.toBeNull();
+          expect(sheetPopup!.getBoundingClientRect().top).toBeGreaterThanOrEqual(
+            sheetCase.expectedMinTop,
+          );
+        },
+        { timeout: 2500 },
+      );
+      const sheetTabbar = document.querySelector(
+        '[data-slot="sheet-popup"] [data-right-panel-tabbar]',
+      ) as HTMLElement;
+      expect(sheetTabbar).not.toBeNull();
+      expect(sheetTabbar.getBoundingClientRect().top).toBeGreaterThanOrEqual(
+        sheetCase.expectedMinTop,
+      );
+      const sheetButtons = Array.from(sheetTabbar.querySelectorAll("button"));
+      expect(sheetButtons.length).toBeGreaterThan(0);
+      for (const button of sheetButtons) {
+        expect(button.getBoundingClientRect().top).toBeGreaterThanOrEqual(sheetCase.expectedMinTop);
+      }
     }
-
-    root.style.setProperty("--mygo-titlebar-height", "20px");
-    root.style.setProperty("--mygo-titlebar-controls-bottom", "58px");
-    await vi.waitFor(
-      () => {
-        const sheetPopup = document.querySelector('[data-slot="sheet-popup"]') as HTMLElement | null;
-        expect(sheetPopup).not.toBeNull();
-        expect(sheetPopup!.getBoundingClientRect().top).toBeGreaterThanOrEqual(57.5);
-      },
-      { timeout: 2500 },
-    );
   } finally {
     useRightPanelStore.getState().removeThread(threadRef);
     root.style.removeProperty("--mygo-titlebar-inset-right");
